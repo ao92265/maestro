@@ -5,6 +5,7 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { writeText as writeClipboardText } from "@tauri-apps/plugin-clipboard-manager";
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import "@xterm/xterm/css/xterm.css";
 
@@ -40,6 +41,34 @@ interface TerminalViewProps {
   terminalCount?: number;
   isZoomed?: boolean;
   onToggleZoom?: () => void;
+}
+
+/**
+ * Writes text to the system clipboard reliably.
+ *
+ * Prefers the Tauri clipboard plugin (writes from the Rust side, so it works
+ * even when invoked outside a direct user gesture — e.g. from an OSC 52 escape
+ * sequence that arrives asynchronously via the PTY). Falls back to the browser
+ * Clipboard API if the plugin call fails.
+ */
+async function copyToClipboard(text: string): Promise<void> {
+  try {
+    await writeClipboardText(text);
+  } catch (err) {
+    console.warn("Tauri clipboard write failed, falling back to navigator.clipboard:", err);
+    await navigator.clipboard.writeText(text);
+  }
+}
+
+/**
+ * Decodes a base64 string (as carried by an OSC 52 clipboard sequence) into a
+ * UTF-8 string. `atob` only yields a binary string, so we re-decode the bytes
+ * to preserve multi-byte characters.
+ */
+function decodeBase64Utf8(b64: string): string {
+  const binary = atob(b64);
+  const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
 }
 
 /** Map backend AiMode to frontend AIProvider */
@@ -397,6 +426,29 @@ export const TerminalView = memo(function TerminalView({
         } catch { /* DOM renderer as final fallback */ }
       }
 
+      // Handle OSC 52 clipboard escape sequences. TUI apps like Claude Code copy
+      // selected text by emitting OSC 52 ("\x1b]52;c;<base64>\x07") rather than
+      // relying on xterm's own selection. xterm.js does NOT write to the system
+      // clipboard on its own, so without this handler the app prints "Copied to
+      // clipboard" but nothing actually lands on the clipboard. The payload is
+      // "<targets>;<base64data>"; a "?" payload is a paste/read request, which
+      // we don't support (returning false leaves it unhandled).
+      term.parser.registerOscHandler(52, (payload) => {
+        const sep = payload.indexOf(";");
+        if (sep === -1) return false;
+        const b64 = payload.slice(sep + 1);
+        if (b64 === "?" || b64.length === 0) return false;
+        try {
+          copyToClipboard(decodeBase64Utf8(b64)).catch((err) =>
+            console.error("OSC 52 clipboard write failed:", err),
+          );
+        } catch (err) {
+          console.error("OSC 52 decode failed:", err);
+          return false;
+        }
+        return true; // handled — suppress xterm's default (no-op) handling
+      });
+
       termRef.current = term;
       fitAddonRef.current = fitAddon;
 
@@ -509,7 +561,7 @@ export const TerminalView = memo(function TerminalView({
         const isCopy = event.key === "c" && (event.metaKey || event.ctrlKey) && event.type === "keydown";
         if (isCopy && term?.hasSelection()) {
           const selection = term.getSelection();
-          navigator.clipboard.writeText(selection).catch(console.error);
+          copyToClipboard(selection).catch(console.error);
           return false; // Don't send to PTY
         }
 

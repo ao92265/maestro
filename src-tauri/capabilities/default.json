@@ -12,6 +12,8 @@
     "store:default",
     "dialog:default",
     "opener:default",
+    "clipboard-manager:allow-write-text",
+    "clipboard-manager:allow-read-text",
     "updater:default",
     "cli:default",
     "core:window:allow-set-focus"
