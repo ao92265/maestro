@@ -3,6 +3,7 @@ import {
   GitMerge,
   Minus,
   PanelLeft,
+  Plus,
   Square,
   X,
 } from "lucide-react";
@@ -16,6 +17,13 @@ interface TopBarProps {
   gitPanelOpen?: boolean;
   /** When true, hides window controls (minimize/maximize/close) - use when ProjectTabs provides them */
   hideWindowControls?: boolean;
+  /** Whether sessions have been launched for the active project (grid view) */
+  inGridView?: boolean;
+  /** Number of session slots in the active project */
+  slotCount?: number;
+  /** Maximum number of sessions allowed */
+  maxSessions?: number;
+  onAddSession?: () => void;
 }
 
 export function TopBar({
@@ -24,6 +32,10 @@ export function TopBar({
   onToggleGitPanel,
   gitPanelOpen,
   hideWindowControls = false,
+  inGridView = false,
+  slotCount = 0,
+  maxSessions = 6,
+  onAddSession,
 }: TopBarProps) {
   const appWindow = useMemo(() => getCurrentWindow(), []);
 
@@ -56,6 +68,18 @@ export function TopBar({
 
       {/* Right: action icons */}
       <div className="flex items-center gap-0.5 mr-1">
+        {inGridView && (
+          <button
+            type="button"
+            onClick={onAddSession}
+            disabled={slotCount >= maxSessions}
+            className="rounded p-1.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text disabled:cursor-not-allowed disabled:opacity-50"
+            aria-label="Add session"
+            title="Add session"
+          >
+            <Plus size={14} />
+          </button>
+        )}
         <button
           type="button"
           onClick={onToggleGitPanel}

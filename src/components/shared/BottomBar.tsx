@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { FolderOpen, Play, Plus, UserRound } from "lucide-react";
+import { Play, UserRound } from "lucide-react";
 import { UsageBar } from "./UsageBar";
 import { SystemMetrics } from "./SystemMetrics";
 import { useClaudeAccountStore } from "@/stores/useClaudeAccountStore";
@@ -11,20 +11,14 @@ interface BottomBarProps {
   slotCount: number;
   /** Number of actually running sessions */
   launchedCount: number;
-  maxSessions?: number;
-  onSelectDirectory: () => void;
   onLaunchAll: () => void;
-  onAddSession?: () => void;
 }
 
 export function BottomBar({
   inGridView,
   slotCount,
   launchedCount,
-  maxSessions = 6,
-  onSelectDirectory,
   onLaunchAll,
-  onAddSession,
 }: BottomBarProps) {
   const hasUnlaunchedSlots = slotCount > launchedCount;
   const unlaunchedCount = slotCount - launchedCount;
@@ -46,32 +40,6 @@ export function BottomBar({
           <span className="truncate">{account.email}</span>
         </div>
       )}
-      <button
-        type="button"
-        onClick={inGridView ? undefined : onSelectDirectory}
-        disabled={inGridView}
-        className={`flex items-center gap-2 rounded-lg border border-maestro-border bg-maestro-card px-4 py-1.5 text-xs font-medium shadow-md shadow-black/20 transition-colors ${
-          inGridView
-            ? "cursor-not-allowed text-maestro-muted/50 opacity-50"
-            : "text-maestro-text hover:bg-maestro-border/50"
-        }`}
-      >
-        <FolderOpen size={13} />
-        Select Directory
-      </button>
-
-      {inGridView && (
-        <button
-          type="button"
-          onClick={onAddSession}
-          disabled={slotCount >= maxSessions}
-          className="flex items-center gap-2 rounded-lg border border-maestro-border bg-maestro-card px-4 py-1.5 text-xs font-medium shadow-md shadow-black/20 transition-colors text-maestro-text hover:bg-maestro-border/50 disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          <Plus size={13} />
-          Add Session
-        </button>
-      )}
-
       {(hasUnlaunchedSlots || !inGridView) && (
         <button
           type="button"

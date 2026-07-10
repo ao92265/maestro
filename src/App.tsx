@@ -406,6 +406,10 @@ function App() {
               onToggleGitPanel={() => setGitPanelOpen((prev) => !prev)}
               gitPanelOpen={gitPanelOpen}
               hideWindowControls
+              inGridView={activeTabSessionsLaunched}
+              slotCount={activeTabSlotCount}
+              maxSessions={DEFAULT_SESSION_COUNT}
+              onAddSession={() => multiProjectRef.current?.addSessionToActiveProject()}
             />
 
             {/* Git panel header - inline at same level as TopBar */}
@@ -492,8 +496,6 @@ function App() {
               inGridView={activeTabSessionsLaunched}
               slotCount={activeTabSlotCount}
               launchedCount={activeTabLaunchedCount}
-              maxSessions={DEFAULT_SESSION_COUNT}
-              onSelectDirectory={handleOpenProject}
               onLaunchAll={() => {
                 if (!activeTabSessionsLaunched && activeTab) {
                   // First enter grid view, then launch
@@ -501,7 +503,6 @@ function App() {
                 }
                 multiProjectRef.current?.launchAllInActiveProject();
               }}
-              onAddSession={() => multiProjectRef.current?.addSessionToActiveProject()}
             />
           </div>
         </div>
