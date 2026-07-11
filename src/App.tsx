@@ -24,6 +24,8 @@ import {
   MultiProjectView,
   type MultiProjectViewHandle,
 } from "./components/shared/MultiProjectView";
+import { UnifiedTerminalView } from "./components/shared/UnifiedTerminalView";
+import { useUnifiedViewStore } from "./stores/useUnifiedViewStore";
 import { MAC_TITLE_BAR_INSET_PX, useMacTitleBarPadding } from "@/hooks/useMacTitleBarPadding";
 import { isMac } from "@/lib/platform";
 import { ProjectTabs } from "./components/shared/ProjectTabs";
@@ -56,6 +58,8 @@ function App() {
   const dismissFDADialogPermanently = useFDAStore((s) => s.dismissPermanently);
   const retryAfterFDAGrant = useFDAStore((s) => s.retryAfterGrant);
   const multiProjectRef = useRef<MultiProjectViewHandle>(null);
+  const unifiedView = useUnifiedViewStore((s) => s.enabled);
+  const toggleUnifiedView = useUnifiedViewStore((s) => s.toggle);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [gitPanelOpen, setGitPanelOpen] = useState(false);
   const [gitPanelTab, setGitPanelTab] = useState<GitPanelTab>("status");
@@ -343,6 +347,7 @@ function App() {
     canAddSession: activeTabSessionsLaunched,
     onToggleSidebar: handleToggleSidebar,
     onToggleGitPanel: handleToggleGitPanel,
+    onToggleUnifiedView: toggleUnifiedView,
   });
 
   // Handler to enter grid view for the active project
@@ -372,7 +377,7 @@ function App() {
     >
       {/* Project tabs — full width at top (with window controls) */}
       <ProjectTabs
-        tabs={tabs.map((t) => ({ id: t.id, name: t.name, active: t.active }))}
+        tabs={tabs.map((t) => ({ id: t.id, name: t.name, active: t.active, color: t.color }))}
         onSelectTab={selectTab}
         onCloseTab={closeTab}
         onNewTab={handleOpenProject}
@@ -410,6 +415,8 @@ function App() {
               slotCount={activeTabSlotCount}
               maxSessions={DEFAULT_SESSION_COUNT}
               onAddSession={() => multiProjectRef.current?.addSessionToActiveProject()}
+              unifiedView={unifiedView}
+              onToggleUnifiedView={toggleUnifiedView}
             />
 
             {/* Git panel header - inline at same level as TopBar */}
@@ -468,12 +475,28 @@ function App() {
 
           {/* Content area (main + optional git panel) */}
           <div className="flex flex-1 overflow-hidden">
-            {/* Main content - MultiProjectView keeps all projects alive */}
+            {/* Main content - MultiProjectView keeps all projects alive.
+                When the unified view is active it overlays on top; MultiProjectView
+                stays mounted (and full-size) underneath so terminal state and
+                scrollback survive toggling. */}
             <main className="relative flex-1 overflow-hidden bg-maestro-bg">
-              <MultiProjectView
-                ref={multiProjectRef}
-                onSessionCountChange={handleSessionCountChange}
-              />
+              <div
+                className={
+                  unifiedView
+                    ? "invisible pointer-events-none absolute inset-0"
+                    : "absolute inset-0"
+                }
+              >
+                <MultiProjectView
+                  ref={multiProjectRef}
+                  onSessionCountChange={handleSessionCountChange}
+                />
+              </div>
+              {unifiedView && (
+                <div className="absolute inset-0 z-20">
+                  <UnifiedTerminalView />
+                </div>
+              )}
             </main>
 
             {/* Git graph panel (optional right side) */}

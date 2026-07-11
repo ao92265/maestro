@@ -23,6 +23,8 @@ export type ProjectTab = {
   id: string;
   name: string;
   active: boolean;
+  /** Accent color used to distinguish this project (matches the unified terminals view). */
+  color?: string;
 };
 
 interface ProjectTabsProps {
@@ -76,6 +78,11 @@ function TabItem({
     transform: CSS.Transform.toString(transform),
     transition,
     opacity: isDragging ? 0.5 : 1,
+    // Project accent as a 2px underline (inset shadow avoids affecting layout).
+    // Dimmed on inactive tabs so the active tab stays the focal point.
+    ...(tab.color
+      ? { boxShadow: `inset 0 -2px 0 0 ${tab.color}${tab.active ? "" : "80"}` }
+      : {}),
   };
 
   return (

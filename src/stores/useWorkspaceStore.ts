@@ -4,6 +4,7 @@ import { create } from "zustand";
 import { createJSONStorage, persist, type StateStorage } from "zustand/middleware";
 import { arrayMove } from "@dnd-kit/sortable";
 import { killSession } from "@/lib/terminal";
+import { colorForIndex, pickProjectColor } from "@/lib/projectColors";
 
 // --- Types ---
 
@@ -36,6 +37,7 @@ export interface RepositoryInfo {
  * @property repositories - Detected repositories within this workspace (empty for single-repo).
  * @property selectedRepoPath - Currently selected repository path for git operations.
  * @property worktreeBasePath - Custom worktree base directory for this project (null = use default).
+ * @property color - Accent color used to distinguish this project (e.g. in the unified terminals view).
  */
 export type WorkspaceTab = {
   id: string;
@@ -48,6 +50,7 @@ export type WorkspaceTab = {
   repositories: RepositoryInfo[];
   selectedRepoPath: string | null;
   worktreeBasePath: string | null;
+  color: string;
 };
 
 /** Read-only slice of the workspace store; persisted to disk via Zustand `persist`. */
@@ -169,6 +172,7 @@ export const useWorkspaceStore = create<WorkspaceState & WorkspaceActions>()(
 
         const id = crypto.randomUUID();
         const name = basename(path);
+        const color = pickProjectColor(tabs.map((t) => t.color));
 
         // Detect workspace type
         let workspaceType: WorkspaceType;
@@ -209,6 +213,7 @@ export const useWorkspaceStore = create<WorkspaceState & WorkspaceActions>()(
               repositories,
               selectedRepoPath,
               worktreeBasePath: null,
+              color,
             },
           ],
         });
@@ -360,16 +365,19 @@ export const useWorkspaceStore = create<WorkspaceState & WorkspaceActions>()(
       name: "maestro-workspace",
       storage: createJSONStorage(() => tauriStorage),
       partialize: (state) => ({ tabs: state.tabs }),
-      version: 4,
+      version: 5,
       onRehydrateStorage: () => {
         return (state) => {
           if (state) {
             // Clear stale sessionIds - sessions don't survive app restarts
-            // This prevents session ID collision between persisted tabs and new sessions
-            state.tabs = state.tabs.map((t) => ({
+            // This prevents session ID collision between persisted tabs and new sessions.
+            // Also backfill a project color for any tab missing one (defensive: covers
+            // states that bypassed the migrate path).
+            state.tabs = state.tabs.map((t, i) => ({
               ...t,
               sessionIds: [],
               sessionsLaunched: false,
+              color: t.color ?? colorForIndex(i),
             }));
           }
         };
@@ -403,6 +411,14 @@ export const useWorkspaceStore = create<WorkspaceState & WorkspaceActions>()(
           tabs = tabs.map((t) => ({
             ...t,
             worktreeBasePath: t.worktreeBasePath ?? null,
+          }));
+        }
+
+        // v4 -> v5: Assign a stable per-project color, distinct across existing tabs.
+        if (version < 5) {
+          tabs = tabs.map((t, i) => ({
+            ...t,
+            color: t.color ?? colorForIndex(i),
           }));
         }
 

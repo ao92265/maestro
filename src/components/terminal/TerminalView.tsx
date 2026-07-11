@@ -37,7 +37,8 @@ interface TerminalViewProps {
   isFocused?: boolean;
   isActive?: boolean;
   onFocus?: () => void;
-  onKill: (sessionId: number) => void;
+  /** When omitted, the kill button is hidden (e.g. the monitor-only unified view). */
+  onKill?: (sessionId: number) => void;
   terminalCount?: number;
   isZoomed?: boolean;
   onToggleZoom?: () => void;
@@ -272,7 +273,7 @@ export const TerminalView = memo(function TerminalView({
   const handleKill = useCallback(
     (id: number) => {
       // Update UI immediately (optimistic)
-      onKill(id);
+      onKill?.(id);
       // Kill session in background - don't await
       killSession(id).catch((err) => {
         console.error("Failed to kill session:", err);
@@ -802,7 +803,7 @@ export const TerminalView = memo(function TerminalView({
         sessionName={sessionData?.name}
         branchName={effectiveBranch}
         isWorktree={isWorktree}
-        onKill={handleKill}
+        onKill={onKill ? handleKill : undefined}
         onRename={handleRename}
         terminalCount={terminalCount}
         isZoomed={isZoomed}

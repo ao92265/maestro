@@ -31,6 +31,7 @@ function setTabs(tabs: Array<{ id: string; name: string; active: boolean }>) {
       repositories: [],
       selectedRepoPath: null,
       worktreeBasePath: null,
+      color: "#60a5fa",
     })),
   });
 }
