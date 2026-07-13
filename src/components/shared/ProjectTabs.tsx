@@ -23,6 +23,8 @@ export type ProjectTab = {
   id: string;
   name: string;
   active: boolean;
+  /** Project accent color (name-derived, matches the eagle view's tile borders). */
+  color?: string;
 };
 
 interface ProjectTabsProps {
@@ -76,6 +78,16 @@ function TabItem({
     transform: CSS.Transform.toString(transform),
     transition,
     opacity: isDragging ? 0.5 : 1,
+    // Project accent as a 2px underline (inset shadow avoids affecting layout).
+    // Dimmed on inactive tabs so the active tab stays the focal point.
+    // color-mix (not a hex alpha suffix) because the accents are hsl() strings.
+    ...(tab.color
+      ? {
+          boxShadow: `inset 0 -2px 0 0 ${
+            tab.active ? tab.color : `color-mix(in srgb, ${tab.color} 50%, transparent)`
+          }`,
+        }
+      : {}),
   };
 
   return (

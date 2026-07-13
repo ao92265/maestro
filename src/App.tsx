@@ -26,6 +26,7 @@ import {
 } from "./components/shared/MultiProjectView";
 import { MAC_TITLE_BAR_INSET_PX, useMacTitleBarPadding } from "@/hooks/useMacTitleBarPadding";
 import { isMac } from "@/lib/platform";
+import { projectColorFor } from "@/lib/projectColor";
 import { ProjectTabs } from "./components/shared/ProjectTabs";
 import { TopBar } from "./components/shared/TopBar";
 import { Sidebar } from "./components/sidebar/Sidebar";
@@ -345,6 +346,7 @@ function App() {
     canAddSession: activeTabSessionsLaunched,
     onToggleSidebar: handleToggleSidebar,
     onToggleGitPanel: handleToggleGitPanel,
+    onToggleEagleView: useCallback(() => setEagleView((v) => !v), []),
   });
 
   // Handler to enter grid view for the active project
@@ -374,7 +376,12 @@ function App() {
     >
       {/* Project tabs — full width at top (with window controls) */}
       <ProjectTabs
-        tabs={tabs.map((t) => ({ id: t.id, name: t.name, active: t.active }))}
+        tabs={tabs.map((t) => ({
+          id: t.id,
+          name: t.name,
+          active: t.active,
+          color: projectColorFor(t.name),
+        }))}
         onSelectTab={selectTab}
         onCloseTab={closeTab}
         onNewTab={handleOpenProject}

@@ -9,6 +9,8 @@ interface UseAppKeyboardOptions {
   onToggleSidebar?: () => void;
   /** Callback to toggle the git panel (Cmd/Ctrl+2) */
   onToggleGitPanel?: () => void;
+  /** Callback to toggle the eagle all-projects terminals view (Cmd/Ctrl+G) */
+  onToggleEagleView?: () => void;
 }
 
 /**
@@ -24,6 +26,7 @@ function isMac(): boolean {
  * Shortcuts:
  * - Cmd/Ctrl+T: Add a new session slot (when in grid view)
  * - Cmd/Ctrl+2: Toggle the git panel
+ * - Cmd/Ctrl+G: Toggle the eagle all-projects terminals view
  * - Alt+1: Toggle the left sidebar
  * - Alt+N: Add a new session slot (when in grid view)
  */
@@ -32,6 +35,7 @@ export function useAppKeyboard({
   canAddSession,
   onToggleSidebar,
   onToggleGitPanel,
+  onToggleEagleView,
 }: UseAppKeyboardOptions): void {
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -74,6 +78,14 @@ export function useAppKeyboard({
         if (canAddSession) {
           onAddSession();
         }
+        return;
+      }
+
+      // Cmd/Ctrl+G: toggle the eagle all-projects terminals view.
+      if (event.code === "KeyG" && onToggleEagleView) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        onToggleEagleView();
       }
     }
 
@@ -82,5 +94,5 @@ export function useAppKeyboard({
     // bubble-phase listener — including xterm's textarea and other modal handlers.
     window.addEventListener("keydown", handleKeyDown, { capture: true });
     return () => window.removeEventListener("keydown", handleKeyDown, { capture: true });
-  }, [onAddSession, canAddSession, onToggleSidebar, onToggleGitPanel]);
+  }, [onAddSession, canAddSession, onToggleSidebar, onToggleGitPanel, onToggleEagleView]);
 }
