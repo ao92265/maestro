@@ -6,6 +6,7 @@
 //! [`parse_transcript_line`](super::transcript_parser::parse_transcript_line),
 //! and emits the resulting [`ClaudeEvent`]s.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -16,7 +17,6 @@ use notify::{Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-#[cfg(test)]
 use super::claude_event::ClaudeEvent;
 use super::event_bus::EventBus;
 use super::transcript_parser::parse_transcript_line;
@@ -155,13 +155,22 @@ async fn reader_task(
     event_bus: Arc<EventBus>,
 ) {
     let mut byte_offset: u64 = 0;
+    // tool_use ids of Task invocations whose result hasn't been seen yet;
+    // lets us turn a generic tool_result into a SubagentCompleted event.
+    let mut pending_task_ids: HashSet<String> = HashSet::new();
 
     while rx.recv().await.is_some() {
         // Coalesce rapid notifications: drain any buffered signals so we
         // only read once per burst.
         while rx.try_recv().is_ok() {}
 
-        byte_offset = read_new_lines(session_id, &path, byte_offset, &event_bus);
+        byte_offset = read_new_lines(
+            session_id,
+            &path,
+            byte_offset,
+            &event_bus,
+            &mut pending_task_ids,
+        );
     }
 
     log::debug!("TranscriptWatcher: reader task for session {session_id} exiting");
@@ -174,9 +183,21 @@ async fn reader_task(
 /// Read new lines from `path` starting at `byte_offset`, parse each one, and
 /// emit the resulting events on `event_bus`.
 ///
+/// `pending_task_ids` carries the Task tool_use ids spawned earlier in this
+/// transcript. A `ToolUseCompleted` whose id matches becomes a
+/// `SubagentCompleted`; all other `ToolUseCompleted` events are dropped here —
+/// the parser emits one per tool_result of every tool, and putting those on
+/// the bus would crowd real activity out of the frontend's capped event feed.
+///
 /// Returns the updated byte offset (pointing just past the last byte read).
 /// If the file does not exist, returns the same `byte_offset` without error.
-fn read_new_lines(session_id: u32, path: &PathBuf, byte_offset: u64, event_bus: &EventBus) -> u64 {
+fn read_new_lines(
+    session_id: u32,
+    path: &PathBuf,
+    byte_offset: u64,
+    event_bus: &EventBus,
+    pending_task_ids: &mut HashSet<String>,
+) -> u64 {
     let file = match File::open(path) {
         Ok(f) => f,
         Err(e) => {
@@ -212,7 +233,28 @@ fn read_new_lines(session_id: u32, path: &PathBuf, byte_offset: u64, event_bus: 
                 if !trimmed.is_empty() {
                     let events = parse_transcript_line(session_id, trimmed);
                     for event in events {
-                        event_bus.emit(event);
+                        match event {
+                            ClaudeEvent::SubagentSpawned { ref agent_id, .. } => {
+                                pending_task_ids.insert(agent_id.clone());
+                                event_bus.emit(event);
+                            }
+                            ClaudeEvent::ToolUseCompleted {
+                                tool_use_id,
+                                success,
+                                timestamp,
+                                ..
+                            } => {
+                                if pending_task_ids.remove(&tool_use_id) {
+                                    event_bus.emit(ClaudeEvent::SubagentCompleted {
+                                        session_id,
+                                        agent_id: tool_use_id,
+                                        success,
+                                        timestamp,
+                                    });
+                                }
+                            }
+                            other => event_bus.emit(other),
+                        }
                     }
                 }
             }
@@ -255,7 +297,7 @@ mod tests {
         let path = file.path().to_path_buf();
         let (bus, collected) = test_event_bus();
 
-        let new_offset = read_new_lines(1, &path, 0, &bus);
+        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new());
 
         assert_eq!(new_offset, 0, "empty file should keep offset at 0");
         assert!(
@@ -273,7 +315,7 @@ mod tests {
         let path = file.path().to_path_buf();
         let (bus, collected) = test_event_bus();
 
-        let new_offset = read_new_lines(1, &path, 0, &bus);
+        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new());
 
         assert!(new_offset > 0, "offset should advance past the written line");
 
@@ -305,9 +347,10 @@ mod tests {
 
         let path = file.path().to_path_buf();
         let (bus, collected) = test_event_bus();
+        let mut task_ids = HashSet::new();
 
         // First read picks up the first line.
-        let offset1 = read_new_lines(1, &path, 0, &bus);
+        let offset1 = read_new_lines(1, &path, 0, &bus, &mut task_ids);
         assert_eq!(
             collected.lock().unwrap().len(),
             1,
@@ -320,7 +363,7 @@ mod tests {
         file.flush().expect("flush");
 
         // Second read starts from offset1 and should only pick up the new line.
-        let offset2 = read_new_lines(1, &path, offset1, &bus);
+        let offset2 = read_new_lines(1, &path, offset1, &bus, &mut task_ids);
         assert!(
             offset2 > offset1,
             "offset should advance after reading second line"
@@ -344,11 +387,46 @@ mod tests {
     }
 
     #[test]
+    fn test_task_tool_result_becomes_subagent_completed() {
+        let mut file = NamedTempFile::new().expect("create temp file");
+        // A Task spawn, its tool_result, and an unrelated (Read) tool_result.
+        let task_line = r#"{"type":"assistant","message":{"model":"claude-opus-4-6","content":[{"type":"tool_use","id":"toolu_task9","name":"Task","input":{"description":"explore","subagent_type":"Explore"}}],"usage":{"input_tokens":10,"output_tokens":5}},"uuid":"a1","timestamp":"2026-07-13T10:00:00Z"}"#;
+        let task_result_line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_task9","content":"done"}]},"uuid":"u1","timestamp":"2026-07-13T10:01:00Z"}"#;
+        let read_result_line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_read1","content":"file body"}]},"uuid":"u2","timestamp":"2026-07-13T10:02:00Z"}"#;
+        writeln!(file, "{task_line}").unwrap();
+        writeln!(file, "{task_result_line}").unwrap();
+        writeln!(file, "{read_result_line}").unwrap();
+        file.flush().unwrap();
+
+        let (bus, collected) = test_event_bus();
+        read_new_lines(7, &file.path().to_path_buf(), 0, &bus, &mut HashSet::new());
+
+        let events = collected.lock().unwrap();
+        // The Task's result surfaces as SubagentCompleted…
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ClaudeEvent::SubagentCompleted { agent_id, success: true, .. } if agent_id == "toolu_task9"
+            )),
+            "Expected SubagentCompleted for toolu_task9, got {:?}",
+            *events
+        );
+        // …and no raw ToolUseCompleted reaches the bus (non-Task results are dropped).
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ClaudeEvent::ToolUseCompleted { .. })),
+            "ToolUseCompleted must not be emitted on the bus, got {:?}",
+            *events
+        );
+    }
+
+    #[test]
     fn test_read_nonexistent_file() {
         let path = PathBuf::from("/tmp/nonexistent_transcript_test_file_12345.jsonl");
         let (bus, collected) = test_event_bus();
 
-        let new_offset = read_new_lines(1, &path, 0, &bus);
+        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new());
 
         assert_eq!(
             new_offset, 0,

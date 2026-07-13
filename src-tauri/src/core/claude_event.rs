@@ -106,6 +106,8 @@ pub enum ClaudeEvent {
     SubagentCompleted {
         session_id: u32,
         agent_id: String,
+        /// Whether the Task tool_result reported success (`is_error` absent/false).
+        success: bool,
         timestamp: String,
     },
 
@@ -248,7 +250,7 @@ mod tests {
             ClaudeEvent::FileEdited { session_id: 7, file_path: "/a".into(), tool: "Edit".into(), timestamp: "t".into() },
             ClaudeEvent::FileCreated { session_id: 8, file_path: "/b".into(), timestamp: "t".into() },
             ClaudeEvent::SubagentSpawned { session_id: 9, agent_type: "Explore".into(), agent_id: "s".into(), description: "d".into(), timestamp: "t".into() },
-            ClaudeEvent::SubagentCompleted { session_id: 10, agent_id: "s".into(), timestamp: "t".into() },
+            ClaudeEvent::SubagentCompleted { session_id: 10, agent_id: "s".into(), success: true, timestamp: "t".into() },
             ClaudeEvent::StatusUpdate { session_id: 11, state: "working".into(), message: "m".into(), needs_input_prompt: None, timestamp: "t".into() },
             ClaudeEvent::TokenUsageUpdate { session_id: 12, input_tokens: 100, output_tokens: 50, cache_read_tokens: 10, cache_creation_tokens: 5, timestamp: "t".into() },
         ];

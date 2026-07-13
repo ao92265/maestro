@@ -120,10 +120,12 @@ fn parse_user_message(session_id: u32, obj: &Value) -> Vec<ClaudeEvent> {
     let uuid = extract_uuid(obj);
     let timestamp = extract_timestamp(obj);
 
-    let text = obj
+    let content_blocks = obj
         .get("message")
         .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_array())
+        .and_then(|c| c.as_array());
+
+    let text = content_blocks
         .map(|blocks| {
             blocks
                 .iter()
@@ -139,12 +141,44 @@ fn parse_user_message(session_id: u32, obj: &Value) -> Vec<ClaudeEvent> {
         })
         .unwrap_or_default();
 
-    vec![ClaudeEvent::UserMessage {
+    let mut events = vec![ClaudeEvent::UserMessage {
         session_id,
         uuid,
         text,
-        timestamp,
-    }]
+        timestamp: timestamp.clone(),
+    }];
+
+    // tool_result blocks close out an earlier tool_use with the same id.
+    // The originating tool's name isn't present on the result block, so
+    // tool_name is left empty; consumers match on tool_use_id.
+    if let Some(blocks) = content_blocks {
+        for block in blocks {
+            if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                continue;
+            }
+            let tool_use_id = block
+                .get("tool_use_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if tool_use_id.is_empty() {
+                continue;
+            }
+            let is_error = block
+                .get("is_error")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            events.push(ClaudeEvent::ToolUseCompleted {
+                session_id,
+                tool_name: String::new(),
+                tool_use_id,
+                success: !is_error,
+                timestamp: timestamp.clone(),
+            });
+        }
+    }
+
+    events
 }
 
 fn parse_assistant_message(session_id: u32, obj: &Value) -> Vec<ClaudeEvent> {
@@ -325,6 +359,10 @@ mod tests {
 
     const FILE_HISTORY: &str = r#"{"type":"file-history-snapshot","messageId":"e2c301be","snapshot":{}}"#;
 
+    const USER_MSG_TOOL_RESULT: &str = r#"{"parentUuid":"uuid-asst-3","isSidechain":false,"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_task1","content":[{"type":"text","text":"Task finished"}]}]},"uuid":"uuid-user-2","timestamp":"2026-02-24T10:05:00.000Z"}"#;
+
+    const USER_MSG_TOOL_RESULT_ERROR: &str = r#"{"parentUuid":"uuid-asst-1","isSidechain":false,"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_abc","is_error":true,"content":"boom"}]},"uuid":"uuid-user-3","timestamp":"2026-02-24T10:06:00.000Z"}"#;
+
     #[test]
     fn test_parse_user_message() {
         let events = parse_transcript_line(1, USER_MSG);
@@ -434,6 +472,51 @@ mod tests {
             assert_eq!(agent_id, "toolu_task1");
             assert_eq!(description, "Search for auth code");
         }
+    }
+
+    #[test]
+    fn test_parse_tool_result_emits_completed() {
+        let events = parse_transcript_line(4, USER_MSG_TOOL_RESULT);
+
+        let completed = events
+            .iter()
+            .find(|e| matches!(e, ClaudeEvent::ToolUseCompleted { .. }));
+        assert!(completed.is_some(), "Should have a ToolUseCompleted event");
+        if let Some(ClaudeEvent::ToolUseCompleted {
+            session_id,
+            tool_use_id,
+            success,
+            ..
+        }) = completed
+        {
+            assert_eq!(*session_id, 4);
+            assert_eq!(tool_use_id, "toolu_task1");
+            assert!(*success);
+        }
+    }
+
+    #[test]
+    fn test_parse_tool_result_error_marks_failure() {
+        let events = parse_transcript_line(4, USER_MSG_TOOL_RESULT_ERROR);
+
+        let completed = events
+            .iter()
+            .find(|e| matches!(e, ClaudeEvent::ToolUseCompleted { .. }));
+        assert!(completed.is_some(), "Should have a ToolUseCompleted event");
+        if let Some(ClaudeEvent::ToolUseCompleted { success, .. }) = completed {
+            assert!(!*success, "is_error:true should map to success:false");
+        }
+    }
+
+    #[test]
+    fn test_plain_user_message_has_no_completed_event() {
+        let events = parse_transcript_line(1, USER_MSG);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ClaudeEvent::ToolUseCompleted { .. })),
+            "text-only user message must not emit ToolUseCompleted"
+        );
     }
 
     #[test]
