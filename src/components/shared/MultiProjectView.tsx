@@ -1,10 +1,16 @@
-import { useRef, forwardRef, useImperativeHandle, useMemo } from "react";
+import { useEffect, useRef, useState, forwardRef, useImperativeHandle, useMemo } from "react";
+import { useSessionStore } from "@/stores/useSessionStore";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { IdleLandingView } from "./IdleLandingView";
 import { TerminalGrid, type TerminalGridHandle } from "../terminal/TerminalGrid";
 
 interface MultiProjectViewProps {
   onSessionCountChange?: (tabId: string, slotCount: number, launchedCount: number) => void;
+  /**
+   * Eagle view: show every project's terminals at once in one flat grid
+   * (tiles color-coded by project) instead of only the active project.
+   */
+  eagleView?: boolean;
 }
 
 export interface MultiProjectViewHandle {
@@ -22,11 +28,49 @@ export interface MultiProjectViewHandle {
  * uses a ZStack to preserve terminal NSView state across project switches.
  */
 export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectViewProps>(
-  function MultiProjectView({ onSessionCountChange }, ref) {
+  function MultiProjectView({ onSessionCountChange, eagleView = false }, ref) {
   const tabs = useWorkspaceStore((s) => s.tabs);
   const setSessionsLaunched = useWorkspaceStore((s) => s.setSessionsLaunched);
   const setSelectedRepo = useWorkspaceStore((s) => s.setSelectedRepo);
   const gridRefs = useRef<Map<string, TerminalGridHandle>>(new Map());
+
+  // Eagle view: which pane (if any) is zoomed to fill the window.
+  const [eagleZoom, setEagleZoom] = useState<{ tabId: string; slotId: string } | null>(null);
+
+  // Live session count drives the eagle grid's column count. Gated on
+  // eagleView so session launches/kills don't re-render every project's grid
+  // while the eagle grid isn't even showing.
+  const liveSessionCount = useSessionStore((s) => (eagleView ? s.sessions.length : 0));
+
+  // Leaving eagle view always drops the zoom.
+  useEffect(() => {
+    if (!eagleView) setEagleZoom(null);
+  }, [eagleView]);
+
+  // Esc exits the eagle zoom back to the grid.
+  useEffect(() => {
+    if (!eagleView || !eagleZoom) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setEagleZoom(null);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [eagleView, eagleZoom]);
+
+  // Stable per-tab eagle zoom toggles (same pattern as the other callbacks).
+  const eagleZoomCallbacks = useMemo(() => {
+    const callbacks = new Map<string, (slotId: string) => void>();
+    for (const tab of tabs) {
+      callbacks.set(tab.id, (slotId: string) => {
+        setEagleZoom((prev) =>
+          prev && prev.tabId === tab.id && prev.slotId === slotId
+            ? null
+            : { tabId: tab.id, slotId }
+        );
+      });
+    }
+    return callbacks;
+  }, [tabs]);
 
   // Expose methods to parent
   useImperativeHandle(ref, () => ({
@@ -124,21 +168,62 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
     );
   }
 
+  // Eagle view lays every launched pane of every project into one flat grid.
+  // The per-project wrappers and split trees flatten out via `display:contents`
+  // (className "contents"), so the SAME mounted xterm elements become direct
+  // grid items — no remount, scrollback and PTY wiring survive the toggle.
+  const eagleColumns = Math.max(1, Math.ceil(Math.sqrt(Math.max(1, liveSessionCount))));
+
   return (
-    <div className="relative h-full w-full">
-      {/* Render ALL project views in a stacked container (ZStack equivalent) */}
+    <div
+      className={eagleView ? "h-full w-full bg-maestro-bg p-2" : "relative h-full w-full"}
+      style={
+        eagleView
+          ? {
+              display: "grid",
+              gridTemplateColumns: `repeat(${eagleColumns}, minmax(0, 1fr))`,
+              gridAutoRows: "minmax(0, 1fr)",
+              gap: "8px",
+            }
+          : undefined
+      }
+    >
+      {/* Eagle view with nothing running: every tile is hidden, so give the
+          empty grid a hint instead of a blank screen. */}
+      {eagleView && liveSessionCount === 0 && (
+        <div className="flex h-full items-center justify-center" style={{ gridColumn: "1 / -1" }}>
+          <p className="text-sm text-maestro-muted">
+            No running terminals — launch sessions to see them here
+          </p>
+        </div>
+      )}
+
+      {/* Render ALL project views in a stacked container (ZStack equivalent).
+          In eagle view the stack flattens: launched projects become transparent
+          (display:contents) so their panes tile into the grid above; idle
+          projects are hidden entirely. */}
       {tabs.map((tab) => (
         <div
           key={tab.id}
-          className={`absolute inset-0 transition-opacity duration-150 ${
-            tab.active
-              ? "opacity-100 pointer-events-auto z-10"
-              : "opacity-0 pointer-events-none z-0"
-          }`}
-          style={{
-            // Keep in DOM but visually hidden when inactive
-            visibility: tab.active ? "visible" : "hidden",
-          }}
+          className={
+            eagleView
+              ? tab.sessionsLaunched
+                ? "contents"
+                : "hidden"
+              : `absolute inset-0 transition-opacity duration-150 ${
+                  tab.active
+                    ? "opacity-100 pointer-events-auto z-10"
+                    : "opacity-0 pointer-events-none z-0"
+                }`
+          }
+          style={
+            eagleView
+              ? undefined
+              : {
+                  // Keep in DOM but visually hidden when inactive
+                  visibility: tab.active ? "visible" : "hidden",
+                }
+          }
         >
           {tab.sessionsLaunched ? (
             <TerminalGrid
@@ -153,6 +238,13 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
               isActive={tab.active}
               onSessionCountChange={sessionCountChangeCallbacks.get(tab.id)}
               onAllSessionsClosed={allSessionsClosedCallbacks.get(tab.id)}
+              eagleMode={eagleView}
+              projectName={tab.name}
+              eagleZoomedSlotId={
+                eagleZoom && eagleZoom.tabId === tab.id ? eagleZoom.slotId : null
+              }
+              eagleAnyZoomed={eagleView && eagleZoom !== null}
+              onEagleZoomToggle={eagleZoomCallbacks.get(tab.id)}
             />
           ) : (
             <IdleLandingView onAdd={launchCallbacks.get(tab.id)!} />

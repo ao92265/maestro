@@ -64,6 +64,8 @@ function App() {
   >(new Map());
   const [isStoppingAll, setIsStoppingAll] = useState(false);
   const [currentBranch, setCurrentBranch] = useState<string | undefined>(undefined);
+  // Eagle view: one flat grid of every project's terminals at once
+  const [eagleView, setEagleView] = useState(false);
   const [theme, setTheme] = useState<Theme>(() => {
     const stored = localStorage.getItem("maestro-theme");
     return isValidTheme(stored) ? stored : "dark";
@@ -410,6 +412,8 @@ function App() {
               slotCount={activeTabSlotCount}
               maxSessions={DEFAULT_SESSION_COUNT}
               onAddSession={() => multiProjectRef.current?.addSessionToActiveProject()}
+              eagleView={eagleView}
+              onToggleEagleView={() => setEagleView((v) => !v)}
             />
 
             {/* Git panel header - inline at same level as TopBar */}
@@ -473,6 +477,7 @@ function App() {
               <MultiProjectView
                 ref={multiProjectRef}
                 onSessionCountChange={handleSessionCountChange}
+                eagleView={eagleView}
               />
             </main>
 
