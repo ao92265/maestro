@@ -24,8 +24,7 @@ interface TerminalHeaderProps {
   branchName?: string;
   showLaunch?: boolean;
   isWorktree?: boolean;
-  /** When omitted, the kill button is hidden (e.g. read-only/monitor contexts). */
-  onKill?: (sessionId: number) => void;
+  onKill: (sessionId: number) => void;
   onRename?: (sessionId: number, name: string | null) => void;
   onLaunch?: () => void;
   terminalCount?: number;
@@ -320,17 +319,15 @@ export const TerminalHeader = memo(function TerminalHeader({
         )}
 
         {/* Close button */}
-        {onKill && (
-          <button
-            type="button"
-            onClick={() => onKill(sessionId)}
-            className="rounded p-0.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-red"
-            title="Kill session"
-            aria-label={`Kill session ${sessionId}`}
-          >
-            <X size={terminalCount <= 4 ? 11 : 9} />
-          </button>
-        )}
+        <button
+          type="button"
+          onClick={() => onKill(sessionId)}
+          className="rounded p-0.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-red"
+          title="Kill session"
+          aria-label={`Kill session ${sessionId}`}
+        >
+          <X size={terminalCount <= 4 ? 11 : 9} />
+        </button>
       </div>
     </div>
   );

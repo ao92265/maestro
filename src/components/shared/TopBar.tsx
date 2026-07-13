@@ -1,7 +1,6 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   GitMerge,
-  LayoutGrid,
   Minus,
   PanelLeft,
   Plus,
@@ -25,9 +24,6 @@ interface TopBarProps {
   /** Maximum number of sessions allowed */
   maxSessions?: number;
   onAddSession?: () => void;
-  /** Whether the unified "all terminals" view is active */
-  unifiedView?: boolean;
-  onToggleUnifiedView?: () => void;
 }
 
 export function TopBar({
@@ -40,8 +36,6 @@ export function TopBar({
   slotCount = 0,
   maxSessions = 6,
   onAddSession,
-  unifiedView = false,
-  onToggleUnifiedView,
 }: TopBarProps) {
   const appWindow = useMemo(() => getCurrentWindow(), []);
 
@@ -74,22 +68,6 @@ export function TopBar({
 
       {/* Right: action icons */}
       <div className="flex items-center gap-0.5 mr-1">
-        {onToggleUnifiedView && (
-          <button
-            type="button"
-            onClick={onToggleUnifiedView}
-            className={`rounded p-1.5 transition-colors ${
-              unifiedView
-                ? "text-maestro-accent hover:bg-maestro-accent/10"
-                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
-            }`}
-            aria-label="Toggle all-terminals view"
-            aria-pressed={unifiedView}
-            title="All terminals (every project at once)"
-          >
-            <LayoutGrid size={14} />
-          </button>
-        )}
         {inGridView && (
           <button
             type="button"

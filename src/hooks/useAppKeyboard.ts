@@ -9,8 +9,6 @@ interface UseAppKeyboardOptions {
   onToggleSidebar?: () => void;
   /** Callback to toggle the git panel (Cmd/Ctrl+2) */
   onToggleGitPanel?: () => void;
-  /** Callback to toggle the unified all-terminals view (Cmd/Ctrl+G) */
-  onToggleUnifiedView?: () => void;
 }
 
 /**
@@ -26,7 +24,6 @@ function isMac(): boolean {
  * Shortcuts:
  * - Cmd/Ctrl+T: Add a new session slot (when in grid view)
  * - Cmd/Ctrl+2: Toggle the git panel
- * - Cmd/Ctrl+G: Toggle the unified all-terminals view
  * - Alt+1: Toggle the left sidebar
  * - Alt+N: Add a new session slot (when in grid view)
  */
@@ -35,7 +32,6 @@ export function useAppKeyboard({
   canAddSession,
   onToggleSidebar,
   onToggleGitPanel,
-  onToggleUnifiedView,
 }: UseAppKeyboardOptions): void {
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -78,14 +74,6 @@ export function useAppKeyboard({
         if (canAddSession) {
           onAddSession();
         }
-        return;
-      }
-
-      // Cmd/Ctrl+G: toggle the unified all-terminals view.
-      if (event.code === "KeyG" && onToggleUnifiedView) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        onToggleUnifiedView();
       }
     }
 
@@ -94,5 +82,5 @@ export function useAppKeyboard({
     // bubble-phase listener — including xterm's textarea and other modal handlers.
     window.addEventListener("keydown", handleKeyDown, { capture: true });
     return () => window.removeEventListener("keydown", handleKeyDown, { capture: true });
-  }, [onAddSession, canAddSession, onToggleSidebar, onToggleGitPanel, onToggleUnifiedView]);
+  }, [onAddSession, canAddSession, onToggleSidebar, onToggleGitPanel]);
 }
