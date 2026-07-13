@@ -76,9 +76,11 @@ export function McpServerEditorModal({
     managedServer !== undefined &&
     (managedServer.transport === "http" || managedServer.transport === "sse");
 
-  // Form state
+  // Form state. New servers default to "local": that matches `claude mcp add`
+  // and keeps pasted credentials out of the repo-tracked .mcp.json unless the
+  // user explicitly chooses to share them.
   const [scope, setScope] = useState<EditorScope>(
-    server ? "custom" : (managedServer?.scope as EditorScope) ?? "project"
+    server ? "custom" : (managedServer?.scope as EditorScope) ?? "local"
   );
   const [transport, setTransport] = useState<"stdio" | "http">(
     managedIsUrl ? "http" : "stdio"
@@ -289,7 +291,10 @@ export function McpServerEditorModal({
           projectPath,
           scope as McpManagedScope,
           name.trim(),
-          buildManagedConfig()
+          buildManagedConfig(),
+          // Only an explicit edit may replace an existing entry; the Add
+          // flow errors on a name collision instead of clobbering it.
+          !!managedServer
         );
       }
 
@@ -328,9 +333,9 @@ export function McpServerEditorModal({
         <div className="max-h-[70vh] space-y-4 overflow-y-auto p-4">
           {/* Scope */}
           <section>
-            <label className="mb-1.5 block text-xs font-medium text-maestro-text">
+            <span className="mb-1.5 block text-xs font-medium text-maestro-text">
               Scope
-            </label>
+            </span>
             <div className="flex gap-1">
               {SCOPE_OPTIONS.map((option) => (
                 <button
@@ -356,9 +361,9 @@ export function McpServerEditorModal({
           {/* Transport (managed scopes only — custom servers are always stdio) */}
           {!isCustom && (
             <section>
-              <label className="mb-1.5 block text-xs font-medium text-maestro-text">
+              <span className="mb-1.5 block text-xs font-medium text-maestro-text">
                 Transport
-              </label>
+              </span>
               <div className="flex gap-1">
                 {(["stdio", "http"] as const).map((t) => (
                   <button
@@ -402,10 +407,14 @@ export function McpServerEditorModal({
           {/* URL (HTTP transport) */}
           {showUrl && (
             <section>
-              <label className="mb-1.5 block text-xs font-medium text-maestro-text">
+              <label
+                htmlFor="mcp-server-url"
+                className="mb-1.5 block text-xs font-medium text-maestro-text"
+              >
                 URL
               </label>
               <input
+                id="mcp-server-url"
                 type="text"
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}

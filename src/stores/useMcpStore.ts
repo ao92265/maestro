@@ -132,13 +132,15 @@ interface McpState {
 
   /**
    * Adds or replaces a server in the real config file for a scope, then
-   * refreshes both the management view and launch-time discovery.
+   * refreshes the management view. (Launch-time discovery picks the change
+   * up via its mtime-based cache invalidation — no explicit refresh needed.)
    */
   upsertManagedServer: (
     projectPath: string,
     scope: McpManagedScope,
     name: string,
-    config: Record<string, unknown>
+    config: Record<string, unknown>,
+    overwrite: boolean
   ) => Promise<void>;
 
   /** Removes a server from the real config file for a scope. */
@@ -378,22 +380,29 @@ export const useMcpStore = create<McpState>()((set, get) => ({
     }
   },
 
-  upsertManagedServer: async (projectPath, scope, name, config) => {
-    await upsertMcpServer(projectPath, scope, name, config);
-    // Re-read the files so the UI reflects exactly what was written, and
-    // refresh discovery so session launches pick the change up too.
-    await Promise.all([
-      get().fetchMcpStatus(projectPath),
-      get().refreshProjectServers(projectPath),
-    ]);
+  upsertManagedServer: async (projectPath, scope, name, config, overwrite) => {
+    try {
+      await upsertMcpServer(projectPath, scope, name, config, overwrite);
+      set((state) => ({ errors: { ...state.errors, [projectPath]: null } }));
+    } catch (err) {
+      set((state) => ({ errors: { ...state.errors, [projectPath]: String(err) } }));
+      throw err;
+    } finally {
+      // Re-read the files so the UI reflects exactly what was written.
+      await get().fetchMcpStatus(projectPath);
+    }
   },
 
   removeManagedServer: async (projectPath, scope, name) => {
-    await removeMcpServer(projectPath, scope, name);
-    await Promise.all([
-      get().fetchMcpStatus(projectPath),
-      get().refreshProjectServers(projectPath),
-    ]);
+    try {
+      await removeMcpServer(projectPath, scope, name);
+      set((state) => ({ errors: { ...state.errors, [projectPath]: null } }));
+    } catch (err) {
+      set((state) => ({ errors: { ...state.errors, [projectPath]: String(err) } }));
+      throw err;
+    } finally {
+      await get().fetchMcpStatus(projectPath);
+    }
   },
 
   setManagedServerEnabled: async (projectPath, scope, name, enabled) => {
@@ -406,7 +415,9 @@ export const useMcpStore = create<McpState>()((set, get) => ({
           ...state.mcpStatus,
           [projectPath]: {
             servers: status.servers.map((s) =>
-              s.name === name && s.scope === scope ? { ...s, enabled } : s
+              s.name === name && s.scope === scope
+                ? { ...s, enabled, pending: false }
+                : s
             ),
             connectors: status.connectors.map((c) =>
               scope === "connector" && c.name === name ? { ...c, enabled } : c
@@ -418,6 +429,11 @@ export const useMcpStore = create<McpState>()((set, get) => ({
 
     try {
       await setMcpServerEnabled(projectPath, scope, name, enabled);
+      set((state) => ({ errors: { ...state.errors, [projectPath]: null } }));
+    } catch (err) {
+      // Surface the failure — the refetch below also snaps the optimistic
+      // toggle back, so without this the write would fail invisibly.
+      set((state) => ({ errors: { ...state.errors, [projectPath]: String(err) } }));
     } finally {
       await get().fetchMcpStatus(projectPath);
     }

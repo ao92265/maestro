@@ -9,6 +9,7 @@
 //! Enable/disable piggybacks on Claude Code's own per-project lists in
 //! `~/.claude.json` `projects[<key>]`:
 //! - `.mcp.json` servers: `enabledMcpjsonServers` / `disabledMcpjsonServers`
+//!   (tri-state: a server in neither list is *pending approval*, not enabled)
 //! - user/local servers and claude.ai connectors: `disabledMcpServers`
 //!
 //! claude.ai connectors (account-level, e.g. "claude.ai Atlassian") are not
@@ -17,15 +18,36 @@
 //! through `disabledMcpServers` — so they can be listed and toggled, but not
 //! added, edited or removed locally.
 //!
-//! Every write copies the target file to `<file>.maestro-backup` first and
-//! only mutates the addressed subtree, leaving all other keys untouched.
+//! Write safety:
+//! - Only the addressed subtree is mutated; all other keys round-trip intact
+//!   (serde_json `preserve_order` keeps the file's key order).
+//! - The first write to a file in an app run copies it to
+//!   `<file>.maestro-backup`.
+//! - Writes go through a temp file + rename so a crash can't truncate.
+//! - `~/.claude.json` read-modify-write cycles are serialized in-process via
+//!   [`CLAUDE_JSON_LOCK`]; project `.mcp.json` writes must be serialized by
+//!   the caller via `mcp_config_writer::dir_lock` (shared with session-launch
+//!   injection). Races with the Claude CLI rewriting `~/.claude.json` are
+//!   inherent to the shared-file design; the window is kept minimal.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+
+use super::config_recovery::read_json_or_recover;
+
+/// Serializes all in-process read-modify-write cycles on ~/.claude.json.
+static CLAUDE_JSON_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Files already backed up in this app run. One backup per file per run is
+/// enough to undo a bad editing session without copying a potentially large
+/// ~/.claude.json on every toggle click.
+static BACKED_UP: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Scope of a managed MCP server.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -49,6 +71,9 @@ pub struct McpManagedServer {
     pub name: String,
     pub scope: McpScope,
     pub enabled: bool,
+    /// Project-scope only: the server is in neither the enabled nor the
+    /// disabled list, so Claude Code treats it as awaiting user approval.
+    pub pending: bool,
     /// "stdio" | "http" | "sse" | … (explicit `type` or inferred)
     pub transport: String,
     /// Raw entry from the config file, for display and editing.
@@ -72,9 +97,12 @@ pub struct McpStatusView {
 }
 
 /// Servers injected by Maestro itself for session status reporting.
-/// Mirrors the naming used by `mcp_config_writer`.
+/// Matches exactly the names `mcp_config_writer` writes: the current
+/// "maestro-status" entry, legacy per-session "maestro-status-N" entries, and
+/// the original "maestro" name. Deliberately NOT a blanket `maestro-` prefix:
+/// a user's own server named e.g. "maestro-tools" stays manageable.
 pub fn is_internal_server(name: &str) -> bool {
-    name == "maestro" || name == "maestro-status" || name.starts_with("maestro-")
+    name == "maestro" || name == "maestro-status" || name.starts_with("maestro-status-")
 }
 
 fn claude_json_path() -> Result<PathBuf, String> {
@@ -121,23 +149,42 @@ fn find_project_key(projects: &Map<String, Value>, project_key: &str) -> Option<
         .cloned()
 }
 
-fn read_json_file(path: &Path) -> Result<Value, String> {
+/// Strict read for WRITE paths: a corrupt file is an error, never silently
+/// replaced — a read-modify-write over `{}` would wipe the user's config.
+fn read_json_strict(path: &Path) -> Result<Value, String> {
     if !path.exists() {
         return Ok(json!({}));
     }
-    let content = fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read {:?}: {}", path, e))?;
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("Failed to read {:?}: {}", path, e))?;
     if content.trim().is_empty() {
         return Ok(json!({}));
     }
     serde_json::from_str(&content).map_err(|e| format!("Failed to parse {:?}: {}", path, e))
 }
 
-/// Writes `value` to `path`, backing up the existing file to
-/// `<file>.maestro-backup` and using a temp-file + rename so a crash can't
-/// leave a truncated config behind.
+/// Lenient read for the STATUS view: a missing or corrupt file just
+/// contributes no servers (logged), so one bad file doesn't blank the whole
+/// sidebar section. Never modifies or moves the file.
+fn read_json_lenient(path: &Path) -> Value {
+    match read_json_strict(path) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("MCP status: {} — showing no servers from this file", e);
+            json!({})
+        }
+    }
+}
+
+/// Writes `value` to `path` via temp file + rename. The first write to a
+/// given path in this app run also copies the original to
+/// `<file>.maestro-backup`.
 fn write_json_file(path: &Path, value: &Value) -> Result<(), String> {
-    if path.exists() {
+    let should_backup = {
+        let mut done = BACKED_UP.lock().map_err(|e| e.to_string())?;
+        path.exists() && done.insert(path.to_path_buf())
+    };
+    if should_backup {
         let backup = path.with_extension(match path.extension().and_then(|e| e.to_str()) {
             Some(ext) => format!("{}.maestro-backup", ext),
             None => "maestro-backup".to_string(),
@@ -178,35 +225,69 @@ fn project_list(project_entry: Option<&Value>, list: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Names disabled for this project via Claude Code's per-project lists
+/// (both the `.mcp.json` list and the user/connector list). Used by the
+/// session-launch writers so a server disabled in the sidebar is never
+/// copied into a session config. Lenient: unreadable config disables nothing.
+pub fn disabled_server_names(project_path: &str) -> HashSet<String> {
+    let Ok(path) = claude_json_path() else {
+        return HashSet::new();
+    };
+    let root = read_json_lenient(&path);
+    let project_key = claude_project_key(project_path);
+    let empty_map = Map::new();
+    let projects = root
+        .get("projects")
+        .and_then(|v| v.as_object())
+        .unwrap_or(&empty_map);
+    let entry = find_project_key(projects, &project_key).and_then(|k| projects.get(&k));
+
+    let mut names: HashSet<String> = HashSet::new();
+    names.extend(project_list(entry, "disabledMcpjsonServers"));
+    names.extend(project_list(entry, "disabledMcpServers"));
+    names
+}
+
 /// Reads the full management view for a project, fresh from disk.
+///
+/// Degrades per file: a corrupt `~/.claude.json` still shows `.mcp.json`
+/// servers and vice versa.
 pub fn get_status(project_path: &str) -> Result<McpStatusView, String> {
     let project_key = claude_project_key(project_path);
-    let claude_root = read_json_file(&claude_json_path()?)?;
+    let claude_root = read_json_lenient(&claude_json_path()?);
 
     let empty_map = Map::new();
     let projects = claude_root
         .get("projects")
         .and_then(|v| v.as_object())
         .unwrap_or(&empty_map);
-    let project_entry = find_project_key(projects, &project_key)
-        .and_then(|k| projects.get(&k));
+    let project_entry = find_project_key(projects, &project_key).and_then(|k| projects.get(&k));
 
+    let enabled_mcpjson = project_list(project_entry, "enabledMcpjsonServers");
     let disabled_mcpjson = project_list(project_entry, "disabledMcpjsonServers");
     let disabled_mcp = project_list(project_entry, "disabledMcpServers");
+    let approve_all = project_entry
+        .and_then(|p| p.get("enableAllProjectMcpServers"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let mut servers = Vec::new();
 
-    // Project scope: <project>/.mcp.json
-    let mcp_json = read_json_file(&Path::new(project_path).join(".mcp.json"))?;
+    // Project scope: <project>/.mcp.json. Claude Code's approval model for
+    // these is tri-state: disabled list > enabled list / approve-all > pending.
+    let mcp_json = read_json_lenient(&Path::new(project_path).join(".mcp.json"));
     if let Some(entries) = mcp_json.get("mcpServers").and_then(|v| v.as_object()) {
         for (name, config) in entries {
             if is_internal_server(name) {
                 continue;
             }
+            let disabled = disabled_mcpjson.contains(name);
+            let approved = approve_all || enabled_mcpjson.contains(name);
             servers.push(McpManagedServer {
                 name: name.clone(),
                 scope: McpScope::Project,
-                enabled: !disabled_mcpjson.contains(name),
+                enabled: !disabled && approved,
+                pending: !disabled && !approved,
                 transport: transport_of(config),
                 config: config.clone(),
             });
@@ -219,10 +300,14 @@ pub fn get_status(project_path: &str) -> Result<McpStatusView, String> {
         .and_then(|v| v.as_object())
     {
         for (name, config) in entries {
+            if is_internal_server(name) {
+                continue;
+            }
             servers.push(McpManagedServer {
                 name: name.clone(),
                 scope: McpScope::Local,
                 enabled: !disabled_mcp.contains(name),
+                pending: false,
                 transport: transport_of(config),
                 config: config.clone(),
             });
@@ -232,10 +317,14 @@ pub fn get_status(project_path: &str) -> Result<McpStatusView, String> {
     // User scope: ~/.claude.json top-level mcpServers
     if let Some(entries) = claude_root.get("mcpServers").and_then(|v| v.as_object()) {
         for (name, config) in entries {
+            if is_internal_server(name) {
+                continue;
+            }
             servers.push(McpManagedServer {
                 name: name.clone(),
                 scope: McpScope::User,
                 enabled: !disabled_mcp.contains(name),
+                pending: false,
                 transport: transport_of(config),
                 config: config.clone(),
             });
@@ -257,15 +346,25 @@ pub fn get_status(project_path: &str) -> Result<McpStatusView, String> {
         })
         .unwrap_or_default();
 
-    Ok(McpStatusView { servers, connectors })
+    Ok(McpStatusView {
+        servers,
+        connectors,
+    })
 }
 
 /// Adds or replaces a server entry in the file for the given scope.
+///
+/// With `overwrite == false`, an existing entry with the same name in that
+/// scope is an error — protects against the Add flow silently clobbering a
+/// server (and its credentials) the user forgot they had.
+///
+/// Project-scope callers must hold `mcp_config_writer::dir_lock(project_path)`.
 pub fn upsert_server(
     project_path: &str,
     scope: McpScope,
     name: &str,
     config: Value,
+    overwrite: bool,
 ) -> Result<(), String> {
     if name.trim().is_empty() {
         return Err("Server name cannot be empty".to_string());
@@ -280,27 +379,43 @@ pub fn upsert_server(
         return Err("Server config must be a JSON object".to_string());
     }
 
+    let check_collision = |servers: &Map<String, Value>| -> Result<(), String> {
+        if !overwrite && servers.contains_key(name) {
+            return Err(format!(
+                "A server named '{}' already exists in this scope — edit it instead",
+                name
+            ));
+        }
+        Ok(())
+    };
+
     match scope {
         McpScope::Project => {
             let path = Path::new(project_path).join(".mcp.json");
-            let mut root = read_json_file(&path)?;
-            ensure_object(&mut root, "mcpServers")?
-                .insert(name.to_string(), config);
+            // Self-heal a corrupt .mcp.json the same way session launch does.
+            let mut root = read_json_or_recover(&path)?;
+            let servers = ensure_object(&mut root, "mcpServers")?;
+            check_collision(servers)?;
+            servers.insert(name.to_string(), config);
             write_json_file(&path, &root)
         }
         McpScope::User => {
+            let _guard = CLAUDE_JSON_LOCK.lock().map_err(|e| e.to_string())?;
             let path = claude_json_path()?;
-            let mut root = read_json_file(&path)?;
-            ensure_object(&mut root, "mcpServers")?
-                .insert(name.to_string(), config);
+            let mut root = read_json_strict(&path)?;
+            let servers = ensure_object(&mut root, "mcpServers")?;
+            check_collision(servers)?;
+            servers.insert(name.to_string(), config);
             write_json_file(&path, &root)
         }
         McpScope::Local => {
+            let _guard = CLAUDE_JSON_LOCK.lock().map_err(|e| e.to_string())?;
             let path = claude_json_path()?;
-            let mut root = read_json_file(&path)?;
+            let mut root = read_json_strict(&path)?;
             let entry = ensure_project_entry(&mut root, project_path)?;
-            ensure_object(entry, "mcpServers")?
-                .insert(name.to_string(), config);
+            let servers = ensure_object(entry, "mcpServers")?;
+            check_collision(servers)?;
+            servers.insert(name.to_string(), config);
             write_json_file(&path, &root)
         }
         McpScope::Connector => Err(
@@ -312,21 +427,28 @@ pub fn upsert_server(
 
 /// Removes a server entry from the file for the given scope, and cleans its
 /// name out of the project's enable/disable lists.
+///
+/// Project-scope callers must hold `mcp_config_writer::dir_lock(project_path)`.
 pub fn remove_server(project_path: &str, scope: McpScope, name: &str) -> Result<(), String> {
     if is_internal_server(name) {
-        return Err(format!("'{}' is managed by Maestro and cannot be removed", name));
+        return Err(format!(
+            "'{}' is managed by Maestro and cannot be removed",
+            name
+        ));
     }
+
+    let remove_from = |root: &mut Value, name: &str| -> bool {
+        root.get_mut("mcpServers")
+            .and_then(|v| v.as_object_mut())
+            .map(|m| m.remove(name).is_some())
+            .unwrap_or(false)
+    };
 
     match scope {
         McpScope::Project => {
             let path = Path::new(project_path).join(".mcp.json");
-            let mut root = read_json_file(&path)?;
-            let removed = root
-                .get_mut("mcpServers")
-                .and_then(|v| v.as_object_mut())
-                .map(|m| m.remove(name).is_some())
-                .unwrap_or(false);
-            if !removed {
+            let mut root = read_json_or_recover(&path)?;
+            if !remove_from(&mut root, name) {
                 return Err(format!("Server '{}' not found in .mcp.json", name));
             }
             write_json_file(&path, &root)?;
@@ -335,21 +457,18 @@ pub fn remove_server(project_path: &str, scope: McpScope, name: &str) -> Result<
             Ok(())
         }
         McpScope::User => {
+            let _guard = CLAUDE_JSON_LOCK.lock().map_err(|e| e.to_string())?;
             let path = claude_json_path()?;
-            let mut root = read_json_file(&path)?;
-            let removed = root
-                .get_mut("mcpServers")
-                .and_then(|v| v.as_object_mut())
-                .map(|m| m.remove(name).is_some())
-                .unwrap_or(false);
-            if !removed {
+            let mut root = read_json_strict(&path)?;
+            if !remove_from(&mut root, name) {
                 return Err(format!("Server '{}' not found in ~/.claude.json", name));
             }
             write_json_file(&path, &root)
         }
         McpScope::Local => {
+            let _guard = CLAUDE_JSON_LOCK.lock().map_err(|e| e.to_string())?;
             let path = claude_json_path()?;
-            let mut root = read_json_file(&path)?;
+            let mut root = read_json_strict(&path)?;
             let entry = ensure_project_entry(&mut root, project_path)?;
             let removed = entry
                 .get_mut("mcpServers")
@@ -380,11 +499,15 @@ pub fn set_server_enabled(
     enabled: bool,
 ) -> Result<(), String> {
     if is_internal_server(name) {
-        return Err(format!("'{}' is managed by Maestro and cannot be toggled", name));
+        return Err(format!(
+            "'{}' is managed by Maestro and cannot be toggled",
+            name
+        ));
     }
 
+    let _guard = CLAUDE_JSON_LOCK.lock().map_err(|e| e.to_string())?;
     let path = claude_json_path()?;
-    let mut root = read_json_file(&path)?;
+    let mut root = read_json_strict(&path)?;
     let entry = ensure_project_entry(&mut root, project_path)?;
 
     match scope {
@@ -414,8 +537,9 @@ pub fn set_server_enabled(
 /// Removes `name` from both mcpjson approve/deny lists (used after deleting a
 /// project-scope server).
 fn prune_from_lists(project_path: &str, name: &str) -> Result<(), String> {
+    let _guard = CLAUDE_JSON_LOCK.lock().map_err(|e| e.to_string())?;
     let path = claude_json_path()?;
-    let mut root = read_json_file(&path)?;
+    let mut root = read_json_strict(&path)?;
     let project_key = claude_project_key(project_path);
 
     let Some(projects) = root.get_mut("projects").and_then(|v| v.as_object_mut()) else {
@@ -428,18 +552,10 @@ fn prune_from_lists(project_path: &str, name: &str) -> Result<(), String> {
         return Ok(());
     };
 
-    let before = (
-        project_list(Some(entry), "enabledMcpjsonServers"),
-        project_list(Some(entry), "disabledMcpjsonServers"),
-    );
-    list_remove(entry, "enabledMcpjsonServers", name);
-    list_remove(entry, "disabledMcpjsonServers", name);
-    let after = (
-        project_list(Some(entry), "enabledMcpjsonServers"),
-        project_list(Some(entry), "disabledMcpjsonServers"),
-    );
+    let removed_enabled = list_remove(entry, "enabledMcpjsonServers", name);
+    let removed_disabled = list_remove(entry, "disabledMcpjsonServers", name);
 
-    if before != after {
+    if removed_enabled || removed_disabled {
         write_json_file(&path, &root)?;
     }
     Ok(())
@@ -476,7 +592,9 @@ fn ensure_project_entry<'a>(
 
 /// Adds `name` to the string array `entry[list]` if not present (creates the array).
 fn list_add(entry: &mut Value, list: &str, name: &str) {
-    let Some(obj) = entry.as_object_mut() else { return };
+    let Some(obj) = entry.as_object_mut() else {
+        return;
+    };
     if !obj.get(list).map(|v| v.is_array()).unwrap_or(false) {
         obj.insert(list.to_string(), json!([]));
     }
@@ -486,15 +604,18 @@ fn list_add(entry: &mut Value, list: &str, name: &str) {
     }
 }
 
-/// Removes `name` from the string array `entry[list]` if present.
-fn list_remove(entry: &mut Value, list: &str, name: &str) {
+/// Removes `name` from the string array `entry[list]`; returns whether it was present.
+fn list_remove(entry: &mut Value, list: &str, name: &str) -> bool {
     if let Some(arr) = entry
         .as_object_mut()
         .and_then(|o| o.get_mut(list))
         .and_then(|v| v.as_array_mut())
     {
+        let before = arr.len();
         arr.retain(|v| v.as_str() != Some(name));
+        return arr.len() != before;
     }
+    false
 }
 
 #[cfg(test)]
@@ -524,6 +645,8 @@ mod tests {
         assert!(is_internal_server("maestro"));
         assert!(is_internal_server("maestro-status"));
         assert!(is_internal_server("maestro-status-3"));
+        // A user's own server that merely shares the prefix stays manageable.
+        assert!(!is_internal_server("maestro-tools"));
         assert!(!is_internal_server("playwright"));
     }
 
@@ -540,7 +663,8 @@ mod tests {
         list_add(&mut entry, "disabledMcpServers", "foo");
         list_add(&mut entry, "disabledMcpServers", "foo");
         assert_eq!(entry["disabledMcpServers"], json!(["foo"]));
-        list_remove(&mut entry, "disabledMcpServers", "foo");
+        assert!(list_remove(&mut entry, "disabledMcpServers", "foo"));
+        assert!(!list_remove(&mut entry, "disabledMcpServers", "foo"));
         assert_eq!(entry["disabledMcpServers"], json!([]));
     }
 
@@ -554,11 +678,31 @@ mod tests {
             McpScope::Project,
             "test-server",
             json!({"type": "stdio", "command": "npx", "args": ["-y", "pkg"]}),
+            false,
         )
         .unwrap();
 
-        let written = read_json_file(&dir.path().join(".mcp.json")).unwrap();
+        let written = read_json_strict(&dir.path().join(".mcp.json")).unwrap();
         assert_eq!(written["mcpServers"]["test-server"]["command"], "npx");
+
+        // Adding a same-name server without overwrite is rejected…
+        let err = upsert_server(
+            &project,
+            McpScope::Project,
+            "test-server",
+            json!({"type": "stdio", "command": "other"}),
+            false,
+        );
+        assert!(err.is_err());
+        // …but an explicit edit (overwrite) goes through.
+        upsert_server(
+            &project,
+            McpScope::Project,
+            "test-server",
+            json!({"type": "stdio", "command": "other"}),
+            true,
+        )
+        .unwrap();
 
         // Upsert preserves sibling entries (e.g. Maestro's injected server).
         upsert_server(
@@ -566,17 +710,14 @@ mod tests {
             McpScope::Project,
             "second",
             json!({"type": "http", "url": "http://localhost:1"}),
+            false,
         )
         .unwrap();
-        let written = read_json_file(&dir.path().join(".mcp.json")).unwrap();
-        assert!(written["mcpServers"]["test-server"].is_object());
-
-        // Backup exists after the second write.
-        assert!(dir.path().join(".mcp.maestro-backup").exists()
-            || dir.path().join(".mcp.json.maestro-backup").exists());
+        let written = read_json_strict(&dir.path().join(".mcp.json")).unwrap();
+        assert_eq!(written["mcpServers"]["test-server"]["command"], "other");
 
         remove_server(&project, McpScope::Project, "test-server").unwrap();
-        let written = read_json_file(&dir.path().join(".mcp.json")).unwrap();
+        let written = read_json_strict(&dir.path().join(".mcp.json")).unwrap();
         assert!(written["mcpServers"]["test-server"].is_null());
         assert!(written["mcpServers"]["second"].is_object());
     }
@@ -594,7 +735,10 @@ mod tests {
         let status = get_status(&repo_root).unwrap();
         println!("servers:");
         for s in &status.servers {
-            println!("  [{:?}] {} ({}) enabled={}", s.scope, s.name, s.transport, s.enabled);
+            println!(
+                "  [{:?}] {} ({}) enabled={} pending={}",
+                s.scope, s.name, s.transport, s.enabled, s.pending
+            );
         }
         println!("connectors:");
         for c in &status.connectors {
@@ -606,7 +750,34 @@ mod tests {
     fn test_upsert_rejects_internal_names() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().to_string_lossy().into_owned();
-        let err = upsert_server(&project, McpScope::Project, "maestro-status", json!({}));
+        let err = upsert_server(
+            &project,
+            McpScope::Project,
+            "maestro-status",
+            json!({}),
+            false,
+        );
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_corrupt_mcp_json_self_heals_on_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+        std::fs::write(dir.path().join(".mcp.json"), "{ not json").unwrap();
+
+        upsert_server(
+            &project,
+            McpScope::Project,
+            "fresh",
+            json!({"type": "stdio", "command": "npx"}),
+            false,
+        )
+        .unwrap();
+
+        let written = read_json_strict(&dir.path().join(".mcp.json")).unwrap();
+        assert_eq!(written["mcpServers"]["fresh"]["command"], "npx");
+        // The corrupt original is preserved for debugging.
+        assert!(dir.path().join(".mcp.corrupt").exists());
     }
 }

@@ -616,17 +616,23 @@ function McpScopeGroup({
         >
           <span
             title={
-              server.enabled
-                ? "Enabled — loaded into sessions on launch"
-                : "Disabled for this project"
+              server.pending
+                ? "Awaiting approval — Claude won't load it until enabled"
+                : server.enabled
+                  ? "Enabled — loaded into sessions on launch"
+                  : "Disabled for this project"
             }
             className={`h-2 w-2 shrink-0 rounded-full ${
-              server.enabled ? "bg-maestro-green" : "bg-maestro-muted"
+              server.pending
+                ? "bg-yellow-500"
+                : server.enabled
+                  ? "bg-maestro-green"
+                  : "bg-maestro-muted"
             }`}
           />
           <span
             className={`flex-1 truncate font-medium ${
-              server.enabled ? "" : "text-maestro-muted line-through"
+              server.enabled || server.pending ? "" : "text-maestro-muted line-through"
             }`}
           >
             {server.name}
@@ -639,11 +645,23 @@ function McpScopeGroup({
               type="button"
               onClick={() => onToggle(server)}
               className="rounded p-0.5 hover:bg-maestro-border/40"
-              title={server.enabled ? "Disable for this project" : "Enable for this project"}
+              title={
+                server.pending
+                  ? "Approve for this project"
+                  : server.enabled
+                    ? "Disable for this project"
+                    : "Enable for this project"
+              }
             >
               <Power
                 size={10}
-                className={server.enabled ? "text-maestro-green" : "text-maestro-muted"}
+                className={
+                  server.pending
+                    ? "text-yellow-500"
+                    : server.enabled
+                      ? "text-maestro-green"
+                      : "text-maestro-muted"
+                }
               />
             </button>
             <button
@@ -756,12 +774,14 @@ function MCPServersSection() {
     setManagedServerEnabled,
     removeManagedServer,
     isLoading,
+    errors,
   } = useMcpStore();
 
   const status = projectPath ? mcpStatus[projectPath] : undefined;
   const managedServers = status?.servers ?? [];
   const connectors = status?.connectors ?? [];
   const loading = projectPath ? (isLoading[projectPath] ?? false) : false;
+  const writeError = projectPath ? (errors[projectPath] ?? null) : null;
 
   const totalCount = managedServers.length + connectors.length + customServers.length;
 
@@ -885,6 +905,13 @@ function MCPServersSection() {
 
         {expanded && (
           <div className="space-y-0.5">
+            {/* Config write failures (toggle/delete have no modal to show them) */}
+            {writeError && (
+              <div className="px-2 py-1 text-[10px] text-maestro-red break-words">
+                {writeError}
+              </div>
+            )}
+
             {/* Managed servers grouped by scope. Project = repo's .mcp.json,
                 Local = ~/.claude.json projects[path] (per-machine), User = top-level
                 ~/.claude.json (user-global). All editable in place. */}

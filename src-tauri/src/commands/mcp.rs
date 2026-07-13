@@ -298,11 +298,16 @@ pub async fn write_session_mcp_config(
     let status_url = status_server.status_url();
     let instance_id = status_server.instance_id();
 
-    // Get full server configs for enabled discovered servers
+    // Get full server configs for enabled discovered servers. Servers the
+    // user disabled for this project in the sidebar (Claude Code's native
+    // disable lists in ~/.claude.json) are excluded even if the session slot
+    // still has them ticked — copying them into the session .mcp.json would
+    // sidestep the very list the toggle wrote.
+    let disabled = mcp_settings::disabled_server_names(&canonical);
     let all_discovered = mcp_state.get_project_servers(&canonical);
     let enabled_discovered: Vec<_> = all_discovered
         .into_iter()
-        .filter(|s| enabled_server_names.contains(&s.name))
+        .filter(|s| enabled_server_names.contains(&s.name) && !disabled.contains(&s.name))
         .collect();
 
     // Get enabled custom servers
@@ -362,11 +367,13 @@ pub async fn write_opencode_mcp_config(
     let status_url = status_server.status_url();
     let instance_id = status_server.instance_id();
 
-    // Get full server configs for enabled discovered servers
+    // Get full server configs for enabled discovered servers, excluding
+    // servers disabled for this project (see write_session_mcp_config).
+    let disabled = mcp_settings::disabled_server_names(&canonical);
     let all_discovered = mcp_state.get_project_servers(&canonical);
     let enabled_discovered: Vec<_> = all_discovered
         .into_iter()
-        .filter(|s| enabled_server_names.contains(&s.name))
+        .filter(|s| enabled_server_names.contains(&s.name) && !disabled.contains(&s.name))
         .collect();
 
     // Get enabled custom servers
@@ -447,6 +454,9 @@ pub async fn generate_project_hash(project_path: String) -> Result<String, Strin
 /// Reads the full MCP management view for a project, fresh from disk:
 /// servers from `.mcp.json` and `~/.claude.json` (all scopes, no dedup) with
 /// their per-project enabled state, plus claude.ai account connectors.
+///
+/// The launch-time discovery cache needs no explicit refresh after writes:
+/// `McpManager::get_project_servers` invalidates on config-file mtime changes.
 #[tauri::command]
 pub async fn get_mcp_status(project_path: String) -> Result<McpStatusView, String> {
     mcp_settings::get_status(&project_path)
@@ -454,54 +464,58 @@ pub async fn get_mcp_status(project_path: String) -> Result<McpStatusView, Strin
 
 /// Adds or replaces an MCP server in the real config file for the given scope
 /// (project = `.mcp.json`, user/local = `~/.claude.json`).
+///
+/// `overwrite == false` (the Add flow) rejects a name that already exists in
+/// the scope instead of silently replacing it.
 #[tauri::command]
 pub async fn upsert_mcp_server(
-    state: State<'_, McpManager>,
     project_path: String,
     scope: McpScope,
     name: String,
     config: serde_json::Value,
+    overwrite: bool,
 ) -> Result<(), String> {
-    mcp_settings::upsert_server(&project_path, scope, &name, config)?;
-    refresh_discovery_cache(&state, &project_path);
-    Ok(())
+    // Project scope edits .mcp.json — serialize against session-launch
+    // injection, which read-modify-writes the same file under this lock.
+    let _guard = match scope {
+        McpScope::Project => Some(
+            mcp_config_writer::dir_lock(Path::new(&project_path))
+                .lock_owned()
+                .await,
+        ),
+        _ => None,
+    };
+    mcp_settings::upsert_server(&project_path, scope, &name, config, overwrite)
 }
 
 /// Removes an MCP server from the real config file for the given scope.
 #[tauri::command]
 pub async fn remove_mcp_server(
-    state: State<'_, McpManager>,
     project_path: String,
     scope: McpScope,
     name: String,
 ) -> Result<(), String> {
-    mcp_settings::remove_server(&project_path, scope, &name)?;
-    refresh_discovery_cache(&state, &project_path);
-    Ok(())
+    let _guard = match scope {
+        McpScope::Project => Some(
+            mcp_config_writer::dir_lock(Path::new(&project_path))
+                .lock_owned()
+                .await,
+        ),
+        _ => None,
+    };
+    mcp_settings::remove_server(&project_path, scope, &name)
 }
 
 /// Enables or disables an MCP server (or claude.ai connector) for this project
 /// via Claude Code's native per-project lists in `~/.claude.json`.
 #[tauri::command]
 pub async fn set_mcp_server_enabled(
-    state: State<'_, McpManager>,
     project_path: String,
     scope: McpScope,
     name: String,
     enabled: bool,
 ) -> Result<(), String> {
-    mcp_settings::set_server_enabled(&project_path, scope, &name, enabled)?;
-    refresh_discovery_cache(&state, &project_path);
-    Ok(())
-}
-
-/// Keeps the launch-time discovery cache in sync after a config write.
-/// Best-effort: a failure to canonicalize just leaves the mtime check to
-/// catch the change on the next read.
-fn refresh_discovery_cache(state: &State<'_, McpManager>, project_path: &str) {
-    if let Ok(canonical) = std::fs::canonicalize(project_path) {
-        state.refresh_project_servers(&canonical.to_string_lossy());
-    }
+    mcp_settings::set_server_enabled(&project_path, scope, &name, enabled)
 }
 
 /// Gets all custom MCP servers configured by the user.

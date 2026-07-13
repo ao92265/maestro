@@ -228,6 +228,11 @@ export interface McpManagedServer {
   scope: McpManagedScope;
   /** Enabled for the current project (per Claude Code's disable lists). */
   enabled: boolean;
+  /**
+   * Project-scope only: in neither the enabled nor the disabled list, so
+   * Claude Code treats it as awaiting user approval (won't load it yet).
+   */
+  pending: boolean;
   /** "stdio" | "http" | "sse" | … */
   transport: string;
   /** Raw config entry — command/args/env for stdio, url for http/sse. */
@@ -251,14 +256,19 @@ export async function getMcpStatus(projectPath: string): Promise<McpStatusView> 
   return invoke<McpStatusView>("get_mcp_status", { projectPath });
 }
 
-/** Adds or replaces a server in the real config file for the given scope. */
+/**
+ * Adds or replaces a server in the real config file for the given scope.
+ * With `overwrite: false` (Add flow) an existing same-name entry is an error
+ * instead of being silently replaced.
+ */
 export async function upsertMcpServer(
   projectPath: string,
   scope: McpManagedScope,
   name: string,
-  config: Record<string, unknown>
+  config: Record<string, unknown>,
+  overwrite: boolean
 ): Promise<void> {
-  return invoke("upsert_mcp_server", { projectPath, scope, name, config });
+  return invoke("upsert_mcp_server", { projectPath, scope, name, config, overwrite });
 }
 
 /** Removes a server from the real config file for the given scope. */
