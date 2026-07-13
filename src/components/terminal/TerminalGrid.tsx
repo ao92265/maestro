@@ -160,6 +160,12 @@ interface TerminalGridProps {
   projectName?: string;
   /** Slot currently zoomed in eagle view (owned by MultiProjectView). */
   eagleZoomedSlotId?: string | null;
+  /**
+   * A pane somewhere (any project) is eagle-zoomed. Non-zoomed tiles hide
+   * (visibility) so their xterm/WebGL renderers stop painting behind the
+   * opaque zoom overlay.
+   */
+  eagleAnyZoomed?: boolean;
   /** Toggles eagle zoom for a slot (owned by MultiProjectView). */
   onEagleZoomToggle?: (slotId: string) => void;
 }
@@ -178,7 +184,23 @@ interface TerminalGridProps {
  *   a fresh slot so the user is never left with an empty grid.
  */
 export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(function TerminalGrid(
-  { projectPath, repoPath, repositories, workspaceType, onRepoChange, tabId, preserveOnHide = false, isActive = true, onSessionCountChange, onAllSessionsClosed, eagleMode = false, projectName, eagleZoomedSlotId = null, onEagleZoomToggle },
+  {
+    projectPath,
+    repoPath,
+    repositories,
+    workspaceType,
+    onRepoChange,
+    tabId,
+    preserveOnHide = false,
+    isActive = true,
+    onSessionCountChange,
+    onAllSessionsClosed,
+    eagleMode = false,
+    projectName,
+    eagleZoomedSlotId = null,
+    eagleAnyZoomed = false,
+    onEagleZoomToggle,
+  },
   ref,
 ) {
   // Use repoPath for git operations, falling back to projectPath
@@ -359,9 +381,11 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   // Drag-and-drop files from Finder/Explorer onto terminal panes.
   // Only the active project's grid handles window drop events — inactive
   // grids stay mounted (ZStack) and would otherwise swallow the drop.
+  // In eagle view every project's panes are visible, so every grid listens;
+  // a drop on a foreign pane is ignored (its slot isn't in this grid's map).
   const { dropTargetSlotId, isDraggingFiles } = useTerminalDragDrop({
     slots,
-    enabled: isActive,
+    enabled: isActive || eagleMode,
     onDrop: useCallback((sessionId: number, paths: string[], slotId: string) => {
       const escaped = shellEscapePaths(paths);
       writeStdin(sessionId, escaped).catch(console.error);
@@ -1292,6 +1316,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
 
     const showReorderHandle = slots.length > 1 && !eagleMode;
     const isEagleZoomed = eagleMode && eagleZoomedSlotId === slot.id;
+    const isEagleObscured = eagleMode && eagleAnyZoomed && !isEagleZoomed;
 
     if (slot.sessionId !== null) {
       return (
@@ -1302,6 +1327,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
           eagleMode={eagleMode}
           eagleHidden={false}
           eagleZoomed={isEagleZoomed}
+          eagleObscured={isEagleObscured}
           eagleColor={eagleColor}
         >
           <TerminalView
@@ -1332,6 +1358,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
         eagleMode={eagleMode}
         eagleHidden={eagleMode}
         eagleZoomed={false}
+        eagleObscured={false}
         eagleColor={eagleColor}
       >
       <PreLaunchCard
@@ -1372,7 +1399,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       </DraggablePane>
     );
   // eslint-disable-next-line react-hooks/exhaustive-deps -- Deps cover all render-affecting state
-  }, [slots, focusedSlotId, isActive, isDraggingFiles, dropTargetSlotId, getFocusCallback, handleKill, handleToggleZoom, handleSwapSlots, projectPath, branches, isLoadingBranches, isGitRepo, hasManagedWorktree, repositories, workspaceType, effectiveRepoPath, onRepoChange, mcpServers, skills, plugins, handleCreateBranch, updateSlotCustomName, updateSlotMode, updateSlotBranch, updateSlotWorktreeMode, refreshBranches, toggleSlotMcp, toggleSlotSkill, toggleSlotPlugin, selectAllMcp, unselectAllMcp, selectAllPlugins, unselectAllPlugins, launchSlot, removeSlot, updateSlotResumeSession, eagleMode, eagleZoomedSlotId, onEagleZoomToggle, projectName, eagleColor]);
+  }, [slots, focusedSlotId, isActive, isDraggingFiles, dropTargetSlotId, getFocusCallback, handleKill, handleToggleZoom, handleSwapSlots, projectPath, branches, isLoadingBranches, isGitRepo, hasManagedWorktree, repositories, workspaceType, effectiveRepoPath, onRepoChange, mcpServers, skills, plugins, handleCreateBranch, updateSlotCustomName, updateSlotMode, updateSlotBranch, updateSlotWorktreeMode, refreshBranches, toggleSlotMcp, toggleSlotSkill, toggleSlotPlugin, selectAllMcp, unselectAllMcp, selectAllPlugins, unselectAllPlugins, launchSlot, removeSlot, updateSlotResumeSession, eagleMode, eagleZoomedSlotId, eagleAnyZoomed, onEagleZoomToggle, projectName, eagleColor]);
 
   const handleRatioChange = useCallback((nodeId: string, ratio: number) => {
     setLayoutTree((prev) => updateRatio(prev, nodeId, ratio));
@@ -1380,7 +1407,17 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
 
   if (error) {
     return (
-      <div className="flex h-full flex-col items-center justify-center gap-3 text-maestro-muted">
+      // In eagle mode this renders as a labeled tile of the global grid
+      // (the wrapper above is display:contents), not an anonymous full-flex div.
+      <div
+        className="flex h-full flex-col items-center justify-center gap-3 text-maestro-muted rounded-md"
+        style={eagleMode && eagleColor ? { border: `2px solid ${eagleColor}` } : undefined}
+      >
+        {eagleMode && projectName && (
+          <span className="text-xs font-bold" style={{ color: eagleColor }}>
+            {projectName}
+          </span>
+        )}
         <span className="text-sm text-maestro-red">{error}</span>
         <button
           type="button"
@@ -1400,7 +1437,10 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
 
   if (slots.length === 0) {
     return (
-      <div className="flex h-full items-center justify-center text-maestro-muted text-sm">
+      <div
+        className="flex h-full items-center justify-center text-maestro-muted text-sm rounded-md"
+        style={eagleMode && eagleColor ? { border: `2px solid ${eagleColor}` } : undefined}
+      >
         Initializing...
       </div>
     );
@@ -1564,6 +1604,7 @@ function DraggablePane({
   eagleMode = false,
   eagleHidden = false,
   eagleZoomed = false,
+  eagleObscured = false,
   eagleColor,
 }: {
   slotId: string;
@@ -1576,6 +1617,8 @@ function DraggablePane({
   eagleHidden?: boolean;
   /** Eagle view: pane is zoomed to fill the window (position: fixed). */
   eagleZoomed?: boolean;
+  /** Eagle view: another pane is zoomed — stop painting under its overlay. */
+  eagleObscured?: boolean;
   /** Eagle view: project-assigned tile border color. */
   eagleColor?: string;
 }) {
@@ -1643,9 +1686,11 @@ function DraggablePane({
 
   // Eagle view restyles this container purely with CSS so the children
   // (the live xterm instance) never remount:
-  // - hidden: pre-launch panes don't belong in a terminals-only overview
-  // - zoomed: position:fixed overlays the whole window, Esc/header returns
-  // - tile:   grid item with the project's assigned border color
+  // - hidden:   pre-launch panes don't belong in a terminals-only overview
+  // - zoomed:   position:fixed overlays the whole window, Esc/header returns
+  // - obscured: another pane is zoomed — visibility:hidden stops WebGL paints
+  //             behind the opaque overlay (also excludes it from drop hit-tests)
+  // - tile:     grid item with the project's assigned border color
   const eagleClass = eagleHidden
     ? "hidden"
     : eagleZoomed
@@ -1654,9 +1699,16 @@ function DraggablePane({
   return (
     <div
       className={eagleMode ? eagleClass : "relative h-full w-full min-h-0 min-w-0"}
+      // In eagle mode the normal [data-slot-id] wrapper (SplitPaneView's leaf)
+      // is display:contents, whose rect is 0x0 — carrying the id here keeps
+      // file drag-and-drop hit-testing working on the visible tile box.
+      data-slot-id={eagleMode && !eagleHidden ? slotId : undefined}
       style={
-        eagleMode && !eagleHidden && eagleColor
-          ? { border: `2px solid ${eagleColor}` }
+        eagleMode && !eagleHidden
+          ? {
+              ...(eagleColor ? { border: `2px solid ${eagleColor}` } : undefined),
+              ...(eagleObscured ? { visibility: "hidden" as const } : undefined),
+            }
           : undefined
       }
     >

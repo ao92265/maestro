@@ -37,8 +37,10 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
   // Eagle view: which pane (if any) is zoomed to fill the window.
   const [eagleZoom, setEagleZoom] = useState<{ tabId: string; slotId: string } | null>(null);
 
-  // Live session count drives the eagle grid's column count.
-  const liveSessionCount = useSessionStore((s) => s.sessions.length);
+  // Live session count drives the eagle grid's column count. Gated on
+  // eagleView so session launches/kills don't re-render every project's grid
+  // while the eagle grid isn't even showing.
+  const liveSessionCount = useSessionStore((s) => (eagleView ? s.sessions.length : 0));
 
   // Leaving eagle view always drops the zoom.
   useEffect(() => {
@@ -241,6 +243,7 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
               eagleZoomedSlotId={
                 eagleZoom && eagleZoom.tabId === tab.id ? eagleZoom.slotId : null
               }
+              eagleAnyZoomed={eagleView && eagleZoom !== null}
               onEagleZoomToggle={eagleZoomCallbacks.get(tab.id)}
             />
           ) : (

@@ -74,7 +74,9 @@ export function TopBar({
 
       {/* Right: action icons */}
       <div className="flex items-center gap-0.5 mr-1">
-        {inGridView && (
+        {/* Hidden in eagle view: new pre-launch slots are invisible there,
+            so the button would appear to do nothing while stacking up slots. */}
+        {inGridView && !eagleView && (
           <button
             type="button"
             onClick={onAddSession}

@@ -30,7 +30,13 @@ function clampRatio(ratio: number): number {
  * - SplitNode → flex container with a draggable divider between two children
  * - LeafNode → calls `renderLeaf(slotId)`
  */
-export function SplitPaneView({ node, renderLeaf, onRatioChange, onDragStateChange, eagleMode = false }: SplitPaneViewProps) {
+export function SplitPaneView({
+  node,
+  renderLeaf,
+  onRatioChange,
+  onDragStateChange,
+  eagleMode = false,
+}: SplitPaneViewProps) {
   if (node.type === "leaf") {
     return (
       <div

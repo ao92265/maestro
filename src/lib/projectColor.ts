@@ -20,10 +20,3 @@ export function projectColorFor(name: string): string {
   const hue = ((hash % 360) + 360) % 360;
   return `hsl(${hue} 70% 55%)`;
 }
-
-/** Last path segment of a project path, for display fallbacks. */
-export function projectBaseName(projectPath: string): string {
-  const normalized = projectPath.replace(/\\/g, "/").replace(/\/+$/, "");
-  const base = normalized.slice(normalized.lastIndexOf("/") + 1);
-  return base || normalized;
-}
