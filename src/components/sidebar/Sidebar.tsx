@@ -1,5 +1,6 @@
 import {
   AlertTriangle,
+  Bot,
   Check,
   ChevronDown,
   ChevronRight,
@@ -28,12 +29,17 @@ import {
   Wrench,
   Zap,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { ask } from "@tauri-apps/plugin-dialog";
+import { sessionsForTab } from "@/hooks/useProjectStatus";
+import { projectColorFor } from "@/lib/projectColor";
+import { useAgentStore, type SubagentInfo } from "@/stores/useAgentStore";
 import { useGitStore } from "@/stores/useGitStore";
 import { useMcpStore } from "@/stores/useMcpStore";
 import { usePluginStore } from "@/stores/usePluginStore";
 import { useMarketplaceStore } from "@/stores/useMarketplaceStore";
+import { useSessionStore, type BackendSessionStatus } from "@/stores/useSessionStore";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { GitSettingsModal, RemoteStatusIndicator } from "@/components/git";
 import { MarketplaceBrowser } from "@/components/marketplace";
@@ -60,6 +66,10 @@ interface SidebarProps {
   isStoppingAll?: boolean;
   /** Stop all running sessions in the active project. */
   onStopAll?: () => void;
+  /** Agents section: jump to a terminal (activate its tab + focus its pane). */
+  onAgentNavigate?: (tabId: string, sessionId: number) => void;
+  /** Agents section: kill one terminal (PTY + pane cleanup). */
+  onAgentKill?: (tabId: string, sessionId: number) => void;
 }
 
 /* ── Shared card class ── */
@@ -85,6 +95,8 @@ export function Sidebar({
   launchedCount = 0,
   isStoppingAll = false,
   onStopAll,
+  onAgentNavigate,
+  onAgentKill,
 }: SidebarProps) {
   const [width, setWidth] = useState(240);
   const [isDragging, setIsDragging] = useState(false);
@@ -184,6 +196,8 @@ export function Sidebar({
           launchedCount={launchedCount}
           isStoppingAll={isStoppingAll}
           onStopAll={onStopAll}
+          onAgentNavigate={onAgentNavigate}
+          onAgentKill={onAgentKill}
         />
       </div>
 
@@ -250,15 +264,21 @@ function ConfigTab({
   launchedCount = 0,
   isStoppingAll = false,
   onStopAll,
+  onAgentNavigate,
+  onAgentKill,
 }: {
   theme?: "dark" | "light";
   onToggleTheme?: () => void;
   launchedCount?: number;
   isStoppingAll?: boolean;
   onStopAll?: () => void;
+  onAgentNavigate?: (tabId: string, sessionId: number) => void;
+  onAgentKill?: (tabId: string, sessionId: number) => void;
 }) {
   return (
     <>
+      <AgentsSection onNavigate={onAgentNavigate} onKill={onAgentKill} />
+      {divider}
       <GitRepositorySection />
       {divider}
       <ProjectContextSection />
@@ -273,6 +293,203 @@ function ConfigTab({
         onStopAll={onStopAll}
       />
     </>
+  );
+}
+
+/* ── 0. Agents ── */
+
+/** Word badge per terminal (session) status. */
+const SESSION_STATUS_BADGES: Record<BackendSessionStatus, { label: string; cls: string }> = {
+  Starting: { label: "STARTING", cls: "bg-orange-500/15 text-orange-400" },
+  Idle: { label: "IDLE", cls: "bg-maestro-muted/15 text-maestro-muted" },
+  Working: { label: "WORKING", cls: "bg-maestro-accent/15 text-maestro-accent" },
+  NeedsInput: { label: "NEEDS INPUT", cls: "bg-yellow-500/15 text-yellow-500" },
+  Done: { label: "DONE", cls: "bg-maestro-green/15 text-maestro-green" },
+  Error: { label: "ERROR", cls: "bg-red-500/15 text-red-400" },
+  Timeout: { label: "TIMEOUT", cls: "bg-red-500/15 text-red-400" },
+};
+
+const badgeBaseClass =
+  "shrink-0 whitespace-nowrap rounded px-1 py-px text-[9px] font-bold tracking-wide";
+
+/**
+ * Live hierarchical view of every running agent across all open projects:
+ * Project → Terminal (session) → Subagents (Task tool invocations).
+ * Terminals can be killed or jumped to (double-click); subagents are
+ * display-only — they live inside the parent Claude process.
+ */
+function AgentsSection({
+  onNavigate,
+  onKill,
+}: {
+  onNavigate?: (tabId: string, sessionId: number) => void;
+  onKill?: (tabId: string, sessionId: number) => void;
+}) {
+  const [expanded, setExpanded] = useState(true);
+  const tabs = useWorkspaceStore((s) => s.tabs);
+  const sessions = useSessionStore((s) => s.sessions);
+  const agents = useAgentStore((s) => s.agents);
+
+  const projects = useMemo(
+    () =>
+      tabs
+        .map((tab) => ({ tab, sessions: sessionsForTab(tab, sessions) }))
+        .filter((p) => p.sessions.length > 0),
+    [tabs, sessions],
+  );
+
+  // Group agents by session and count running ones in a single pass instead
+  // of re-filtering the agents array inside the per-session render loop.
+  const { agentsBySession, runningAgentCount } = useMemo(() => {
+    const bySession = new Map<number, SubagentInfo[]>();
+    let running = 0;
+    for (const agent of agents) {
+      const list = bySession.get(agent.sessionId);
+      if (list) {
+        list.push(agent);
+      } else {
+        bySession.set(agent.sessionId, [agent]);
+      }
+      if (agent.completedAt === null) running += 1;
+    }
+    return { agentsBySession: bySession, runningAgentCount: running };
+  }, [agents]);
+
+  const terminalCount = projects.reduce((n, p) => n + p.sessions.length, 0);
+
+  // Guards double-clicks on the kill button: one confirm dialog per session.
+  const pendingKillIds = useRef(new Set<number>());
+  const handleKillClick = useCallback(
+    async (tabId: string, sessionId: number, name: string) => {
+      if (pendingKillIds.current.has(sessionId)) return;
+      pendingKillIds.current.add(sessionId);
+      try {
+        const confirmed = await ask(
+          `Kill "${name}" and everything running inside it?`,
+          { title: "Kill Terminal", kind: "warning" },
+        ).catch(() => false);
+        if (confirmed) onKill?.(tabId, sessionId);
+      } finally {
+        pendingKillIds.current.delete(sessionId);
+      }
+    },
+    [onKill],
+  );
+
+  return (
+    <div className={cardClass}>
+      <button type="button" onClick={() => setExpanded((v) => !v)} className="block w-full text-left">
+        <SectionHeader
+          icon={Bot}
+          label="Agents"
+          breathe={runningAgentCount > 0}
+          badge={
+            terminalCount > 0 ? (
+              <span
+                className="rounded-full bg-maestro-accent/20 px-1.5 text-[10px] font-bold text-maestro-accent"
+                title={`${terminalCount} terminal${terminalCount === 1 ? "" : "s"}`}
+              >
+                {terminalCount}
+              </span>
+            ) : undefined
+          }
+          right={
+            expanded ? (
+              <ChevronDown size={12} className="text-maestro-muted" />
+            ) : (
+              <ChevronRight size={12} className="text-maestro-muted" />
+            )
+          }
+        />
+      </button>
+
+      {expanded &&
+        (projects.length === 0 ? (
+          <p className="px-1 py-0.5 text-[11px] text-maestro-muted">No running agents</p>
+        ) : (
+          projects.map(({ tab, sessions: projectSessions }) => {
+            const color = projectColorFor(tab.name);
+            return (
+              <div key={tab.id} className="mt-1">
+                {/* Project row */}
+                <div className="flex items-center gap-1.5 px-1 text-[11px] font-semibold">
+                  <span
+                    className="h-1.5 w-1.5 shrink-0 rounded-full"
+                    style={{ backgroundColor: color }}
+                  />
+                  <span className="truncate" style={{ color }}>
+                    {tab.name}
+                  </span>
+                </div>
+
+                {/* Terminal rows */}
+                {projectSessions.map((session) => {
+                  const badge = SESSION_STATUS_BADGES[session.status] ?? SESSION_STATUS_BADGES.Idle;
+                  const name = session.name?.trim() || `Terminal ${session.id}`;
+                  const sessionAgents = agentsBySession.get(session.id) ?? [];
+                  return (
+                    <div key={session.id} className="ml-2">
+                      <div
+                        className="group flex cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 hover:bg-maestro-border/30"
+                        onDoubleClick={() => onNavigate?.(tab.id, session.id)}
+                        title={`${name} — double-click to open this terminal`}
+                      >
+                        <span className="flex-1 truncate text-xs text-maestro-text">{name}</span>
+                        <span className={`${badgeBaseClass} ${badge.cls}`}>{badge.label}</span>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void handleKillClick(tab.id, session.id, name);
+                          }}
+                          // dblclick is a separate event that would bubble to the
+                          // row's onDoubleClick and navigate to the terminal
+                          // being killed — swallow it here.
+                          onDoubleClick={(e) => e.stopPropagation()}
+                          className="shrink-0 rounded p-0.5 text-maestro-muted opacity-0 transition-opacity hover:bg-red-500/15 hover:text-red-400 group-hover:opacity-100"
+                          title="Kill this terminal"
+                          aria-label={`Kill ${name}`}
+                        >
+                          <Square size={10} />
+                        </button>
+                      </div>
+
+                      {/* Subagent rows */}
+                      {sessionAgents.length > 0 && (
+                        <div className="ml-2 border-l border-maestro-border/40 pl-2">
+                          {sessionAgents.map((agent) => {
+                            const agentBadge =
+                              agent.completedAt === null
+                                ? { label: "RUNNING", cls: "bg-maestro-accent/15 text-maestro-accent animate-pulse" }
+                                : agent.success === false
+                                  ? { label: "FAILED", cls: "bg-red-500/15 text-red-400" }
+                                  : { label: "DONE", cls: "bg-maestro-green/15 text-maestro-green" };
+                            return (
+                              <div
+                                key={agent.agentId}
+                                className="flex items-center gap-1.5 py-0.5 text-[11px]"
+                                title={agent.description || agent.agentType}
+                              >
+                                <span className="flex-1 truncate text-maestro-muted">
+                                  <span className="text-maestro-text/80">{agent.agentType}</span>
+                                  {agent.description ? ` — ${agent.description}` : ""}
+                                </span>
+                                <span className={`${badgeBaseClass} ${agentBadge.cls}`}>
+                                  {agentBadge.label}
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })
+        ))}
+    </div>
   );
 }
 

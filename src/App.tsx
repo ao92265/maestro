@@ -15,6 +15,7 @@ import { useAppKeyboard } from "./hooks/useAppKeyboard";
 import { useSwipeNavigation } from "./hooks/useSwipeNavigation";
 import { useUpdateStore } from "./stores/useUpdateStore";
 import { initActivityListener, stopActivityListener } from "./stores/useActivityStore";
+import { initAgentListener, stopAgentListener } from "./stores/useAgentStore";
 import { UpdateNotification } from "./components/update/UpdateNotification";
 import { GitGraphPanel } from "./components/git/GitGraphPanel";
 import type { GitPanelTab } from "./components/git/GitPanelTabs";
@@ -147,6 +148,16 @@ function App() {
     });
     return () => {
       stopActivityListener();
+    };
+  }, []);
+
+  // Initialize agent listener (tracks subagents for the sidebar Agents section)
+  useEffect(() => {
+    initAgentListener().catch((err) => {
+      console.error("Failed to initialize agent listener:", err);
+    });
+    return () => {
+      stopAgentListener();
     };
   }, []);
 
@@ -331,6 +342,33 @@ function App() {
     multiProjectRef.current?.addSessionToActiveProject();
   }, []);
 
+  // Sidebar Agents section: jump to a terminal (leave eagle view — the target
+  // pane may be hidden behind an eagle zoom overlay there — then activate its
+  // project tab and focus its pane once the switch has committed to the DOM).
+  const handleAgentNavigate = useCallback(
+    (tabId: string, sessionId: number) => {
+      setEagleView(false);
+      selectTab(tabId);
+      requestAnimationFrame(() => {
+        multiProjectRef.current?.focusSessionInProject(tabId, sessionId);
+      });
+    },
+    [selectTab],
+  );
+
+  // Sidebar Agents section: kill one terminal. Normally routed through the
+  // project's grid for full pane cleanup; if that grid isn't mounted (stale
+  // session row), fall back to killing the PTY and store entries directly so
+  // a confirmed kill never silently no-ops.
+  const handleAgentKill = useCallback((tabId: string, sessionId: number) => {
+    const handledByGrid = multiProjectRef.current?.killSessionInProject(tabId, sessionId) ?? false;
+    if (!handledByGrid) {
+      killSession(sessionId).catch(console.error);
+      useSessionStore.getState().removeSession(sessionId);
+      useWorkspaceStore.getState().removeSessionFromProject(tabId, sessionId);
+    }
+  }, []);
+
   const handleToggleSidebar = useCallback(() => setSidebarOpen((prev) => !prev), []);
   // Ctrl/Cmd+2 always lands the panel on the Status tab when toggling open.
   // Manual tab switches while the panel is open are preserved until the next open.
@@ -402,6 +440,8 @@ function App() {
           launchedCount={activeTabLaunchedCount}
           isStoppingAll={isStoppingAll}
           onStopAll={handleStopAll}
+          onAgentNavigate={handleAgentNavigate}
+          onAgentKill={handleAgentKill}
         />
 
         {/* Right column: top bar + content + bottom bar */}

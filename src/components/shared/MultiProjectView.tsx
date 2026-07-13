@@ -17,6 +17,10 @@ export interface MultiProjectViewHandle {
   addSessionToActiveProject: () => void;
   launchAllInActiveProject: () => Promise<void>;
   refreshBranchesInActiveProject: () => void;
+  /** Focus the pane running the given session. False if that grid isn't mounted or doesn't own it. */
+  focusSessionInProject: (tabId: string, sessionId: number) => boolean;
+  /** Kill the given session (with full pane cleanup). False if that grid isn't mounted or doesn't own it. */
+  killSessionInProject: (tabId: string, sessionId: number) => boolean;
 }
 
 /**
@@ -94,6 +98,12 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
         const gridRef = gridRefs.current.get(activeTab.id);
         gridRef?.refreshBranches();
       }
+    },
+    focusSessionInProject: (tabId: string, sessionId: number) => {
+      return gridRefs.current.get(tabId)?.focusSession(sessionId) ?? false;
+    },
+    killSessionInProject: (tabId: string, sessionId: number) => {
+      return gridRefs.current.get(tabId)?.killSessionById(sessionId) ?? false;
     },
   }), [tabs]);
 

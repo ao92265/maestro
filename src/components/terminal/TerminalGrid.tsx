@@ -94,6 +94,22 @@ function generateSlotId(): string {
   return `slot-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
+/**
+ * Move keyboard focus into a pane's xterm textarea. Double rAF: the caller
+ * often just changed React state that reveals the pane (un-zoom, tab switch),
+ * so wait for that render to commit before querying the DOM.
+ */
+function focusSlotTextarea(slotId: string): void {
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      const textarea = document.querySelector<HTMLElement>(
+        `[data-slot-id="${slotId}"] .xterm-helper-textarea`,
+      );
+      textarea?.focus();
+    });
+  });
+}
+
 /** Creates a new empty session slot with default configuration. */
 function createEmptySlot(
   mcpServers: McpServerConfig[] = [],
@@ -123,6 +139,10 @@ export interface TerminalGridHandle {
   addSession: () => void;
   launchAll: () => Promise<void>;
   refreshBranches: () => void;
+  /** Focus the pane running the given session. Returns false if this grid doesn't own it. */
+  focusSession: (sessionId: number) => boolean;
+  /** Kill the given session and clean up its pane. Returns false if this grid doesn't own it. */
+  killSessionById: (sessionId: number) => boolean;
 }
 
 /**
@@ -394,12 +414,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       // the direct DOM focus covers the already-focused pane (no isFocused
       // transition for TerminalView's focus effect to react to).
       setFocusedSlotId(slotId);
-      requestAnimationFrame(() => {
-        const textarea = document.querySelector<HTMLElement>(
-          `[data-slot-id="${slotId}"] .xterm-helper-textarea`,
-        );
-        textarea?.focus();
-      });
+      focusSlotTextarea(slotId);
     }, []),
   });
 
@@ -897,6 +912,10 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       if (slot) {
         focusCallbacksRef.current.delete(slot.id);
       }
+      // This branch skips setSlots, so the count-reporting effect never fires
+      // with 0 — report it explicitly or the parent keeps stale counts
+      // (e.g. the sidebar's "Stop All (1)" with nothing running).
+      onSessionCountChange?.(0, 0);
       onAllSessionsClosedRef.current();
     } else {
       // Clean up cached focus callback for this slot
@@ -967,7 +986,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       }
       // "keep" (default): do nothing — worktree persists
     }
-  }, [tabId, effectiveRepoPath, projectPath, removeSessionFromProject, refreshBranches, focusedSlotId, layoutTree]);
+  }, [tabId, effectiveRepoPath, projectPath, removeSessionFromProject, refreshBranches, focusedSlotId, layoutTree, onSessionCountChange]);
 
   /**
    * Removes a pre-launch slot (before it's launched).
@@ -978,6 +997,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     // If removing the last slot, return to idle landing view immediately
     // rather than going through an intermediate empty state
     if (slotsRef.current.length <= 1 && onAllSessionsClosedRef.current) {
+      onSessionCountChange?.(0, 0);
       onAllSessionsClosedRef.current();
       return;
     }
@@ -995,7 +1015,28 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     });
 
     setSlots((prev) => prev.filter((s) => s.id !== slotId));
-  }, [focusedSlotId, layoutTree]);
+  }, [focusedSlotId, layoutTree, onSessionCountChange]);
+
+  /** Kill a session's PTY and clean up its pane. False if this grid doesn't own it. */
+  const killSessionById = useCallback((sessionId: number): boolean => {
+    const slot = slotsRef.current.find((s) => s.sessionId === sessionId);
+    if (!slot) return false;
+    // Kill the backend PTY process (fire-and-forget)
+    killSession(sessionId).catch(console.error);
+    handleKill(sessionId);
+    return true;
+  }, [handleKill]);
+
+  /** Focus the pane running a session. False if this grid doesn't own it. */
+  const focusSession = useCallback((sessionId: number): boolean => {
+    const slot = slotsRef.current.find((s) => s.sessionId === sessionId);
+    if (!slot) return false;
+    // Leave zoom if a different pane is zoomed, so the target is visible.
+    setZoomedSlotId((prev) => (prev === slot.id ? prev : null));
+    setFocusedSlotId(slot.id);
+    focusSlotTextarea(slot.id);
+    return true;
+  }, []);
 
   // Keep closePaneRef in sync with latest handleKill/removeSlot
   closePaneRef.current = () => {
@@ -1012,9 +1053,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
         kind: "warning",
       }).then((confirmed) => {
         if (!confirmed) return;
-        // Kill the backend PTY process (fire-and-forget)
-        killSession(slot.sessionId!).catch(console.error);
-        handleKill(slot.sessionId!);
+        killSessionById(slot.sessionId!);
       }).catch(console.error);
     } else {
       removeSlot(slot.id);
@@ -1273,7 +1312,11 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     refreshBranches();
   }, [mcpServers, skills, plugins, refreshBranches, orderedSlotIds]);
 
-  useImperativeHandle(ref, () => ({ addSession, launchAll, refreshBranches }), [addSession, launchAll, refreshBranches]);
+  useImperativeHandle(
+    ref,
+    () => ({ addSession, launchAll, refreshBranches, focusSession, killSessionById }),
+    [addSession, launchAll, refreshBranches, focusSession, killSessionById],
+  );
 
   // Handle zoom toggle for a slot
   const handleToggleZoom = useCallback((slotId: string) => {

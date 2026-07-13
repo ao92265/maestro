@@ -1,7 +1,20 @@
 import { useMemo } from "react";
-import { useSessionStore, type BackendSessionStatus } from "@/stores/useSessionStore";
-import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
+import { useSessionStore, type BackendSessionStatus, type SessionConfig } from "@/stores/useSessionStore";
+import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 import { samePath } from "@/lib/path";
+
+/**
+ * The sessions belonging to a project tab.
+ * Filters by both session ID and project_path to prevent cross-project session
+ * matching — this guards against session ID collision when IDs reset after an
+ * app restart. Shared by useProjectStatus and the sidebar Agents section so
+ * the collision rule can't drift between them.
+ */
+export function sessionsForTab(tab: WorkspaceTab, sessions: SessionConfig[]): SessionConfig[] {
+  return sessions.filter(
+    (s) => tab.sessionIds.includes(s.id) && samePath(s.project_path, tab.projectPath)
+  );
+}
 
 /**
  * Aggregated status for a project, derived from its sessions.
@@ -44,11 +57,7 @@ export function useProjectStatus(tabId: string): {
       return { status: "idle" as ProjectStatus, sessionCount: 0, activeSessionCount: 0 };
     }
 
-    // Filter by both session ID and project_path to prevent cross-project session matching
-    // This guards against session ID collision when IDs reset after app restart
-    const projectSessions = sessions.filter(
-      (s) => tab.sessionIds.includes(s.id) && samePath(s.project_path, tab.projectPath)
-    );
+    const projectSessions = sessionsForTab(tab, sessions);
     const sessionCount = projectSessions.length;
 
     if (sessionCount === 0) {
