@@ -1,5 +1,6 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
+  Bird,
   GitMerge,
   Minus,
   PanelLeft,
@@ -24,6 +25,9 @@ interface TopBarProps {
   /** Maximum number of sessions allowed */
   maxSessions?: number;
   onAddSession?: () => void;
+  /** Whether eagle view (all projects' terminals at once) is active */
+  eagleView?: boolean;
+  onToggleEagleView?: () => void;
 }
 
 export function TopBar({
@@ -36,6 +40,8 @@ export function TopBar({
   slotCount = 0,
   maxSessions = 6,
   onAddSession,
+  eagleView = false,
+  onToggleEagleView,
 }: TopBarProps) {
   const appWindow = useMemo(() => getCurrentWindow(), []);
 
@@ -78,6 +84,21 @@ export function TopBar({
             title="Add session"
           >
             <Plus size={14} />
+          </button>
+        )}
+        {onToggleEagleView && (
+          <button
+            type="button"
+            onClick={onToggleEagleView}
+            className={`rounded p-1.5 transition-colors ${
+              eagleView
+                ? "text-maestro-accent hover:bg-maestro-accent/10"
+                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
+            }`}
+            aria-label="Eagle view"
+            title="Eagle view — all projects' terminals at once"
+          >
+            <Bird size={14} />
           </button>
         )}
         <button

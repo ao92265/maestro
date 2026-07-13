@@ -41,6 +41,10 @@ interface TerminalViewProps {
   terminalCount?: number;
   isZoomed?: boolean;
   onToggleZoom?: () => void;
+  /** Project name shown in bold before the session label (eagle view). */
+  projectLabel?: string;
+  /** Color for the project label — matches the tile border color. */
+  projectColor?: string;
 }
 
 /**
@@ -147,6 +151,8 @@ export const TerminalView = memo(function TerminalView({
   terminalCount = 1,
   isZoomed = false,
   onToggleZoom,
+  projectLabel,
+  projectColor,
 }: TerminalViewProps) {
   const sessionData = useSessionStore(
     useShallow((s) => {
@@ -809,6 +815,8 @@ export const TerminalView = memo(function TerminalView({
         onToggleZoom={onToggleZoom}
         zoomLevel={zoomLevel}
         onSetZoomLevel={setZoomLevel}
+        projectLabel={projectLabel}
+        projectColor={projectColor}
       />
 
       {/* Tab bar */}

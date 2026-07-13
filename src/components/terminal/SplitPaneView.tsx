@@ -7,6 +7,14 @@ interface SplitPaneViewProps {
   renderLeaf: (slotId: string) => ReactNode;
   onRatioChange: (nodeId: string, ratio: number) => void;
   onDragStateChange: (dragging: boolean) => void;
+  /**
+   * Eagle view: flatten this tree out of the layout entirely.
+   * Split containers, leaf wrappers and dividers stop participating in
+   * layout (`display: contents` / hidden dividers) so every pane becomes a
+   * direct item of the global eagle grid — WITHOUT changing the React tree,
+   * which keeps the xterm instances mounted (no remount, no lost scrollback).
+   */
+  eagleMode?: boolean;
 }
 
 const MIN_RATIO = 0.15;
@@ -22,10 +30,13 @@ function clampRatio(ratio: number): number {
  * - SplitNode → flex container with a draggable divider between two children
  * - LeafNode → calls `renderLeaf(slotId)`
  */
-export function SplitPaneView({ node, renderLeaf, onRatioChange, onDragStateChange }: SplitPaneViewProps) {
+export function SplitPaneView({ node, renderLeaf, onRatioChange, onDragStateChange, eagleMode = false }: SplitPaneViewProps) {
   if (node.type === "leaf") {
     return (
-      <div className="h-full w-full min-w-0 min-h-0 relative" data-slot-id={node.slotId}>
+      <div
+        className={eagleMode ? "contents" : "h-full w-full min-w-0 min-h-0 relative"}
+        data-slot-id={node.slotId}
+      >
         {renderLeaf(node.slotId)}
       </div>
     );
@@ -37,36 +48,44 @@ export function SplitPaneView({ node, renderLeaf, onRatioChange, onDragStateChan
   // subtracted from available space before children divide the remainder.
   return (
     <div
-      className={`flex ${isVertical ? "flex-row" : "flex-col"} h-full w-full min-w-0 min-h-0`}
+      className={
+        eagleMode
+          ? "contents"
+          : `flex ${isVertical ? "flex-row" : "flex-col"} h-full w-full min-w-0 min-h-0`
+      }
     >
       <div
-        style={{ flexGrow: node.ratio, flexShrink: 1, flexBasis: 0 }}
-        className="min-w-0 min-h-0 overflow-hidden"
+        style={eagleMode ? undefined : { flexGrow: node.ratio, flexShrink: 1, flexBasis: 0 }}
+        className={eagleMode ? "contents" : "min-w-0 min-h-0 overflow-hidden"}
       >
         <SplitPaneView
           node={node.children[0]}
           renderLeaf={renderLeaf}
           onRatioChange={onRatioChange}
           onDragStateChange={onDragStateChange}
+          eagleMode={eagleMode}
         />
       </div>
 
-      <Divider
-        direction={node.direction}
-        nodeId={node.id}
-        onRatioChange={onRatioChange}
-        onDragStateChange={onDragStateChange}
-      />
+      {!eagleMode && (
+        <Divider
+          direction={node.direction}
+          nodeId={node.id}
+          onRatioChange={onRatioChange}
+          onDragStateChange={onDragStateChange}
+        />
+      )}
 
       <div
-        style={{ flexGrow: 1 - node.ratio, flexShrink: 1, flexBasis: 0 }}
-        className="min-w-0 min-h-0 overflow-hidden"
+        style={eagleMode ? undefined : { flexGrow: 1 - node.ratio, flexShrink: 1, flexBasis: 0 }}
+        className={eagleMode ? "contents" : "min-w-0 min-h-0 overflow-hidden"}
       >
         <SplitPaneView
           node={node.children[1]}
           renderLeaf={renderLeaf}
           onRatioChange={onRatioChange}
           onDragStateChange={onDragStateChange}
+          eagleMode={eagleMode}
         />
       </div>
     </div>

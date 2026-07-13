@@ -42,6 +42,7 @@ import { useSessionStore } from "@/stores/useSessionStore";
 import type { AiMode } from "@/stores/useSessionStore";
 import { useWorkspaceStore, type RepositoryInfo, type WorkspaceType } from "@/stores/useWorkspaceStore";
 import { shellEscapePaths } from "@/lib/shellEscape";
+import { projectColorFor } from "@/lib/projectColor";
 import { PreLaunchCard, type SessionSlot } from "./PreLaunchCard";
 import { SplitPaneView } from "./SplitPaneView";
 import { createLeaf, splitLeaf, removeLeaf, updateRatio, collectSlotIds, findSiblingSlotId, buildGridTree, swapSlots, type TreeNode, type SplitDirection } from "./splitTree";
@@ -148,6 +149,19 @@ interface TerminalGridProps {
   isActive?: boolean;
   onSessionCountChange?: (slotCount: number, launchedCount: number) => void;
   onAllSessionsClosed?: () => void;
+  /**
+   * Eagle view: this grid's launched panes become items of the global
+   * all-projects grid (via `display: contents` flattening) instead of using
+   * the local split-tree layout. Pre-launch cards are hidden, per-project
+   * zoom and pane drag/split are suspended.
+   */
+  eagleMode?: boolean;
+  /** Project name shown on each pane header in eagle mode. */
+  projectName?: string;
+  /** Slot currently zoomed in eagle view (owned by MultiProjectView). */
+  eagleZoomedSlotId?: string | null;
+  /** Toggles eagle zoom for a slot (owned by MultiProjectView). */
+  onEagleZoomToggle?: (slotId: string) => void;
 }
 
 /**
@@ -164,7 +178,7 @@ interface TerminalGridProps {
  *   a fresh slot so the user is never left with an empty grid.
  */
 export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(function TerminalGrid(
-  { projectPath, repoPath, repositories, workspaceType, onRepoChange, tabId, preserveOnHide = false, isActive = true, onSessionCountChange, onAllSessionsClosed },
+  { projectPath, repoPath, repositories, workspaceType, onRepoChange, tabId, preserveOnHide = false, isActive = true, onSessionCountChange, onAllSessionsClosed, eagleMode = false, projectName, eagleZoomedSlotId = null, onEagleZoomToggle },
   ref,
 ) {
   // Use repoPath for git operations, falling back to projectPath
@@ -337,7 +351,9 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     // doesn't swallow them). In normal split-pane mode Alt+Arrow stays as
     // xterm's word-movement.
     isZoomed: zoomedSlotId !== null,
-    enabled: isActive,
+    // Split/zoom/focus shortcuts act on the per-project layout, which is
+    // suspended while the global eagle grid is showing.
+    enabled: isActive && !eagleMode,
   });
 
   // Drag-and-drop files from Finder/Explorer onto terminal panes.
@@ -1258,6 +1274,12 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     setLayoutTree((prev) => swapSlots(prev, srcSlotId, destSlotId));
   }, []);
 
+  // Stable per-project accent color for eagle mode tiles.
+  const eagleColor = useMemo(
+    () => (projectName ? projectColorFor(projectName) : undefined),
+    [projectName]
+  );
+
   const renderLeaf = useCallback((slotId: string) => {
     const slot = slots.find((s) => s.id === slotId);
     if (!slot) return null;
@@ -1268,7 +1290,8 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       </div>
     );
 
-    const showReorderHandle = slots.length > 1;
+    const showReorderHandle = slots.length > 1 && !eagleMode;
+    const isEagleZoomed = eagleMode && eagleZoomedSlotId === slot.id;
 
     if (slot.sessionId !== null) {
       return (
@@ -1276,6 +1299,10 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
           slotId={slot.id}
           showHandle={showReorderHandle}
           onSwap={handleSwapSlots}
+          eagleMode={eagleMode}
+          eagleHidden={false}
+          eagleZoomed={isEagleZoomed}
+          eagleColor={eagleColor}
         >
           <TerminalView
             key={slot.id}
@@ -1285,8 +1312,12 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
             onFocus={getFocusCallback(slot.id)}
             onKill={handleKill}
             terminalCount={slots.length}
-            isZoomed={false}
-            onToggleZoom={() => handleToggleZoom(slot.id)}
+            isZoomed={isEagleZoomed}
+            onToggleZoom={() =>
+              eagleMode ? onEagleZoomToggle?.(slot.id) : handleToggleZoom(slot.id)
+            }
+            projectLabel={eagleMode ? projectName : undefined}
+            projectColor={eagleMode ? eagleColor : undefined}
           />
           {dropOverlay}
         </DraggablePane>
@@ -1298,6 +1329,10 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
         slotId={slot.id}
         showHandle={showReorderHandle}
         onSwap={handleSwapSlots}
+        eagleMode={eagleMode}
+        eagleHidden={eagleMode}
+        eagleZoomed={false}
+        eagleColor={eagleColor}
       >
       <PreLaunchCard
         key={slot.id}
@@ -1337,7 +1372,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       </DraggablePane>
     );
   // eslint-disable-next-line react-hooks/exhaustive-deps -- Deps cover all render-affecting state
-  }, [slots, focusedSlotId, isActive, isDraggingFiles, dropTargetSlotId, getFocusCallback, handleKill, handleToggleZoom, handleSwapSlots, projectPath, branches, isLoadingBranches, isGitRepo, hasManagedWorktree, repositories, workspaceType, effectiveRepoPath, onRepoChange, mcpServers, skills, plugins, handleCreateBranch, updateSlotCustomName, updateSlotMode, updateSlotBranch, updateSlotWorktreeMode, refreshBranches, toggleSlotMcp, toggleSlotSkill, toggleSlotPlugin, selectAllMcp, unselectAllMcp, selectAllPlugins, unselectAllPlugins, launchSlot, removeSlot, updateSlotResumeSession]);
+  }, [slots, focusedSlotId, isActive, isDraggingFiles, dropTargetSlotId, getFocusCallback, handleKill, handleToggleZoom, handleSwapSlots, projectPath, branches, isLoadingBranches, isGitRepo, hasManagedWorktree, repositories, workspaceType, effectiveRepoPath, onRepoChange, mcpServers, skills, plugins, handleCreateBranch, updateSlotCustomName, updateSlotMode, updateSlotBranch, updateSlotWorktreeMode, refreshBranches, toggleSlotMcp, toggleSlotSkill, toggleSlotPlugin, selectAllMcp, unselectAllMcp, selectAllPlugins, unselectAllPlugins, launchSlot, removeSlot, updateSlotResumeSession, eagleMode, eagleZoomedSlotId, onEagleZoomToggle, projectName, eagleColor]);
 
   const handleRatioChange = useCallback((nodeId: string, ratio: number) => {
     setLayoutTree((prev) => updateRatio(prev, nodeId, ratio));
@@ -1371,8 +1406,10 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     );
   }
 
-  // If a terminal is zoomed, show only that one at full screen with navigation bar
-  if (zoomedSlotId) {
+  // If a terminal is zoomed, show only that one at full screen with navigation bar.
+  // Suspended in eagle mode: this branch swaps the element tree (remounting the
+  // xterm instances), while eagle view needs every pane to stay mounted.
+  if (zoomedSlotId && !eagleMode) {
     const zoomedSlot = slots.find(s => s.id === zoomedSlotId);
     if (!zoomedSlot) {
       setZoomedSlotId(null);
@@ -1488,12 +1525,19 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   }
 
   return (
-    <div className={`flex h-full bg-maestro-bg p-2 ${isDragging ? "split-dragging" : ""}`}>
+    <div
+      className={
+        eagleMode
+          ? "contents"
+          : `flex h-full bg-maestro-bg p-2 ${isDragging ? "split-dragging" : ""}`
+      }
+    >
       <SplitPaneView
         node={layoutTree}
         renderLeaf={renderLeaf}
         onRatioChange={handleRatioChange}
         onDragStateChange={setIsDragging}
+        eagleMode={eagleMode}
       />
     </div>
   );
@@ -1517,11 +1561,23 @@ function DraggablePane({
   showHandle,
   onSwap,
   children,
+  eagleMode = false,
+  eagleHidden = false,
+  eagleZoomed = false,
+  eagleColor,
 }: {
   slotId: string;
   showHandle: boolean;
   onSwap: (srcSlotId: string, destSlotId: string) => void;
   children: ReactNode;
+  /** Eagle view: this pane is a tile of the global all-projects grid. */
+  eagleMode?: boolean;
+  /** Eagle view: pane has no live terminal (pre-launch) — not shown. */
+  eagleHidden?: boolean;
+  /** Eagle view: pane is zoomed to fill the window (position: fixed). */
+  eagleZoomed?: boolean;
+  /** Eagle view: project-assigned tile border color. */
+  eagleColor?: string;
 }) {
   const [isDragging, setIsDragging] = useState(false);
 
@@ -1585,8 +1641,25 @@ function DraggablePane({
     [slotId, onSwap],
   );
 
+  // Eagle view restyles this container purely with CSS so the children
+  // (the live xterm instance) never remount:
+  // - hidden: pre-launch panes don't belong in a terminals-only overview
+  // - zoomed: position:fixed overlays the whole window, Esc/header returns
+  // - tile:   grid item with the project's assigned border color
+  const eagleClass = eagleHidden
+    ? "hidden"
+    : eagleZoomed
+      ? "fixed inset-0 z-40 bg-maestro-bg min-h-0 min-w-0"
+      : "relative h-full w-full min-h-0 min-w-0 overflow-hidden rounded-md";
   return (
-    <div className="relative h-full w-full min-h-0 min-w-0">
+    <div
+      className={eagleMode ? eagleClass : "relative h-full w-full min-h-0 min-w-0"}
+      style={
+        eagleMode && !eagleHidden && eagleColor
+          ? { border: `2px solid ${eagleColor}` }
+          : undefined
+      }
+    >
       {children}
       {showHandle && (
         <div

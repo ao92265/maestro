@@ -32,6 +32,10 @@ interface TerminalHeaderProps {
   onToggleZoom?: () => void;
   zoomLevel?: number;
   onSetZoomLevel?: (level: number) => void;
+  /** Project name shown in bold before the session label (eagle view). */
+  projectLabel?: string;
+  /** Color for the project label — matches the tile border color. */
+  projectColor?: string;
 }
 
 const providerConfig: Record<AIProvider, { icon: IconComponent; label: string }> = {
@@ -57,6 +61,8 @@ export const TerminalHeader = memo(function TerminalHeader({
   onToggleZoom,
   zoomLevel = 100,
   onSetZoomLevel,
+  projectLabel,
+  projectColor,
 }: TerminalHeaderProps) {
   const { icon: ProviderIcon, label: providerLabel } = providerConfig[provider];
   const [showZoomMenu, setShowZoomMenu] = useState(false);
@@ -211,6 +217,17 @@ export const TerminalHeader = memo(function TerminalHeader({
           />
           {!isZoomed && terminalCount <= 4 && <ChevronDown size={9} className="text-maestro-muted/60" />}
         </button>
+
+        {/* Project label (eagle view) — bold, in the project's assigned color */}
+        {projectLabel && (
+          <span
+            className={`shrink-0 truncate font-bold ${adaptive.sessionLabelSize}`}
+            style={projectColor ? { color: projectColor } : undefined}
+            title={`Project: ${projectLabel}`}
+          >
+            {projectLabel}
+          </span>
+        )}
 
         {/* Session label */}
         {isEditingName ? (
