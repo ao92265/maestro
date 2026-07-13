@@ -11,10 +11,12 @@ import {
   Info,
   Keyboard,
   Loader2,
+  Cloud,
   Moon,
   Package,
   Plus,
   PlusCircle,
+  Power,
   RefreshCw,
   Server,
   Settings,
@@ -40,7 +42,11 @@ import { ContextDocEditorModal } from "@/components/claudemd";
 import { CliSettingsModal } from "@/components/terminal/CliSettingsModal";
 import { TerminalSettingsModal } from "@/components/terminal/TerminalSettingsModal";
 import { MaestroSettingsModal, ShortcutsModal } from "@/components/settings";
-import type { McpCustomServer, McpServerConfig } from "@/lib/mcp";
+import type {
+  McpConnector,
+  McpCustomServer,
+  McpManagedServer,
+} from "@/lib/mcp";
 import { listContextDocs, readContextDoc, type ContextDoc } from "@/lib/claudemd";
 
 interface SidebarProps {
@@ -577,18 +583,25 @@ function ExtensionsSection() {
 }
 
 /**
- * Renders a labelled group of MCP servers for one scope (project / local / user).
- * Shows nothing when the group is empty so the section stays compact.
+ * Renders a labelled group of managed MCP servers for one scope
+ * (project / local / user), with per-server toggle / edit / delete actions
+ * that write to Claude Code's real config files.
  *
- * Status dot: green = configured (Claude will load it on session launch).
- * No live "running" check exists yet — the indicator reflects configured state.
+ * Status dot: green = enabled for this project, gray = disabled via
+ * Claude Code's per-project disable lists in ~/.claude.json.
  */
 function McpScopeGroup({
   label,
   servers,
+  onToggle,
+  onEdit,
+  onDelete,
 }: {
   label: string;
-  servers: McpServerConfig[];
+  servers: McpManagedServer[];
+  onToggle: (server: McpManagedServer) => void;
+  onEdit: (server: McpManagedServer) => void;
+  onDelete: (server: McpManagedServer) => void;
 }) {
   if (servers.length === 0) return null;
   return (
@@ -596,24 +609,146 @@ function McpScopeGroup({
       <div className="px-2 py-0.5 text-[9px] font-medium uppercase tracking-wide text-maestro-muted/60">
         {label} ({servers.length})
       </div>
-      {servers.map((server) => {
-        const isHttp = server.type === "http";
-        return (
-          <div
-            key={`${server.source ?? "project"}:${server.name}`}
-            className="flex items-center gap-2 rounded-md px-2 py-1 text-xs text-maestro-text hover:bg-maestro-border/40"
+      {servers.map((server) => (
+        <div
+          key={`${server.scope}:${server.name}`}
+          className="group flex items-center gap-2 rounded-md px-2 py-1 text-xs text-maestro-text hover:bg-maestro-border/40"
+        >
+          <span
+            title={
+              server.pending
+                ? "Awaiting approval — Claude won't load it until enabled"
+                : server.enabled
+                  ? "Enabled — loaded into sessions on launch"
+                  : "Disabled for this project"
+            }
+            className={`h-2 w-2 shrink-0 rounded-full ${
+              server.pending
+                ? "bg-yellow-500"
+                : server.enabled
+                  ? "bg-maestro-green"
+                  : "bg-maestro-muted"
+            }`}
+          />
+          <span
+            className={`flex-1 truncate font-medium ${
+              server.enabled || server.pending ? "" : "text-maestro-muted line-through"
+            }`}
           >
-            <span
-              title="Configured — loaded into sessions on launch"
-              className="h-2 w-2 shrink-0 rounded-full bg-maestro-green"
-            />
-            <span className="flex-1 truncate font-medium">{server.name}</span>
-            <span className="text-[10px] text-maestro-muted">
-              {isHttp ? "HTTP" : "stdio"}
-            </span>
+            {server.name}
+          </span>
+          <span className="text-[10px] text-maestro-muted group-hover:hidden">
+            {server.transport === "http" ? "HTTP" : server.transport}
+          </span>
+          <div className="hidden items-center gap-0.5 group-hover:flex">
+            <button
+              type="button"
+              onClick={() => onToggle(server)}
+              className="rounded p-0.5 hover:bg-maestro-border/40"
+              title={
+                server.pending
+                  ? "Approve for this project"
+                  : server.enabled
+                    ? "Disable for this project"
+                    : "Enable for this project"
+              }
+            >
+              <Power
+                size={10}
+                className={
+                  server.pending
+                    ? "text-yellow-500"
+                    : server.enabled
+                      ? "text-maestro-green"
+                      : "text-maestro-muted"
+                }
+              />
+            </button>
+            <button
+              type="button"
+              onClick={() => onEdit(server)}
+              className="rounded p-0.5 hover:bg-maestro-border/40"
+              title="Edit server"
+            >
+              <Edit2 size={10} className="text-maestro-muted" />
+            </button>
+            <button
+              type="button"
+              onClick={() => onDelete(server)}
+              className="rounded p-0.5 hover:bg-maestro-red/10"
+              title="Remove from config file"
+            >
+              <Trash2 size={10} className="text-maestro-red" />
+            </button>
           </div>
-        );
-      })}
+        </div>
+      ))}
+    </>
+  );
+}
+
+/**
+ * claude.ai account connectors. They are defined in the user's claude.ai
+ * account (not in any local file), so they can only be enabled/disabled per
+ * project — Claude Code's `disabledMcpServers` list — never edited or removed.
+ */
+function McpConnectorGroup({
+  connectors,
+  onToggle,
+}: {
+  connectors: McpConnector[];
+  onToggle: (connector: McpConnector) => void;
+}) {
+  if (connectors.length === 0) return null;
+  return (
+    <>
+      <div
+        className="flex items-center gap-1 px-2 py-0.5 text-[9px] font-medium uppercase tracking-wide text-maestro-muted/60"
+        title="Managed in your claude.ai account — Maestro can only enable/disable them per project"
+      >
+        <Cloud size={9} />
+        claude.ai account ({connectors.length})
+      </div>
+      {connectors.map((connector) => (
+        <div
+          key={connector.name}
+          className="group flex items-center gap-2 rounded-md px-2 py-1 text-xs text-maestro-text hover:bg-maestro-border/40"
+        >
+          <span
+            title={
+              connector.enabled
+                ? "Enabled for this project"
+                : "Disabled for this project"
+            }
+            className={`h-2 w-2 shrink-0 rounded-full ${
+              connector.enabled ? "bg-maestro-green" : "bg-maestro-muted"
+            }`}
+          />
+          <span
+            className={`flex-1 truncate font-medium ${
+              connector.enabled ? "" : "text-maestro-muted line-through"
+            }`}
+          >
+            {connector.name}
+          </span>
+          <span className="text-[10px] text-maestro-muted group-hover:hidden">remote</span>
+          <div className="hidden items-center gap-0.5 group-hover:flex">
+            <button
+              type="button"
+              onClick={() => onToggle(connector)}
+              className="rounded p-0.5 hover:bg-maestro-border/40"
+              title={
+                connector.enabled ? "Disable for this project" : "Enable for this project"
+              }
+            >
+              <Power
+                size={10}
+                className={connector.enabled ? "text-maestro-green" : "text-maestro-muted"}
+              />
+            </button>
+          </div>
+        </div>
+      ))}
     </>
   );
 }
@@ -622,36 +757,41 @@ function MCPServersSection() {
   const [expanded, setExpanded] = useState(false);
   const [showEditorModal, setShowEditorModal] = useState(false);
   const [editingServer, setEditingServer] = useState<McpCustomServer | undefined>(undefined);
+  const [editingManaged, setEditingManaged] = useState<McpManagedServer | undefined>(undefined);
   const tabs = useWorkspaceStore((s) => s.tabs);
   const activeTab = tabs.find((t) => t.active);
   const projectPath = activeTab?.projectPath ?? "";
 
   const {
-    projectServers,
     customServers,
     customServersLoaded,
     fetchProjectServers,
     refreshProjectServers,
     fetchCustomServers,
     deleteCustomServer,
+    mcpStatus,
+    fetchMcpStatus,
+    setManagedServerEnabled,
+    removeManagedServer,
     isLoading,
+    errors,
   } = useMcpStore();
 
-  // Filter out the internal "maestro" server - it's shown in the dedicated Maestro MCP section
-  const discoveredServers = projectPath
-    ? (projectServers[projectPath] ?? []).filter((s) => s.name !== "maestro")
-    : [];
+  const status = projectPath ? mcpStatus[projectPath] : undefined;
+  const managedServers = status?.servers ?? [];
+  const connectors = status?.connectors ?? [];
   const loading = projectPath ? (isLoading[projectPath] ?? false) : false;
+  const writeError = projectPath ? (errors[projectPath] ?? null) : null;
 
-  // Total count includes discovered + custom servers
-  const totalCount = discoveredServers.length + customServers.length;
+  const totalCount = managedServers.length + connectors.length + customServers.length;
 
-  // Fetch servers when project changes
+  // Fetch the management view and launch-time discovery when project changes
   useEffect(() => {
     if (projectPath) {
+      fetchMcpStatus(projectPath);
       fetchProjectServers(projectPath);
     }
-  }, [projectPath, fetchProjectServers]);
+  }, [projectPath, fetchMcpStatus, fetchProjectServers]);
 
   // Fetch custom servers on mount
   useEffect(() => {
@@ -662,19 +802,55 @@ function MCPServersSection() {
 
   const handleRefresh = useCallback(() => {
     if (projectPath) {
+      fetchMcpStatus(projectPath);
       refreshProjectServers(projectPath);
     }
     fetchCustomServers();
-  }, [projectPath, refreshProjectServers, fetchCustomServers]);
+  }, [projectPath, fetchMcpStatus, refreshProjectServers, fetchCustomServers]);
 
   const handleAddServer = () => {
     setEditingServer(undefined);
+    setEditingManaged(undefined);
     setShowEditorModal(true);
   };
 
   const handleEditServer = (server: McpCustomServer) => {
     setEditingServer(server);
+    setEditingManaged(undefined);
     setShowEditorModal(true);
+  };
+
+  const handleEditManaged = (server: McpManagedServer) => {
+    setEditingManaged(server);
+    setEditingServer(undefined);
+    setShowEditorModal(true);
+  };
+
+  const handleToggleManaged = async (server: McpManagedServer) => {
+    if (!projectPath) return;
+    try {
+      await setManagedServerEnabled(projectPath, server.scope, server.name, !server.enabled);
+    } catch (err) {
+      console.error("Failed to toggle MCP server:", err);
+    }
+  };
+
+  const handleToggleConnector = async (connector: McpConnector) => {
+    if (!projectPath) return;
+    try {
+      await setManagedServerEnabled(projectPath, "connector", connector.name, !connector.enabled);
+    } catch (err) {
+      console.error("Failed to toggle claude.ai connector:", err);
+    }
+  };
+
+  const handleDeleteManaged = async (server: McpManagedServer) => {
+    if (!projectPath) return;
+    try {
+      await removeManagedServer(projectPath, server.scope, server.name);
+    } catch (err) {
+      console.error("Failed to remove MCP server:", err);
+    }
   };
 
   const handleDeleteServer = async (serverId: string) => {
@@ -729,20 +905,42 @@ function MCPServersSection() {
 
         {expanded && (
           <div className="space-y-0.5">
-            {/* Discovered servers grouped by scope. Project = repo's .mcp.json,
+            {/* Config write failures (toggle/delete have no modal to show them) */}
+            {writeError && (
+              <div className="px-2 py-1 text-[10px] text-maestro-red break-words">
+                {writeError}
+              </div>
+            )}
+
+            {/* Managed servers grouped by scope. Project = repo's .mcp.json,
                 Local = ~/.claude.json projects[path] (per-machine), User = top-level
-                ~/.claude.json (user-global). */}
+                ~/.claude.json (user-global). All editable in place. */}
             <McpScopeGroup
               label="Project (.mcp.json)"
-              servers={discoveredServers.filter((s) => (s.source ?? "project") === "project")}
+              servers={managedServers.filter((s) => s.scope === "project")}
+              onToggle={handleToggleManaged}
+              onEdit={handleEditManaged}
+              onDelete={handleDeleteManaged}
             />
             <McpScopeGroup
               label="Local (this machine)"
-              servers={discoveredServers.filter((s) => s.source === "local")}
+              servers={managedServers.filter((s) => s.scope === "local")}
+              onToggle={handleToggleManaged}
+              onEdit={handleEditManaged}
+              onDelete={handleDeleteManaged}
             />
             <McpScopeGroup
               label="User (global)"
-              servers={discoveredServers.filter((s) => s.source === "user")}
+              servers={managedServers.filter((s) => s.scope === "user")}
+              onToggle={handleToggleManaged}
+              onEdit={handleEditManaged}
+              onDelete={handleDeleteManaged}
+            />
+
+            {/* claude.ai account connectors (toggle only) */}
+            <McpConnectorGroup
+              connectors={connectors}
+              onToggle={handleToggleConnector}
             />
 
             {/* Custom servers */}
@@ -800,8 +998,13 @@ function MCPServersSection() {
       {showEditorModal && (
         <McpServerEditorModal
           server={editingServer}
+          managedServer={editingManaged}
+          projectPath={projectPath}
           onClose={() => setShowEditorModal(false)}
-          onSaved={() => fetchCustomServers()}
+          onSaved={() => {
+            fetchCustomServers();
+            if (projectPath) fetchMcpStatus(projectPath);
+          }}
         />
       )}
     </>

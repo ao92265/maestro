@@ -20,7 +20,11 @@ use crate::commands::mcp::McpCustomServer;
 static DIR_LOCKS: LazyLock<DashMap<PathBuf, Arc<Mutex<()>>>> = LazyLock::new(DashMap::new);
 
 /// Acquire a per-directory lock for atomic .mcp.json operations.
-fn dir_lock(dir: &Path) -> Arc<Mutex<()>> {
+///
+/// `pub(crate)` so other writers of the same `.mcp.json` (the MCP management
+/// commands in `commands::mcp`) serialize against session-launch injection —
+/// two unsynchronized read-modify-write paths would silently lose updates.
+pub(crate) fn dir_lock(dir: &Path) -> Arc<Mutex<()>> {
     DIR_LOCKS
         .entry(dir.to_path_buf())
         .or_insert_with(|| Arc::new(Mutex::new(())))

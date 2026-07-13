@@ -211,6 +211,85 @@ export async function removeOpenCodeMcpConfig(
   return invoke("remove_opencode_mcp_config", { workingDir, sessionId });
 }
 
+/* ── Management of Claude Code's real MCP configuration ──
+ *
+ * These commands read and edit the files Claude Code itself uses:
+ * project = <project>/.mcp.json, user/local = ~/.claude.json.
+ * Enable/disable piggybacks on Claude Code's native per-project lists,
+ * so toggles here are honored by the Claude CLI directly.
+ */
+
+/** Scope of a managed MCP server. `connector` = claude.ai account (toggle only). */
+export type McpManagedScope = "project" | "user" | "local" | "connector";
+
+/** A server as read from the real config files, with its raw JSON entry. */
+export interface McpManagedServer {
+  name: string;
+  scope: McpManagedScope;
+  /** Enabled for the current project (per Claude Code's disable lists). */
+  enabled: boolean;
+  /**
+   * Project-scope only: in neither the enabled nor the disabled list, so
+   * Claude Code treats it as awaiting user approval (won't load it yet).
+   */
+  pending: boolean;
+  /** "stdio" | "http" | "sse" | … */
+  transport: string;
+  /** Raw config entry — command/args/env for stdio, url for http/sse. */
+  config: Record<string, unknown>;
+}
+
+/** A claude.ai account connector. Defined remotely; only toggleable locally. */
+export interface McpConnector {
+  name: string;
+  enabled: boolean;
+}
+
+/** Full management view for a project, read fresh from disk. */
+export interface McpStatusView {
+  servers: McpManagedServer[];
+  connectors: McpConnector[];
+}
+
+/** Reads the full MCP management view for a project (no cache). */
+export async function getMcpStatus(projectPath: string): Promise<McpStatusView> {
+  return invoke<McpStatusView>("get_mcp_status", { projectPath });
+}
+
+/**
+ * Adds or replaces a server in the real config file for the given scope.
+ * With `overwrite: false` (Add flow) an existing same-name entry is an error
+ * instead of being silently replaced.
+ */
+export async function upsertMcpServer(
+  projectPath: string,
+  scope: McpManagedScope,
+  name: string,
+  config: Record<string, unknown>,
+  overwrite: boolean
+): Promise<void> {
+  return invoke("upsert_mcp_server", { projectPath, scope, name, config, overwrite });
+}
+
+/** Removes a server from the real config file for the given scope. */
+export async function removeMcpServer(
+  projectPath: string,
+  scope: McpManagedScope,
+  name: string
+): Promise<void> {
+  return invoke("remove_mcp_server", { projectPath, scope, name });
+}
+
+/** Enables/disables a server (or claude.ai connector) for this project. */
+export async function setMcpServerEnabled(
+  projectPath: string,
+  scope: McpManagedScope,
+  name: string,
+  enabled: boolean
+): Promise<void> {
+  return invoke("set_mcp_server_enabled", { projectPath, scope, name, enabled });
+}
+
 /**
  * Gets all custom MCP servers configured by the user.
  * Custom servers are stored globally and available across all projects.
