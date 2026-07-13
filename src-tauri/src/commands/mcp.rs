@@ -11,6 +11,7 @@ use tauri_plugin_store::StoreExt;
 
 use crate::core::mcp_config_writer;
 use crate::core::mcp_manager::{McpManager, McpServerConfig};
+use crate::core::mcp_settings::{self, McpScope, McpStatusView};
 use crate::core::status_server::StatusServer;
 
 /// Store filename for custom MCP servers (global, user-level).
@@ -441,6 +442,66 @@ pub async fn generate_project_hash(project_path: String) -> Result<String, Strin
         .into_owned();
 
     Ok(StatusServer::generate_project_hash(&canonical))
+}
+
+/// Reads the full MCP management view for a project, fresh from disk:
+/// servers from `.mcp.json` and `~/.claude.json` (all scopes, no dedup) with
+/// their per-project enabled state, plus claude.ai account connectors.
+#[tauri::command]
+pub async fn get_mcp_status(project_path: String) -> Result<McpStatusView, String> {
+    mcp_settings::get_status(&project_path)
+}
+
+/// Adds or replaces an MCP server in the real config file for the given scope
+/// (project = `.mcp.json`, user/local = `~/.claude.json`).
+#[tauri::command]
+pub async fn upsert_mcp_server(
+    state: State<'_, McpManager>,
+    project_path: String,
+    scope: McpScope,
+    name: String,
+    config: serde_json::Value,
+) -> Result<(), String> {
+    mcp_settings::upsert_server(&project_path, scope, &name, config)?;
+    refresh_discovery_cache(&state, &project_path);
+    Ok(())
+}
+
+/// Removes an MCP server from the real config file for the given scope.
+#[tauri::command]
+pub async fn remove_mcp_server(
+    state: State<'_, McpManager>,
+    project_path: String,
+    scope: McpScope,
+    name: String,
+) -> Result<(), String> {
+    mcp_settings::remove_server(&project_path, scope, &name)?;
+    refresh_discovery_cache(&state, &project_path);
+    Ok(())
+}
+
+/// Enables or disables an MCP server (or claude.ai connector) for this project
+/// via Claude Code's native per-project lists in `~/.claude.json`.
+#[tauri::command]
+pub async fn set_mcp_server_enabled(
+    state: State<'_, McpManager>,
+    project_path: String,
+    scope: McpScope,
+    name: String,
+    enabled: bool,
+) -> Result<(), String> {
+    mcp_settings::set_server_enabled(&project_path, scope, &name, enabled)?;
+    refresh_discovery_cache(&state, &project_path);
+    Ok(())
+}
+
+/// Keeps the launch-time discovery cache in sync after a config write.
+/// Best-effort: a failure to canonicalize just leaves the mtime check to
+/// catch the change on the next read.
+fn refresh_discovery_cache(state: &State<'_, McpManager>, project_path: &str) {
+    if let Ok(canonical) = std::fs::canonicalize(project_path) {
+        state.refresh_project_servers(&canonical.to_string_lossy());
+    }
 }
 
 /// Gets all custom MCP servers configured by the user.

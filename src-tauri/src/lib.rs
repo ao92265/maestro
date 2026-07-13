@@ -305,6 +305,10 @@ pub fn run() {
             commands::mcp::save_custom_mcp_server,
             commands::mcp::delete_custom_mcp_server,
             commands::mcp::get_status_server_info,
+            commands::mcp::get_mcp_status,
+            commands::mcp::upsert_mcp_server,
+            commands::mcp::remove_mcp_server,
+            commands::mcp::set_mcp_server_enabled,
             // Plugin commands
             commands::plugin::get_project_plugins,
             commands::plugin::refresh_project_plugins,

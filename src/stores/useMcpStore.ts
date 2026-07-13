@@ -16,8 +16,14 @@ import {
   getCustomMcpServers,
   saveCustomMcpServer,
   deleteCustomMcpServer as deleteCustomMcpServerApi,
+  getMcpStatus,
+  upsertMcpServer,
+  removeMcpServer,
+  setMcpServerEnabled,
   type McpServerConfig,
   type McpCustomServer,
+  type McpStatusView,
+  type McpManagedScope,
 } from "@/lib/mcp";
 
 /** Key for session-enabled lookup: "projectPath:sessionId" */
@@ -117,6 +123,38 @@ interface McpState {
    * Gets all servers (discovered + custom) for a project.
    */
   getAllServers: (projectPath: string) => McpServerConfig[];
+
+  /** Management view (real config files + connectors) per project path. */
+  mcpStatus: Record<string, McpStatusView>;
+
+  /** Fetches the management view for a project, fresh from disk. */
+  fetchMcpStatus: (projectPath: string) => Promise<McpStatusView | null>;
+
+  /**
+   * Adds or replaces a server in the real config file for a scope, then
+   * refreshes both the management view and launch-time discovery.
+   */
+  upsertManagedServer: (
+    projectPath: string,
+    scope: McpManagedScope,
+    name: string,
+    config: Record<string, unknown>
+  ) => Promise<void>;
+
+  /** Removes a server from the real config file for a scope. */
+  removeManagedServer: (
+    projectPath: string,
+    scope: McpManagedScope,
+    name: string
+  ) => Promise<void>;
+
+  /** Enables/disables a server or connector for this project. */
+  setManagedServerEnabled: (
+    projectPath: string,
+    scope: McpManagedScope,
+    name: string,
+    enabled: boolean
+  ) => Promise<void>;
 }
 
 export const useMcpStore = create<McpState>()((set, get) => ({
@@ -319,6 +357,69 @@ export const useMcpStore = create<McpState>()((set, get) => ({
       // Revert on error
       set({ customServers: previousServers });
       throw err;
+    }
+  },
+
+  mcpStatus: {},
+
+  fetchMcpStatus: async (projectPath: string) => {
+    try {
+      const status = await getMcpStatus(projectPath);
+      set((state) => ({
+        mcpStatus: { ...state.mcpStatus, [projectPath]: status },
+      }));
+      return status;
+    } catch (err) {
+      console.error("Failed to fetch MCP status:", err);
+      set((state) => ({
+        errors: { ...state.errors, [projectPath]: String(err) },
+      }));
+      return null;
+    }
+  },
+
+  upsertManagedServer: async (projectPath, scope, name, config) => {
+    await upsertMcpServer(projectPath, scope, name, config);
+    // Re-read the files so the UI reflects exactly what was written, and
+    // refresh discovery so session launches pick the change up too.
+    await Promise.all([
+      get().fetchMcpStatus(projectPath),
+      get().refreshProjectServers(projectPath),
+    ]);
+  },
+
+  removeManagedServer: async (projectPath, scope, name) => {
+    await removeMcpServer(projectPath, scope, name);
+    await Promise.all([
+      get().fetchMcpStatus(projectPath),
+      get().refreshProjectServers(projectPath),
+    ]);
+  },
+
+  setManagedServerEnabled: async (projectPath, scope, name, enabled) => {
+    // Optimistic flip so the toggle feels instant; the refetch corrects it.
+    set((state) => {
+      const status = state.mcpStatus[projectPath];
+      if (!status) return {};
+      return {
+        mcpStatus: {
+          ...state.mcpStatus,
+          [projectPath]: {
+            servers: status.servers.map((s) =>
+              s.name === name && s.scope === scope ? { ...s, enabled } : s
+            ),
+            connectors: status.connectors.map((c) =>
+              scope === "connector" && c.name === name ? { ...c, enabled } : c
+            ),
+          },
+        },
+      };
+    });
+
+    try {
+      await setMcpServerEnabled(projectPath, scope, name, enabled);
+    } finally {
+      await get().fetchMcpStatus(projectPath);
     }
   },
 

@@ -11,6 +11,9 @@ use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::SystemTime;
+
+use super::mcp_settings;
 
 /// The source/origin of an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -69,8 +72,10 @@ struct McpJsonFile {
 /// A single entry in the mcpServers object.
 #[derive(Debug, Deserialize)]
 struct McpServerEntry {
-    #[serde(rename = "type")]
-    server_type: String,
+    /// Claude Code treats `type` as optional: entries without it are stdio
+    /// when they have a `command`, http when they have a `url`.
+    #[serde(rename = "type", default)]
+    server_type: Option<String>,
     #[serde(default)]
     command: Option<String>,
     #[serde(default)]
@@ -84,12 +89,23 @@ struct McpServerEntry {
 /// Session-specific key for enabled servers lookup.
 type SessionKey = (String, u32); // (project_path, session_id)
 
+/// Modification times of the two config files a discovery result was built
+/// from. Used to detect out-of-band edits (Claude Code, Maestro's own session
+/// injection, the user) and invalidate the cache.
+type ConfigStamp = (Option<SystemTime>, Option<SystemTime>); // (.mcp.json, ~/.claude.json)
+
+/// A cached discovery result plus the file stamps it was computed from.
+struct CachedServers {
+    servers: Vec<McpServerConfig>,
+    stamp: ConfigStamp,
+}
+
 /// Manages MCP server discovery and per-session enabled state.
 ///
 /// Thread-safe via `DashMap` — can be accessed from multiple async tasks.
 pub struct McpManager {
     /// Cached MCP servers per project path (canonicalized).
-    project_servers: DashMap<String, Vec<McpServerConfig>>,
+    project_servers: DashMap<String, CachedServers>,
     /// Enabled server names per (project_path, session_id).
     session_enabled: DashMap<SessionKey, Vec<String>>,
 }
@@ -102,7 +118,14 @@ fn parse_mcp_entries(
     entries
         .into_iter()
         .filter_map(|(name, entry)| {
-            let server_type = match entry.server_type.as_str() {
+            let type_str = match &entry.server_type {
+                Some(t) => t.clone(),
+                // Type omitted: infer from the fields present.
+                None if entry.command.is_some() => "stdio".to_string(),
+                None if entry.url.is_some() => "http".to_string(),
+                None => return None,
+            };
+            let server_type = match type_str.as_str() {
                 "stdio" => {
                     let command = entry.command?;
                     McpServerType::Stdio {
@@ -196,9 +219,17 @@ impl McpManager {
             }
         }
 
-        // 2. Local-scope servers: projects[project_path].mcpServers
+        // 2. Local-scope servers: projects[<key>].mcpServers.
+        // Claude Code keys projects with forward-slash paths (e.g. "C:/git/maestro")
+        // while our project_path is a canonicalized OS path (backslashes and a
+        // possible \\?\ prefix on Windows), so match keys leniently.
+        let project_key = mcp_settings::claude_project_key(project_path);
         if let Some(projects) = parsed.get("projects").and_then(|v| v.as_object()) {
-            if let Some(project) = projects.get(project_path).and_then(|v| v.as_object()) {
+            let project = projects
+                .iter()
+                .find(|(k, _)| mcp_settings::project_keys_match(k, &project_key))
+                .map(|(_, v)| v);
+            if let Some(project) = project.and_then(|v| v.as_object()) {
                 if let Some(mcp_servers) = project.get("mcpServers").and_then(|v| v.as_object()) {
                     for (name, config) in mcp_servers {
                         if let Some(server) =
@@ -217,6 +248,8 @@ impl McpManager {
     /// Discovers all MCP servers from all sources, deduplicated.
     ///
     /// Priority: local scope > project scope > user scope (earlier sources win).
+    /// Maestro's own injected status server (written into `.mcp.json` while a
+    /// session is live) is never part of the result — it is not user-managed.
     fn discover_all_servers(project_path: &str) -> Vec<McpServerConfig> {
         let mut all_servers = Vec::new();
         let mut seen_names = HashSet::new();
@@ -244,29 +277,61 @@ impl McpManager {
         }
 
         all_servers
+            .into_iter()
+            .filter(|s| !mcp_settings::is_internal_server(&s.name))
+            .collect()
     }
 
-    /// Gets the MCP servers for a project, discovering from all sources if not cached.
+    /// Reads the current modification times of the config files that feed
+    /// discovery for this project.
+    fn config_stamp(project_path: &str) -> ConfigStamp {
+        let mcp_json_mtime = std::fs::metadata(Path::new(project_path).join(".mcp.json"))
+            .and_then(|m| m.modified())
+            .ok();
+        let claude_json_mtime = BaseDirs::new()
+            .and_then(|d| std::fs::metadata(d.home_dir().join(".claude.json")).ok())
+            .and_then(|m| m.modified().ok());
+        (mcp_json_mtime, claude_json_mtime)
+    }
+
+    /// Gets the MCP servers for a project, discovering from all sources if not
+    /// cached. A cached result is reused only while neither `.mcp.json` nor
+    /// `~/.claude.json` has changed on disk since it was computed, so edits made
+    /// by Claude Code, the user, or Maestro's session launch show up without a
+    /// manual refresh.
     ///
     /// The project_path should be canonicalized for consistent caching.
     pub fn get_project_servers(&self, project_path: &str) -> Vec<McpServerConfig> {
-        // Return cached if available
-        if let Some(servers) = self.project_servers.get(project_path) {
-            return servers.clone();
+        let stamp = Self::config_stamp(project_path);
+
+        if let Some(cached) = self.project_servers.get(project_path) {
+            if cached.stamp == stamp {
+                return cached.servers.clone();
+            }
         }
 
-        // Discover from all sources and cache
         let servers = Self::discover_all_servers(project_path);
-        self.project_servers
-            .insert(project_path.to_string(), servers.clone());
+        self.project_servers.insert(
+            project_path.to_string(),
+            CachedServers {
+                servers: servers.clone(),
+                stamp,
+            },
+        );
         servers
     }
 
     /// Refreshes the cached servers for a project by re-discovering from all sources.
     pub fn refresh_project_servers(&self, project_path: &str) -> Vec<McpServerConfig> {
+        let stamp = Self::config_stamp(project_path);
         let servers = Self::discover_all_servers(project_path);
-        self.project_servers
-            .insert(project_path.to_string(), servers.clone());
+        self.project_servers.insert(
+            project_path.to_string(),
+            CachedServers {
+                servers: servers.clone(),
+                stamp,
+            },
+        );
         servers
     }
 
@@ -311,7 +376,13 @@ fn parse_mcp_value_entry(
     config: &serde_json::Value,
     source: McpServerSource,
 ) -> Option<McpServerConfig> {
-    let server_type_str = config.get("type")?.as_str()?;
+    // Type omitted: infer from the fields present (matches Claude Code).
+    let server_type_str = match config.get("type").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None if config.get("command").is_some() => "stdio",
+        None if config.get("url").is_some() => "http",
+        None => return None,
+    };
 
     let server_type = match server_type_str {
         "stdio" => {
@@ -385,7 +456,7 @@ mod tests {
         entries.insert(
             "test-server".to_string(),
             McpServerEntry {
-                server_type: "stdio".to_string(),
+                server_type: Some("stdio".to_string()),
                 command: Some("/usr/bin/test".to_string()),
                 args: Some(vec!["--arg1".to_string()]),
                 env: None,
