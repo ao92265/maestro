@@ -118,9 +118,9 @@ describe("Sidebar tab bar", () => {
     useWorkspaceStore.setState({ tabs: [buildTab()] });
   });
 
-  it("renders the four tabs with General active by default", () => {
+  it("renders the five tabs with General active by default", () => {
     render(<Sidebar />);
-    for (const label of ["General", "Infra", "Memory", "Settings"]) {
+    for (const label of ["General", "Processes", "Infra", "Memory", "Settings"]) {
       expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
     }
     // General tab content
@@ -129,6 +129,18 @@ describe("Sidebar tab bar", () => {
     // Content from other tabs is not mounted
     expect(screen.queryByText("MCP Servers")).not.toBeInTheDocument();
     expect(screen.queryByText("User Memory")).not.toBeInTheDocument();
+  });
+
+  it("switches to Processes (dev process watchlist)", async () => {
+    render(<Sidebar />);
+    fireEvent.click(screen.getByRole("button", { name: "Processes" }));
+    // The section header and the tab button share the "Processes" name, so
+    // assert on section-only content instead.
+    expect(
+      screen.getByText("Dev processes on this machine, grouped by command."),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("No watched processes running")).toBeInTheDocument();
+    expect(screen.queryByText("Agents")).not.toBeInTheDocument();
   });
 
   it("switches to Infra (MCP + skills + project context)", () => {

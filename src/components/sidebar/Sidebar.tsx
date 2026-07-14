@@ -1,4 +1,5 @@
 import {
+  Activity,
   AlertTriangle,
   Bot,
   Brain,
@@ -235,10 +236,11 @@ export function Sidebar({
 /*  TAB BAR                                                          */
 /* ================================================================ */
 
-type SidebarTabId = "general" | "infra" | "memory" | "settings";
+type SidebarTabId = "general" | "processes" | "infra" | "memory" | "settings";
 
 const SIDEBAR_TABS: { id: SidebarTabId; label: string; icon: React.ElementType }[] = [
   { id: "general", label: "General", icon: Home },
+  { id: "processes", label: "Processes", icon: Activity },
   { id: "infra", label: "Infra", icon: Package },
   { id: "memory", label: "Memory", icon: Brain },
   { id: "settings", label: "Settings", icon: Settings },
@@ -312,11 +314,11 @@ function ConfigTab({
           <GitRepositorySection />
         </>
       );
+    case "processes":
+      return <ProcessesSection />;
     case "infra":
       return (
         <>
-          <ProcessesSection />
-          {divider}
           <ExtensionsSection />
           {divider}
           <ProjectContextSection />
