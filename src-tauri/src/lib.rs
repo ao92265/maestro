@@ -351,6 +351,12 @@ pub fn run() {
             commands::claudemd::list_context_docs,
             commands::claudemd::read_context_doc,
             commands::claudemd::write_context_doc,
+            // Claude auto-memory commands
+            commands::memory::list_memory_projects,
+            commands::memory::list_memory_files,
+            commands::memory::read_memory_file,
+            commands::memory::write_memory_file,
+            commands::memory::delete_memory_file,
             // Font detection commands
             commands::fonts::get_available_fonts,
             commands::fonts::check_font_available,

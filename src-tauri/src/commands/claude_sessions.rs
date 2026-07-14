@@ -112,7 +112,7 @@ fn extract_prompt_text(content: &str) -> String {
 ///
 /// An earlier version only replaced `/`, which silently returned an empty list
 /// for any path containing a dot — e.g. hidden directories or extensions.
-fn encode_project_path(project_path: &str) -> String {
+pub(crate) fn encode_project_path(project_path: &str) -> String {
     project_path
         .chars()
         .map(|c| {
