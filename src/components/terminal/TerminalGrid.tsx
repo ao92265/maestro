@@ -43,6 +43,7 @@ import type { AiMode } from "@/stores/useSessionStore";
 import { useWorkspaceStore, type RepositoryInfo, type WorkspaceType } from "@/stores/useWorkspaceStore";
 import { shellEscapePaths } from "@/lib/shellEscape";
 import { projectColorFor } from "@/lib/projectColor";
+import { useProjectColors } from "@/lib/useProjectColors";
 import { PreLaunchCard, type SessionSlot } from "./PreLaunchCard";
 import { SplitPaneView } from "./SplitPaneView";
 import { createLeaf, splitLeaf, removeLeaf, updateRatio, collectSlotIds, findSiblingSlotId, buildGridTree, swapSlots, type TreeNode, type SplitDirection } from "./splitTree";
@@ -1345,10 +1346,15 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     setLayoutTree((prev) => swapSlots(prev, srcSlotId, destSlotId));
   }, []);
 
-  // Stable per-project accent color for eagle mode tiles.
+  // Stable per-project accent color for eagle mode tiles (clash-resolved
+  // against the other open projects).
+  const projectColors = useProjectColors();
   const eagleColor = useMemo(
-    () => (projectName ? projectColorFor(projectName) : undefined),
-    [projectName]
+    () =>
+      projectName
+        ? projectColors.get(projectName) ?? projectColorFor(projectName)
+        : undefined,
+    [projectName, projectColors]
   );
 
   const renderLeaf = useCallback((slotId: string) => {

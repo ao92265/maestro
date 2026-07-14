@@ -28,6 +28,7 @@ import {
 import { MAC_TITLE_BAR_INSET_PX, useMacTitleBarPadding } from "@/hooks/useMacTitleBarPadding";
 import { isMac } from "@/lib/platform";
 import { projectColorFor } from "@/lib/projectColor";
+import { useProjectColors } from "@/lib/useProjectColors";
 import { ProjectTabs } from "./components/shared/ProjectTabs";
 import { TopBar } from "./components/shared/TopBar";
 import { Sidebar } from "./components/sidebar/Sidebar";
@@ -42,6 +43,7 @@ function isValidTheme(value: string | null): value is Theme {
 
 function App() {
   const tabs = useWorkspaceStore((s) => s.tabs);
+  const projectColors = useProjectColors();
   const selectTab = useWorkspaceStore((s) => s.selectTab);
   const closeTab = useWorkspaceStore((s) => s.closeTab);
   const reorderTabs = useWorkspaceStore((s) => s.reorderTabs);
@@ -418,7 +420,7 @@ function App() {
           id: t.id,
           name: t.name,
           active: t.active,
-          color: projectColorFor(t.name),
+          color: projectColors.get(t.name) ?? projectColorFor(t.name),
         }))}
         onSelectTab={selectTab}
         onCloseTab={closeTab}

@@ -3,6 +3,7 @@ import { useShallow } from "zustand/react/shallow";
 import { useSessionStore } from "@/stores/useSessionStore";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { projectColorFor } from "@/lib/projectColor";
+import { useProjectColors } from "@/lib/useProjectColors";
 import { IdleLandingView } from "./IdleLandingView";
 import { TerminalGrid, type TerminalGridHandle } from "../terminal/TerminalGrid";
 import { ThinkingIndicator } from "../terminal/ThinkingIndicator";
@@ -61,17 +62,22 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
 
   // All running sessions across projects in tab/launch order — drives the
   // global zoom tab bar and Alt+Arrow cycling.
+  const projectColors = useProjectColors();
   const eagleSessions = useMemo(() => {
     if (!eagleView) return [];
     const list: { sessionId: number; projectName: string; color: string }[] = [];
     for (const tab of tabs) {
       if (!tab.sessionsLaunched) continue;
       for (const sessionId of tab.sessionIds) {
-        list.push({ sessionId, projectName: tab.name, color: projectColorFor(tab.name) });
+        list.push({
+          sessionId,
+          projectName: tab.name,
+          color: projectColors.get(tab.name) ?? projectColorFor(tab.name),
+        });
       }
     }
     return list;
-  }, [eagleView, tabs]);
+  }, [eagleView, tabs, projectColors]);
 
   // Session names for the tab labels. Derived record + shallow compare so the
   // raw sessions array (replaced on every status update) doesn't re-render

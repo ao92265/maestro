@@ -34,6 +34,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { sessionsForTab } from "@/hooks/useProjectStatus";
 import { projectColorFor } from "@/lib/projectColor";
+import { useProjectColors } from "@/lib/useProjectColors";
 import { useAgentStore, type SubagentInfo } from "@/stores/useAgentStore";
 import { useGitStore } from "@/stores/useGitStore";
 import { useMcpStore } from "@/stores/useMcpStore";
@@ -329,6 +330,7 @@ function AgentsSection({
   const tabs = useWorkspaceStore((s) => s.tabs);
   const sessions = useSessionStore((s) => s.sessions);
   const agents = useAgentStore((s) => s.agents);
+  const projectColors = useProjectColors();
 
   const projects = useMemo(
     () =>
@@ -408,7 +410,7 @@ function AgentsSection({
           <p className="px-1 py-0.5 text-[11px] text-maestro-muted">No running agents</p>
         ) : (
           projects.map(({ tab, sessions: projectSessions }) => {
-            const color = projectColorFor(tab.name);
+            const color = projectColors.get(tab.name) ?? projectColorFor(tab.name);
             return (
               <div key={tab.id} className="mt-1">
                 {/* Project row */}
