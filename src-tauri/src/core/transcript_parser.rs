@@ -42,13 +42,17 @@ pub fn parse_transcript_line(session_id: u32, line: &str) -> Vec<ClaudeEvent> {
 // ---------------------------------------------------------------------------
 
 /// Truncate a string to `max` characters, appending "..." if truncated.
+///
+/// Truncation is by *character*, not byte: `&s[..max]` slices on a byte index
+/// and panics if that index falls mid-codepoint. Because this runs on untrusted
+/// transcript content inside a spawned reader task, a panic would silently kill
+/// the session's live activity feed.
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        let mut result = s[..max].to_string();
-        result.push_str("...");
-        result
+        let truncated: String = s.chars().take(max).collect();
+        format!("{truncated}...")
     }
 }
 
@@ -348,6 +352,24 @@ fn parse_assistant_message(session_id: u32, obj: &Value) -> Vec<ClaudeEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_does_not_panic_on_multibyte_boundary() {
+        // A run of 4-byte emoji straddling the byte cutoff used to panic on the
+        // byte-index slice; truncation must now be char-based.
+        let s = "🚀".repeat(50); // 200 bytes, 50 chars
+        for max in [1, 79, 80, 100, 120] {
+            let out = truncate(&s, max);
+            // Must not panic, and must respect the char budget.
+            assert!(out.chars().count() <= max + 3); // +3 for the "..."
+        }
+    }
+
+    #[test]
+    fn truncate_appends_ellipsis_only_when_cut() {
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("abcdef", 3), "abc...");
+    }
 
     const USER_MSG: &str = r#"{"parentUuid":"parent-1","isSidechain":false,"type":"user","message":{"role":"user","content":[{"type":"text","text":"Fix the login bug"}]},"uuid":"uuid-user-1","timestamp":"2026-02-24T10:00:00.000Z"}"#;
 

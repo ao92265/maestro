@@ -682,10 +682,32 @@ impl GitHub {
 
     /// Lists discussions using the GraphQL API.
     pub async fn list_discussions(&self, limit: u32) -> Result<Vec<DiscussionInfo>, GitHubError> {
+        // We need repo info first to fill in owner/name.
+        let repo_output = self.run(&["repo", "view", "--json", "owner,name"]).await?;
+
+        #[derive(Deserialize)]
+        struct RepoInfo {
+            owner: RepoOwner,
+            name: String,
+        }
+
+        #[derive(Deserialize)]
+        struct RepoOwner {
+            login: String,
+        }
+
+        let repo_info: RepoInfo = serde_json::from_str(&repo_output.stdout)?;
+
+        // Interpolate owner/name directly rather than via sequential
+        // String::replace on shared placeholders: a login containing the literal
+        // "REPO" would otherwise be partially rewritten by the second replace,
+        // redirecting the query to a different repository. GitHub restricts
+        // logins/repo names to [A-Za-z0-9._-], so they cannot break out of the
+        // GraphQL string literal.
         let query = format!(
             r#"{{
-                repository(owner: "OWNER", name: "REPO") {{
-                    discussions(first: {}, orderBy: {{field: CREATED_AT, direction: DESC}}) {{
+                repository(owner: "{owner}", name: "{name}") {{
+                    discussions(first: {limit}, orderBy: {{field: CREATED_AT, direction: DESC}}) {{
                         nodes {{
                             number
                             title
@@ -703,28 +725,10 @@ impl GitHub {
                     }}
                 }}
             }}"#,
-            limit
+            owner = repo_info.owner.login,
+            name = repo_info.name,
+            limit = limit
         );
-
-        // We need to get repo info first to fill in OWNER/REPO
-        let repo_output = self.run(&["repo", "view", "--json", "owner,name"]).await?;
-
-        #[derive(Deserialize)]
-        struct RepoInfo {
-            owner: RepoOwner,
-            name: String,
-        }
-
-        #[derive(Deserialize)]
-        struct RepoOwner {
-            login: String,
-        }
-
-        let repo_info: RepoInfo = serde_json::from_str(&repo_output.stdout)?;
-
-        let query = query
-            .replace("OWNER", &repo_info.owner.login)
-            .replace("REPO", &repo_info.name);
 
         let result = self.graphql(&query).await;
 
