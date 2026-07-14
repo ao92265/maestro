@@ -136,6 +136,40 @@ function basename(path: string): string {
   return segments[segments.length - 1] || path;
 }
 
+/** Strips trailing path separators so equal paths compare equal. */
+function normalizePath(path: string): string {
+  return path.replace(/[\\/]+$/, "");
+}
+
+/**
+ * Ensures the workspace root itself appears as a selectable entry in a
+ * multi-repo repositories list.
+ *
+ * `detect_repositories` only includes the scanned root when the root is a git
+ * repo, so a plain parent folder that merely *contains* repos would otherwise
+ * be impossible to select as the working directory — the UI would force one
+ * of the nested repos. The root is prepended (first entry) so it is also the
+ * default selection when the project is first opened.
+ */
+export function withWorkspaceRoot(
+  projectPath: string,
+  repositories: RepositoryInfo[]
+): RepositoryInfo[] {
+  if (repositories.length === 0) return repositories;
+  const root = normalizePath(projectPath);
+  if (repositories.some((r) => normalizePath(r.path) === root)) return repositories;
+  return [
+    {
+      path: projectPath,
+      name: basename(projectPath),
+      isGitRepo: false,
+      currentBranch: null,
+      remoteUrl: null,
+    },
+    ...repositories,
+  ];
+}
+
 // --- Store ---
 
 /**
@@ -183,8 +217,10 @@ export const useWorkspaceStore = create<WorkspaceState & WorkspaceActions>()(
             workspaceType = "single-repo";
             selectedRepoPath = path;
           } else {
-            // Check for nested repositories
-            repositories = await invoke<RepositoryInfo[]>("detect_repositories", { path });
+            // Check for nested repositories; include the parent folder itself
+            // as a selectable root so the user isn't forced into a subfolder.
+            const detected = await invoke<RepositoryInfo[]>("detect_repositories", { path });
+            repositories = withWorkspaceRoot(path, detected);
             workspaceType = repositories.length > 0 ? "multi-repo" : "non-git";
             selectedRepoPath = repositories[0]?.path ?? null;
           }
@@ -299,20 +335,21 @@ export const useWorkspaceStore = create<WorkspaceState & WorkspaceActions>()(
 
       updateRepositories: (tabId: string, repositories: RepositoryInfo[]) => {
         set({
-          tabs: get().tabs.map((t) =>
-            t.id === tabId
-              ? {
-                  ...t,
-                  repositories,
-                  workspaceType: repositories.length > 0 ? "multi-repo" : "non-git",
-                  // Auto-select first repo if current selection is no longer valid
-                  selectedRepoPath:
-                    repositories.find((r) => r.path === t.selectedRepoPath)?.path ??
-                    repositories[0]?.path ??
-                    null,
-                }
-              : t
-          ),
+          tabs: get().tabs.map((t) => {
+            if (t.id !== tabId) return t;
+            // Re-add the workspace root so a rescan doesn't drop it.
+            const withRoot = withWorkspaceRoot(t.projectPath, repositories);
+            return {
+              ...t,
+              repositories: withRoot,
+              workspaceType: withRoot.length > 0 ? "multi-repo" : "non-git",
+              // Auto-select first repo if current selection is no longer valid
+              selectedRepoPath:
+                withRoot.find((r) => r.path === t.selectedRepoPath)?.path ??
+                withRoot[0]?.path ??
+                null,
+            };
+          }),
         });
       },
 
