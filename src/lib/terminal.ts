@@ -381,6 +381,13 @@ export function buildCliCommand(mode: AiMode, flags?: CliFlags, resumeSessionId?
   const parts: string[] = [config.command];
 
   if (resumeSessionId) {
+    // The resume id ultimately reaches a shell PTY. Only allow UUID-shaped
+    // tokens so an attacker-planted transcript can't smuggle shell
+    // metacharacters into the launched command (defense in depth; the backend
+    // already filters these out of the resume picker).
+    if (!/^[0-9a-fA-F-]+$/.test(resumeSessionId)) {
+      throw new Error(`Refusing unsafe resume session id: ${resumeSessionId}`);
+    }
     parts.push("--resume", resumeSessionId);
   }
 
