@@ -1,12 +1,12 @@
 import { Plus, Trash2, X } from "lucide-react";
 import {
-  type ChangeEvent,
   type KeyboardEvent,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
+import { MarkdownEditor } from "@/components/shared/MarkdownEditor";
 import { useNotesStore } from "@/stores/useNotesStore";
 
 /**
@@ -136,9 +136,9 @@ export function NotepadPanel() {
     }
   };
 
-  const handleContentChange = (e: ChangeEvent<HTMLTextAreaElement>) => {
+  const handleContentChange = (value: string) => {
     if (!activeNote) return;
-    setContent(activeNote.id, e.target.value);
+    setContent(activeNote.id, value);
   };
 
   const handleDelete = (id: string) => {
@@ -240,15 +240,15 @@ export function NotepadPanel() {
               <Trash2 size={11} />
             </button>
           </div>
-          <textarea
-            // Keying on the id ensures the textarea remounts when switching
-            // tabs, so cursor position is reset cleanly per note.
+          <MarkdownEditor
+            // Keying on the id ensures the editor remounts when switching
+            // tabs, so cursor position and edit/preview mode reset per note.
             key={activeNote.id}
             value={activeNote.content}
             onChange={handleContentChange}
             placeholder="Jot something down..."
-            spellCheck={false}
-            className="min-h-0 flex-1 resize-none bg-maestro-surface px-3 py-2 font-mono text-xs text-maestro-text outline-none placeholder:text-maestro-muted/40"
+            className="min-h-0 flex-1 px-3 py-2"
+            heightClassName="min-h-0 flex-1"
           />
         </div>
       ) : (

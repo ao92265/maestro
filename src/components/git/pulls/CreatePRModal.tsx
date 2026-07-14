@@ -1,5 +1,6 @@
 import { X, GitPullRequest, Loader2 } from "lucide-react";
 import { useState } from "react";
+import { MarkdownEditor } from "@/components/shared/MarkdownEditor";
 import { useGitHubStore } from "../../../stores/useGitHubStore";
 import { useGitStore } from "../../../stores/useGitStore";
 
@@ -137,12 +138,11 @@ export function CreatePRModal({ repoPath, onClose, onSuccess }: CreatePRModalPro
             <label className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-maestro-muted">
               Description
             </label>
-            <textarea
+            <MarkdownEditor
               value={body}
-              onChange={(e) => setBody(e.target.value)}
+              onChange={setBody}
               placeholder="Describe your changes..."
-              rows={4}
-              className="w-full resize-none rounded border border-maestro-border bg-maestro-surface px-2 py-1.5 text-xs text-maestro-text placeholder:text-maestro-muted"
+              heightClassName="h-28"
             />
           </div>
 

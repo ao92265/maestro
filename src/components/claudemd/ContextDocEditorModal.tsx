@@ -1,5 +1,6 @@
 import { Loader2, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { MarkdownEditor } from "@/components/shared/MarkdownEditor";
 import { type ContextDocKind, type ContextDocTier, writeContextDoc } from "@/lib/claudemd";
 
 interface ContextDocEditorModalProps {
@@ -135,6 +136,8 @@ export function ContextDocEditorModal({
   };
 
   const tierLabel = tier === "user" ? "User" : "Project";
+  // .md docs get the Edit/Preview toggle; JSON and ignore files stay raw.
+  const isMarkdown = label.toLowerCase().endsWith(".md");
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
@@ -165,14 +168,23 @@ export function ContextDocEditorModal({
             {path}
           </p>
 
-          <textarea
-            ref={textareaRef}
-            value={content}
-            onChange={(e) => setContent(e.target.value)}
-            placeholder={`Enter ${label} content...`}
-            className="h-80 w-full resize-none rounded border border-maestro-border bg-maestro-surface p-3 font-mono text-xs text-maestro-text placeholder:text-maestro-muted focus:border-maestro-accent focus:outline-none"
-            spellCheck={false}
-          />
+          {isMarkdown ? (
+            <MarkdownEditor
+              ref={textareaRef}
+              value={content}
+              onChange={setContent}
+              placeholder={`Enter ${label} content...`}
+            />
+          ) : (
+            <textarea
+              ref={textareaRef}
+              value={content}
+              onChange={(e) => setContent(e.target.value)}
+              placeholder={`Enter ${label} content...`}
+              className="h-80 w-full resize-none rounded border border-maestro-border bg-maestro-surface p-3 font-mono text-xs text-maestro-text placeholder:text-maestro-muted focus:border-maestro-accent focus:outline-none"
+              spellCheck={false}
+            />
+          )}
 
           {error && <p className="mt-2 text-xs text-maestro-red">{error}</p>}
         </div>
