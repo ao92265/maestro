@@ -21,6 +21,13 @@ use super::claude_event::ClaudeEvent;
 use super::event_bus::EventBus;
 use super::transcript_parser::parse_transcript_line;
 
+/// Upper bound on concurrently watched sessions. Each watcher consumes an OS
+/// file-watch handle (e.g. an inotify instance) plus a tokio task, so an
+/// unbounded count is a resource-exhaustion vector when watch requests can be
+/// triggered by an unauthenticated caller. Far above any realistic number of
+/// live Claude sessions.
+const MAX_WATCHED_SESSIONS: usize = 256;
+
 /// Manages filesystem watchers for Claude Code transcript JSONL files.
 ///
 /// Each watched session has its own `notify` watcher monitoring the parent
@@ -58,13 +65,21 @@ impl TranscriptWatcher {
             return;
         }
 
+        if self.watchers.len() >= MAX_WATCHED_SESSIONS {
+            log::warn!(
+                "TranscriptWatcher: refusing to watch session {session_id}; \
+                 at capacity ({MAX_WATCHED_SESSIONS} sessions)"
+            );
+            return;
+        }
+
         let (tx, rx) = mpsc::channel::<()>(64);
 
         // Create the notify watcher that sends a signal on any file change.
         let watcher = {
             let tx = tx.clone();
             let watched_path = transcript_path.clone();
-            let mut watcher = notify::recommended_watcher(move |res: Result<NotifyEvent, notify::Error>| {
+            let watcher_result = notify::recommended_watcher(move |res: Result<NotifyEvent, notify::Error>| {
                 match res {
                     Ok(event) => {
                         // Only care about events that touch our transcript file.
@@ -77,8 +92,17 @@ impl TranscriptWatcher {
                         log::error!("TranscriptWatcher: notify error: {e}");
                     }
                 }
-            })
-            .expect("failed to create filesystem watcher");
+            });
+            // Don't panic if the OS refuses another watcher (e.g. inotify limit);
+            // just skip watching this session so a flood of requests can't crash
+            // the process.
+            let mut watcher = match watcher_result {
+                Ok(w) => w,
+                Err(e) => {
+                    log::error!("TranscriptWatcher: failed to create filesystem watcher: {e}");
+                    return;
+                }
+            };
 
             // Watch the parent directory so we catch file creation as well.
             let watch_dir = transcript_path

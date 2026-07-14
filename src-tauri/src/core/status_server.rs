@@ -350,6 +350,46 @@ fn extract_maestro_session_id(headers: &HeaderMap) -> Option<u32> {
         .and_then(|s| s.parse::<u32>().ok())
 }
 
+/// Verify the `X-Maestro-Instance` header matches this server's instance id.
+///
+/// The legitimate hook commands (written by `hook_config_writer`) always send
+/// this per-instance secret. Without this check the hook routes would accept
+/// requests from any local process, letting it inject fabricated events or
+/// point the transcript watcher at an arbitrary path.
+fn instance_id_matches(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get("X-Maestro-Instance")
+        .and_then(|v| v.to_str().ok())
+        .map(|got| got == expected)
+        .unwrap_or(false)
+}
+
+/// Confines a hook-supplied transcript path to the Claude projects directory.
+///
+/// `transcript_path` arrives in a hook request body; without confinement a
+/// caller could make Maestro open, read, and watch an arbitrary file/directory.
+/// Returns `true` when the (lexically normalized) path stays under
+/// `~/.claude/projects`.
+fn is_within_claude_projects(transcript_path: &str) -> bool {
+    use std::path::{Component, Path};
+
+    // Reject traversal components outright rather than trusting canonicalization
+    // (the file may not exist yet).
+    let path = Path::new(transcript_path);
+    if path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return false;
+    }
+
+    let Some(base_dirs) = directories::BaseDirs::new() else {
+        return false;
+    };
+    let projects = base_dirs.home_dir().join(".claude").join("projects");
+    path.starts_with(&projects)
+}
+
 // ── Hook handlers ────────────────────────────────────────────────────
 
 /// Handle the SessionStart hook callback.
@@ -358,6 +398,11 @@ async fn handle_hook_session_start(
     headers: HeaderMap,
     Json(payload): Json<HookSessionStartRequest>,
 ) -> StatusCode {
+    if !instance_id_matches(&headers, &state.instance_id) {
+        eprintln!("[HOOK] session-start: rejected - missing/invalid X-Maestro-Instance");
+        return StatusCode::FORBIDDEN;
+    }
+
     let maestro_session_id = match extract_maestro_session_id(&headers) {
         Some(id) => id,
         None => {
@@ -365,6 +410,16 @@ async fn handle_hook_session_start(
             return StatusCode::BAD_REQUEST;
         }
     };
+
+    // Confine the watched transcript to ~/.claude/projects so a hook cannot
+    // point the filesystem watcher at an arbitrary path.
+    if !is_within_claude_projects(&payload.transcript_path) {
+        eprintln!(
+            "[HOOK] session-start: rejected transcript_path outside Claude projects dir: {}",
+            payload.transcript_path
+        );
+        return StatusCode::BAD_REQUEST;
+    }
 
     info!(
         "[HOOK] session-start: maestro_session={}, claude_session={}, cwd={}",
@@ -408,6 +463,11 @@ async fn handle_hook_session_end(
     headers: HeaderMap,
     Json(payload): Json<HookGenericRequest>,
 ) -> StatusCode {
+    if !instance_id_matches(&headers, &state.instance_id) {
+        eprintln!("[HOOK] session-end: rejected - missing/invalid X-Maestro-Instance");
+        return StatusCode::FORBIDDEN;
+    }
+
     let maestro_session_id = match extract_maestro_session_id(&headers) {
         Some(id) => id,
         None => {
@@ -447,6 +507,11 @@ async fn handle_hook_pre_tool(
     headers: HeaderMap,
     Json(payload): Json<HookGenericRequest>,
 ) -> StatusCode {
+    if !instance_id_matches(&headers, &state.instance_id) {
+        eprintln!("[HOOK] pre-tool: rejected - missing/invalid X-Maestro-Instance");
+        return StatusCode::FORBIDDEN;
+    }
+
     let maestro_session_id = match extract_maestro_session_id(&headers) {
         Some(id) => id,
         None => {
@@ -501,6 +566,11 @@ async fn handle_hook_stop(
     headers: HeaderMap,
     Json(payload): Json<HookGenericRequest>,
 ) -> StatusCode {
+    if !instance_id_matches(&headers, &state.instance_id) {
+        eprintln!("[HOOK] stop: rejected - missing/invalid X-Maestro-Instance");
+        return StatusCode::FORBIDDEN;
+    }
+
     let maestro_session_id = match extract_maestro_session_id(&headers) {
         Some(id) => id,
         None => {
@@ -607,6 +677,86 @@ mod tests {
             needs_input_prompt: None,
             timestamp: "2024-01-01T00:00:00Z".to_string(),
         }
+    }
+
+    // ── Auth / confinement unit tests ───────────────────────────────
+
+    #[test]
+    fn instance_id_matches_requires_exact_header() {
+        let mut headers = HeaderMap::new();
+        assert!(!instance_id_matches(&headers, "secret")); // missing header
+        headers.insert("X-Maestro-Instance", "wrong".parse().unwrap());
+        assert!(!instance_id_matches(&headers, "secret"));
+        headers.insert("X-Maestro-Instance", "secret".parse().unwrap());
+        assert!(instance_id_matches(&headers, "secret"));
+    }
+
+    #[test]
+    fn transcript_path_confinement_rejects_traversal_and_outside_paths() {
+        assert!(!is_within_claude_projects("/etc/passwd"));
+        assert!(!is_within_claude_projects("C:/Windows/System32/config"));
+        // Even a path nominally under the dir but using traversal is rejected.
+        let base = directories::BaseDirs::new().unwrap();
+        let escaped = base
+            .home_dir()
+            .join(".claude/projects/../../secret.jsonl");
+        assert!(!is_within_claude_projects(&escaped.to_string_lossy()));
+        // A genuine transcript path is accepted.
+        let ok = base.home_dir().join(".claude/projects/enc/abc.jsonl");
+        assert!(is_within_claude_projects(&ok.to_string_lossy()));
+    }
+
+    /// Helper: POST a JSON body to a hook route with optional instance header.
+    async fn post_hook(
+        addr: std::net::SocketAddr,
+        route: &str,
+        instance_header: Option<&str>,
+        body: serde_json::Value,
+    ) -> u16 {
+        let mut req = reqwest::Client::new()
+            .post(format!("http://{}{}", addr, route))
+            .header("X-Maestro-Session", "1")
+            .json(&body);
+        if let Some(inst) = instance_header {
+            req = req.header("X-Maestro-Instance", inst);
+        }
+        req.send().await.unwrap().status().as_u16()
+    }
+
+    #[tokio::test]
+    async fn hook_routes_reject_missing_instance_header() {
+        let (emit_fn, _events) = test_emit_fn();
+        let (addr, _p, _pend) = start_test_http_server("inst-secret", emit_fn).await;
+
+        let body = serde_json::json!({
+            "session_id": "claude-uuid",
+            "transcript_path": "/tmp/x.jsonl",
+            "cwd": "/tmp",
+            "hook_event_name": "SessionStart",
+        });
+        // No instance header → 403 for every hook route.
+        assert_eq!(post_hook(addr, "/hook/session-start", None, body.clone()).await, 403);
+        assert_eq!(post_hook(addr, "/hook/session-end", None, body.clone()).await, 403);
+        assert_eq!(post_hook(addr, "/hook/pre-tool", None, body.clone()).await, 403);
+        assert_eq!(post_hook(addr, "/hook/stop", None, body).await, 403);
+    }
+
+    #[tokio::test]
+    async fn hook_session_start_rejects_transcript_path_outside_projects() {
+        let (emit_fn, _events) = test_emit_fn();
+        let (addr, _p, _pend) = start_test_http_server("inst-secret", emit_fn).await;
+
+        let body = serde_json::json!({
+            "session_id": "claude-uuid",
+            "transcript_path": "/etc/passwd",
+            "cwd": "/tmp",
+            "hook_event_name": "SessionStart",
+        });
+        // Correct instance header but attacker-chosen path → 400.
+        assert_eq!(
+            post_hook(addr, "/hook/session-start", Some("inst-secret"), body).await,
+            400
+        );
     }
 
     // ── Hash tests ──────────────────────────────────────────────────
@@ -900,9 +1050,16 @@ mod tests {
     async fn test_hook_session_start() {
         let (hook_events, port) = start_test_http_server_with_hooks().await;
 
+        // Must be inside ~/.claude/projects to pass the confinement check.
+        let base = directories::BaseDirs::new().unwrap();
+        let transcript = base
+            .home_dir()
+            .join(".claude/projects/enc/transcript.jsonl");
+        let transcript_str = transcript.to_string_lossy().to_string();
+
         let body = serde_json::json!({
             "session_id": "claude-uuid-123",
-            "transcript_path": "/tmp/transcript.jsonl",
+            "transcript_path": transcript_str,
             "cwd": "/home/user/project",
             "hook_event_name": "SessionStart"
         });
@@ -910,6 +1067,7 @@ mod tests {
         let resp = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{}/hook/session-start", port))
             .header("X-Maestro-Session", "42")
+            .header("X-Maestro-Instance", "test-instance")
             .json(&body)
             .send()
             .await
@@ -929,7 +1087,7 @@ mod tests {
             } => {
                 assert_eq!(*session_id, 42);
                 assert_eq!(claude_session_uuid, "claude-uuid-123");
-                assert_eq!(transcript_path, "/tmp/transcript.jsonl");
+                assert_eq!(transcript_path, &transcript_str);
             }
             other => panic!("Expected SessionStarted, got {:?}", other),
         }
@@ -939,16 +1097,22 @@ mod tests {
     async fn test_hook_missing_session_header() {
         let (_hook_events, port) = start_test_http_server_with_hooks().await;
 
+        let base = directories::BaseDirs::new().unwrap();
+        let transcript = base
+            .home_dir()
+            .join(".claude/projects/enc/transcript.jsonl");
+
         let body = serde_json::json!({
             "session_id": "claude-uuid-123",
-            "transcript_path": "/tmp/transcript.jsonl",
+            "transcript_path": transcript.to_string_lossy(),
             "cwd": "/home/user/project",
             "hook_event_name": "SessionStart"
         });
 
-        // POST without X-Maestro-Session header
+        // Valid instance header but no X-Maestro-Session header → 400.
         let resp = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{}/hook/session-start", port))
+            .header("X-Maestro-Instance", "test-instance")
             .json(&body)
             .send()
             .await
