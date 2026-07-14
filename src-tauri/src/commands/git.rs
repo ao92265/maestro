@@ -196,6 +196,42 @@ pub async fn git_create_branch(
     git.create_branch(&branch_name, start_point.as_deref()).await
 }
 
+/// Deletes a local branch. `force` uses `-D` (delete even if unmerged).
+#[tauri::command]
+pub async fn git_delete_branch(
+    repo_path: String,
+    branch_name: String,
+    force: bool,
+) -> Result<(), GitError> {
+    validate_repo_path(&repo_path)?;
+    let git = Git::new(&repo_path);
+    git.delete_branch(&branch_name, force).await
+}
+
+/// Renames a local branch.
+#[tauri::command]
+pub async fn git_rename_branch(
+    repo_path: String,
+    old_name: String,
+    new_name: String,
+) -> Result<(), GitError> {
+    validate_repo_path(&repo_path)?;
+    let git = Git::new(&repo_path);
+    git.rename_branch(&old_name, &new_name).await
+}
+
+/// Deletes a branch on a remote (`git push <remote> --delete <branch>`).
+#[tauri::command]
+pub async fn git_delete_remote_branch(
+    repo_path: String,
+    remote_name: String,
+    branch_name: String,
+) -> Result<(), GitError> {
+    validate_repo_path(&repo_path)?;
+    let git = Git::new(&repo_path);
+    git.delete_remote_branch(&remote_name, &branch_name).await
+}
+
 /// Returns the list of files changed in a specific commit.
 #[tauri::command]
 pub async fn git_commit_files(

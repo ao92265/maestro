@@ -503,6 +503,45 @@ impl Git {
         Ok(())
     }
 
+    /// Deletes a local branch.
+    ///
+    /// Uses `git branch -d` by default, which refuses to delete a branch that
+    /// isn't fully merged; `force` switches to `-D`. Git itself refuses to
+    /// delete the currently checked-out branch.
+    pub async fn delete_branch(&self, name: &str, force: bool) -> Result<(), GitError> {
+        reject_option_like_ref(name)?;
+        let flag = if force { "-D" } else { "-d" };
+        // `--` stops git from parsing the branch name as an option.
+        self.run(&["branch", flag, "--", name]).await?;
+        Ok(())
+    }
+
+    /// Renames a local branch (`git branch -m <old> <new>`).
+    pub async fn rename_branch(&self, old_name: &str, new_name: &str) -> Result<(), GitError> {
+        reject_option_like_ref(old_name)?;
+        reject_option_like_ref(new_name)?;
+        self.run(&["branch", "-m", "--", old_name, new_name]).await?;
+        Ok(())
+    }
+
+    /// Deletes a branch on a remote (`git push <remote> --delete <branch>`).
+    ///
+    /// Network operation — allows up to 120 seconds, like fetch.
+    pub async fn delete_remote_branch(
+        &self,
+        remote_name: &str,
+        branch_name: &str,
+    ) -> Result<(), GitError> {
+        reject_option_like_ref(remote_name)?;
+        reject_option_like_ref(branch_name)?;
+        self.run_with_timeout(
+            &["push", remote_name, "--delete", branch_name],
+            std::time::Duration::from_secs(120),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Returns the list of files changed in a specific commit.
     ///
     /// Parses `git show --name-status --format=` output.
