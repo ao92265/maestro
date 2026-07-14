@@ -169,36 +169,36 @@ impl Git {
     /// Lists all local and remote branches, excluding `HEAD` pointer entries.
     ///
     /// Parses `git branch -a` with a custom format using `|` delimiters.
-    /// Any branch name containing "HEAD" (e.g. `origin/HEAD`) is skipped to
-    /// avoid exposing symbolic refs that confuse branch selectors in the UI.
+    /// Symbolic refs (e.g. `origin/HEAD`, whose short name is just `origin`)
+    /// are skipped via the `%(symref)` field, which is empty for real branches.
     pub async fn list_branches(&self) -> Result<Vec<BranchInfo>, GitError> {
         let output = self
             .run(&[
                 "branch",
                 "-a",
                 "--no-color",
-                "--format=%(HEAD)|%(refname:short)|%(refname:rstrip=-2)",
+                "--format=%(HEAD)|%(refname:short)|%(refname)|%(symref)",
             ])
             .await?;
 
         let mut branches = Vec::new();
         for line in output.lines() {
-            let parts: Vec<&str> = line.splitn(3, '|').collect();
-            if parts.len() < 2 {
+            let parts: Vec<&str> = line.splitn(4, '|').collect();
+            if parts.len() < 3 {
                 continue;
             }
             let is_current = parts[0].trim() == "*";
             let name = parts[1].trim().to_string();
+            let full_ref = parts[2].trim();
 
-            // Skip HEAD pointer entries like "origin/HEAD"
-            if name == "HEAD" || name.ends_with("/HEAD") {
+            // Skip symbolic refs like origin/HEAD (short name "origin") and
+            // any leftover HEAD pointer entries.
+            let is_symref = parts.get(3).map(|s| !s.trim().is_empty()).unwrap_or(false);
+            if is_symref || name == "HEAD" || full_ref.ends_with("/HEAD") {
                 continue;
             }
 
-            let is_remote = parts
-                .get(2)
-                .map(|r| r.trim() == "remotes")
-                .unwrap_or(false);
+            let is_remote = full_ref.starts_with("refs/remotes/");
 
             branches.push(BranchInfo {
                 name,
@@ -1339,6 +1339,43 @@ mod tests {
             .collect();
 
         assert!(local_names.contains(&"local-test"));
+    }
+
+    #[tokio::test]
+    async fn test_list_branches_classifies_remotes_and_skips_symrefs() {
+        let (_dir, git) = create_test_repo().await;
+        // Fabricate a remote-tracking ref and the origin/HEAD symref without
+        // needing a real network remote.
+        let head = git.run(&["rev-parse", "HEAD"]).await.unwrap();
+        git.run(&["update-ref", "refs/remotes/origin/feature-x", head.stdout.trim()])
+            .await
+            .unwrap();
+        git.run(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/feature-x",
+        ])
+        .await
+        .unwrap();
+
+        let branches = git.list_branches().await.unwrap();
+
+        assert!(
+            branches
+                .iter()
+                .any(|b| b.name == "origin/feature-x" && b.is_remote),
+            "remote-tracking ref must be classified as remote: {branches:?}"
+        );
+        // The origin/HEAD symref shortens to just "origin" — it must not leak
+        // into the list as either a local or remote branch.
+        assert!(
+            branches.iter().all(|b| b.name != "origin"),
+            "origin/HEAD symref must be filtered out: {branches:?}"
+        );
+        assert!(
+            branches.iter().any(|b| b.is_current && !b.is_remote),
+            "checked-out branch must stay local: {branches:?}"
+        );
     }
 
     #[tokio::test]
