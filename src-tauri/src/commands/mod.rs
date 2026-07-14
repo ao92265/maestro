@@ -9,6 +9,7 @@ pub mod marketplace;
 pub mod mcp;
 pub mod memory;
 pub mod plugin;
+pub mod processes;
 pub mod session;
 pub mod system;
 pub mod terminal;

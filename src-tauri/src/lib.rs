@@ -150,6 +150,7 @@ pub fn run() {
         .manage(SessionManager::new())
         .manage(WorktreeManager::new())
         .manage(commands::system::SystemMetricsState::new())
+        .manage(commands::processes::ProcessScanState::new())
         .setup(|app| {
             // Generate a unique instance ID for this Maestro run
             // This prevents status pollution between different app instances
@@ -365,6 +366,11 @@ pub fn run() {
             commands::usage::get_claude_account,
             // System metrics
             commands::system::get_system_metrics,
+            // Dev process / container visibility (Processes sidebar section)
+            commands::processes::list_dev_processes,
+            commands::processes::kill_process_tree,
+            commands::processes::list_docker_containers,
+            commands::processes::stop_docker_container,
             // GitHub commands
             commands::github::github_auth_status,
             commands::github::github_list_prs,

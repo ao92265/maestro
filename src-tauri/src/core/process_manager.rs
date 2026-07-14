@@ -639,6 +639,18 @@ impl ProcessManager {
         Ok(())
     }
 
+    /// PIDs of every shell this manager spawned and still tracks.
+    ///
+    /// Used by the Processes sidebar to badge OS processes that descend from
+    /// a Maestro-owned terminal.
+    pub fn tracked_pids(&self) -> Vec<i32> {
+        self.inner
+            .sessions
+            .iter()
+            .map(|entry| entry.value().child_pid)
+            .collect()
+    }
+
     /// Kills all active PTY sessions.
     ///
     /// This is used to clean up orphaned sessions when the frontend reloads.
