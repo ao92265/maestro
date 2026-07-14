@@ -3,20 +3,16 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { GitFork, RefreshCw, StickyNote, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { MAC_TITLE_BAR_INSET_PX, useMacTitleBarPadding } from "@/hooks/useMacTitleBarPadding";
 import { getDeduplicatedCurrentBranch } from "@/lib/git";
+import { isMac } from "@/lib/platform";
+import { projectColorFor } from "@/lib/projectColor";
 import { killSession } from "@/lib/terminal";
 import { useOpenProject } from "@/lib/useOpenProject";
+import { useProjectColors } from "@/lib/useProjectColors";
 import { useFDAStore } from "@/stores/useFDAStore";
 import { useSessionStore } from "@/stores/useSessionStore";
-import { useWorkspaceStore, type RepositoryInfo } from "@/stores/useWorkspaceStore";
-import { useGitStore } from "./stores/useGitStore";
-import { useTerminalSettingsStore } from "./stores/useTerminalSettingsStore";
-import { useAppKeyboard } from "./hooks/useAppKeyboard";
-import { useSwipeNavigation } from "./hooks/useSwipeNavigation";
-import { useUpdateStore } from "./stores/useUpdateStore";
-import { initActivityListener, stopActivityListener } from "./stores/useActivityStore";
-import { initAgentListener, stopAgentListener } from "./stores/useAgentStore";
-import { UpdateNotification } from "./components/update/UpdateNotification";
+import { type RepositoryInfo, useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { GitGraphPanel } from "./components/git/GitGraphPanel";
 import type { GitPanelTab } from "./components/git/GitPanelTabs";
 import { BottomBar } from "./components/shared/BottomBar";
@@ -25,14 +21,22 @@ import {
   MultiProjectView,
   type MultiProjectViewHandle,
 } from "./components/shared/MultiProjectView";
-import { MAC_TITLE_BAR_INSET_PX, useMacTitleBarPadding } from "@/hooks/useMacTitleBarPadding";
-import { isMac } from "@/lib/platform";
-import { projectColorFor } from "@/lib/projectColor";
-import { useProjectColors } from "@/lib/useProjectColors";
+import {
+  loadRightPanelWidth,
+  RIGHT_PANEL_WIDTH_STORAGE_KEY,
+} from "./components/shared/PanelResizeHandle";
 import { ProjectTabs } from "./components/shared/ProjectTabs";
-import { TopBar, type EagleProjectOption } from "./components/shared/TopBar";
+import { type EagleProjectOption, TopBar } from "./components/shared/TopBar";
 import { UtilityPanel, type UtilityPanelKind } from "./components/shared/UtilityPanel";
 import { Sidebar } from "./components/sidebar/Sidebar";
+import { UpdateNotification } from "./components/update/UpdateNotification";
+import { useAppKeyboard } from "./hooks/useAppKeyboard";
+import { useSwipeNavigation } from "./hooks/useSwipeNavigation";
+import { initActivityListener, stopActivityListener } from "./stores/useActivityStore";
+import { initAgentListener, stopAgentListener } from "./stores/useAgentStore";
+import { useGitStore } from "./stores/useGitStore";
+import { useTerminalSettingsStore } from "./stores/useTerminalSettingsStore";
+import { useUpdateStore } from "./stores/useUpdateStore";
 
 const DEFAULT_SESSION_COUNT = 6;
 
@@ -74,6 +78,13 @@ function App() {
   // Right-side utility panel (Memory / Processes), opened from the top bar.
   // One at a time: opening one replaces the other.
   const [utilityPanel, setUtilityPanel] = useState<UtilityPanelKind | null>(null);
+  // One shared width for every right-docked panel (Memory/Processes, Git),
+  // so switching between them never changes the pane size. Persisted.
+  const [rightPanelWidth, setRightPanelWidth] = useState<number>(loadRightPanelWidth);
+  const handleRightPanelResize = useCallback((width: number) => {
+    setRightPanelWidth(width);
+    localStorage.setItem(RIGHT_PANEL_WIDTH_STORAGE_KEY, String(width));
+  }, []);
   const [theme, setTheme] = useState<Theme>(() => {
     const stored = localStorage.getItem("maestro-theme");
     return isValidTheme(stored) ? stored : "dark";
@@ -499,7 +510,7 @@ function App() {
             {gitPanelOpen && (
               <div
                 className="flex h-10 shrink-0 items-center border-l border-maestro-border px-3 gap-2 bg-maestro-bg"
-                style={{ width: 560 }}
+                style={{ width: rightPanelWidth }}
               >
                 {gitPanelTab === "notes" ? (
                   <>
@@ -562,7 +573,12 @@ function App() {
 
             {/* Memory / Processes utility panel (optional right side) */}
             {utilityPanel && (
-              <UtilityPanel panel={utilityPanel} onClose={() => setUtilityPanel(null)} />
+              <UtilityPanel
+                panel={utilityPanel}
+                width={rightPanelWidth}
+                onResize={handleRightPanelResize}
+                onClose={() => setUtilityPanel(null)}
+              />
             )}
 
             {/* Git graph panel (optional right side) */}
@@ -576,6 +592,8 @@ function App() {
               onRepoChange={(path) => activeTab && setSelectedRepo(activeTab.id, path)}
               activeTab={gitPanelTab}
               onActiveTabChange={setGitPanelTab}
+              width={rightPanelWidth}
+              onResize={handleRightPanelResize}
             />
           </div>
 

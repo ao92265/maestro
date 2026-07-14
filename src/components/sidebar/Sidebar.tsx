@@ -75,9 +75,18 @@ interface SidebarProps {
 }
 
 const SIDEBAR_MIN_WIDTH = 180;
-const SIDEBAR_MAX_WIDTH = 320;
+const SIDEBAR_MAX_WIDTH = 480;
+const SIDEBAR_DEFAULT_WIDTH = 320;
 const SIDEBAR_COLLAPSE_THRESHOLD = 60;
 const SIDEBAR_WIDTH_STEP = 4;
+const SIDEBAR_WIDTH_STORAGE_KEY = "maestro-sidebar-width";
+
+function loadSavedWidth(): number {
+  const saved = Number(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY));
+  return Number.isFinite(saved) && saved >= SIDEBAR_MIN_WIDTH && saved <= SIDEBAR_MAX_WIDTH
+    ? saved
+    : SIDEBAR_DEFAULT_WIDTH;
+}
 
 /* ================================================================ */
 /*  SIDEBAR ROOT                                                     */
@@ -94,11 +103,14 @@ export function Sidebar({
   onAgentNavigate,
   onAgentKill,
 }: SidebarProps) {
-  const [width, setWidth] = useState(240);
+  const [width, setWidth] = useState(loadSavedWidth);
   const [isDragging, setIsDragging] = useState(false);
   const dragStartRef = useRef<{ x: number; w: number } | null>(null);
-  const sidebarWidthClass = collapsed ? "w-0" : `sidebar-w-${width}`;
   const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTabId>(loadSavedTab);
+
+  useEffect(() => {
+    localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(width));
+  }, [width]);
 
   const handleSelectTab = useCallback((tab: SidebarTabId) => {
     setActiveSidebarTab(tab);
@@ -184,9 +196,12 @@ export function Sidebar({
   }, [isDragging, onCollapse, clampWidth]);
 
   return (
-    // Use a class-based width to avoid inline styles (CSP-friendly).
+    // min-w-0 + shrink-0 pin the pane to the chosen width: without them a
+    // flex item's min-width:auto lets wide tab content push the pane wider,
+    // so switching tabs used to change the sidebar width.
     <aside
-      className={`theme-transition no-select relative flex h-full flex-col border-r border-maestro-border bg-maestro-surface ${sidebarWidthClass} ${
+      style={{ width: collapsed ? 0 : width }}
+      className={`theme-transition no-select relative flex h-full min-w-0 shrink-0 flex-col border-r border-maestro-border bg-maestro-surface ${
         isDragging ? "" : "transition-all duration-200 ease-out"
       } ${collapsed ? "overflow-hidden border-r-0 opacity-0" : "opacity-100"}`}
     >
@@ -194,7 +209,7 @@ export function Sidebar({
       <SidebarTabBar active={activeSidebarTab} onSelect={handleSelectTab} />
 
       {/* Scrollable content */}
-      <div className="flex-1 overflow-y-auto px-2.5 py-3">
+      <div className="flex-1 overflow-y-auto overflow-x-hidden px-2.5 py-3">
         <ConfigTab
           activeSidebarTab={activeSidebarTab}
           theme={theme}

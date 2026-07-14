@@ -1,15 +1,20 @@
-import { GitFork, AlertCircle, Loader2, Terminal } from "lucide-react";
+import { AlertCircle, GitFork, Loader2, Terminal } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import {
+  PanelResizeHandle,
+  RIGHT_PANEL_MAX_WIDTH,
+  RIGHT_PANEL_MIN_WIDTH,
+} from "@/components/shared/PanelResizeHandle";
 import type { GraphNode } from "../../lib/graphLayout";
-import { useGitStore } from "../../stores/useGitStore";
 import { useGitHubStore } from "../../stores/useGitHubStore";
+import { useGitStore } from "../../stores/useGitStore";
 import type { RepositoryInfo, WorkspaceType } from "../../stores/useWorkspaceStore";
 import { CommitDetailPanel } from "./CommitDetailPanel";
-import { GitPanelTabs, GITHUB_TABS, type GitPanelTab } from "./GitPanelTabs";
-import { GitPanelContent } from "./GitPanelContent";
-import { PullRequestDetailPanel } from "./pulls/PullRequestDetailPanel";
-import { IssueDetailPanel } from "./issues/IssueDetailPanel";
 import { DiscussionDetailPanel } from "./discussions/DiscussionDetailPanel";
+import { GitPanelContent } from "./GitPanelContent";
+import { GITHUB_TABS, type GitPanelTab, GitPanelTabs } from "./GitPanelTabs";
+import { IssueDetailPanel } from "./issues/IssueDetailPanel";
+import { PullRequestDetailPanel } from "./pulls/PullRequestDetailPanel";
 import { RepoRail } from "./RepoRail";
 
 interface GitGraphPanelProps {
@@ -24,6 +29,9 @@ interface GitGraphPanelProps {
    *  force a specific tab whenever it toggles the panel open. */
   activeTab: GitPanelTab;
   onActiveTabChange: (tab: GitPanelTab) => void;
+  /** Width shared with the other right-docked panels (see App). */
+  width: number;
+  onResize: (width: number) => void;
 }
 
 export function GitGraphPanel({
@@ -36,7 +44,10 @@ export function GitGraphPanel({
   onRepoChange,
   activeTab,
   onActiveTabChange,
+  width,
+  onResize,
 }: GitGraphPanelProps) {
+  const [isResizing, setIsResizing] = useState(false);
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const [selectedPRNumber, setSelectedPRNumber] = useState<number | null>(null);
   const [selectedIssueNumber, setSelectedIssueNumber] = useState<number | null>(null);
@@ -225,10 +236,22 @@ export function GitGraphPanel({
       aria-hidden={!open}
       tabIndex={open ? undefined : -1}
       {...(!open ? ({ inert: "" } as { inert: "" }) : {})}
-      className={`relative z-30 flex flex-row border-l border-maestro-border bg-maestro-surface transition-all duration-200 overflow-hidden ${
-        open ? "w-[560px]" : "w-0 border-l-0"
-      }`}
+      style={{ width: open ? width : 0 }}
+      className={`relative z-30 flex min-w-0 shrink-0 flex-row border-l border-maestro-border bg-maestro-surface overflow-hidden ${
+        isResizing ? "" : "transition-all duration-200"
+      } ${open ? "" : "border-l-0"}`}
     >
+      {open && (
+        <PanelResizeHandle
+          edge="left"
+          width={width}
+          min={RIGHT_PANEL_MIN_WIDTH}
+          max={RIGHT_PANEL_MAX_WIDTH}
+          onResize={onResize}
+          label="Resize git panel"
+          onDraggingChange={setIsResizing}
+        />
+      )}
       {/* PR Detail panel - full width when shown */}
       {showPRDetail ? (
         <div className="flex min-w-[320px] flex-1 flex-col">

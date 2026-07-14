@@ -1,4 +1,9 @@
 import { Activity, Brain, X } from "lucide-react";
+import {
+  PanelResizeHandle,
+  RIGHT_PANEL_MAX_WIDTH,
+  RIGHT_PANEL_MIN_WIDTH,
+} from "@/components/shared/PanelResizeHandle";
 import { MemorySection } from "@/components/sidebar/MemorySection";
 import { ProcessesSection } from "@/components/sidebar/ProcessesSection";
 
@@ -16,14 +21,30 @@ const PANEL_META: Record<UtilityPanelKind, { title: string; icon: React.ElementT
  */
 export function UtilityPanel({
   panel,
+  width,
+  onResize,
   onClose,
 }: {
   panel: UtilityPanelKind;
+  /** Width shared with the other right-docked panels (see App). */
+  width: number;
+  onResize: (width: number) => void;
   onClose: () => void;
 }) {
   const { title, icon: Icon } = PANEL_META[panel];
   return (
-    <aside className="flex h-full w-[340px] shrink-0 flex-col border-l border-maestro-border bg-maestro-surface">
+    <aside
+      style={{ width }}
+      className="relative flex h-full min-w-0 shrink-0 flex-col border-l border-maestro-border bg-maestro-surface"
+    >
+      <PanelResizeHandle
+        edge="left"
+        width={width}
+        min={RIGHT_PANEL_MIN_WIDTH}
+        max={RIGHT_PANEL_MAX_WIDTH}
+        onResize={onResize}
+        label={`Resize ${title} panel`}
+      />
       <div className="flex h-9 shrink-0 items-center gap-2 border-b border-maestro-border/60 px-3">
         <Icon size={14} className="text-maestro-accent" />
         <span className="flex-1 text-sm font-medium text-maestro-text">{title}</span>
