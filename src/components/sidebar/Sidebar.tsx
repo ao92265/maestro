@@ -1,8 +1,6 @@
 import {
-  Activity,
   AlertTriangle,
   Bot,
-  Brain,
   Check,
   ChevronDown,
   ChevronRight,
@@ -57,8 +55,6 @@ import type {
   McpManagedServer,
 } from "@/lib/mcp";
 import { listContextDocs, readContextDoc, type ContextDoc } from "@/lib/claudemd";
-import { MemorySection } from "./MemorySection";
-import { ProcessesSection } from "./ProcessesSection";
 import { cardClass, divider, SectionHeader } from "./sectionChrome";
 
 interface SidebarProps {
@@ -236,13 +232,11 @@ export function Sidebar({
 /*  TAB BAR                                                          */
 /* ================================================================ */
 
-type SidebarTabId = "general" | "processes" | "infra" | "memory" | "settings";
+type SidebarTabId = "general" | "infra" | "settings";
 
 const SIDEBAR_TABS: { id: SidebarTabId; label: string; icon: React.ElementType }[] = [
   { id: "general", label: "General", icon: Home },
-  { id: "processes", label: "Processes", icon: Activity },
   { id: "infra", label: "Infra", icon: Package },
-  { id: "memory", label: "Memory", icon: Brain },
   { id: "settings", label: "Settings", icon: Settings },
 ];
 
@@ -261,14 +255,17 @@ function SidebarTabBar({
   onSelect: (tab: SidebarTabId) => void;
 }) {
   return (
-    <div className="flex shrink-0 border-b border-maestro-border/60">
+    // Equal-width columns (auto-cols-fr): every tab gets the same width
+    // regardless of its label, sized by the available space, with a small
+    // gap between tab names.
+    <div className="grid shrink-0 auto-cols-fr grid-flow-col gap-1 border-b border-maestro-border/60 px-1">
       {SIDEBAR_TABS.map(({ id, label, icon: Icon }) => (
         <button
           key={id}
           type="button"
           onClick={() => onSelect(id)}
           title={label}
-          className={`flex min-w-0 flex-1 flex-col items-center gap-0.5 border-b-2 px-0.5 py-1.5 text-[9px] font-semibold uppercase tracking-wide transition-colors ${
+          className={`flex min-w-0 flex-col items-center gap-0.5 border-b-2 px-0.5 py-1.5 text-[9px] font-semibold uppercase tracking-wide transition-colors ${
             active === id
               ? "border-maestro-accent text-maestro-accent"
               : "border-transparent text-maestro-muted hover:text-maestro-text"
@@ -314,8 +311,6 @@ function ConfigTab({
           <GitRepositorySection />
         </>
       );
-    case "processes":
-      return <ProcessesSection />;
     case "infra":
       return (
         <>
@@ -324,8 +319,6 @@ function ConfigTab({
           <ProjectContextSection />
         </>
       );
-    case "memory":
-      return <MemorySection />;
     case "settings":
       return (
         <AppearanceSection

@@ -22,6 +22,8 @@ interface MultiProjectViewProps {
 
 export interface MultiProjectViewHandle {
   addSessionToActiveProject: () => void;
+  /** Eagle view: add + launch a terminal in the given project's grid. False if that grid isn't mounted. */
+  addAndLaunchSessionInProject: (tabId: string) => boolean;
   launchAllInActiveProject: () => Promise<void>;
   refreshBranchesInActiveProject: () => void;
   /** Focus the pane running the given session. False if that grid isn't mounted or doesn't own it. */
@@ -148,6 +150,12 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
         const gridRef = gridRefs.current.get(activeTab.id);
         gridRef?.addSession();
       }
+    },
+    addAndLaunchSessionInProject: (tabId: string) => {
+      const gridRef = gridRefs.current.get(tabId);
+      if (!gridRef) return false;
+      void gridRef.addAndLaunchSession();
+      return true;
     },
     launchAllInActiveProject: async () => {
       const activeTab = tabs.find((t) => t.active);

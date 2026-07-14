@@ -54,36 +54,6 @@ function mockInvoke() {
             exists: true,
           },
         ];
-      case "list_memory_projects":
-        return [
-          {
-            dirName: "C--git-maestro",
-            memoryPath: "C:\\Users\\me\\.claude\\projects\\C--git-maestro\\memory",
-            fileCount: 2,
-            isActive: true,
-          },
-        ];
-      case "list_memory_files":
-        return [
-          {
-            relPath: "MEMORY.md",
-            path: "C:\\Users\\me\\.claude\\projects\\C--git-maestro\\memory\\MEMORY.md",
-            description: null,
-            memType: null,
-            isIndex: true,
-            sizeBytes: 100,
-            modified: null,
-          },
-          {
-            relPath: "user_profile.md",
-            path: "C:\\Users\\me\\.claude\\projects\\C--git-maestro\\memory\\user_profile.md",
-            description: "Who the user is",
-            memType: "user",
-            isIndex: false,
-            sizeBytes: 200,
-            modified: null,
-          },
-        ];
       case "git_user_config":
         return { name: "Test User", email: "test@example.com" };
       case "git_list_remotes":
@@ -118,29 +88,19 @@ describe("Sidebar tab bar", () => {
     useWorkspaceStore.setState({ tabs: [buildTab()] });
   });
 
-  it("renders the five tabs with General active by default", () => {
+  it("renders the three tabs with General active by default", () => {
     render(<Sidebar />);
-    for (const label of ["General", "Processes", "Infra", "Memory", "Settings"]) {
+    for (const label of ["General", "Infra", "Settings"]) {
       expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
     }
+    // Processes and Memory moved to the right-side utility panel
+    expect(screen.queryByRole("button", { name: "Processes" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Memory" })).not.toBeInTheDocument();
     // General tab content
     expect(screen.getByText("Agents")).toBeInTheDocument();
     expect(screen.getByText("Git Repository")).toBeInTheDocument();
     // Content from other tabs is not mounted
     expect(screen.queryByText("MCP Servers")).not.toBeInTheDocument();
-    expect(screen.queryByText("User Memory")).not.toBeInTheDocument();
-  });
-
-  it("switches to Processes (dev process watchlist)", async () => {
-    render(<Sidebar />);
-    fireEvent.click(screen.getByRole("button", { name: "Processes" }));
-    // The section header and the tab button share the "Processes" name, so
-    // assert on section-only content instead.
-    expect(
-      screen.getByText("Dev processes on this machine, grouped by command."),
-    ).toBeInTheDocument();
-    expect(await screen.findByText("No watched processes running")).toBeInTheDocument();
-    expect(screen.queryByText("Agents")).not.toBeInTheDocument();
   });
 
   it("switches to Infra (MCP + skills + project context)", () => {
@@ -152,19 +112,6 @@ describe("Sidebar tab bar", () => {
     expect(screen.queryByText("Agents")).not.toBeInTheDocument();
   });
 
-  it("shows memory: user CLAUDE.md plus per-project files with index and type badges", async () => {
-    render(<Sidebar />);
-    fireEvent.click(screen.getByRole("button", { name: "Memory" }));
-    expect(screen.getByText("User Memory")).toBeInTheDocument();
-    expect(await screen.findByText("~/.claude/CLAUDE.md")).toBeInTheDocument();
-    // Active project auto-expands with its memory files
-    expect(await screen.findByText("C--git-maestro")).toBeInTheDocument();
-    expect(await screen.findByText("MEMORY.md")).toBeInTheDocument();
-    expect(screen.getByText("INDEX")).toBeInTheDocument();
-    expect(screen.getByText("user_profile.md")).toBeInTheDocument();
-    expect(screen.getByText("Who the user is")).toBeInTheDocument();
-  });
-
   it("switches to Settings and persists the chosen tab", async () => {
     render(<Sidebar />);
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
@@ -172,5 +119,11 @@ describe("Sidebar tab bar", () => {
     await waitFor(() => {
       expect(localStorage.getItem("maestro-sidebar-tab")).toBe("settings");
     });
+  });
+
+  it("falls back to General when a removed tab id was persisted", () => {
+    localStorage.setItem("maestro-sidebar-tab", "memory");
+    render(<Sidebar />);
+    expect(screen.getByText("Agents")).toBeInTheDocument();
   });
 });

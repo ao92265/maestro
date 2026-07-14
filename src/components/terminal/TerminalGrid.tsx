@@ -138,6 +138,8 @@ function createEmptySlot(
  */
 export interface TerminalGridHandle {
   addSession: () => void;
+  /** Adds a slot AND launches it immediately (eagle view — pre-launch cards are hidden there). */
+  addAndLaunchSession: () => Promise<void>;
   launchAll: () => Promise<void>;
   refreshBranches: () => void;
   /** Focus the pane running the given session. Returns false if this grid doesn't own it. */
@@ -1317,10 +1319,31 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     refreshBranches();
   }, [mcpServers, skills, plugins, refreshBranches, orderedSlotIds]);
 
+  /**
+   * Adds a new slot and launches it immediately. Used by the eagle-view
+   * add-terminal dropdown, where pre-launch cards are invisible so a bare
+   * addSession would appear to do nothing.
+   */
+  const addAndLaunchSession = useCallback(async () => {
+    if (slotsRef.current.length >= MAX_SESSIONS) return;
+    const newSlot = createEmptySlot(mcpServers, skills, plugins);
+    // launchSlot resolves the slot through slotsRef, which is only synced to
+    // state after the next render — mirror the new slot into it now.
+    slotsRef.current = [...slotsRef.current, newSlot];
+    setSlots((prev) => {
+      if (prev.length >= MAX_SESSIONS) return prev;
+      return [...prev, newSlot];
+    });
+    setLayoutTree(() => buildGridTree([...orderedSlotIds, newSlot.id]));
+    setFocusedSlotId(newSlot.id);
+    refreshBranches();
+    await launchSlot(newSlot.id);
+  }, [mcpServers, skills, plugins, refreshBranches, orderedSlotIds, launchSlot]);
+
   useImperativeHandle(
     ref,
-    () => ({ addSession, launchAll, refreshBranches, focusSession, killSessionById }),
-    [addSession, launchAll, refreshBranches, focusSession, killSessionById],
+    () => ({ addSession, addAndLaunchSession, launchAll, refreshBranches, focusSession, killSessionById }),
+    [addSession, addAndLaunchSession, launchAll, refreshBranches, focusSession, killSessionById],
   );
 
   // Handle zoom toggle for a slot

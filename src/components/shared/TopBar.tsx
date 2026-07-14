@@ -1,6 +1,8 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
+  Activity,
   Bird,
+  Brain,
   GitMerge,
   Minus,
   PanelLeft,
@@ -8,8 +10,17 @@ import {
   Square,
   X,
 } from "lucide-react";
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { isMac } from "@/lib/platform";
+
+/** One entry of the eagle-view "add terminal" project dropdown. */
+export interface EagleProjectOption {
+  tabId: string;
+  name: string;
+  color: string;
+  /** Project already has the maximum number of session slots. */
+  atMax: boolean;
+}
 
 interface TopBarProps {
   sidebarOpen: boolean;
@@ -28,6 +39,16 @@ interface TopBarProps {
   /** Whether eagle view (all projects' terminals at once) is active */
   eagleView?: boolean;
   onToggleEagleView?: () => void;
+  /** Eagle view: projects offered in the add-terminal dropdown. */
+  eagleProjects?: EagleProjectOption[];
+  /** Eagle view: add a terminal (add + launch a slot) to the given project. */
+  onAddSessionToProject?: (tabId: string) => void;
+  /** Right-side Memory panel */
+  memoryPanelOpen?: boolean;
+  onToggleMemoryPanel?: () => void;
+  /** Right-side Processes panel */
+  processesPanelOpen?: boolean;
+  onToggleProcessesPanel?: () => void;
 }
 
 export function TopBar({
@@ -42,8 +63,35 @@ export function TopBar({
   onAddSession,
   eagleView = false,
   onToggleEagleView,
+  eagleProjects = [],
+  onAddSessionToProject,
+  memoryPanelOpen = false,
+  onToggleMemoryPanel,
+  processesPanelOpen = false,
+  onToggleProcessesPanel,
 }: TopBarProps) {
   const appWindow = useMemo(() => getCurrentWindow(), []);
+
+  // Eagle view add-terminal dropdown (pick which project gets the new terminal)
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
+  const addMenuRef = useRef<HTMLDivElement | null>(null);
+
+  // Close the dropdown on any outside click.
+  useEffect(() => {
+    if (!addMenuOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (addMenuRef.current && !addMenuRef.current.contains(e.target as Node)) {
+        setAddMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    return () => document.removeEventListener("mousedown", onPointerDown);
+  }, [addMenuOpen]);
+
+  // Leaving eagle view (or losing all projects) drops the menu.
+  useEffect(() => {
+    if (!eagleView) setAddMenuOpen(false);
+  }, [eagleView]);
 
   return (
     <div data-tauri-drag-region className="no-select flex h-10 flex-1 items-center bg-maestro-bg">
@@ -74,8 +122,7 @@ export function TopBar({
 
       {/* Right: action icons */}
       <div className="flex items-center gap-0.5 mr-1">
-        {/* Hidden in eagle view: new pre-launch slots are invisible there,
-            so the button would appear to do nothing while stacking up slots. */}
+        {/* Active project: adds a pre-launch slot to its grid. */}
         {inGridView && !eagleView && (
           <button
             type="button"
@@ -87,6 +134,56 @@ export function TopBar({
           >
             <Plus size={14} />
           </button>
+        )}
+        {/* Eagle view: pre-launch slots are invisible there, so the plus
+            becomes a project dropdown that adds AND launches a terminal in
+            the chosen project. */}
+        {eagleView && onAddSessionToProject && eagleProjects.length > 0 && (
+          <div className="relative" ref={addMenuRef}>
+            <button
+              type="button"
+              onClick={() => setAddMenuOpen((v) => !v)}
+              className={`rounded p-1.5 transition-colors ${
+                addMenuOpen
+                  ? "bg-maestro-card text-maestro-text"
+                  : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
+              }`}
+              aria-label="Add terminal to project"
+              title="Add terminal — pick a project"
+            >
+              <Plus size={14} />
+            </button>
+            {addMenuOpen && (
+              <div className="absolute right-0 top-full z-50 mt-1 min-w-[180px] rounded-md border border-maestro-border bg-maestro-surface py-1 shadow-lg">
+                <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-maestro-muted">
+                  Add terminal to…
+                </div>
+                {eagleProjects.map((project) => (
+                  <button
+                    key={project.tabId}
+                    type="button"
+                    disabled={project.atMax}
+                    onClick={() => {
+                      setAddMenuOpen(false);
+                      onAddSessionToProject(project.tabId);
+                    }}
+                    className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-maestro-text transition-colors hover:bg-maestro-card disabled:cursor-not-allowed disabled:opacity-50"
+                    title={
+                      project.atMax
+                        ? `${project.name} already has the maximum number of terminals`
+                        : `Add and launch a terminal in ${project.name}`
+                    }
+                  >
+                    <span
+                      className="h-2 w-2 shrink-0 rounded-full"
+                      style={{ backgroundColor: project.color }}
+                    />
+                    <span className="truncate">{project.name}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
         )}
         {onToggleEagleView && (
           <button
@@ -101,6 +198,36 @@ export function TopBar({
             title="Eagle view — all projects' terminals at once"
           >
             <Bird size={14} />
+          </button>
+        )}
+        {onToggleMemoryPanel && (
+          <button
+            type="button"
+            onClick={onToggleMemoryPanel}
+            className={`rounded p-1.5 transition-colors ${
+              memoryPanelOpen
+                ? "text-maestro-accent hover:bg-maestro-accent/10"
+                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
+            }`}
+            aria-label="Memory"
+            title="Memory — Claude Code memory files"
+          >
+            <Brain size={14} />
+          </button>
+        )}
+        {onToggleProcessesPanel && (
+          <button
+            type="button"
+            onClick={onToggleProcessesPanel}
+            className={`rounded p-1.5 transition-colors ${
+              processesPanelOpen
+                ? "text-maestro-accent hover:bg-maestro-accent/10"
+                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
+            }`}
+            aria-label="Processes"
+            title="Processes — dev processes and containers"
+          >
+            <Activity size={14} />
           </button>
         )}
         <button

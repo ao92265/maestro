@@ -30,7 +30,8 @@ import { isMac } from "@/lib/platform";
 import { projectColorFor } from "@/lib/projectColor";
 import { useProjectColors } from "@/lib/useProjectColors";
 import { ProjectTabs } from "./components/shared/ProjectTabs";
-import { TopBar } from "./components/shared/TopBar";
+import { TopBar, type EagleProjectOption } from "./components/shared/TopBar";
+import { UtilityPanel, type UtilityPanelKind } from "./components/shared/UtilityPanel";
 import { Sidebar } from "./components/sidebar/Sidebar";
 
 const DEFAULT_SESSION_COUNT = 6;
@@ -70,6 +71,9 @@ function App() {
   const [currentBranch, setCurrentBranch] = useState<string | undefined>(undefined);
   // Eagle view: one flat grid of every project's terminals at once
   const [eagleView, setEagleView] = useState(false);
+  // Right-side utility panel (Memory / Processes), opened from the top bar.
+  // One at a time: opening one replaces the other.
+  const [utilityPanel, setUtilityPanel] = useState<UtilityPanelKind | null>(null);
   const [theme, setTheme] = useState<Theme>(() => {
     const stored = localStorage.getItem("maestro-theme");
     return isValidTheme(stored) ? stored : "dark";
@@ -344,6 +348,26 @@ function App() {
     multiProjectRef.current?.addSessionToActiveProject();
   }, []);
 
+  const handleToggleUtilityPanel = useCallback((panel: UtilityPanelKind) => {
+    setUtilityPanel((prev) => (prev === panel ? null : panel));
+  }, []);
+
+  // Eagle view add-terminal dropdown: only projects whose grid is mounted
+  // (sessions launched) can receive a new terminal — idle projects aren't
+  // visible in the eagle grid anyway.
+  const eagleProjects: EagleProjectOption[] = tabs
+    .filter((t) => t.sessionsLaunched)
+    .map((t) => ({
+      tabId: t.id,
+      name: t.name,
+      color: projectColors.get(t.name) ?? projectColorFor(t.name),
+      atMax: (sessionCounts.get(t.id)?.slotCount ?? 0) >= DEFAULT_SESSION_COUNT,
+    }));
+
+  const handleAddSessionToProject = useCallback((tabId: string) => {
+    multiProjectRef.current?.addAndLaunchSessionInProject(tabId);
+  }, []);
+
   // Sidebar Agents section: jump to a terminal (leave eagle view — the target
   // pane may be hidden behind an eagle zoom overlay there — then activate its
   // project tab and focus its pane once the switch has committed to the DOM).
@@ -463,6 +487,12 @@ function App() {
               onAddSession={() => multiProjectRef.current?.addSessionToActiveProject()}
               eagleView={eagleView}
               onToggleEagleView={() => setEagleView((v) => !v)}
+              eagleProjects={eagleProjects}
+              onAddSessionToProject={handleAddSessionToProject}
+              memoryPanelOpen={utilityPanel === "memory"}
+              onToggleMemoryPanel={() => handleToggleUtilityPanel("memory")}
+              processesPanelOpen={utilityPanel === "processes"}
+              onToggleProcessesPanel={() => handleToggleUtilityPanel("processes")}
             />
 
             {/* Git panel header - inline at same level as TopBar */}
@@ -529,6 +559,11 @@ function App() {
                 eagleView={eagleView}
               />
             </main>
+
+            {/* Memory / Processes utility panel (optional right side) */}
+            {utilityPanel && (
+              <UtilityPanel panel={utilityPanel} onClose={() => setUtilityPanel(null)} />
+            )}
 
             {/* Git graph panel (optional right side) */}
             <GitGraphPanel
