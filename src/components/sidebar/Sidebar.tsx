@@ -1,6 +1,7 @@
 import {
   AlertTriangle,
   Bot,
+  Brain,
   Check,
   ChevronDown,
   ChevronRight,
@@ -55,6 +56,8 @@ import type {
   McpManagedServer,
 } from "@/lib/mcp";
 import { listContextDocs, readContextDoc, type ContextDoc } from "@/lib/claudemd";
+import { MemorySection } from "./MemorySection";
+import { cardClass, divider, SectionHeader } from "./sectionChrome";
 
 interface SidebarProps {
   collapsed?: boolean;
@@ -72,12 +75,6 @@ interface SidebarProps {
   /** Agents section: kill one terminal (PTY + pane cleanup). */
   onAgentKill?: (tabId: string, sessionId: number) => void;
 }
-
-/* ── Shared card class ── */
-const cardClass =
-  "sidebar-card-link rounded-lg border border-maestro-border/60 bg-maestro-card p-3 overflow-hidden shadow-[0_1px_4px_rgb(0_0_0/0.15),0_0_0_1px_rgb(255_255_255/0.03)_inset] transition-shadow hover:shadow-[0_2px_8px_rgb(0_0_0/0.25),0_0_0_1px_rgb(255_255_255/0.05)_inset]";
-
-const divider = <div className="h-px bg-maestro-border/30 my-1" />;
 
 const SIDEBAR_MIN_WIDTH = 180;
 const SIDEBAR_MAX_WIDTH = 320;
@@ -103,6 +100,12 @@ export function Sidebar({
   const [isDragging, setIsDragging] = useState(false);
   const dragStartRef = useRef<{ x: number; w: number } | null>(null);
   const sidebarWidthClass = collapsed ? "w-0" : `sidebar-w-${width}`;
+  const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTabId>(loadSavedTab);
+
+  const handleSelectTab = useCallback((tab: SidebarTabId) => {
+    setActiveSidebarTab(tab);
+    localStorage.setItem(SIDEBAR_TAB_STORAGE_KEY, tab);
+  }, []);
 
   const handleDragStart = useCallback(
     (e: React.MouseEvent) => {
@@ -189,9 +192,13 @@ export function Sidebar({
         isDragging ? "" : "transition-all duration-200 ease-out"
       } ${collapsed ? "overflow-hidden border-r-0 opacity-0" : "opacity-100"}`}
     >
+      {/* Tab bar */}
+      <SidebarTabBar active={activeSidebarTab} onSelect={handleSelectTab} />
+
       {/* Scrollable content */}
       <div className="flex-1 overflow-y-auto px-2.5 py-3">
         <ConfigTab
+          activeSidebarTab={activeSidebarTab}
           theme={theme}
           onToggleTheme={onToggleTheme}
           launchedCount={launchedCount}
@@ -224,33 +231,50 @@ export function Sidebar({
 }
 
 /* ================================================================ */
-/*  SECTION HEADER (reusable)                                        */
+/*  TAB BAR                                                          */
 /* ================================================================ */
 
-function SectionHeader({
-  icon: Icon,
-  label,
-  breathe = false,
-  iconColor,
-  badge,
-  right,
+type SidebarTabId = "general" | "infra" | "memory" | "settings";
+
+const SIDEBAR_TABS: { id: SidebarTabId; label: string; icon: React.ElementType }[] = [
+  { id: "general", label: "General", icon: Home },
+  { id: "infra", label: "Infra", icon: Package },
+  { id: "memory", label: "Memory", icon: Brain },
+  { id: "settings", label: "Settings", icon: Settings },
+];
+
+const SIDEBAR_TAB_STORAGE_KEY = "maestro-sidebar-tab";
+
+function loadSavedTab(): SidebarTabId {
+  const saved = localStorage.getItem(SIDEBAR_TAB_STORAGE_KEY);
+  return SIDEBAR_TABS.some((t) => t.id === saved) ? (saved as SidebarTabId) : "general";
+}
+
+function SidebarTabBar({
+  active,
+  onSelect,
 }: {
-  icon: React.ElementType;
-  label: string;
-  breathe?: boolean;
-  iconColor?: string;
-  badge?: React.ReactNode;
-  right?: React.ReactNode;
+  active: SidebarTabId;
+  onSelect: (tab: SidebarTabId) => void;
 }) {
   return (
-    <div className="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-maestro-muted">
-      <Icon
-        size={13}
-        className={`${iconColor ?? "text-maestro-muted/80"} ${breathe ? "animate-breathe" : ""}`}
-      />
-      <span className="flex-1">{label}</span>
-      {badge}
-      {right}
+    <div className="flex shrink-0 border-b border-maestro-border/60">
+      {SIDEBAR_TABS.map(({ id, label, icon: Icon }) => (
+        <button
+          key={id}
+          type="button"
+          onClick={() => onSelect(id)}
+          title={label}
+          className={`flex min-w-0 flex-1 flex-col items-center gap-0.5 border-b-2 px-0.5 py-1.5 text-[9px] font-semibold uppercase tracking-wide transition-colors ${
+            active === id
+              ? "border-maestro-accent text-maestro-accent"
+              : "border-transparent text-maestro-muted hover:text-maestro-text"
+          }`}
+        >
+          <Icon size={14} />
+          <span className="truncate">{label}</span>
+        </button>
+      ))}
     </div>
   );
 }
@@ -260,6 +284,7 @@ function SectionHeader({
 /* ================================================================ */
 
 function ConfigTab({
+  activeSidebarTab,
   theme,
   onToggleTheme,
   launchedCount = 0,
@@ -268,6 +293,7 @@ function ConfigTab({
   onAgentNavigate,
   onAgentKill,
 }: {
+  activeSidebarTab: SidebarTabId;
   theme?: "dark" | "light";
   onToggleTheme?: () => void;
   launchedCount?: number;
@@ -276,25 +302,36 @@ function ConfigTab({
   onAgentNavigate?: (tabId: string, sessionId: number) => void;
   onAgentKill?: (tabId: string, sessionId: number) => void;
 }) {
-  return (
-    <>
-      <AgentsSection onNavigate={onAgentNavigate} onKill={onAgentKill} />
-      {divider}
-      <GitRepositorySection />
-      {divider}
-      <ProjectContextSection />
-      {divider}
-      <ExtensionsSection />
-      {divider}
-      <AppearanceSection
-        theme={theme}
-        onToggle={onToggleTheme}
-        launchedCount={launchedCount}
-        isStoppingAll={isStoppingAll}
-        onStopAll={onStopAll}
-      />
-    </>
-  );
+  switch (activeSidebarTab) {
+    case "general":
+      return (
+        <>
+          <AgentsSection onNavigate={onAgentNavigate} onKill={onAgentKill} />
+          {divider}
+          <GitRepositorySection />
+        </>
+      );
+    case "infra":
+      return (
+        <>
+          <ExtensionsSection />
+          {divider}
+          <ProjectContextSection />
+        </>
+      );
+    case "memory":
+      return <MemorySection />;
+    case "settings":
+      return (
+        <AppearanceSection
+          theme={theme}
+          onToggle={onToggleTheme}
+          launchedCount={launchedCount}
+          isStoppingAll={isStoppingAll}
+          onStopAll={onStopAll}
+        />
+      );
+  }
 }
 
 /* ── 0. Agents ── */
