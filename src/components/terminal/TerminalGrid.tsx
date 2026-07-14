@@ -178,16 +178,20 @@ interface TerminalGridProps {
   eagleMode?: boolean;
   /** Project name shown on each pane header in eagle mode. */
   projectName?: string;
-  /** Slot currently zoomed in eagle view (owned by MultiProjectView). */
-  eagleZoomedSlotId?: string | null;
+  /**
+   * Session currently zoomed in eagle view (owned by MultiProjectView).
+   * Keyed by backend session ID — globally unique across projects — so the
+   * owner can drive the global zoom tab bar straight from the stores.
+   */
+  eagleZoomedSessionId?: number | null;
   /**
    * A pane somewhere (any project) is eagle-zoomed. Non-zoomed tiles hide
    * (visibility) so their xterm/WebGL renderers stop painting behind the
    * opaque zoom overlay.
    */
   eagleAnyZoomed?: boolean;
-  /** Toggles eagle zoom for a slot (owned by MultiProjectView). */
-  onEagleZoomToggle?: (slotId: string) => void;
+  /** Toggles eagle zoom for a session (owned by MultiProjectView). */
+  onEagleZoomToggle?: (sessionId: number) => void;
 }
 
 /**
@@ -217,7 +221,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     onAllSessionsClosed,
     eagleMode = false,
     projectName,
-    eagleZoomedSlotId = null,
+    eagleZoomedSessionId = null,
     eagleAnyZoomed = false,
     onEagleZoomToggle,
   },
@@ -1358,10 +1362,13 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     );
 
     const showReorderHandle = slots.length > 1 && !eagleMode;
-    const isEagleZoomed = eagleMode && eagleZoomedSlotId === slot.id;
+    const isEagleZoomed =
+      eagleMode && slot.sessionId !== null && eagleZoomedSessionId === slot.sessionId;
     const isEagleObscured = eagleMode && eagleAnyZoomed && !isEagleZoomed;
 
     if (slot.sessionId !== null) {
+      // TS narrowing on slot.sessionId doesn't survive into the closure below.
+      const sessionId = slot.sessionId;
       return (
         <DraggablePane
           slotId={slot.id}
@@ -1382,7 +1389,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
             terminalCount={slots.length}
             isZoomed={isEagleZoomed}
             onToggleZoom={() =>
-              eagleMode ? onEagleZoomToggle?.(slot.id) : handleToggleZoom(slot.id)
+              eagleMode ? onEagleZoomToggle?.(sessionId) : handleToggleZoom(slot.id)
             }
             projectLabel={eagleMode ? projectName : undefined}
             projectColor={eagleMode ? eagleColor : undefined}
@@ -1440,7 +1447,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       </DraggablePane>
     );
   // eslint-disable-next-line react-hooks/exhaustive-deps -- Deps cover all render-affecting state
-  }, [slots, focusedSlotId, isActive, isDraggingFiles, dropTargetSlotId, getFocusCallback, handleKill, handleToggleZoom, handleSwapSlots, projectPath, branches, isLoadingBranches, isGitRepo, hasManagedWorktree, repositories, workspaceType, effectiveRepoPath, onRepoChange, mcpServers, skills, plugins, handleCreateBranch, updateSlotCustomName, updateSlotMode, updateSlotBranch, updateSlotWorktreeMode, refreshBranches, toggleSlotMcp, toggleSlotSkill, toggleSlotPlugin, selectAllMcp, unselectAllMcp, selectAllPlugins, unselectAllPlugins, launchSlot, removeSlot, updateSlotResumeSession, eagleMode, eagleZoomedSlotId, eagleAnyZoomed, onEagleZoomToggle, projectName, eagleColor]);
+  }, [slots, focusedSlotId, isActive, isDraggingFiles, dropTargetSlotId, getFocusCallback, handleKill, handleToggleZoom, handleSwapSlots, projectPath, branches, isLoadingBranches, isGitRepo, hasManagedWorktree, repositories, workspaceType, effectiveRepoPath, onRepoChange, mcpServers, skills, plugins, handleCreateBranch, updateSlotCustomName, updateSlotMode, updateSlotBranch, updateSlotWorktreeMode, refreshBranches, toggleSlotMcp, toggleSlotSkill, toggleSlotPlugin, selectAllMcp, unselectAllMcp, selectAllPlugins, unselectAllPlugins, launchSlot, removeSlot, updateSlotResumeSession, eagleMode, eagleZoomedSessionId, eagleAnyZoomed, onEagleZoomToggle, projectName, eagleColor]);
 
   const handleRatioChange = useCallback((nodeId: string, ratio: number) => {
     setLayoutTree((prev) => updateRatio(prev, nodeId, ratio));
@@ -1733,7 +1740,8 @@ function DraggablePane({
   const eagleClass = eagleHidden
     ? "hidden"
     : eagleZoomed
-      ? "fixed inset-0 z-40 bg-maestro-bg min-h-0 min-w-0"
+      ? // top-8 leaves room for MultiProjectView's global tab bar (h-8, z-50).
+        "fixed inset-x-0 bottom-0 top-8 z-40 bg-maestro-bg p-2 min-h-0 min-w-0"
       : "relative h-full w-full min-h-0 min-w-0 overflow-hidden rounded-md";
   return (
     <div

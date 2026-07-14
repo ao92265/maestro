@@ -1,8 +1,14 @@
-import { useEffect, useRef, useState, forwardRef, useImperativeHandle, useMemo } from "react";
+import { useCallback, useEffect, useRef, useState, forwardRef, useImperativeHandle, useMemo } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { useSessionStore } from "@/stores/useSessionStore";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
+import { projectColorFor } from "@/lib/projectColor";
 import { IdleLandingView } from "./IdleLandingView";
 import { TerminalGrid, type TerminalGridHandle } from "../terminal/TerminalGrid";
+import { ThinkingIndicator } from "../terminal/ThinkingIndicator";
+
+/** Stable empty record so the names selector doesn't re-render grids while the bar is hidden. */
+const EMPTY_SESSION_NAMES: Record<number, string> = {};
 
 interface MultiProjectViewProps {
   onSessionCountChange?: (tabId: string, slotCount: number, launchedCount: number) => void;
@@ -38,8 +44,10 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
   const setSelectedRepo = useWorkspaceStore((s) => s.setSelectedRepo);
   const gridRefs = useRef<Map<string, TerminalGridHandle>>(new Map());
 
-  // Eagle view: which pane (if any) is zoomed to fill the window.
-  const [eagleZoom, setEagleZoom] = useState<{ tabId: string; slotId: string } | null>(null);
+  // Eagle view: which session (if any) is zoomed to fill the window.
+  // Keyed by backend session ID (globally unique across projects) so the
+  // global zoom tab bar can be built purely from the stores.
+  const [eagleZoom, setEagleZoom] = useState<number | null>(null);
 
   // Live session count drives the eagle grid's column count. Gated on
   // eagleView so session launches/kills don't re-render every project's grid
@@ -51,30 +59,80 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
     if (!eagleView) setEagleZoom(null);
   }, [eagleView]);
 
-  // Esc exits the eagle zoom back to the grid.
+  // All running sessions across projects in tab/launch order — drives the
+  // global zoom tab bar and Alt+Arrow cycling.
+  const eagleSessions = useMemo(() => {
+    if (!eagleView) return [];
+    const list: { sessionId: number; projectName: string; color: string }[] = [];
+    for (const tab of tabs) {
+      if (!tab.sessionsLaunched) continue;
+      for (const sessionId of tab.sessionIds) {
+        list.push({ sessionId, projectName: tab.name, color: projectColorFor(tab.name) });
+      }
+    }
+    return list;
+  }, [eagleView, tabs]);
+
+  // Session names for the tab labels. Derived record + shallow compare so the
+  // raw sessions array (replaced on every status update) doesn't re-render
+  // every grid; only visible while the bar is showing.
+  const sessionNames = useSessionStore(
+    useShallow((s) => {
+      if (!eagleView || eagleZoom === null) return EMPTY_SESSION_NAMES;
+      const names: Record<number, string> = {};
+      for (const sess of s.sessions) {
+        if (sess.name) names[sess.id] = sess.name;
+      }
+      return names;
+    })
+  );
+
+  // Stale-zoom guard: if the zoomed session disappears (killed), drop the
+  // zoom — otherwise every tile stays visibility:hidden and the view blanks.
   useEffect(() => {
-    if (!eagleView || !eagleZoom) return;
+    if (eagleZoom === null) return;
+    if (!eagleSessions.some((s) => s.sessionId === eagleZoom)) setEagleZoom(null);
+  }, [eagleZoom, eagleSessions]);
+
+  // Keyboard while eagle-zoomed. Capture phase: xterm stops propagation on
+  // keys it handles, so bubble-phase Alt+Arrow would never fire while a
+  // terminal has focus. Esc is left to propagate (xterm sees it, same as the
+  // per-project zoom today).
+  useEffect(() => {
+    if (!eagleView || eagleZoom === null) return;
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setEagleZoom(null);
+      if (e.key === "Escape") {
+        setEagleZoom(null);
+        return;
+      }
+      if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      const idx = eagleSessions.findIndex((s) => s.sessionId === eagleZoom);
+      if (idx < 0 || eagleSessions.length === 0) return;
+      const delta = e.key === "ArrowRight" ? 1 : -1;
+      const next = eagleSessions[(idx + delta + eagleSessions.length) % eagleSessions.length];
+      setEagleZoom(next.sessionId);
     };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    window.addEventListener("keydown", handleKeyDown, { capture: true });
+    return () => window.removeEventListener("keydown", handleKeyDown, { capture: true });
+  }, [eagleView, eagleZoom, eagleSessions]);
+
+  // Focus follows the zoomed terminal (tab click / Alt+Arrow). Only the grid
+  // that owns the session accepts the call, same pattern as killSessionInProject.
+  useEffect(() => {
+    if (!eagleView || eagleZoom === null) return;
+    for (const handle of gridRefs.current.values()) {
+      if (handle.focusSession(eagleZoom)) break;
+    }
   }, [eagleView, eagleZoom]);
 
-  // Stable per-tab eagle zoom toggles (same pattern as the other callbacks).
-  const eagleZoomCallbacks = useMemo(() => {
-    const callbacks = new Map<string, (slotId: string) => void>();
-    for (const tab of tabs) {
-      callbacks.set(tab.id, (slotId: string) => {
-        setEagleZoom((prev) =>
-          prev && prev.tabId === tab.id && prev.slotId === slotId
-            ? null
-            : { tabId: tab.id, slotId }
-        );
-      });
-    }
-    return callbacks;
-  }, [tabs]);
+  // Single stable toggle shared by every grid — session IDs are global, so
+  // no per-tab closure is needed.
+  const handleEagleZoomToggle = useCallback((sessionId: number) => {
+    setEagleZoom((prev) => (prev === sessionId ? null : sessionId));
+  }, []);
 
   // Expose methods to parent
   useImperativeHandle(ref, () => ({
@@ -198,6 +256,67 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
           : undefined
       }
     >
+      {/* Global zoom tab bar: all running terminals across all projects,
+          color-coded by project. position:fixed lifts it out of the grid flow
+          and above the zoomed pane (z-40); the pane leaves top-8 for it. */}
+      {eagleView && eagleZoom !== null && (() => {
+        const zoomedIndex = eagleSessions.findIndex((s) => s.sessionId === eagleZoom);
+        return (
+          <div className="fixed inset-x-0 top-0 z-50 flex h-8 items-center gap-2 border-b border-maestro-border bg-maestro-surface px-3">
+            <span className="text-[11px] font-medium uppercase tracking-wider text-maestro-muted">
+              Terminal {zoomedIndex + 1}/{eagleSessions.length}
+            </span>
+            <div className="h-3.5 w-px bg-maestro-border" />
+            <div className="flex flex-1 gap-0.5 overflow-x-auto">
+              {eagleSessions.map((session, index) => {
+                const isActive = session.sessionId === eagleZoom;
+                const label =
+                  sessionNames[session.sessionId]?.trim() || `Terminal ${index + 1}`;
+                return (
+                  <button
+                    key={session.sessionId}
+                    onClick={() => handleEagleZoomToggle(session.sessionId)}
+                    className={`flex shrink-0 items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                      isActive ? "" : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
+                    }`}
+                    style={
+                      isActive
+                        ? {
+                            backgroundColor: `color-mix(in srgb, ${session.color} 15%, transparent)`,
+                            color: session.color,
+                          }
+                        : undefined
+                    }
+                    title={
+                      isActive
+                        ? `${session.projectName} · ${label} (click to exit zoom)`
+                        : `Switch to ${session.projectName} · ${label}`
+                    }
+                  >
+                    <span className="font-mono text-[10px] opacity-60">{index + 1}</span>
+                    <span className="font-bold" style={{ color: session.color }}>
+                      {session.projectName}
+                    </span>
+                    <span className="max-w-[180px] truncate">{label}</span>
+                    <ThinkingIndicator sessionId={session.sessionId} size={3} />
+                    <span className="h-1.5 w-1.5 rounded-full bg-maestro-green" />
+                  </button>
+                );
+              })}
+            </div>
+            <button
+              onClick={() => setEagleZoom(null)}
+              className="rounded p-0.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text"
+              title="Exit zoom (Esc)"
+            >
+              <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+        );
+      })()}
+
       {/* Eagle view with nothing running: every tile is hidden, so give the
           empty grid a hint instead of a blank screen. */}
       {eagleView && liveSessionCount === 0 && (
@@ -250,11 +369,9 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
               onAllSessionsClosed={allSessionsClosedCallbacks.get(tab.id)}
               eagleMode={eagleView}
               projectName={tab.name}
-              eagleZoomedSlotId={
-                eagleZoom && eagleZoom.tabId === tab.id ? eagleZoom.slotId : null
-              }
+              eagleZoomedSessionId={eagleZoom}
               eagleAnyZoomed={eagleView && eagleZoom !== null}
-              onEagleZoomToggle={eagleZoomCallbacks.get(tab.id)}
+              onEagleZoomToggle={handleEagleZoomToggle}
             />
           ) : (
             <IdleLandingView onAdd={launchCallbacks.get(tab.id)!} />
