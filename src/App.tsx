@@ -374,11 +374,10 @@ function App() {
     setUtilityPanel((prev) => (prev === panel ? null : panel));
   }, []);
 
-  // Eagle view add-terminal dropdown: only projects whose grid is mounted
-  // (sessions launched) can receive a new terminal — idle projects aren't
-  // visible in the eagle grid anyway.
+  // Eagle view add-terminal dropdown: every open project tab is offered.
+  // Idle projects (no sessions launched) get their grid mounted and their
+  // first terminal launched by MultiProjectView's auto-launch fallback.
   const eagleProjects: EagleProjectOption[] = tabs
-    .filter((t) => t.sessionsLaunched)
     .map((t) => ({
       tabId: t.id,
       name: t.name,

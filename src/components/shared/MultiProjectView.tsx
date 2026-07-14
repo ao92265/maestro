@@ -47,6 +47,11 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
   const setSelectedRepo = useWorkspaceStore((s) => s.setSelectedRepo);
   const gridRefs = useRef<Map<string, TerminalGridHandle>>(new Map());
 
+  // Tabs whose grid should auto-launch its first slot on mount. Populated
+  // when the eagle add-terminal dropdown targets an idle project (no grid
+  // mounted yet); consumed when that grid's ref registers.
+  const pendingAutoLaunch = useRef<Set<string>>(new Set());
+
   // Eagle view: which session (if any) is zoomed to fill the window.
   // Keyed by backend session ID (globally unique across projects) so the
   // global zoom tab bar can be built purely from the stores.
@@ -153,8 +158,16 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
     },
     addAndLaunchSessionInProject: (tabId: string) => {
       const gridRef = gridRefs.current.get(tabId);
-      if (!gridRef) return false;
-      void gridRef.addAndLaunchSession();
+      if (gridRef) {
+        void gridRef.addAndLaunchSession();
+        return true;
+      }
+      // Idle project: no grid mounted yet. Mark it as launched so the grid
+      // mounts, and flag it to auto-launch its initial slot on mount.
+      const tab = tabs.find((t) => t.id === tabId);
+      if (!tab) return false;
+      pendingAutoLaunch.current.add(tabId);
+      setSessionsLaunched(tabId, true);
       return true;
     },
     launchAllInActiveProject: async () => {
@@ -177,7 +190,7 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
     killSessionInProject: (tabId: string, sessionId: number) => {
       return gridRefs.current.get(tabId)?.killSessionById(sessionId) ?? false;
     },
-  }), [tabs]);
+  }), [tabs, setSessionsLaunched]);
 
   // Create stable callbacks per tab to avoid infinite re-render loops
   // The callbacks are memoized by tab.id so they don't change on every render
@@ -231,6 +244,9 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
       setters.set(tab.id, (handle: TerminalGridHandle | null) => {
         if (handle) {
           gridRefs.current.set(tab.id, handle);
+          // The grid captured autoLaunchOnMount on mount; drop the flag so a
+          // later remount (e.g. stop-all then relaunch) doesn't auto-launch.
+          pendingAutoLaunch.current.delete(tab.id);
         } else {
           gridRefs.current.delete(tab.id);
         }
@@ -389,6 +405,7 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
               eagleZoomedSessionId={eagleZoom}
               eagleAnyZoomed={eagleView && eagleZoom !== null}
               onEagleZoomToggle={handleEagleZoomToggle}
+              autoLaunchOnMount={pendingAutoLaunch.current.has(tab.id)}
             />
           ) : (
             <IdleLandingView onAdd={launchCallbacks.get(tab.id)!} />

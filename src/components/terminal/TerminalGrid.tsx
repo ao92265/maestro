@@ -195,6 +195,13 @@ interface TerminalGridProps {
   eagleAnyZoomed?: boolean;
   /** Toggles eagle zoom for a session (owned by MultiProjectView). */
   onEagleZoomToggle?: (sessionId: number) => void;
+  /**
+   * Launch the initial slot as soon as the grid mounts. Used when the eagle
+   * "add terminal" dropdown targets a project with no grid yet: the grid
+   * mounts with one pre-launch card, which is invisible in eagle mode, so
+   * without this the click would appear to do nothing.
+   */
+  autoLaunchOnMount?: boolean;
 }
 
 /**
@@ -227,6 +234,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     eagleZoomedSessionId = null,
     eagleAnyZoomed = false,
     onEagleZoomToggle,
+    autoLaunchOnMount = false,
   },
   ref,
 ) {
@@ -902,6 +910,17 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       await launchSlot(slot.id);
     }
   }, [launchSlot]);
+
+  // Eagle "add terminal" into a project with no mounted grid: launch the
+  // initial slot right away (see autoLaunchOnMount prop doc). Defined after
+  // the slotsRef sync effect so the slot is visible to launchAll. One-shot:
+  // must never re-fire on later renders.
+  const autoLaunchedRef = useRef(false);
+  useEffect(() => {
+    if (!autoLaunchOnMount || autoLaunchedRef.current) return;
+    autoLaunchedRef.current = true;
+    void launchAll();
+  }, [autoLaunchOnMount, launchAll]);
 
   /**
    * Handles killing/closing a session, updating the slot state.
