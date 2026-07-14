@@ -1,0 +1,455 @@
+import { ask } from "@tauri-apps/plugin-dialog";
+import {
+  Activity,
+  ChevronDown,
+  ChevronRight,
+  Container,
+  Loader2,
+  RefreshCw,
+  SlidersHorizontal,
+  Square,
+} from "lucide-react";
+import { useCallback, useMemo, useRef, useState } from "react";
+import { useDevProcesses } from "@/hooks/useDevProcesses";
+import {
+  killProcessTree,
+  stopDockerContainer,
+  type DevProcess,
+  type DockerContainer,
+} from "@/lib/processes";
+import {
+  DEFAULT_WATCHLIST,
+  useProcessWatchlistStore,
+} from "@/stores/useProcessWatchlistStore";
+import { cardClass, SectionHeader } from "./sectionChrome";
+
+/** Identical command+directory pairs collapse into one row with a ×N count. */
+interface ProcessGroup {
+  key: string;
+  matched: string;
+  cmd: string;
+  cwd: string | null;
+  procs: DevProcess[];
+  memoryBytes: number;
+  cpuPercent: number;
+  anyMaestro: boolean;
+}
+
+function groupProcesses(procs: DevProcess[]): ProcessGroup[] {
+  const groups = new Map<string, ProcessGroup>();
+  for (const p of procs) {
+    const key = `${p.matched}|${p.cmd}|${p.cwd ?? ""}`;
+    const existing = groups.get(key);
+    if (existing) {
+      existing.procs.push(p);
+      existing.memoryBytes += p.memoryBytes;
+      existing.cpuPercent += p.cpuPercent;
+      existing.anyMaestro ||= p.isMaestro;
+    } else {
+      groups.set(key, {
+        key,
+        matched: p.matched,
+        cmd: p.cmd,
+        cwd: p.cwd,
+        procs: [p],
+        memoryBytes: p.memoryBytes,
+        cpuPercent: p.cpuPercent,
+        anyMaestro: p.isMaestro,
+      });
+    }
+  }
+  return [...groups.values()].sort((a, b) => b.memoryBytes - a.memoryBytes);
+}
+
+function formatMem(bytes: number): string {
+  const mb = bytes / (1024 * 1024);
+  return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`;
+}
+
+function formatUptime(secs: number): string {
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
+  return `${Math.floor(secs / 86400)}d ${Math.floor((secs % 86400) / 3600)}h`;
+}
+
+/** Last path segment of a working directory ("C:\git\maestro" → "maestro"). */
+function dirBasename(cwd: string | null): string | null {
+  if (!cwd) return null;
+  const parts = cwd.split(/[\\/]/).filter(Boolean);
+  return parts.length > 0 ? parts[parts.length - 1] : cwd;
+}
+
+const maestroBadge = (
+  <span className="shrink-0 rounded bg-maestro-accent/20 px-1 text-[9px] font-bold text-maestro-accent">
+    MAESTRO
+  </span>
+);
+
+/**
+ * Live view of dev-stack OS processes (node, vite, uvicorn, claude, ...)
+ * matched against a user-editable watchlist, plus running Docker containers.
+ * Kill buttons terminate the whole process tree — orphaned children are the
+ * very thing this section exists to clean up.
+ */
+export function ProcessesSection() {
+  const [expanded, setExpanded] = useState(true);
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  const [editingWatchlist, setEditingWatchlist] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const watchlist = useProcessWatchlistStore((s) => s.watchlist);
+  const { processes, containers, dockerAvailable, error, refresh } = useDevProcesses(
+    expanded,
+    watchlist,
+  );
+
+  const groups = useMemo(() => groupProcesses(processes ?? []), [processes]);
+  const totalCount = processes?.length ?? 0;
+
+  // One confirm dialog per target: guards double-clicks on kill buttons.
+  const pendingKills = useRef(new Set<string>());
+  const confirmAndRun = useCallback(
+    async (key: string, message: string, title: string, action: () => Promise<void>) => {
+      if (pendingKills.current.has(key)) return;
+      pendingKills.current.add(key);
+      try {
+        const confirmed = await ask(message, { title, kind: "warning" }).catch(() => false);
+        if (!confirmed) return;
+        setActionError(null);
+        try {
+          await action();
+        } catch (err) {
+          setActionError(String(err));
+        }
+        await refresh();
+      } finally {
+        pendingKills.current.delete(key);
+      }
+    },
+    [refresh],
+  );
+
+  const handleKillProcess = (p: DevProcess) =>
+    confirmAndRun(
+      `pid-${p.pid}`,
+      `Kill "${p.matched}" (PID ${p.pid}) and all its child processes?`,
+      "Kill Process Tree",
+      () => killProcessTree(p.pid),
+    );
+
+  const handleKillGroup = (g: ProcessGroup) =>
+    confirmAndRun(
+      `group-${g.key}`,
+      `Kill all ${g.procs.length} "${g.matched}" processes${
+        g.cwd ? ` in ${dirBasename(g.cwd)}` : ""
+      } and their children?`,
+      "Kill Process Trees",
+      async () => {
+        for (const p of g.procs) {
+          await killProcessTree(p.pid);
+        }
+      },
+    );
+
+  const handleStopContainer = (c: DockerContainer) =>
+    confirmAndRun(
+      `container-${c.id}`,
+      `Stop container "${c.name}" (${c.image})?`,
+      "Stop Container",
+      () => stopDockerContainer(c.id),
+    );
+
+  const toggleGroup = (key: string) => {
+    setExpandedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      return next;
+    });
+  };
+
+  return (
+    <div className={cardClass}>
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="block w-full text-left"
+      >
+        <SectionHeader
+          icon={Activity}
+          label="Processes"
+          iconColor={totalCount > 0 ? "text-maestro-green" : undefined}
+          badge={
+            totalCount > 0 ? (
+              <span
+                className="rounded-full bg-maestro-green/20 px-1.5 text-[10px] font-bold text-maestro-green"
+                title={`${totalCount} watched process${totalCount === 1 ? "" : "es"} running`}
+              >
+                {totalCount}
+              </span>
+            ) : undefined
+          }
+          right={
+            expanded ? (
+              <ChevronDown size={12} className="text-maestro-muted" />
+            ) : (
+              <ChevronRight size={12} className="text-maestro-muted" />
+            )
+          }
+        />
+      </button>
+
+      {expanded && (
+        <>
+          <div className="mb-1 flex items-center gap-1 px-1">
+            <p className="flex-1 text-[10px] text-maestro-muted/70">
+              Dev processes on this machine, grouped by command.
+            </p>
+            <button
+              type="button"
+              onClick={() => setEditingWatchlist((v) => !v)}
+              className={`rounded p-0.5 hover:bg-maestro-border/40 ${
+                editingWatchlist ? "text-maestro-accent" : "text-maestro-muted"
+              }`}
+              title="Edit watched techs"
+            >
+              <SlidersHorizontal size={12} />
+            </button>
+            <button
+              type="button"
+              onClick={() => void refresh()}
+              className="rounded p-0.5 text-maestro-muted hover:bg-maestro-border/40"
+              title="Refresh now"
+            >
+              <RefreshCw size={12} />
+            </button>
+          </div>
+
+          {editingWatchlist && (
+            <WatchlistEditor onClose={() => setEditingWatchlist(false)} />
+          )}
+
+          {(error || actionError) && (
+            <p className="break-words px-1 py-0.5 text-[10px] text-maestro-red">
+              {actionError ?? error}
+            </p>
+          )}
+
+          {processes === null ? (
+            <div className="flex items-center gap-2 px-1 py-1">
+              <Loader2 size={13} className="shrink-0 animate-spin text-maestro-muted" />
+              <span className="text-xs text-maestro-muted">Scanning...</span>
+            </div>
+          ) : groups.length === 0 ? (
+            <p className="px-1 py-0.5 text-[11px] text-maestro-muted">
+              No watched processes running
+            </p>
+          ) : (
+            <div className="space-y-0.5">
+              {groups.map((group) => {
+                const isMulti = group.procs.length > 1;
+                const groupExpanded = expandedGroups.has(group.key);
+                const repo = dirBasename(group.cwd);
+                return (
+                  <div key={group.key}>
+                    <div
+                      className="group flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-maestro-border/30"
+                      title={group.cmd || group.matched}
+                    >
+                      {isMulti ? (
+                        <button
+                          type="button"
+                          onClick={() => toggleGroup(group.key)}
+                          className="shrink-0 rounded p-px hover:bg-maestro-border/40"
+                          title={groupExpanded ? "Collapse" : "Show each process"}
+                        >
+                          {groupExpanded ? (
+                            <ChevronDown size={11} className="text-maestro-muted" />
+                          ) : (
+                            <ChevronRight size={11} className="text-maestro-muted" />
+                          )}
+                        </button>
+                      ) : (
+                        <span className="w-[13px] shrink-0" />
+                      )}
+                      <span className="min-w-0 flex-1">
+                        <span className="flex items-center gap-1.5">
+                          <span className="truncate text-xs text-maestro-text">
+                            {group.matched}
+                          </span>
+                          {isMulti && (
+                            <span className="shrink-0 rounded bg-maestro-orange/20 px-1 text-[9px] font-bold text-maestro-orange">
+                              ×{group.procs.length}
+                            </span>
+                          )}
+                          {group.anyMaestro && maestroBadge}
+                        </span>
+                        {(repo || group.cmd) && (
+                          <span className="block truncate text-[10px] text-maestro-muted">
+                            {repo ? `${repo} — ` : ""}
+                            {group.cmd || group.procs[0].name}
+                          </span>
+                        )}
+                      </span>
+                      <span className="shrink-0 text-[10px] tabular-nums text-maestro-muted">
+                        {formatMem(group.memoryBytes)}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void (isMulti ? handleKillGroup(group) : handleKillProcess(group.procs[0]))
+                        }
+                        className="shrink-0 rounded p-0.5 text-maestro-muted opacity-0 transition-opacity hover:bg-red-500/15 hover:text-red-400 group-hover:opacity-100"
+                        title={
+                          isMulti
+                            ? `Kill all ${group.procs.length} process trees`
+                            : "Kill this process tree"
+                        }
+                        aria-label={`Kill ${group.matched}`}
+                      >
+                        <Square size={10} />
+                      </button>
+                    </div>
+
+                    {isMulti && groupExpanded && (
+                      <div className="ml-3 border-l border-maestro-border/40 pl-1.5">
+                        {group.procs.map((p) => (
+                          <div
+                            key={p.pid}
+                            className="group flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-maestro-border/30"
+                            title={p.cmd}
+                          >
+                            <span className="flex-1 truncate text-[11px] text-maestro-text/80">
+                              PID {p.pid}
+                            </span>
+                            {p.isMaestro && maestroBadge}
+                            <span className="shrink-0 text-[10px] tabular-nums text-maestro-muted">
+                              {p.cpuPercent >= 0.5 ? `${Math.round(p.cpuPercent)}% · ` : ""}
+                              {formatMem(p.memoryBytes)} · {formatUptime(p.runTimeSecs)}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => void handleKillProcess(p)}
+                              className="shrink-0 rounded p-0.5 text-maestro-muted opacity-0 transition-opacity hover:bg-red-500/15 hover:text-red-400 group-hover:opacity-100"
+                              title="Kill this process tree"
+                              aria-label={`Kill PID ${p.pid}`}
+                            >
+                              <Square size={10} />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {dockerAvailable && (
+            <>
+              <div className="mt-2 mb-1 flex items-center gap-1.5 px-1 text-[10px] font-semibold uppercase tracking-wider text-maestro-muted">
+                <Container size={11} className="text-maestro-muted/80" />
+                <span className="flex-1">Containers</span>
+                {containers.length > 0 && (
+                  <span className="rounded-full bg-maestro-accent/20 px-1.5 text-[10px] font-bold text-maestro-accent">
+                    {containers.length}
+                  </span>
+                )}
+              </div>
+              {containers.length === 0 ? (
+                <p className="px-1 py-0.5 text-[11px] text-maestro-muted">
+                  No running containers
+                </p>
+              ) : (
+                <div className="space-y-0.5">
+                  {containers.map((c) => (
+                    <div
+                      key={c.id}
+                      className="group flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-maestro-border/30"
+                      title={`${c.name} — ${c.image} (${c.status})`}
+                    >
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-xs text-maestro-text">{c.name}</span>
+                        <span className="block truncate text-[10px] text-maestro-muted">
+                          {c.image} — {c.status}
+                        </span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => void handleStopContainer(c)}
+                        className="shrink-0 rounded p-0.5 text-maestro-muted opacity-0 transition-opacity hover:bg-red-500/15 hover:text-red-400 group-hover:opacity-100"
+                        title="Stop this container"
+                        aria-label={`Stop ${c.name}`}
+                      >
+                        <Square size={10} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Inline editor for the watched-tech list (one entry per line or comma). */
+function WatchlistEditor({ onClose }: { onClose: () => void }) {
+  const watchlist = useProcessWatchlistStore((s) => s.watchlist);
+  const setWatchlist = useProcessWatchlistStore((s) => s.setWatchlist);
+  const [draft, setDraft] = useState(watchlist.join("\n"));
+
+  const handleSave = () => {
+    setWatchlist(draft.split(/[\n,]/));
+    onClose();
+  };
+
+  return (
+    <div className="mb-1.5 rounded-md border border-maestro-border/60 bg-maestro-surface p-1.5">
+      <textarea
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        rows={6}
+        spellCheck={false}
+        className="w-full resize-y rounded border border-maestro-border/60 bg-maestro-bg px-1.5 py-1 font-mono text-[11px] text-maestro-text focus:border-maestro-accent focus:outline-none"
+        placeholder={"node\nvite\nuvicorn"}
+      />
+      <p className="mt-1 text-[10px] text-maestro-muted/70">
+        One tech per line. Entries match the executable name exactly; entries of 4+ characters
+        also match anywhere in the command line (so "vite" finds node running vite).
+      </p>
+      <div className="mt-1.5 flex items-center gap-1.5">
+        <button
+          type="button"
+          onClick={handleSave}
+          className="rounded bg-maestro-accent px-2 py-0.5 text-[11px] text-white hover:bg-maestro-accent/80"
+        >
+          Save
+        </button>
+        <button
+          type="button"
+          onClick={onClose}
+          className="rounded px-2 py-0.5 text-[11px] text-maestro-muted hover:bg-maestro-border/40 hover:text-maestro-text"
+        >
+          Cancel
+        </button>
+        <span className="flex-1" />
+        <button
+          type="button"
+          onClick={() => setDraft(DEFAULT_WATCHLIST.join("\n"))}
+          className="rounded px-2 py-0.5 text-[11px] text-maestro-muted hover:bg-maestro-border/40 hover:text-maestro-text"
+          title="Restore the default tech list"
+        >
+          Reset to defaults
+        </button>
+      </div>
+    </div>
+  );
+}

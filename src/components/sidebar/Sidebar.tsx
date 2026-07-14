@@ -57,6 +57,7 @@ import type {
 } from "@/lib/mcp";
 import { listContextDocs, readContextDoc, type ContextDoc } from "@/lib/claudemd";
 import { MemorySection } from "./MemorySection";
+import { ProcessesSection } from "./ProcessesSection";
 import { cardClass, divider, SectionHeader } from "./sectionChrome";
 
 interface SidebarProps {
@@ -314,6 +315,8 @@ function ConfigTab({
     case "infra":
       return (
         <>
+          <ProcessesSection />
+          {divider}
           <ExtensionsSection />
           {divider}
           <ProjectContextSection />
