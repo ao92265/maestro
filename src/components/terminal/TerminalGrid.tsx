@@ -1662,7 +1662,7 @@ function DraggablePane({
   eagleMode?: boolean;
   /** Eagle view: pane has no live terminal (pre-launch) — not shown. */
   eagleHidden?: boolean;
-  /** Eagle view: pane is zoomed to fill the window (position: fixed). */
+  /** Eagle view: pane is zoomed to fill the main content area (position: absolute). */
   eagleZoomed?: boolean;
   /** Eagle view: another pane is zoomed — stop painting under its overlay. */
   eagleObscured?: boolean;
@@ -1732,7 +1732,10 @@ function DraggablePane({
   // Eagle view restyles this container purely with CSS so the children
   // (the live xterm instance) never remount:
   // - hidden:   pre-launch panes don't belong in a terminals-only overview
-  // - zoomed:   position:fixed overlays the whole window, Esc/header returns
+  // - zoomed:   position:absolute overlays the main content area (resolves to
+  //             App's <main>, the nearest positioned ancestor — every eagle
+  //             wrapper in between is display:contents), so the sidebar and
+  //             git panel stay usable while zoomed; Esc/header returns
   // - obscured: another pane is zoomed — visibility:hidden stops WebGL paints
   //             behind the opaque overlay (also excludes it from drop hit-tests)
   // - tile:     plain grid item — the project-colored border is painted by the
@@ -1741,7 +1744,7 @@ function DraggablePane({
     ? "hidden"
     : eagleZoomed
       ? // top-8 leaves room for MultiProjectView's global tab bar (h-8, z-50).
-        "fixed inset-x-0 bottom-0 top-8 z-40 bg-maestro-bg p-2 min-h-0 min-w-0"
+        "absolute inset-x-0 bottom-0 top-8 z-40 bg-maestro-bg p-2 min-h-0 min-w-0"
       : "relative h-full w-full min-h-0 min-w-0 overflow-hidden rounded-md";
   return (
     <div

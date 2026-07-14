@@ -257,12 +257,15 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
       }
     >
       {/* Global zoom tab bar: all running terminals across all projects,
-          color-coded by project. position:fixed lifts it out of the grid flow
-          and above the zoomed pane (z-40); the pane leaves top-8 for it. */}
+          color-coded by project. position:absolute (resolving to App's <main>,
+          the nearest positioned ancestor — this grid container is static) lifts
+          it out of the grid flow and above the zoomed pane (z-40); the pane
+          leaves top-8 for it. Staying inside <main> keeps the sidebar and git
+          panel usable while zoomed, same as the per-project zoom. */}
       {eagleView && eagleZoom !== null && (() => {
         const zoomedIndex = eagleSessions.findIndex((s) => s.sessionId === eagleZoom);
         return (
-          <div className="fixed inset-x-0 top-0 z-50 flex h-8 items-center gap-2 border-b border-maestro-border bg-maestro-surface px-3">
+          <div className="absolute inset-x-0 top-0 z-50 flex h-8 items-center gap-2 border-b border-maestro-border bg-maestro-surface px-3">
             <span className="text-[11px] font-medium uppercase tracking-wider text-maestro-muted">
               Terminal {zoomedIndex + 1}/{eagleSessions.length}
             </span>
