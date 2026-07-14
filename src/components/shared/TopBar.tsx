@@ -238,8 +238,8 @@ export function TopBar({
               ? "text-maestro-accent hover:bg-maestro-accent/10"
               : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
           }`}
-          aria-label="Git graph"
-          title="Git Graph"
+          aria-label="Git"
+          title="Git"
         >
           <GitMerge size={14} />
         </button>

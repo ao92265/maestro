@@ -1,5 +1,6 @@
 import {
   GitBranch,
+  GitFork,
   GitPullRequest,
   CircleDot,
   MessageCircle,
@@ -7,7 +8,14 @@ import {
   StickyNote,
 } from "lucide-react";
 
-export type GitPanelTab = "commits" | "status" | "prs" | "issues" | "discussions" | "notes";
+export type GitPanelTab =
+  | "commits"
+  | "branches"
+  | "status"
+  | "prs"
+  | "issues"
+  | "discussions"
+  | "notes";
 
 /** Tabs that require GitHub auth + the `gh` CLI. */
 export const GITHUB_TABS: ReadonlyArray<GitPanelTab> = ["prs", "issues", "discussions"];
@@ -25,6 +33,7 @@ const TABS: Array<{
   icon: typeof GitBranch;
 }> = [
   { id: "commits", label: "Commits", icon: GitBranch },
+  { id: "branches", label: "Branches", icon: GitFork },
   { id: "status", label: "Status", icon: FileWarning },
   { id: "prs", label: "PRs", icon: GitPullRequest },
   { id: "issues", label: "Issues", icon: CircleDot },

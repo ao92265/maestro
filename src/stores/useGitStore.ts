@@ -94,6 +94,9 @@ interface GitState {
   loadMoreCommits: (repoPath: string, allBranches?: boolean) => Promise<void>;
   checkoutBranch: (repoPath: string, branchName: string) => Promise<void>;
   createBranch: (repoPath: string, branchName: string, startPoint?: string) => Promise<void>;
+  deleteBranch: (repoPath: string, branchName: string, force?: boolean) => Promise<void>;
+  renameBranch: (repoPath: string, oldName: string, newName: string) => Promise<void>;
+  deleteRemoteBranch: (repoPath: string, remoteName: string, branchName: string) => Promise<void>;
   fetchUserConfig: (repoPath: string) => Promise<void>;
   setUserConfig: (
     repoPath: string,
@@ -228,6 +231,46 @@ export const useGitStore = create<GitState>()((set, get) => ({
     } catch (err) {
       console.error("Failed to create branch:", err);
       set({ error: String(err), isLoading: false });
+      throw err;
+    }
+  },
+
+  deleteBranch: async (repoPath: string, branchName: string, force = false) => {
+    set({ error: null });
+    try {
+      await invoke("git_delete_branch", { repoPath, branchName, force });
+      await get().fetchBranches(repoPath);
+    } catch (err) {
+      console.error("Failed to delete branch:", err);
+      set({ error: String(err) });
+      throw err;
+    }
+  },
+
+  renameBranch: async (repoPath: string, oldName: string, newName: string) => {
+    set({ error: null });
+    try {
+      await invoke("git_rename_branch", { repoPath, oldName, newName });
+      // Renaming the checked-out branch changes the current branch name too.
+      await get().fetchCurrentBranch(repoPath);
+      await get().fetchBranches(repoPath);
+    } catch (err) {
+      console.error("Failed to rename branch:", err);
+      set({ error: String(err) });
+      throw err;
+    }
+  },
+
+  deleteRemoteBranch: async (repoPath: string, remoteName: string, branchName: string) => {
+    set({ error: null });
+    try {
+      await invoke("git_delete_remote_branch", { repoPath, remoteName, branchName });
+      // `git push --delete` also drops the local remote-tracking ref, so a
+      // plain branch refetch is enough for the row to disappear.
+      await get().fetchBranches(repoPath);
+    } catch (err) {
+      console.error("Failed to delete remote branch:", err);
+      set({ error: String(err) });
       throw err;
     }
   },

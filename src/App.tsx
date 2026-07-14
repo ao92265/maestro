@@ -40,6 +40,17 @@ import { useUpdateStore } from "./stores/useUpdateStore";
 
 const DEFAULT_SESSION_COUNT = 6;
 
+/** Header title for each git-panel tab (Notes renders its own header). */
+const GIT_PANEL_TITLES: Record<GitPanelTab, string> = {
+  commits: "Commits",
+  branches: "Branches",
+  status: "Status",
+  prs: "Pull Requests",
+  issues: "Issues",
+  discussions: "Discussions",
+  notes: "Notes",
+};
+
 type Theme = "dark" | "light";
 
 function isValidTheme(value: string | null): value is Theme {
@@ -528,8 +539,10 @@ function App() {
                         }
                       </span>
                     )}
-                    <span className="text-sm font-medium text-maestro-text">Commits</span>
-                    {commits.length > 0 && (
+                    <span className="text-sm font-medium text-maestro-text">
+                      {GIT_PANEL_TITLES[gitPanelTab]}
+                    </span>
+                    {gitPanelTab === "commits" && commits.length > 0 && (
                       <span className="rounded-full bg-maestro-accent/15 px-1.5 py-px text-[10px] font-medium text-maestro-accent">
                         {commits.length}
                       </span>

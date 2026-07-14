@@ -1,5 +1,6 @@
 import type { GraphNode } from "../../lib/graphLayout";
 import { NotepadPanel } from "../notepad/NotepadPanel";
+import { BranchesPanel } from "./branches/BranchesPanel";
 import { CommitGraph } from "./CommitGraph";
 import type { GitPanelTab } from "./GitPanelTabs";
 import { PullRequestList } from "./pulls/PullRequestList";
@@ -44,6 +45,8 @@ export function GitPanelContent({
           currentBranch={currentBranch}
         />
       );
+    case "branches":
+      return <BranchesPanel repoPath={repoPath} />;
     case "status":
       return <WorktreeStatusList repoPath={repoPath} />;
     case "prs":
