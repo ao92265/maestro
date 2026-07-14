@@ -16,6 +16,12 @@ interface MarkdownEditorProps {
   /** Extra classes for the textarea (e.g. rounded/border variants). */
   textareaClassName?: string;
   spellCheck?: boolean;
+  /**
+   * Which tab is active when the editor mounts. Use "preview" when the user
+   * opened an existing document to read it (rendered markdown first, one
+   * click away from editing); "edit" (default) when they came to write.
+   */
+  defaultMode?: "edit" | "preview";
 }
 
 /**
@@ -34,10 +40,11 @@ export const MarkdownEditor = forwardRef<HTMLTextAreaElement, MarkdownEditorProp
       heightClassName = "h-80",
       textareaClassName = "",
       spellCheck = false,
+      defaultMode = "edit",
     },
     ref,
   ) {
-    const [mode, setMode] = useState<"edit" | "preview">("edit");
+    const [mode, setMode] = useState<"edit" | "preview">(defaultMode);
 
     const tabClass = (active: boolean) =>
       `flex items-center gap-1 rounded px-2 py-0.5 text-[11px] transition-colors ${
@@ -49,7 +56,11 @@ export const MarkdownEditor = forwardRef<HTMLTextAreaElement, MarkdownEditorProp
     return (
       <div className={`flex flex-col ${className}`}>
         <div className="mb-1.5 flex shrink-0 items-center gap-1">
-          <button type="button" onClick={() => setMode("edit")} className={tabClass(mode === "edit")}>
+          <button
+            type="button"
+            onClick={() => setMode("edit")}
+            className={tabClass(mode === "edit")}
+          >
             <Pencil size={11} />
             Edit
           </button>

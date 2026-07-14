@@ -174,6 +174,9 @@ export function ContextDocEditorModal({
               value={content}
               onChange={setContent}
               placeholder={`Enter ${label} content...`}
+              // Existing docs open rendered (formatted headings/tables); new
+              // docs open straight in the editor since there is nothing to read.
+              defaultMode={exists ? "preview" : "edit"}
             />
           ) : (
             <textarea
