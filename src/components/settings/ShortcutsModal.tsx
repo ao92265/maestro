@@ -32,7 +32,6 @@ function buildGroups(mod: string): ShortcutGroup[] {
         { keys: [mod, "1"], description: "Maximize the focused terminal (toggle)" },
         { keys: ["Alt", "←"], description: "Previous terminal while maximized" },
         { keys: ["Alt", "→"], description: "Next terminal while maximized" },
-        { keys: ["Esc"], description: "Exit maximize view" },
         { keys: [mod, "3-9"], description: "Focus terminal 3-9" },
         { keys: [mod, "0"], description: "Focus terminal 10" },
         { keys: [mod, "["], description: "Cycle to previous terminal" },

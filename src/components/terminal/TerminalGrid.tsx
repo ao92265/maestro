@@ -1370,17 +1370,8 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     setZoomedSlotId(prev => prev === slotId ? null : slotId);
   }, []);
 
-  // Handle Escape key to exit zoom mode
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && zoomedSlotId) {
-        handleToggleZoom(zoomedSlotId);
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [zoomedSlotId, handleToggleZoom]);
+  // Esc deliberately does NOT exit zoom: the focused terminal needs it
+  // (e.g. interrupting Claude). Exit via the header button or Cmd/Ctrl+1.
 
   /** Swap the contents of two leaves so the user can rearrange panes. */
   const handleSwapSlots = useCallback((srcSlotId: string, destSlotId: string) => {
@@ -1596,7 +1587,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
             <button
               onClick={() => handleToggleZoom(zoomedSlotId)}
               className="rounded p-0.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text"
-              title="Exit zoom (Esc)"
+              title="Exit zoom"
             >
               <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -1783,7 +1774,7 @@ function DraggablePane({
   // - zoomed:   position:absolute overlays the main content area (resolves to
   //             App's <main>, the nearest positioned ancestor — every eagle
   //             wrapper in between is display:contents), so the sidebar and
-  //             git panel stay usable while zoomed; Esc/header returns
+  //             git panel stay usable while zoomed; the header button returns
   // - obscured: another pane is zoomed — visibility:hidden stops WebGL paints
   //             behind the opaque overlay (also excludes it from drop hit-tests)
   // - tile:     plain grid item — the project-colored border is painted by the

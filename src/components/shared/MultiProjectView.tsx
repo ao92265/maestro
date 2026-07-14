@@ -109,15 +109,12 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
 
   // Keyboard while eagle-zoomed. Capture phase: xterm stops propagation on
   // keys it handles, so bubble-phase Alt+Arrow would never fire while a
-  // terminal has focus. Esc is left to propagate (xterm sees it, same as the
-  // per-project zoom today).
+  // terminal has focus. Esc deliberately does NOT exit zoom — the focused
+  // terminal needs it (e.g. interrupting Claude); exit via the tab bar's
+  // close button or by clicking the active tab.
   useEffect(() => {
     if (!eagleView || eagleZoom === null) return;
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        setEagleZoom(null);
-        return;
-      }
       if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
       if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
       e.preventDefault();
@@ -340,7 +337,7 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
             <button
               onClick={() => setEagleZoom(null)}
               className="rounded p-0.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text"
-              title="Exit zoom (Esc)"
+              title="Exit zoom"
             >
               <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
