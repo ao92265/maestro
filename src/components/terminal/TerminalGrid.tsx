@@ -1371,7 +1371,6 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
           eagleHidden={false}
           eagleZoomed={isEagleZoomed}
           eagleObscured={isEagleObscured}
-          eagleColor={eagleColor}
         >
           <TerminalView
             key={slot.id}
@@ -1402,7 +1401,6 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
         eagleHidden={eagleMode}
         eagleZoomed={false}
         eagleObscured={false}
-        eagleColor={eagleColor}
       >
       <PreLaunchCard
         key={slot.id}
@@ -1648,7 +1646,6 @@ function DraggablePane({
   eagleHidden = false,
   eagleZoomed = false,
   eagleObscured = false,
-  eagleColor,
 }: {
   slotId: string;
   showHandle: boolean;
@@ -1662,8 +1659,6 @@ function DraggablePane({
   eagleZoomed?: boolean;
   /** Eagle view: another pane is zoomed — stop painting under its overlay. */
   eagleObscured?: boolean;
-  /** Eagle view: project-assigned tile border color. */
-  eagleColor?: string;
 }) {
   const [isDragging, setIsDragging] = useState(false);
 
@@ -1733,7 +1728,8 @@ function DraggablePane({
   // - zoomed:   position:fixed overlays the whole window, Esc/header returns
   // - obscured: another pane is zoomed — visibility:hidden stops WebGL paints
   //             behind the opaque overlay (also excludes it from drop hit-tests)
-  // - tile:     grid item with the project's assigned border color
+  // - tile:     plain grid item — the project-colored border is painted by the
+  //             terminal cell itself (TerminalView's projectColor override)
   const eagleClass = eagleHidden
     ? "hidden"
     : eagleZoomed
@@ -1747,11 +1743,8 @@ function DraggablePane({
       // file drag-and-drop hit-testing working on the visible tile box.
       data-slot-id={eagleMode && !eagleHidden ? slotId : undefined}
       style={
-        eagleMode && !eagleHidden
-          ? {
-              ...(eagleColor ? { border: `2px solid ${eagleColor}` } : undefined),
-              ...(eagleObscured ? { visibility: "hidden" as const } : undefined),
-            }
+        eagleMode && !eagleHidden && eagleObscured
+          ? { visibility: "hidden" }
           : undefined
       }
     >
