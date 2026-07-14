@@ -4,6 +4,27 @@ use std::path::Path;
 use super::error::GitError;
 use super::runner::Git;
 
+/// Rejects a ref/branch name that git would parse as a command-line option
+/// (i.e. one starting with `-`).
+///
+/// Branch and ref names can be attacker-influenced: a malicious repository can
+/// plant a ref such as `refs/heads/-m` via plumbing, which survives clone/fetch
+/// and surfaces in the branch selector as `origin/-m`. When such a value is
+/// passed positionally to a git subcommand (e.g. `git branch -m …`,
+/// `git checkout --detach`), git parses it as an option, letting a third party
+/// mutate the victim's repository. Callers pass attacker-derived refs through
+/// this guard before using them positionally.
+fn reject_option_like_ref(value: &str) -> Result<(), GitError> {
+    if value.starts_with('-') {
+        return Err(GitError::CommandFailed {
+            code: -1,
+            stderr: format!("refusing to use a ref that looks like an option: {value}"),
+            command: String::new(),
+        });
+    }
+    Ok(())
+}
+
 /// A local or remote branch returned by `list_branches`.
 ///
 /// Remote branches have `is_remote = true` and names like `origin/main`.
@@ -317,6 +338,7 @@ impl Git {
         // Collect owned strings to extend their lifetime
         let branch_flag;
         if let Some(branch) = new_branch {
+            reject_option_like_ref(branch)?;
             branch_flag = branch.to_string();
             args.push("-b");
             args.push(&branch_flag);
@@ -326,6 +348,7 @@ impl Git {
 
         let checkout_ref_owned;
         if let Some(cr) = checkout_ref {
+            reject_option_like_ref(cr)?;
             checkout_ref_owned = cr.to_string();
             args.push(&checkout_ref_owned);
         }
@@ -433,10 +456,15 @@ impl Git {
     /// For local branches, uses `git checkout <name>`.
     /// For remote branches like `origin/feature`, creates a local tracking branch.
     pub async fn checkout_branch(&self, name: &str) -> Result<(), GitError> {
+        // `git checkout` uses `--` to separate refs from pathspecs, so it cannot
+        // guard a ref positional; reject option-like refs instead.
+        reject_option_like_ref(name)?;
+
         // Check if this is a remote branch reference
         if name.contains('/') {
             // Try to extract the local branch name from remote ref (e.g., "origin/main" -> "main")
             if let Some(local_name) = name.split('/').last() {
+                reject_option_like_ref(local_name)?;
                 // First try checking out the local branch if it exists
                 match self.run(&["checkout", local_name]).await {
                     Ok(_) => return Ok(()),
@@ -464,8 +492,11 @@ impl Git {
         name: &str,
         start_point: Option<&str>,
     ) -> Result<(), GitError> {
-        let mut args = vec!["branch", name];
+        reject_option_like_ref(name)?;
+        // `--` stops git from parsing the branch name / start-point as options.
+        let mut args = vec!["branch", "--", name];
         if let Some(point) = start_point {
+            reject_option_like_ref(point)?;
             args.push(point);
         }
         self.run(&args).await?;
@@ -1115,6 +1146,31 @@ mod tests {
         git.run(&["commit", "-m", "initial"]).await.unwrap();
 
         (dir, git)
+    }
+
+    #[test]
+    fn reject_option_like_ref_guards_dash_prefixed_names() {
+        assert!(reject_option_like_ref("-m").is_err());
+        assert!(reject_option_like_ref("--detach").is_err());
+        assert!(reject_option_like_ref("-D").is_err());
+        assert!(reject_option_like_ref("main").is_ok());
+        assert!(reject_option_like_ref("feature/x").is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_branch_rejects_option_like_name() {
+        // A ref like `origin/-m` strips to `-m`, which git would parse as the
+        // rename flag and silently rename the current branch. Must be rejected
+        // before reaching git.
+        let (_dir, git) = create_test_repo().await;
+        let err = git.create_branch("-m", Some("origin/-m")).await;
+        assert!(err.is_err(), "create_branch must reject a dash-prefixed name");
+        // The real branch set is unchanged (no rename happened).
+        let branches = git.list_branches().await.unwrap();
+        assert!(
+            branches.iter().all(|b| !b.name.starts_with('-')),
+            "no dash-named branch should have been created"
+        );
     }
 
     #[tokio::test]
