@@ -15,15 +15,16 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ContextDocEditorModal } from "@/components/claudemd";
 import { MarkdownEditor } from "@/components/shared/MarkdownEditor";
-import { listContextDocs, readContextDoc, type ContextDoc } from "@/lib/claudemd";
+import { type ContextDoc, listContextDocs, readContextDoc } from "@/lib/claudemd";
 import {
   deleteMemoryFile,
+  deleteMemoryProject,
   listMemoryFiles,
   listMemoryProjects,
-  readMemoryFile,
-  writeMemoryFile,
   type MemoryFile,
   type MemoryProject,
+  readMemoryFile,
+  writeMemoryFile,
 } from "@/lib/memory";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { cardClass, SectionHeader } from "./sectionChrome";
@@ -155,6 +156,32 @@ export function MemorySection() {
     }
   };
 
+  const handleDeleteProject = async (project: MemoryProject) => {
+    const confirmed = await ask(
+      `Delete all ${project.fileCount} memory file${project.fileCount === 1 ? "" : "s"} of "${
+        project.dirName
+      }"? Claude will no longer recall anything about this project.`,
+      { title: "Delete Project Memory", kind: "warning" },
+    ).catch(() => false);
+    if (!confirmed) return;
+    try {
+      await deleteMemoryProject(project.dirName);
+      setProjects((prev) => prev.filter((p) => p.dirName !== project.dirName));
+      setFilesByDir((prev) => {
+        const next = { ...prev };
+        delete next[project.dirName];
+        return next;
+      });
+      setExpandedDirs((prev) => {
+        const next = new Set(prev);
+        next.delete(project.dirName);
+        return next;
+      });
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
   const totalFiles = projects.reduce((n, p) => n + p.fileCount, 0);
 
   return (
@@ -240,35 +267,45 @@ export function MemorySection() {
               const files = filesByDir[project.dirName];
               return (
                 <div key={project.dirName}>
-                  <button
-                    type="button"
-                    onClick={() => toggleProject(project.dirName)}
-                    title={project.memoryPath}
-                    className="flex w-full items-center gap-1.5 rounded-md px-1 py-1 text-left hover:bg-maestro-border/40"
-                  >
-                    {expanded ? (
-                      <ChevronDown size={11} className="shrink-0 text-maestro-muted" />
-                    ) : (
-                      <ChevronRight size={11} className="shrink-0 text-maestro-muted" />
-                    )}
-                    <span
-                      className={`flex-1 truncate text-xs ${
-                        project.isActive
-                          ? "font-semibold text-maestro-text"
-                          : "text-maestro-text/80"
-                      }`}
+                  <div className="group flex items-center gap-1.5 rounded-md px-1 py-1 hover:bg-maestro-border/40">
+                    <button
+                      type="button"
+                      onClick={() => toggleProject(project.dirName)}
+                      title={project.memoryPath}
+                      className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
                     >
-                      {project.dirName}
-                    </span>
-                    {project.isActive && (
-                      <span className="shrink-0 rounded bg-maestro-accent/20 px-1 text-[9px] font-bold text-maestro-accent">
-                        CURRENT
+                      {expanded ? (
+                        <ChevronDown size={11} className="shrink-0 text-maestro-muted" />
+                      ) : (
+                        <ChevronRight size={11} className="shrink-0 text-maestro-muted" />
+                      )}
+                      <span
+                        className={`flex-1 truncate text-xs ${
+                          project.isActive
+                            ? "font-semibold text-maestro-text"
+                            : "text-maestro-text/80"
+                        }`}
+                      >
+                        {project.dirName}
                       </span>
-                    )}
-                    <span className="shrink-0 text-[10px] text-maestro-muted">
-                      {project.fileCount}
-                    </span>
-                  </button>
+                      {project.isActive && (
+                        <span className="shrink-0 rounded bg-maestro-accent/20 px-1 text-[9px] font-bold text-maestro-accent">
+                          CURRENT
+                        </span>
+                      )}
+                      <span className="shrink-0 text-[10px] text-maestro-muted">
+                        {project.fileCount}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleDeleteProject(project)}
+                      className="shrink-0 rounded p-0.5 opacity-0 transition-opacity hover:bg-maestro-red/10 group-hover:opacity-100"
+                      title="Delete all memories of this project"
+                    >
+                      <Trash2 size={10} className="text-maestro-red" />
+                    </button>
+                  </div>
 
                   {expanded && (
                     <div className="ml-2 border-l border-maestro-border/40 pl-1.5">
@@ -431,7 +468,11 @@ function MemoryFileEditorModal({
               {dirName}
             </span>
           </div>
-          <button type="button" onClick={onClose} className="rounded p-1 hover:bg-maestro-border/40">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded p-1 hover:bg-maestro-border/40"
+          >
             <X size={16} className="text-maestro-muted" />
           </button>
         </div>
@@ -441,7 +482,12 @@ function MemoryFileEditorModal({
             {file.path}
           </p>
 
-          <MarkdownEditor value={content} onChange={setContent} placeholder="Memory content..." />
+          <MarkdownEditor
+            value={content}
+            onChange={setContent}
+            placeholder="Memory content..."
+            defaultMode="preview"
+          />
 
           <p className="mt-2 text-[10px] text-maestro-muted/70">
             Heads up: if a Claude session is running in this project, it may save new memories and

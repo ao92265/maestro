@@ -358,6 +358,7 @@ pub fn run() {
             commands::memory::read_memory_file,
             commands::memory::write_memory_file,
             commands::memory::delete_memory_file,
+            commands::memory::delete_memory_project,
             // Font detection commands
             commands::fonts::get_available_fonts,
             commands::fonts::check_font_available,

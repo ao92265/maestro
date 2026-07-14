@@ -314,6 +314,22 @@ pub async fn delete_memory_file(dir_name: String, rel_path: String) -> Result<()
         .map_err(|e| format!("Failed to delete {rel_path}: {e}"))
 }
 
+/// Deletes a project's entire memory directory (every remembered fact plus
+/// the MEMORY.md index). Only the `memory/` subdirectory is removed — session
+/// transcripts and other data under the project dir are untouched.
+#[tauri::command]
+pub async fn delete_memory_project(dir_name: String) -> Result<(), String> {
+    validate_dir_name(&dir_name)?;
+    let memory_dir = projects_root()?.join(&dir_name).join("memory");
+    if !memory_dir.is_dir() {
+        // Already gone — treat as success so the UI can just drop the row.
+        return Ok(());
+    }
+    tokio::fs::remove_dir_all(&memory_dir)
+        .await
+        .map_err(|e| format!("Failed to delete memory of {dir_name}: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

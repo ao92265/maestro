@@ -62,3 +62,8 @@ export async function writeMemoryFile(
 export async function deleteMemoryFile(dirName: string, relPath: string): Promise<void> {
   return invoke<void>("delete_memory_file", { dirName, relPath });
 }
+
+/** Delete a project's entire memory directory (all facts + the index). */
+export async function deleteMemoryProject(dirName: string): Promise<void> {
+  return invoke<void>("delete_memory_project", { dirName });
+}
