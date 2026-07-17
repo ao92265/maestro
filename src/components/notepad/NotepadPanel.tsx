@@ -16,8 +16,8 @@ import { useNotesStore } from "@/stores/useNotesStore";
  * Notes are fully user-managed: created via the "New" button, deleted via the
  * X — nothing is auto-created or auto-removed behind the user's back.
  *
- * Layout note: this lives inside the existing `GitGraphPanel`'s flex column,
- * so it fills the remaining height under the tab bar without needing fixed
+ * Layout note: this lives inside the `UtilityPanel`'s flex column, so it
+ * fills the remaining height under the panel header without needing fixed
  * sizing.
  */
 export function NotepadPanel() {

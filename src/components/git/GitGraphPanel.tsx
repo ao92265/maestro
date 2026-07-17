@@ -269,8 +269,7 @@ export function GitGraphPanel({
         <>
           {/* Main panel */}
           <div className="flex min-w-[320px] flex-1 flex-col">
-            {/* Tabs — shown whenever the panel is open. The Notes tab works
-                without a repo, so we no longer gate the tab strip on hasRepo. */}
+            {/* Tabs — shown whenever the panel is open */}
             <GitPanelTabs
               activeTab={activeTab}
               onTabChange={handleTabChange}
@@ -279,22 +278,7 @@ export function GitGraphPanel({
             />
 
             {/* Content */}
-            {activeTab === "notes" ? (
-              // Notes work independently of any repository / GitHub auth.
-              <GitPanelContent
-                activeTab={activeTab}
-                repoPath={repoPath ?? ""}
-                currentBranch={currentBranch}
-                onSelectCommit={handleSelectCommit}
-                selectedCommitHash={selectedNode?.commit.hash ?? null}
-                onSelectPR={handleSelectPR}
-                selectedPRNumber={selectedPRNumber}
-                onSelectIssue={handleSelectIssue}
-                selectedIssueNumber={selectedIssueNumber}
-                onSelectDiscussion={handleSelectDiscussion}
-                selectedDiscussionNumber={selectedDiscussionNumber}
-              />
-            ) : !hasRepo ? (
+            {!hasRepo ? (
               // Empty state - no repo
               <div className="flex flex-1 items-center justify-center px-4 text-center">
                 <div className="flex flex-col items-center gap-3">
