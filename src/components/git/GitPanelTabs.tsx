@@ -45,7 +45,7 @@ const TABS: Array<{
 
 export function GitPanelTabs({ activeTab, onTabChange, prCount, issueCount }: GitPanelTabsProps) {
   return (
-    <div className="flex shrink-0 border-b border-maestro-border">
+    <div className="flex shrink-0 overflow-x-auto border-b border-maestro-border">
       {TABS.map((tab) => {
         const Icon = tab.icon;
         const isActive = activeTab === tab.id;
@@ -60,7 +60,7 @@ export function GitPanelTabs({ activeTab, onTabChange, prCount, issueCount }: Gi
             key={tab.id}
             type="button"
             onClick={() => onTabChange(tab.id)}
-            className={`flex items-center gap-1.5 px-3 py-2 text-xs transition-colors ${
+            className={`flex shrink-0 items-center gap-1 whitespace-nowrap px-2 py-2 text-xs transition-colors ${
               isActive
                 ? "border-b-2 border-maestro-accent text-maestro-accent"
                 : "text-maestro-muted hover:text-maestro-text"
