@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { GitFork, RefreshCw, StickyNote, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { MAC_TITLE_BAR_INSET_PX, useMacTitleBarPadding } from "@/hooks/useMacTitleBarPadding";
@@ -417,6 +418,28 @@ function App() {
   }, []);
 
   const handleToggleSidebar = useCallback(() => setSidebarOpen((prev) => !prev), []);
+
+  // Closing a project tab terminates every terminal running in it, so when the
+  // tab has live sessions we confirm first. `getState()` (not the reactive
+  // `tabs` closure) keeps this callback stable and always reads fresh counts.
+  const handleCloseTab = useCallback(
+    async (id: string) => {
+      const tab = useWorkspaceStore.getState().tabs.find((t) => t.id === id);
+      const count = tab?.sessionIds.length ?? 0;
+      if (count > 0) {
+        const confirmed = await ask(
+          `Close "${tab?.name}"? This will terminate ${count} running terminal${
+            count === 1 ? "" : "s"
+          } in this project.`,
+          { title: "Close project", kind: "warning" },
+        ).catch(() => false);
+        if (!confirmed) return;
+      }
+      closeTab(id);
+    },
+    [closeTab],
+  );
+
   // Ctrl/Cmd+2 always lands the panel on the Status tab when toggling open.
   // Manual tab switches while the panel is open are preserved until the next open.
   const handleToggleGitPanel = useCallback(() => {
@@ -468,7 +491,7 @@ function App() {
           color: projectColors.get(t.name) ?? projectColorFor(t.name),
         }))}
         onSelectTab={selectTab}
-        onCloseTab={closeTab}
+        onCloseTab={handleCloseTab}
         onNewTab={handleOpenProject}
         onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
         sidebarOpen={sidebarOpen}
