@@ -99,6 +99,16 @@
     -webkit-user-select: none;
     -moz-user-select: none;
   }
+
+  /* Scrollable containers that must not render a scrollbar (e.g. tab strips). */
+  .scrollbar-none {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
 }
 
 /* ── Split Pane Dividers ── */

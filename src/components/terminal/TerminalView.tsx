@@ -4,6 +4,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { writeText as writeClipboardText } from "@tauri-apps/plugin-clipboard-manager";
 import { memo, useCallback, useEffect, useRef, useState } from "react";
@@ -272,17 +273,26 @@ export const TerminalView = memo(function TerminalView({
   }, [fontSize, fontFamily, lineHeight, zoomLevel, getEffectiveFontFamily, getEffectiveFontSize]);
 
   /**
-   * Immediately removes the terminal from UI (optimistic update),
-   * then kills the backend session in the background.
+   * Confirms with the user first (same dialog as the Cmd/Ctrl+W close path),
+   * then immediately removes the terminal from UI (optimistic update) and
+   * kills the backend session in the background.
    */
   const handleKill = useCallback(
     (id: number) => {
-      // Update UI immediately (optimistic)
-      onKill(id);
-      // Kill session in background - don't await
-      killSession(id).catch((err) => {
-        console.error("Failed to kill session:", err);
-      });
+      ask("Are you sure you want to close this session?", {
+        title: "Close Session",
+        kind: "warning",
+      })
+        .then((confirmed) => {
+          if (!confirmed) return;
+          // Update UI immediately (optimistic)
+          onKill(id);
+          // Kill session in background - don't await
+          killSession(id).catch((err) => {
+            console.error("Failed to kill session:", err);
+          });
+        })
+        .catch(console.error);
     },
     [onKill],
   );

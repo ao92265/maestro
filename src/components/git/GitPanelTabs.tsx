@@ -34,7 +34,7 @@ const TABS: Array<{
 
 export function GitPanelTabs({ activeTab, onTabChange, prCount, issueCount }: GitPanelTabsProps) {
   return (
-    <div className="flex shrink-0 overflow-x-auto border-b border-maestro-border">
+    <div className="scrollbar-none flex shrink-0 overflow-x-auto border-b border-maestro-border">
       {TABS.map((tab) => {
         const Icon = tab.icon;
         const isActive = activeTab === tab.id;

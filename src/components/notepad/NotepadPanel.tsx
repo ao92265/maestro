@@ -158,7 +158,7 @@ export function NotepadPanel() {
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col">
       {/* Tab strip */}
-      <div className="flex shrink-0 items-center gap-px overflow-x-auto border-b border-maestro-border bg-maestro-bg">
+      <div className="scrollbar-none flex shrink-0 items-center gap-px overflow-x-auto border-b border-maestro-border bg-maestro-bg">
         {notes.map((note) => {
           const isActive = note.id === activeNoteId;
           const isRenaming = note.id === renamingId;
