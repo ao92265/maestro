@@ -37,6 +37,7 @@ function buildProc(overrides: Partial<DevProcess> = {}): DevProcess {
     runTimeSecs: 3700,
     isMaestro: false,
     matched: "vite",
+    ports: [],
     ...overrides,
   };
 }
@@ -119,6 +120,25 @@ describe("ProcessesSection", () => {
 
     await waitFor(() => expect(askMock).toHaveBeenCalledOnce());
     expect(invokeMock).not.toHaveBeenCalledWith("kill_process_tree", expect.anything());
+  });
+
+  it("flags a port-holding server that no open project owns, and shows its port", async () => {
+    // No projects are open (persisted store is stubbed empty), so a vite server
+    // listening on :5173 that Maestro didn't launch is a likely leftover.
+    mockInvoke({
+      processes: [
+        buildProc({
+          pid: 300,
+          cwd: "C:\\git\\some-closed-project",
+          isMaestro: false,
+          ports: [5173],
+        }),
+      ],
+    });
+    render(<ProcessesSection />);
+
+    expect(await screen.findByText("STALE")).toBeInTheDocument();
+    expect(screen.getByText(":5173")).toBeInTheDocument();
   });
 
   it("shows Docker containers when the daemon is reachable, hides them otherwise", async () => {

@@ -23,6 +23,9 @@ export interface DevProcess {
   isMaestro: boolean;
   /** The watchlist entry that matched (drives grouping). */
   matched: string;
+  /** TCP ports this process is LISTENING on, sorted ascending. Empty when it
+   *  holds none or the OS port tool was unavailable. */
+  ports: number[];
 }
 
 /** One running Docker container. Mirrors Rust `DockerContainer`. */
