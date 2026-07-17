@@ -186,6 +186,46 @@ export async function removeFile(
   return invoke<void>("git_remove_file", { worktreePath, path });
 }
 
+/** Which two versions of a file a diff compares. */
+export type FileDiffMode = "staged" | "unstaged" | "untracked";
+
+/**
+ * Diff of a single working-tree file, as returned by the backend.
+ * For tracked files `diff` holds raw unified diff text (empty when binary).
+ * For untracked files `content` holds the full file text instead.
+ */
+export interface FileDiff {
+  path: string;
+  old_path: string | null;
+  is_binary: boolean;
+  is_untracked: boolean;
+  diff: string;
+  content: string | null;
+}
+
+/**
+ * Fetches the diff of a single file for the side-by-side diff viewer.
+ *
+ * @param worktreePath - Absolute path to the worktree the file lives in
+ * @param path - Repo-relative path of the file
+ * @param mode - "staged" (HEAD → index), "unstaged" (index → worktree), or
+ *               "untracked" (full content, no old version)
+ * @param oldPath - Original path for a renamed file
+ */
+export async function getFileDiff(
+  worktreePath: string,
+  path: string,
+  mode: FileDiffMode,
+  oldPath?: string | null
+): Promise<FileDiff> {
+  return invoke<FileDiff>("git_file_diff", {
+    worktreePath,
+    path,
+    mode,
+    oldPath: oldPath ?? null,
+  });
+}
+
 /**
  * `true` when the worktree has anything that would be lost on delete:
  * unpushed commits, working-tree changes, or stashes.

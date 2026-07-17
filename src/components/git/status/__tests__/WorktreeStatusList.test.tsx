@@ -27,7 +27,8 @@ function buildStatus(overrides: Partial<WorktreeStatus> = {}): WorktreeStatus {
 /**
  * Routes the global `invoke` mock by command name. `git_worktrees_status`
  * returns the next entry from `statuses` (so a post-action poll can differ);
- * the file-action commands resolve to undefined and are asserted on directly.
+ * `git_file_diff` returns a minimal one-line-changed diff; the file-action
+ * commands resolve to undefined and are asserted on directly.
  */
 function mockInvoke(statuses: WorktreeStatus[][]) {
   let call = 0;
@@ -36,6 +37,23 @@ function mockInvoke(statuses: WorktreeStatus[][]) {
       const idx = Math.min(call, statuses.length - 1);
       call += 1;
       return statuses[idx];
+    }
+    if (cmd === "git_file_diff") {
+      return {
+        path: "src/foo.ts",
+        old_path: null,
+        is_binary: false,
+        is_untracked: false,
+        diff: [
+          "--- a/src/foo.ts",
+          "+++ b/src/foo.ts",
+          "@@ -1,1 +1,1 @@",
+          "-old line",
+          "+new line",
+          "",
+        ].join("\n"),
+        content: null,
+      };
     }
     return undefined;
   });
@@ -116,6 +134,31 @@ describe("WorktreeStatusList file actions", () => {
         path: "junk.txt",
       });
     });
+  });
+
+  it("opens the side-by-side diff modal when a file name is clicked", async () => {
+    mockInvoke([[buildStatus()]]);
+    render(<WorktreeStatusList repoPath="/repo/main" />);
+
+    fireEvent.click(await screen.findByText("src/foo.ts"));
+
+    // An unstaged file requests the index → worktree comparison.
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("git_file_diff", {
+        worktreePath: "/repo/main",
+        path: "src/foo.ts",
+        mode: "unstaged",
+        oldPath: null,
+      });
+    });
+
+    // Old version on the left, current version on the right.
+    expect(await screen.findByText("old line")).toBeInTheDocument();
+    expect(screen.getByText("new line")).toBeInTheDocument();
+
+    // Closing the modal removes the diff.
+    fireEvent.click(screen.getByRole("button", { name: "Close diff" }));
+    expect(screen.queryByText("old line")).not.toBeInTheDocument();
   });
 
   it("surfaces a backend error and keeps the file listed", async () => {

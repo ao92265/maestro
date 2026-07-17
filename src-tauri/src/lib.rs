@@ -250,6 +250,7 @@ pub fn run() {
             commands::git::git_worktrees_status,
             commands::git::git_discard_file,
             commands::git::git_remove_file,
+            commands::git::git_file_diff,
             commands::git::git_commit_log,
             commands::git::git_checkout_branch,
             commands::git::git_create_branch,

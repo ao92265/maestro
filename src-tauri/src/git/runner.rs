@@ -149,6 +149,11 @@ impl Git {
         }
     }
 
+    /// Path of the repository/worktree this runner targets.
+    pub fn repo_path(&self) -> &Path {
+        &self.repo_path
+    }
+
     /// Executes a git subcommand with the default 30-second timeout.
     ///
     /// Returns `GitNotFound` if the git binary is missing, `SpawnError` for

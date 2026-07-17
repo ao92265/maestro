@@ -21,13 +21,23 @@ import {
   getWorktreesStatus,
   isWorktreeAtRisk,
   removeFile,
+  type FileDiffMode,
   type FileStatusEntry,
   type FileStatusKind,
   type WorktreeStatus,
 } from "../../../lib/git";
+import { FileDiffModal } from "./FileDiffModal";
 
 interface WorktreeStatusListProps {
   repoPath: string;
+}
+
+/** File selected in the list, shown in the side-by-side diff modal. */
+interface SelectedFile {
+  worktreePath: string;
+  path: string;
+  oldPath: string | null;
+  mode: FileDiffMode;
 }
 
 const POLL_INTERVAL_MS = 15_000;
@@ -36,6 +46,7 @@ export function WorktreeStatusList({ repoPath }: WorktreeStatusListProps) {
   const [worktrees, setWorktrees] = useState<WorktreeStatus[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -100,9 +111,23 @@ export function WorktreeStatusList({ repoPath }: WorktreeStatusListProps) {
       </div>
       <div className="flex-1 overflow-y-auto">
         {worktrees.map((wt) => (
-          <WorktreeCard key={wt.path} status={wt} onChanged={refresh} />
+          <WorktreeCard
+            key={wt.path}
+            status={wt}
+            onChanged={refresh}
+            onSelectFile={setSelectedFile}
+          />
         ))}
       </div>
+      {selectedFile && (
+        <FileDiffModal
+          worktreePath={selectedFile.worktreePath}
+          path={selectedFile.path}
+          oldPath={selectedFile.oldPath}
+          mode={selectedFile.mode}
+          onClose={() => setSelectedFile(null)}
+        />
+      )}
     </div>
   );
 }
@@ -110,9 +135,11 @@ export function WorktreeStatusList({ repoPath }: WorktreeStatusListProps) {
 function WorktreeCard({
   status,
   onChanged,
+  onSelectFile,
 }: {
   status: WorktreeStatus;
   onChanged: () => void;
+  onSelectFile: (file: SelectedFile) => void;
 }) {
   const [expanded, setExpanded] = useState(true);
   const atRisk = isWorktreeAtRisk(status);
@@ -204,6 +231,14 @@ function WorktreeCard({
                 entry={f}
                 worktreePath={status.path}
                 onChanged={onChanged}
+                onOpenDiff={() =>
+                  onSelectFile({
+                    worktreePath: status.path,
+                    path: f.path,
+                    oldPath: f.old_path,
+                    mode: "staged",
+                  })
+                }
               />
             ))}
           </Section>
@@ -220,6 +255,14 @@ function WorktreeCard({
                 entry={f}
                 worktreePath={status.path}
                 onChanged={onChanged}
+                onOpenDiff={() =>
+                  onSelectFile({
+                    worktreePath: status.path,
+                    path: f.path,
+                    oldPath: f.old_path,
+                    mode: "unstaged",
+                  })
+                }
               />
             ))}
           </Section>
@@ -236,6 +279,14 @@ function WorktreeCard({
                 path={path}
                 worktreePath={status.path}
                 onChanged={onChanged}
+                onOpenDiff={() =>
+                  onSelectFile({
+                    worktreePath: status.path,
+                    path,
+                    oldPath: null,
+                    mode: "untracked",
+                  })
+                }
               />
             ))}
           </Section>
@@ -339,10 +390,12 @@ function FileRow({
   entry,
   worktreePath,
   onChanged,
+  onOpenDiff,
 }: {
   entry: FileStatusEntry;
   worktreePath: string;
   onChanged: () => void;
+  onOpenDiff: () => void;
 }) {
   return (
     <li className="group flex items-center gap-2 px-1 py-0.5 text-[11px]">
@@ -352,9 +405,14 @@ function FileRow({
       >
         {statusLetter(entry.status)}
       </span>
-      <span className="min-w-0 flex-1 truncate text-maestro-text">
+      <button
+        type="button"
+        onClick={onOpenDiff}
+        title="View changes side by side"
+        className="min-w-0 flex-1 truncate text-left text-maestro-text hover:text-maestro-accent hover:underline"
+      >
         {entry.old_path ? `${entry.old_path} → ${entry.path}` : entry.path}
-      </span>
+      </button>
       <RowAction
         label="Restore"
         title="Discard changes — restore this file to its last commit"
@@ -370,14 +428,23 @@ function UntrackedRow({
   path,
   worktreePath,
   onChanged,
+  onOpenDiff,
 }: {
   path: string;
   worktreePath: string;
   onChanged: () => void;
+  onOpenDiff: () => void;
 }) {
   return (
     <li className="group flex items-center gap-2 px-1 py-0.5 text-[11px]">
-      <span className="min-w-0 flex-1 truncate text-maestro-text">{path}</span>
+      <button
+        type="button"
+        onClick={onOpenDiff}
+        title="View file contents"
+        className="min-w-0 flex-1 truncate text-left text-maestro-text hover:text-maestro-accent hover:underline"
+      >
+        {path}
+      </button>
       <RowAction
         label="Remove"
         title="Delete this untracked file from disk"

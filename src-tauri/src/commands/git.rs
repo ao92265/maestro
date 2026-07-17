@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use crate::git::{
-    BranchInfo, CommitInfo, FileChange, Git, GitError, GitUserConfig, RemoteInfo, WorktreeInfo,
-    WorktreeStatus,
+    BranchInfo, CommitInfo, FileChange, FileDiff, FileDiffMode, Git, GitError, GitUserConfig,
+    RemoteInfo, WorktreeInfo, WorktreeStatus,
 };
 
 /// Information about a detected repository or directory within a workspace.
@@ -160,6 +160,32 @@ pub async fn git_remove_file(
     validate_repo_path(&worktree_path)?;
     let git = Git::new(&worktree_path);
     git.remove_file(&path).await
+}
+
+/// Exposes `Git::file_diff` to the frontend.
+///
+/// Returns the unified diff (or full content for untracked files) of a single
+/// file in `worktree_path`. `mode` is "staged", "unstaged", or "untracked".
+#[tauri::command]
+pub async fn git_file_diff(
+    worktree_path: String,
+    path: String,
+    old_path: Option<String>,
+    mode: String,
+) -> Result<FileDiff, GitError> {
+    validate_repo_path(&worktree_path)?;
+    let mode = match mode.as_str() {
+        "staged" => FileDiffMode::Staged,
+        "unstaged" => FileDiffMode::Unstaged,
+        "untracked" => FileDiffMode::Untracked,
+        other => {
+            return Err(GitError::ParseError {
+                message: format!("unknown diff mode: {other}"),
+            })
+        }
+    };
+    let git = Git::new(&worktree_path);
+    git.file_diff(&path, old_path.as_deref(), mode).await
 }
 
 /// Exposes `Git::commit_log` to the frontend.

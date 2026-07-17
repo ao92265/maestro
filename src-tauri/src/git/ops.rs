@@ -165,6 +165,35 @@ pub struct StashEntry {
     pub branch: Option<String>,
 }
 
+/// Which two versions of a file [`Git::file_diff`] compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileDiffMode {
+    /// HEAD → index (`git diff --cached`).
+    Staged,
+    /// Index → working tree (`git diff`).
+    Unstaged,
+    /// Untracked file — no old version exists; the full content is returned.
+    Untracked,
+}
+
+/// Diff of a single working-tree file for the side-by-side diff viewer.
+///
+/// For tracked files `diff` holds the raw unified diff text (empty when the
+/// file is binary). For untracked files `content` holds the full file text
+/// and `diff` is empty, since there is no old version to compare against.
+#[derive(Debug, Clone, Serialize)]
+pub struct FileDiff {
+    pub path: String,
+    pub old_path: Option<String>,
+    pub is_binary: bool,
+    pub is_untracked: bool,
+    pub diff: String,
+    pub content: Option<String>,
+}
+
+/// Maximum size (in bytes) of an untracked file the diff viewer will load.
+const MAX_DIFF_FILE_BYTES: u64 = 1024 * 1024;
+
 impl Git {
     /// Lists all local and remote branches, excluding `HEAD` pointer entries.
     ///
@@ -1102,6 +1131,94 @@ impl Git {
         Ok(())
     }
 
+    /// Returns the diff of a single working-tree file for the side-by-side
+    /// diff viewer. `mode` picks the comparison: staged (HEAD → index),
+    /// unstaged (index → working tree), or untracked (full content, no old
+    /// version). Paths are passed after `--` so option-like names cannot be
+    /// injected as flags.
+    pub async fn file_diff(
+        &self,
+        path: &str,
+        old_path: Option<&str>,
+        mode: FileDiffMode,
+    ) -> Result<FileDiff, GitError> {
+        if mode == FileDiffMode::Untracked {
+            return self.untracked_file_diff(path).await;
+        }
+
+        let mut args = vec!["diff", "--no-color", "--no-ext-diff"];
+        if mode == FileDiffMode::Staged {
+            args.push("--cached");
+        }
+        args.push("--");
+        if let Some(old) = old_path {
+            args.push(old);
+        }
+        args.push(path);
+
+        let output = self.run(&args).await?;
+        // With --no-color, git reports binary content with a single
+        // "Binary files a/… and b/… differ" line instead of a text patch.
+        let is_binary = output
+            .stdout
+            .lines()
+            .any(|l| l.starts_with("Binary files ") && l.ends_with(" differ"));
+
+        Ok(FileDiff {
+            path: path.to_string(),
+            old_path: old_path.map(str::to_string),
+            is_binary,
+            is_untracked: false,
+            diff: if is_binary { String::new() } else { output.stdout },
+            content: None,
+        })
+    }
+
+    /// Builds the [`FileDiff`] for an untracked file by reading it from disk.
+    /// Binary detection mirrors git's heuristic (a NUL byte in the first
+    /// 8000 bytes); files over [`MAX_DIFF_FILE_BYTES`] are rejected to keep
+    /// the viewer responsive.
+    async fn untracked_file_diff(&self, path: &str) -> Result<FileDiff, GitError> {
+        let read_err = |e: std::io::Error| GitError::CommandFailed {
+            code: -1,
+            stderr: format!("cannot read {path}: {e}"),
+            command: String::new(),
+        };
+
+        let full_path = self.repo_path().join(path);
+        let meta = tokio::fs::metadata(&full_path).await.map_err(read_err)?;
+        if meta.is_dir() {
+            return Err(GitError::CommandFailed {
+                code: -1,
+                stderr: format!("{path} is a directory — open a file inside it instead"),
+                command: String::new(),
+            });
+        }
+        if meta.len() > MAX_DIFF_FILE_BYTES {
+            return Err(GitError::CommandFailed {
+                code: -1,
+                stderr: format!("{path} is too large to display (over 1 MB)"),
+                command: String::new(),
+            });
+        }
+
+        let bytes = tokio::fs::read(&full_path).await.map_err(read_err)?;
+        let is_binary = bytes.iter().take(8000).any(|&b| b == 0);
+
+        Ok(FileDiff {
+            path: path.to_string(),
+            old_path: None,
+            is_binary,
+            is_untracked: true,
+            diff: String::new(),
+            content: if is_binary {
+                None
+            } else {
+                Some(String::from_utf8_lossy(&bytes).into_owned())
+            },
+        })
+    }
+
     /// Returns `true` if `path` exists in the HEAD commit tree.
     async fn path_in_head(&self, path: &str) -> bool {
         self.run(&["cat-file", "-e", &format!("HEAD:{path}")])
@@ -1654,6 +1771,104 @@ mod tests {
         assert!(!dir.path().join("RENAMED.md").exists());
         let (staged, unstaged, untracked) = git.working_tree_changes().await.unwrap();
         assert!(staged.is_empty() && unstaged.is_empty() && untracked.is_empty());
+    }
+
+    // ── file_diff ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_file_diff_unstaged_modification() {
+        let (dir, git) = create_test_repo().await;
+        tokio::fs::write(dir.path().join("README.md"), "# Changed")
+            .await
+            .unwrap();
+
+        let diff = git
+            .file_diff("README.md", None, FileDiffMode::Unstaged)
+            .await
+            .unwrap();
+
+        assert!(!diff.is_binary);
+        assert!(!diff.is_untracked);
+        assert!(diff.diff.contains("-# Test"));
+        assert!(diff.diff.contains("+# Changed"));
+    }
+
+    #[tokio::test]
+    async fn test_file_diff_staged_modification() {
+        let (dir, git) = create_test_repo().await;
+        tokio::fs::write(dir.path().join("README.md"), "# Staged")
+            .await
+            .unwrap();
+        git.run(&["add", "README.md"]).await.unwrap();
+
+        let staged = git
+            .file_diff("README.md", None, FileDiffMode::Staged)
+            .await
+            .unwrap();
+        assert!(staged.diff.contains("+# Staged"));
+
+        // Everything is staged, so the unstaged (index → worktree) diff is empty.
+        let unstaged = git
+            .file_diff("README.md", None, FileDiffMode::Unstaged)
+            .await
+            .unwrap();
+        assert!(unstaged.diff.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_file_diff_untracked_returns_content() {
+        let (dir, git) = create_test_repo().await;
+        tokio::fs::write(dir.path().join("new.txt"), "hello\nworld\n")
+            .await
+            .unwrap();
+
+        let diff = git
+            .file_diff("new.txt", None, FileDiffMode::Untracked)
+            .await
+            .unwrap();
+
+        assert!(diff.is_untracked);
+        assert!(!diff.is_binary);
+        assert!(diff.diff.is_empty());
+        assert_eq!(diff.content.as_deref(), Some("hello\nworld\n"));
+    }
+
+    #[tokio::test]
+    async fn test_file_diff_untracked_binary_has_no_content() {
+        let (dir, git) = create_test_repo().await;
+        tokio::fs::write(dir.path().join("blob.bin"), [0u8, 159, 146, 150])
+            .await
+            .unwrap();
+
+        let diff = git
+            .file_diff("blob.bin", None, FileDiffMode::Untracked)
+            .await
+            .unwrap();
+
+        assert!(diff.is_binary);
+        assert!(diff.content.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_file_diff_tracked_binary_modification() {
+        let (dir, git) = create_test_repo().await;
+        // Commit a binary file, then change it so `git diff` reports binary.
+        tokio::fs::write(dir.path().join("blob.bin"), [0u8, 1, 2, 3])
+            .await
+            .unwrap();
+        git.run(&["add", "blob.bin"]).await.unwrap();
+        git.run(&["commit", "-m", "bin"]).await.unwrap();
+        tokio::fs::write(dir.path().join("blob.bin"), [0u8, 9, 9, 9])
+            .await
+            .unwrap();
+
+        let diff = git
+            .file_diff("blob.bin", None, FileDiffMode::Unstaged)
+            .await
+            .unwrap();
+
+        assert!(diff.is_binary);
+        assert!(diff.diff.is_empty());
     }
 
     #[tokio::test]
