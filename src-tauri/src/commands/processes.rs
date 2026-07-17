@@ -14,7 +14,7 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use tauri::State;
 
 use crate::core::process_manager::ProcessManager;
-use crate::core::windows_process::TokioCommandExt;
+use crate::core::windows_process::{StdCommandExt, TokioCommandExt};
 
 /// Command-line substring matching only applies to watchlist entries at least
 /// this long. Short entries like "go" would otherwise match unrelated command
@@ -69,6 +69,11 @@ pub struct DevProcess {
     pub is_maestro: bool,
     /// The watchlist entry that matched (drives grouping in the UI).
     pub matched: String,
+    /// TCP ports this PID is currently LISTENING on, sorted ascending.
+    /// Best-effort: empty when the OS port tool is unavailable or the process
+    /// holds none. This is what identifies a dev server (and lets the UI flag a
+    /// port-holding server that no open project owns as a likely zombie).
+    pub ports: Vec<u16>,
 }
 
 /// Truncate on a char boundary — cutting mid-codepoint would panic.
@@ -103,6 +108,96 @@ fn match_watchlist(name_stem: &str, cmd_lower: &str, watchlist: &[String]) -> Op
     cmd_hit.or(name_hit).cloned()
 }
 
+/// Parses `netstat -ano -p TCP` output into `(pid, port)` pairs for sockets in
+/// the LISTENING state. Kept pure (no I/O) so it can be unit-tested off-Windows.
+///
+/// Row layout: `Proto  Local Address  Foreign Address  State  PID`, e.g.
+/// `  TCP    127.0.0.1:3000   0.0.0.0:0   LISTENING   5678`.
+#[allow(dead_code)] // used on Windows + in tests; unused in a Unix release build
+fn parse_netstat_listening(output: &str) -> Vec<(u32, u16)> {
+    output
+        .lines()
+        .filter(|l| l.contains("LISTENING"))
+        .filter_map(|l| {
+            let cols: Vec<&str> = l.split_whitespace().collect();
+            let local = cols.get(1)?;
+            let pid: u32 = cols.last()?.parse().ok()?;
+            // Local address is `host:port`; IPv6 looks like `[::]:3000`, so the
+            // port is always whatever follows the final colon.
+            let port: u16 = local.rsplit(':').next()?.parse().ok()?;
+            Some((pid, port))
+        })
+        .collect()
+}
+
+/// Parses `lsof -nP -iTCP -sTCP:LISTEN` output into `(pid, port)` pairs. Pure so
+/// it can be unit-tested on any platform.
+///
+/// Row layout: `COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME`, e.g.
+/// `node 5678 me 24u IPv4 0x1 0t0 TCP *:3000 (LISTEN)`. The address token
+/// (`*:3000`, `[::1]:3000`, `127.0.0.1:8000`) is the first one carrying a colon.
+#[allow(dead_code)] // used on Unix + in tests; unused in a Windows release build
+fn parse_lsof_listening(output: &str) -> Vec<(u32, u16)> {
+    output
+        .lines()
+        .skip(1) // header row
+        .filter_map(|l| {
+            let cols: Vec<&str> = l.split_whitespace().collect();
+            let pid: u32 = cols.get(1)?.parse().ok()?;
+            let port = cols
+                .iter()
+                .find(|t| t.contains(':'))
+                .and_then(|t| t.rsplit(':').next())
+                .and_then(|p| p.parse::<u16>().ok())?;
+            Some((pid, port))
+        })
+        .collect()
+}
+
+/// Maps each PID to the TCP ports it is currently LISTENING on (best-effort).
+///
+/// Uses the OS's own tooling — `netstat` on Windows, `lsof` on Unix — instead
+/// of a new dependency, mirroring how this module already shells out to
+/// `taskkill`/`docker`. Any failure (tool missing, non-zero exit, parse miss)
+/// degrades to an empty map, so port info is simply absent rather than fatal.
+fn listening_ports_by_pid() -> HashMap<u32, Vec<u16>> {
+    #[cfg(windows)]
+    let pairs: Vec<(u32, u16)> = {
+        let mut cmd = std::process::Command::new("netstat");
+        cmd.args(["-ano", "-p", "TCP"]);
+        cmd.hide_console_window();
+        match cmd.output() {
+            Ok(o) if o.status.success() => {
+                parse_netstat_listening(&String::from_utf8_lossy(&o.stdout))
+            }
+            _ => Vec::new(),
+        }
+    };
+
+    #[cfg(unix)]
+    let pairs: Vec<(u32, u16)> = {
+        let mut cmd = std::process::Command::new("lsof");
+        cmd.args(["-nP", "-iTCP", "-sTCP:LISTEN"]);
+        cmd.hide_console_window();
+        match cmd.output() {
+            Ok(o) if o.status.success() => parse_lsof_listening(&String::from_utf8_lossy(&o.stdout)),
+            _ => Vec::new(),
+        }
+    };
+
+    let mut map: HashMap<u32, Vec<u16>> = HashMap::new();
+    for (pid, port) in pairs {
+        let entry = map.entry(pid).or_default();
+        if !entry.contains(&port) {
+            entry.push(port);
+        }
+    }
+    for ports in map.values_mut() {
+        ports.sort_unstable();
+    }
+    map
+}
+
 /// Scans all OS processes and returns those matching the watchlist.
 ///
 /// The watchlist comes from the frontend (persisted, user-editable). Entries
@@ -124,6 +219,10 @@ pub fn list_dev_processes(
     }
 
     let own_pid = sysinfo::get_current_pid().map_err(|e| e.to_string())?;
+
+    // Scan listening ports before taking the sysinfo lock — this shells out and
+    // we must not hold the mutex across it.
+    let ports_by_pid = listening_ports_by_pid();
 
     let mut sys = state
         .0
@@ -207,6 +306,7 @@ pub fn list_dev_processes(
             run_time_secs: process.run_time(),
             is_maestro,
             matched,
+            ports: ports_by_pid.get(&pid.as_u32()).cloned().unwrap_or_default(),
         });
     }
 
@@ -437,6 +537,37 @@ mod tests {
         let wl = list(&["node", "vite"]);
         let m = match_watchlist("node", "node /repo/node_modules/vite/bin/vite.js", &wl);
         assert_eq!(m.as_deref(), Some("vite"));
+    }
+
+    #[test]
+    fn netstat_parse_keeps_only_listening_rows() {
+        let out = "\
+Active Connections
+
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       900
+  TCP    127.0.0.1:3000         0.0.0.0:0              LISTENING       5678
+  TCP    [::]:3000              [::]:0                 LISTENING       5678
+  TCP    127.0.0.1:52000        127.0.0.1:3000         ESTABLISHED     5678
+";
+        let pairs = parse_netstat_listening(out);
+        assert!(pairs.contains(&(900, 135)));
+        assert!(pairs.contains(&(5678, 3000)));
+        // Non-LISTENING rows must be ignored (would otherwise yield port 52000).
+        assert!(!pairs.iter().any(|(_, port)| *port == 52000));
+    }
+
+    #[test]
+    fn lsof_parse_reads_pid_and_port() {
+        let out = "\
+COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+node     5678 me     24u  IPv4 0x1a2b      0t0  TCP *:3000 (LISTEN)
+node     5678 me     25u  IPv6 0x3c4d      0t0  TCP [::1]:3000 (LISTEN)
+python    999 me      6u  IPv4 0x5e6f      0t0  TCP 127.0.0.1:8000 (LISTEN)
+";
+        let pairs = parse_lsof_listening(out);
+        assert!(pairs.contains(&(5678, 3000)));
+        assert!(pairs.contains(&(999, 8000)));
     }
 
     #[test]
