@@ -1,6 +1,7 @@
 import { ask } from "@tauri-apps/plugin-dialog";
 import {
   Activity,
+  AlertTriangle,
   ChevronDown,
   ChevronRight,
   Container,
@@ -17,10 +18,12 @@ import {
   type DevProcess,
   type DockerContainer,
 } from "@/lib/processes";
+import { assessStaleness } from "@/lib/staleProcess";
 import {
   DEFAULT_WATCHLIST,
   useProcessWatchlistStore,
 } from "@/stores/useProcessWatchlistStore";
+import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { cardClass, SectionHeader } from "./sectionChrome";
 
 /** Identical command+directory pairs collapse into one row with a ×N count. */
@@ -33,6 +36,8 @@ interface ProcessGroup {
   memoryBytes: number;
   cpuPercent: number;
   anyMaestro: boolean;
+  /** Union of every process's listening ports in this group, sorted ascending. */
+  ports: number[];
 }
 
 function groupProcesses(procs: DevProcess[]): ProcessGroup[] {
@@ -45,6 +50,9 @@ function groupProcesses(procs: DevProcess[]): ProcessGroup[] {
       existing.memoryBytes += p.memoryBytes;
       existing.cpuPercent += p.cpuPercent;
       existing.anyMaestro ||= p.isMaestro;
+      for (const port of p.ports) {
+        if (!existing.ports.includes(port)) existing.ports.push(port);
+      }
     } else {
       groups.set(key, {
         key,
@@ -55,10 +63,13 @@ function groupProcesses(procs: DevProcess[]): ProcessGroup[] {
         memoryBytes: p.memoryBytes,
         cpuPercent: p.cpuPercent,
         anyMaestro: p.isMaestro,
+        ports: [...p.ports],
       });
     }
   }
-  return [...groups.values()].sort((a, b) => b.memoryBytes - a.memoryBytes);
+  const result = [...groups.values()];
+  for (const g of result) g.ports.sort((a, b) => a - b);
+  return result.sort((a, b) => b.memoryBytes - a.memoryBytes);
 }
 
 function formatMem(bytes: number): string {
@@ -86,6 +97,19 @@ const maestroBadge = (
   </span>
 );
 
+/** Monospace `:3000 :5173` chip listing the ports a process/group is holding. */
+function portChips(ports: number[]) {
+  if (ports.length === 0) return null;
+  return (
+    <span
+      className="shrink-0 rounded bg-maestro-border/50 px-1 font-mono text-[9px] text-maestro-muted"
+      title={`Listening on ${ports.map((p) => `port ${p}`).join(", ")}`}
+    >
+      {ports.map((p) => `:${p}`).join(" ")}
+    </span>
+  );
+}
+
 /**
  * Live view of dev-stack OS processes (node, vite, uvicorn, claude, ...)
  * matched against a user-editable watchlist, plus running Docker containers.
@@ -106,6 +130,33 @@ export function ProcessesSection() {
 
   const groups = useMemo(() => groupProcesses(processes ?? []), [processes]);
   const totalCount = processes?.length ?? 0;
+
+  // Which projects are open right now — a port-holding server whose folder is
+  // none of these (and that Maestro didn't launch) is a likely zombie.
+  // Select the stable `tabs` reference, then derive paths (a mapped selector
+  // would return a fresh array each render and defeat store memoization).
+  const tabs = useWorkspaceStore((s) => s.tabs);
+  const openProjectPaths = useMemo(() => tabs.map((t) => t.projectPath), [tabs]);
+
+  const assessedGroups = useMemo(() => {
+    const assessed = groups.map((group) => ({
+      group,
+      stale: assessStaleness({
+        anyMaestro: group.anyMaestro,
+        cwd: group.cwd,
+        ports: group.ports,
+        openProjectPaths,
+      }),
+    }));
+    // Float likely zombies to the top; keep memory order within each bucket.
+    return assessed.sort((a, b) => {
+      const rank = (s: (typeof a)["stale"]) => (s.level === "stale" ? 0 : 1);
+      const diff = rank(a.stale) - rank(b.stale);
+      return diff !== 0 ? diff : b.group.memoryBytes - a.group.memoryBytes;
+    });
+  }, [groups, openProjectPaths]);
+
+  const staleCount = assessedGroups.filter((g) => g.stale.level === "stale").length;
 
   // One confirm dialog per target: guards double-clicks on kill buttons.
   const pendingKills = useRef(new Set<string>());
@@ -229,6 +280,16 @@ export function ProcessesSection() {
             </button>
           </div>
 
+          {staleCount > 0 && (
+            <p className="mb-1 flex items-start gap-1 px-1 text-[10px] text-maestro-red">
+              <AlertTriangle size={11} className="mt-px shrink-0" />
+              <span>
+                {staleCount} likely leftover server{staleCount === 1 ? "" : "s"} holding a port
+                with no open project — {staleCount === 1 ? "it's" : "they're"} flagged below.
+              </span>
+            </p>
+          )}
+
           {editingWatchlist && (
             <WatchlistEditor onClose={() => setEditingWatchlist(false)} />
           )}
@@ -250,15 +311,18 @@ export function ProcessesSection() {
             </p>
           ) : (
             <div className="space-y-0.5">
-              {groups.map((group) => {
+              {assessedGroups.map(({ group, stale }) => {
                 const isMulti = group.procs.length > 1;
                 const groupExpanded = expandedGroups.has(group.key);
                 const repo = dirBasename(group.cwd);
+                const isStale = stale.level === "stale";
                 return (
                   <div key={group.key}>
                     <div
-                      className="group flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-maestro-border/30"
-                      title={group.cmd || group.matched}
+                      className={`group flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-maestro-border/30 ${
+                        isStale ? "bg-maestro-red/5" : ""
+                      }`}
+                      title={isStale ? stale.reason : group.cmd || group.matched}
                     >
                       {isMulti ? (
                         <button
@@ -287,6 +351,16 @@ export function ProcessesSection() {
                             </span>
                           )}
                           {group.anyMaestro && maestroBadge}
+                          {portChips(group.ports)}
+                          {isStale && (
+                            <span
+                              className="flex shrink-0 items-center gap-0.5 rounded bg-maestro-red/20 px-1 text-[9px] font-bold text-maestro-red"
+                              title={stale.reason}
+                            >
+                              <AlertTriangle size={9} />
+                              STALE
+                            </span>
+                          )}
                         </span>
                         {(repo || group.cmd) && (
                           <span className="block truncate text-[10px] text-maestro-muted">
@@ -327,6 +401,7 @@ export function ProcessesSection() {
                               PID {p.pid}
                             </span>
                             {p.isMaestro && maestroBadge}
+                            {portChips(p.ports)}
                             <span className="shrink-0 text-[10px] tabular-nums text-maestro-muted">
                               {p.cpuPercent >= 0.5 ? `${Math.round(p.cpuPercent)}% · ` : ""}
                               {formatMem(p.memoryBytes)} · {formatUptime(p.runTimeSecs)}
