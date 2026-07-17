@@ -103,7 +103,7 @@ describe("UtilityPanel", () => {
   });
 
   it("renders the Memory panel: user CLAUDE.md plus per-project files", async () => {
-    render(<UtilityPanel panel="memory" onClose={() => {}} />);
+    render(<UtilityPanel panel="memory" width={320} onResize={() => {}} onClose={() => {}} />);
     expect(screen.getByText("User Memory")).toBeInTheDocument();
     expect(await screen.findByText("~/.claude/CLAUDE.md")).toBeInTheDocument();
     // Active project auto-expands with its memory files
@@ -115,16 +115,22 @@ describe("UtilityPanel", () => {
   });
 
   it("renders the Processes panel", async () => {
-    render(<UtilityPanel panel="processes" onClose={() => {}} />);
+    render(<UtilityPanel panel="processes" width={320} onResize={() => {}} onClose={() => {}} />);
     expect(
       screen.getByText("Dev processes on this machine, grouped by command."),
     ).toBeInTheDocument();
     expect(await screen.findByText("No watched processes running")).toBeInTheDocument();
   });
 
+  it("renders the Notes panel with its empty state", () => {
+    render(<UtilityPanel panel="notes" width={320} onResize={() => {}} onClose={() => {}} />);
+    expect(screen.getByText("Notes")).toBeInTheDocument();
+    expect(screen.getByText("No notes yet.")).toBeInTheDocument();
+  });
+
   it("calls onClose from the header close button", () => {
     const onClose = vi.fn();
-    render(<UtilityPanel panel="processes" onClose={onClose} />);
+    render(<UtilityPanel panel="processes" width={320} onResize={() => {}} onClose={onClose} />);
     fireEvent.click(screen.getByRole("button", { name: "Close Processes panel" }));
     expect(onClose).toHaveBeenCalledTimes(1);
   });

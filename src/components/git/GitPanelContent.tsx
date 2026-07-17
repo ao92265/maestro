@@ -1,5 +1,4 @@
 import type { GraphNode } from "../../lib/graphLayout";
-import { NotepadPanel } from "../notepad/NotepadPanel";
 import { BranchesPanel } from "./branches/BranchesPanel";
 import { CommitGraph } from "./CommitGraph";
 import type { GitPanelTab } from "./GitPanelTabs";
@@ -73,8 +72,6 @@ export function GitPanelContent({
           selectedDiscussionNumber={selectedDiscussionNumber}
         />
       );
-    case "notes":
-      return <NotepadPanel />;
     default:
       return null;
   }

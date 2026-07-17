@@ -1,21 +1,23 @@
-import { Activity, Brain, X } from "lucide-react";
+import { Activity, Brain, StickyNote, X } from "lucide-react";
 import {
   PanelResizeHandle,
   RIGHT_PANEL_MAX_WIDTH,
   RIGHT_PANEL_MIN_WIDTH,
 } from "@/components/shared/PanelResizeHandle";
+import { NotepadPanel } from "@/components/notepad/NotepadPanel";
 import { MemorySection } from "@/components/sidebar/MemorySection";
 import { ProcessesSection } from "@/components/sidebar/ProcessesSection";
 
-export type UtilityPanelKind = "memory" | "processes";
+export type UtilityPanelKind = "memory" | "processes" | "notes";
 
 const PANEL_META: Record<UtilityPanelKind, { title: string; icon: React.ElementType }> = {
   memory: { title: "Memory", icon: Brain },
   processes: { title: "Processes", icon: Activity },
+  notes: { title: "Notes", icon: StickyNote },
 };
 
 /**
- * Right-side panel for the Memory and Processes views, opened from the
+ * Right-side panel for the Memory, Processes and Notes views, opened from the
  * top-bar buttons. Reuses the same section components the sidebar tabs used
  * to render, just docked on the right instead of the left.
  */
@@ -57,9 +59,15 @@ export function UtilityPanel({
           <X size={14} />
         </button>
       </div>
-      <div className="flex-1 overflow-y-auto px-2.5 py-3">
-        {panel === "memory" ? <MemorySection /> : <ProcessesSection />}
-      </div>
+      {panel === "notes" ? (
+        // NotepadPanel lays itself out (tab strip + editor) edge-to-edge and
+        // scrolls internally, so it skips the padded scroll wrapper.
+        <NotepadPanel />
+      ) : (
+        <div className="flex-1 overflow-y-auto px-2.5 py-3">
+          {panel === "memory" ? <MemorySection /> : <ProcessesSection />}
+        </div>
+      )}
     </aside>
   );
 }

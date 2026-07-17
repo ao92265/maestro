@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ask } from "@tauri-apps/plugin-dialog";
-import { GitFork, RefreshCw, StickyNote, X } from "lucide-react";
+import { GitFork, RefreshCw, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { MAC_TITLE_BAR_INSET_PX, useMacTitleBarPadding } from "@/hooks/useMacTitleBarPadding";
 import { getDeduplicatedCurrentBranch } from "@/lib/git";
@@ -41,7 +41,7 @@ import { useUpdateStore } from "./stores/useUpdateStore";
 
 const DEFAULT_SESSION_COUNT = 6;
 
-/** Header title for each git-panel tab (Notes renders its own header). */
+/** Header title for each git-panel tab. */
 const GIT_PANEL_TITLES: Record<GitPanelTab, string> = {
   commits: "Commits",
   branches: "Branches",
@@ -49,7 +49,6 @@ const GIT_PANEL_TITLES: Record<GitPanelTab, string> = {
   prs: "Pull Requests",
   issues: "Issues",
   discussions: "Discussions",
-  notes: "Notes",
 };
 
 type Theme = "dark" | "light";
@@ -442,12 +441,14 @@ function App() {
 
   // Ctrl/Cmd+2 always lands the panel on the Status tab when toggling open.
   // Manual tab switches while the panel is open are preserved until the next open.
+  // No-op in eagle view, where the per-project git panel is hidden entirely.
   const handleToggleGitPanel = useCallback(() => {
+    if (eagleView) return;
     setGitPanelOpen((prev) => {
       if (!prev) setGitPanelTab("status");
       return !prev;
     });
-  }, []);
+  }, [eagleView]);
 
   useAppKeyboard({
     onAddSession: handleAddSessionShortcut,
@@ -537,42 +538,36 @@ function App() {
               onToggleMemoryPanel={() => handleToggleUtilityPanel("memory")}
               processesPanelOpen={utilityPanel === "processes"}
               onToggleProcessesPanel={() => handleToggleUtilityPanel("processes")}
+              notesPanelOpen={utilityPanel === "notes"}
+              onToggleNotesPanel={() => handleToggleUtilityPanel("notes")}
             />
 
-            {/* Git panel header - inline at same level as TopBar */}
-            {gitPanelOpen && (
+            {/* Git panel header - inline at same level as TopBar.
+                Hidden (like the panel itself) while eagle view is on. */}
+            {gitPanelOpen && !eagleView && (
               <div
                 className="flex h-10 shrink-0 items-center border-l border-maestro-border px-3 gap-2 bg-maestro-bg"
                 style={{ width: rightPanelWidth }}
               >
-                {gitPanelTab === "notes" ? (
-                  <>
-                    <StickyNote size={14} className="text-maestro-muted" />
-                    <span className="text-sm font-medium text-maestro-text">Notes</span>
-                  </>
-                ) : (
-                  <>
-                    <GitFork size={14} className="text-maestro-muted" />
-                    {activeTab?.workspaceType === "multi-repo" && activeTab.selectedRepoPath && (
-                      <span className="text-xs font-medium text-maestro-accent">
-                        {
-                          activeTab.repositories.find((r) => r.path === activeTab.selectedRepoPath)
-                            ?.name
-                        }
-                      </span>
-                    )}
-                    <span className="text-sm font-medium text-maestro-text">
-                      {GIT_PANEL_TITLES[gitPanelTab]}
-                    </span>
-                    {gitPanelTab === "commits" && commits.length > 0 && (
-                      <span className="rounded-full bg-maestro-accent/15 px-1.5 py-px text-[10px] font-medium text-maestro-accent">
-                        {commits.length}
-                      </span>
-                    )}
-                  </>
+                <GitFork size={14} className="text-maestro-muted" />
+                {activeTab?.workspaceType === "multi-repo" && activeTab.selectedRepoPath && (
+                  <span className="text-xs font-medium text-maestro-accent">
+                    {
+                      activeTab.repositories.find((r) => r.path === activeTab.selectedRepoPath)
+                        ?.name
+                    }
+                  </span>
+                )}
+                <span className="text-sm font-medium text-maestro-text">
+                  {GIT_PANEL_TITLES[gitPanelTab]}
+                </span>
+                {gitPanelTab === "commits" && commits.length > 0 && (
+                  <span className="rounded-full bg-maestro-accent/15 px-1.5 py-px text-[10px] font-medium text-maestro-accent">
+                    {commits.length}
+                  </span>
                 )}
                 <div className="flex-1" />
-                {gitPanelTab !== "notes" && activeRepoPath && (
+                {activeRepoPath && (
                   <button
                     type="button"
                     onClick={handleRefreshGit}
@@ -616,9 +611,11 @@ function App() {
               />
             )}
 
-            {/* Git graph panel (optional right side) */}
+            {/* Git graph panel (optional right side). Closed (not unmounted)
+                during eagle view — it shows a single project's repo, which is
+                meaningless there — and restored when eagle view is left. */}
             <GitGraphPanel
-              open={gitPanelOpen}
+              open={gitPanelOpen && !eagleView}
               onClose={() => setGitPanelOpen(false)}
               repoPath={activeRepoPath ?? null}
               currentBranch={currentBranch ?? null}

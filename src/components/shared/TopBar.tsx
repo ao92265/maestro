@@ -8,6 +8,7 @@ import {
   PanelLeft,
   Plus,
   Square,
+  StickyNote,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -49,6 +50,9 @@ interface TopBarProps {
   /** Right-side Processes panel */
   processesPanelOpen?: boolean;
   onToggleProcessesPanel?: () => void;
+  /** Right-side Notes panel */
+  notesPanelOpen?: boolean;
+  onToggleNotesPanel?: () => void;
 }
 
 export function TopBar({
@@ -69,6 +73,8 @@ export function TopBar({
   onToggleMemoryPanel,
   processesPanelOpen = false,
   onToggleProcessesPanel,
+  notesPanelOpen = false,
+  onToggleNotesPanel,
 }: TopBarProps) {
   const appWindow = useMemo(() => getCurrentWindow(), []);
 
@@ -230,19 +236,38 @@ export function TopBar({
             <Activity size={14} />
           </button>
         )}
-        <button
-          type="button"
-          onClick={onToggleGitPanel}
-          className={`rounded p-1.5 transition-colors ${
-            gitPanelOpen
-              ? "text-maestro-accent hover:bg-maestro-accent/10"
-              : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
-          }`}
-          aria-label="Git"
-          title="Git"
-        >
-          <GitMerge size={14} />
-        </button>
+        {onToggleNotesPanel && (
+          <button
+            type="button"
+            onClick={onToggleNotesPanel}
+            className={`rounded p-1.5 transition-colors ${
+              notesPanelOpen
+                ? "text-maestro-accent hover:bg-maestro-accent/10"
+                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
+            }`}
+            aria-label="Notes"
+            title="Notes"
+          >
+            <StickyNote size={14} />
+          </button>
+        )}
+        {/* Git panel is per-project, so it's meaningless while eagle view
+            mixes every project's terminals — hide the button there. */}
+        {!eagleView && (
+          <button
+            type="button"
+            onClick={onToggleGitPanel}
+            className={`rounded p-1.5 transition-colors ${
+              gitPanelOpen
+                ? "text-maestro-accent hover:bg-maestro-accent/10"
+                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
+            }`}
+            aria-label="Git"
+            title="Git"
+          >
+            <GitMerge size={14} />
+          </button>
+        )}
       </div>
 
       {/* Window controls - hidden on macOS (custom traffic lights in row) or when hideWindowControls */}
