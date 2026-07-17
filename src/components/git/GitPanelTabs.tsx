@@ -34,7 +34,13 @@ const TABS: Array<{
 
 export function GitPanelTabs({ activeTab, onTabChange, prCount, issueCount }: GitPanelTabsProps) {
   return (
-    <div className="scrollbar-none flex shrink-0 overflow-x-auto border-b border-maestro-border">
+    <div
+      className="scrollbar-none flex shrink-0 overflow-x-auto border-b border-maestro-border"
+      onWheel={(e) => {
+        // Vertical wheel input scrolls the strip horizontally (scrollbar is hidden).
+        if (e.deltaY !== 0) e.currentTarget.scrollLeft += e.deltaY;
+      }}
+    >
       {TABS.map((tab) => {
         const Icon = tab.icon;
         const isActive = activeTab === tab.id;
