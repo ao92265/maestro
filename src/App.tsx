@@ -375,8 +375,9 @@ function App() {
   }, []);
 
   // Eagle view add-terminal dropdown: every open project tab is offered.
-  // Idle projects (no sessions launched) get their grid mounted and their
-  // first terminal launched by MultiProjectView's auto-launch fallback.
+  // Picking one leaves eagle view and opens a normal pre-launch card in that
+  // project, so the terminal is configured (name/branch/worktree/…) before
+  // launching — the same flow as adding a session outside eagle view.
   const eagleProjects: EagleProjectOption[] = tabs
     .map((t) => ({
       tabId: t.id,
@@ -385,9 +386,14 @@ function App() {
       atMax: (sessionCounts.get(t.id)?.slotCount ?? 0) >= DEFAULT_SESSION_COUNT,
     }));
 
-  const handleAddSessionToProject = useCallback((tabId: string) => {
-    multiProjectRef.current?.addAndLaunchSessionInProject(tabId);
-  }, []);
+  const handleAddSessionToProject = useCallback(
+    (tabId: string) => {
+      setEagleView(false);
+      selectTab(tabId);
+      multiProjectRef.current?.addSessionInProject(tabId);
+    },
+    [selectTab],
+  );
 
   // Sidebar Agents section: jump to a terminal (leave eagle view — the target
   // pane may be hidden behind an eagle zoom overlay there — then activate its

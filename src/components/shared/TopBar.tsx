@@ -42,7 +42,7 @@ interface TopBarProps {
   onToggleEagleView?: () => void;
   /** Eagle view: projects offered in the add-terminal dropdown. */
   eagleProjects?: EagleProjectOption[];
-  /** Eagle view: add a terminal (add + launch a slot) to the given project. */
+  /** Eagle view: add a terminal to the given project (opens its pre-launch card). */
   onAddSessionToProject?: (tabId: string) => void;
   /** Right-side Memory panel */
   memoryPanelOpen?: boolean;
@@ -141,9 +141,8 @@ export function TopBar({
             <Plus size={14} />
           </button>
         )}
-        {/* Eagle view: pre-launch slots are invisible there, so the plus
-            becomes a project dropdown that adds AND launches a terminal in
-            the chosen project. */}
+        {/* Eagle view: the plus becomes a project dropdown; picking a project
+            leaves eagle view and opens a normal pre-launch card there. */}
         {eagleView && onAddSessionToProject && eagleProjects.length > 0 && (
           <div className="relative" ref={addMenuRef}>
             <button
@@ -177,7 +176,7 @@ export function TopBar({
                     title={
                       project.atMax
                         ? `${project.name} already has the maximum number of terminals`
-                        : `Add and launch a terminal in ${project.name}`
+                        : `Add a terminal in ${project.name}`
                     }
                   >
                     <span

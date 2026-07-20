@@ -138,8 +138,6 @@ function createEmptySlot(
  */
 export interface TerminalGridHandle {
   addSession: () => void;
-  /** Adds a slot AND launches it immediately (eagle view — pre-launch cards are hidden there). */
-  addAndLaunchSession: () => Promise<void>;
   launchAll: () => Promise<void>;
   refreshBranches: () => void;
   /** Focus the pane running the given session. Returns false if this grid doesn't own it. */
@@ -195,13 +193,6 @@ interface TerminalGridProps {
   eagleAnyZoomed?: boolean;
   /** Toggles eagle zoom for a session (owned by MultiProjectView). */
   onEagleZoomToggle?: (sessionId: number) => void;
-  /**
-   * Launch the initial slot as soon as the grid mounts. Used when the eagle
-   * "add terminal" dropdown targets a project with no grid yet: the grid
-   * mounts with one pre-launch card, which is invisible in eagle mode, so
-   * without this the click would appear to do nothing.
-   */
-  autoLaunchOnMount?: boolean;
 }
 
 /**
@@ -234,7 +225,6 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     eagleZoomedSessionId = null,
     eagleAnyZoomed = false,
     onEagleZoomToggle,
-    autoLaunchOnMount = false,
   },
   ref,
 ) {
@@ -911,17 +901,6 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     }
   }, [launchSlot]);
 
-  // Eagle "add terminal" into a project with no mounted grid: launch the
-  // initial slot right away (see autoLaunchOnMount prop doc). Defined after
-  // the slotsRef sync effect so the slot is visible to launchAll. One-shot:
-  // must never re-fire on later renders.
-  const autoLaunchedRef = useRef(false);
-  useEffect(() => {
-    if (!autoLaunchOnMount || autoLaunchedRef.current) return;
-    autoLaunchedRef.current = true;
-    void launchAll();
-  }, [autoLaunchOnMount, launchAll]);
-
   /**
    * Handles killing/closing a session, updating the slot state.
    * Also cleans up any associated worktree and session-specific MCP config.
@@ -1338,31 +1317,10 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     refreshBranches();
   }, [mcpServers, skills, plugins, refreshBranches, orderedSlotIds]);
 
-  /**
-   * Adds a new slot and launches it immediately. Used by the eagle-view
-   * add-terminal dropdown, where pre-launch cards are invisible so a bare
-   * addSession would appear to do nothing.
-   */
-  const addAndLaunchSession = useCallback(async () => {
-    if (slotsRef.current.length >= MAX_SESSIONS) return;
-    const newSlot = createEmptySlot(mcpServers, skills, plugins);
-    // launchSlot resolves the slot through slotsRef, which is only synced to
-    // state after the next render — mirror the new slot into it now.
-    slotsRef.current = [...slotsRef.current, newSlot];
-    setSlots((prev) => {
-      if (prev.length >= MAX_SESSIONS) return prev;
-      return [...prev, newSlot];
-    });
-    setLayoutTree(() => buildGridTree([...orderedSlotIds, newSlot.id]));
-    setFocusedSlotId(newSlot.id);
-    refreshBranches();
-    await launchSlot(newSlot.id);
-  }, [mcpServers, skills, plugins, refreshBranches, orderedSlotIds, launchSlot]);
-
   useImperativeHandle(
     ref,
-    () => ({ addSession, addAndLaunchSession, launchAll, refreshBranches, focusSession, killSessionById }),
-    [addSession, addAndLaunchSession, launchAll, refreshBranches, focusSession, killSessionById],
+    () => ({ addSession, launchAll, refreshBranches, focusSession, killSessionById }),
+    [addSession, launchAll, refreshBranches, focusSession, killSessionById],
   );
 
   // Handle zoom toggle for a slot
