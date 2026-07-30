@@ -288,8 +288,19 @@
   }
 }
 
+/* Marching-ants dash flow on the running edges of the agent graph. */
+@keyframes edge-dash {
+  to {
+    stroke-dashoffset: -12;
+  }
+}
+
 .animate-breathe {
   animation: subtle-breathe 3s ease-in-out infinite;
+}
+
+.animate-edge-dash {
+  animation: edge-dash 0.9s linear infinite;
 }
 
 .animate-thinking-dot {
@@ -307,6 +318,7 @@
 
 @media (prefers-reduced-motion: reduce) {
   .animate-breathe,
+  .animate-edge-dash,
   .animate-glow,
   .animate-pod-wake,
   .animate-thinking-dot,
@@ -344,6 +356,7 @@
 
 /* Disable breathe/glow animations */
 .platform-linux .animate-breathe,
+.platform-linux .animate-edge-dash,
 .platform-linux .animate-glow,
 .platform-linux .animate-thinking-dot {
   animation: none;
