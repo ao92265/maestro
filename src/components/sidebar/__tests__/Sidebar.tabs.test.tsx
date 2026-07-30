@@ -20,6 +20,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import { Sidebar } from "../Sidebar";
+import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 import { useSessionStore } from "@/stores/useSessionStore";
 
@@ -75,6 +76,34 @@ function mockInvoke() {
       case "get_project_plugins":
       case "refresh_project_plugins":
         return { skills: [], plugins: [] };
+      // History tab reads
+      case "list_claude_sessions":
+        return [
+          {
+            session_id: "11111111-2222-3333-4444-555555555555",
+            first_prompt: "Fix the login bug",
+            started_at: "2026-07-29T08:00:00Z",
+            last_active: "2026-07-29T09:00:00Z",
+            git_branch: "feat/login",
+          },
+        ];
+      case "git_worktree_list":
+        return [
+          {
+            path: "C:\\git\\maestro",
+            head: "abc123",
+            branch: "main",
+            is_bare: false,
+            is_main_worktree: true,
+          },
+          {
+            path: "C:\\worktrees\\feat-login",
+            head: "def456",
+            branch: "feat/login",
+            is_bare: false,
+            is_main_worktree: false,
+          },
+        ];
       default:
         return undefined;
     }
@@ -90,9 +119,9 @@ describe("Sidebar tab bar", () => {
     useSessionStore.setState({ sessions: [] });
   });
 
-  it("renders the three tabs with General active by default", () => {
+  it("renders the four tabs with General active by default", () => {
     render(<Sidebar />);
-    for (const label of ["General", "Infra", "Settings"]) {
+    for (const label of ["General", "History", "Infra", "Settings"]) {
       expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
     }
     // Processes and Memory moved to the right-side utility panel
@@ -127,6 +156,50 @@ describe("Sidebar tab bar", () => {
     localStorage.setItem("maestro-sidebar-tab", "memory");
     render(<Sidebar />);
     expect(screen.getByText("Agents")).toBeInTheDocument();
+  });
+
+  it("History tab lists past conversations and queues a resume launch", async () => {
+    usePendingLaunchStore.setState({ pending: null });
+    const onHistoryLaunch = vi.fn();
+    render(<Sidebar onHistoryLaunch={onHistoryLaunch} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    // Expand the project's collapsible
+    fireEvent.click(screen.getByRole("button", { name: /maestro/ }));
+
+    const conversation = await screen.findByText("Fix the login bug");
+    fireEvent.click(conversation);
+
+    // The launch is queued with the conversation paired to its worktree
+    expect(usePendingLaunchStore.getState().pending).toMatchObject({
+      tabId: "tab-1",
+      mode: "Claude",
+      resumeSessionId: "11111111-2222-3333-4444-555555555555",
+      workingDirOverride: "C:\\worktrees\\feat-login",
+      branch: "feat/login",
+    });
+    // The project grid is set to mount, and App is asked to reveal it
+    expect(useWorkspaceStore.getState().tabs[0].sessionsLaunched).toBe(true);
+    expect(onHistoryLaunch).toHaveBeenCalledWith("tab-1");
+  });
+
+  it("History tab launches an agent into a surviving worktree", async () => {
+    usePendingLaunchStore.setState({ pending: null });
+    render(<Sidebar />);
+
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    fireEvent.click(screen.getByRole("button", { name: /maestro/ }));
+
+    // Main worktree is filtered out; only the feature worktree is listed
+    const worktreeRow = await screen.findByTitle("Launch an agent in C:\\worktrees\\feat-login");
+    fireEvent.click(worktreeRow);
+
+    expect(usePendingLaunchStore.getState().pending).toMatchObject({
+      tabId: "tab-1",
+      resumeSessionId: null,
+      workingDirOverride: "C:\\worktrees\\feat-login",
+      branch: "feat/login",
+    });
   });
 
   it("clicking a terminal row in Agents navigates to it", () => {

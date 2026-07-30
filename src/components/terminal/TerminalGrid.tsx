@@ -54,6 +54,7 @@ import { useTerminalKeyboard } from "@/hooks/useTerminalKeyboard";
 import { useMcpStore } from "@/stores/useMcpStore";
 import { useWorktreeSettingsStore } from "@/stores/useWorktreeSettingsStore";
 import { usePluginStore } from "@/stores/usePluginStore";
+import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
 import { useSessionStore } from "@/stores/useSessionStore";
 import type { AiMode } from "@/stores/useSessionStore";
 import { useWorkspaceStore, type RepositoryInfo, type WorkspaceType } from "@/stores/useWorkspaceStore";
@@ -727,12 +728,15 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       // Determine the working directory
       // If a branch is selected, prepare a worktree first
       // For multi-repo workspaces, use effectiveRepoPath for git operations
-      let workingDirectory = effectiveRepoPath ?? projectPath;
+      let workingDirectory = slot.workingDirOverride ?? effectiveRepoPath ?? projectPath;
       let worktreePath: string | null = null;
       let worktreeWarning: string | null = null;
       let detectedBranch: string | null = null;
 
-      if (effectiveRepoPath && slot.worktreeMode !== "project") {
+      if (slot.workingDirOverride && slot.workingDirOverride !== (effectiveRepoPath ?? projectPath)) {
+        // Recovered worktree from the History tab: run there as-is, no preparation.
+        worktreePath = slot.workingDirOverride;
+      } else if (effectiveRepoPath && slot.worktreeMode !== "project") {
         try {
           const result = await prepareSessionWorktree(
             effectiveRepoPath,
@@ -1468,6 +1472,56 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     () => ({ addSession, launchAll, refreshBranches, focusSession, zoomSession, killSessionById }),
     [addSession, launchAll, refreshBranches, focusSession, zoomSession, killSessionById],
   );
+
+  // ── History-tab launches ─────────────────────────────────────────
+  // The sidebar History tab queues a pre-configured launch (resume id and/or
+  // worktree dir) in usePendingLaunchStore because this grid may not even be
+  // mounted when the user clicks. Consume it here: configure a slot, then let
+  // the effect below launch it once the slot has committed to state.
+  const pendingLaunch = usePendingLaunchStore((s) =>
+    tabId && s.pending?.tabId === tabId ? s.pending : null
+  );
+  const autoLaunchSlotIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!pendingLaunch || !tabId) return;
+    const launch = usePendingLaunchStore.getState().consume(tabId);
+    if (!launch) return;
+
+    // Reuse the pristine initial slot when it's the only one; otherwise append.
+    const current = slotsRef.current;
+    const reusable = current.length === 1 && current[0].sessionId === null ? current[0] : null;
+    if (!reusable && current.length >= MAX_SESSIONS) {
+      setError(`Cannot resume: maximum of ${MAX_SESSIONS} sessions per project`);
+      return;
+    }
+    const base = reusable ?? createEmptySlot(mcpServers, skills, plugins);
+    const slot: SessionSlot = {
+      ...base,
+      mode: launch.mode,
+      branch: launch.branch,
+      resumeSessionId: launch.resumeSessionId,
+      workingDirOverride: launch.workingDirOverride,
+    };
+    autoLaunchSlotIdRef.current = slot.id;
+    if (reusable) {
+      setSlots((prev) => prev.map((s) => (s.id === reusable.id ? slot : s)));
+    } else {
+      setSlots((prev) => (prev.length >= MAX_SESSIONS ? prev : [...prev, slot]));
+      setLayoutTree(() => buildGridTree([...orderedSlotIds, slot.id]));
+    }
+    setFocusedSlotId(slot.id);
+  }, [pendingLaunch, tabId, mcpServers, skills, plugins, orderedSlotIds]);
+
+  // Launch the queued slot only after it exists in committed state — calling
+  // launchSlot in the effect above would race slotsRef against the setSlots.
+  useEffect(() => {
+    const slotId = autoLaunchSlotIdRef.current;
+    if (!slotId) return;
+    if (!slots.some((s) => s.id === slotId)) return;
+    autoLaunchSlotIdRef.current = null;
+    void launchSlot(slotId);
+  }, [slots, launchSlot]);
 
   // Handle zoom toggle for a slot
   const handleToggleZoom = useCallback((slotId: string) => {

@@ -58,6 +58,11 @@ export interface SessionSlot {
   enabledPlugins: string[];
   /** Claude session UUID to resume, if resuming a previous session. */
   resumeSessionId?: string | null;
+  /**
+   * Launch in this exact directory (an existing worktree recovered from the
+   * History tab) instead of deriving one from branch/worktreeMode.
+   */
+  workingDirOverride?: string | null;
 }
 
 interface PreLaunchCardProps {

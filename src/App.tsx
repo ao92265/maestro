@@ -432,6 +432,16 @@ function App() {
     [selectTab],
   );
 
+  // Sidebar History tab queued a recovery launch: leave eagle view and select
+  // the project so its grid mounts and consumes the pending launch.
+  const handleHistoryLaunch = useCallback(
+    (tabId: string) => {
+      setEagleView(false);
+      selectTab(tabId);
+    },
+    [selectTab],
+  );
+
   // Sidebar Agents section: zoom into a terminal. In eagle view the eagle zoom
   // overlay is used (panes stay mounted); otherwise activate the project tab
   // and zoom its pane once the tab switch has committed to the DOM.
@@ -554,6 +564,7 @@ function App() {
           onStopAll={handleStopAll}
           onAgentNavigate={handleAgentNavigate}
           onAgentKill={handleAgentKill}
+          onHistoryLaunch={handleHistoryLaunch}
         />
 
         {/* Right column: top bar + content + bottom bar */}

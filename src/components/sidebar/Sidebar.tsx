@@ -8,6 +8,7 @@ import {
   FileText,
   FolderGit2,
   GitBranch,
+  History,
   Home,
   Info,
   Keyboard,
@@ -55,6 +56,7 @@ import type {
   McpManagedServer,
 } from "@/lib/mcp";
 import { listContextDocs, readContextDoc, type ContextDoc } from "@/lib/claudemd";
+import { HistorySection } from "./HistorySection";
 import { cardClass, divider, SectionHeader } from "./sectionChrome";
 
 interface SidebarProps {
@@ -72,6 +74,8 @@ interface SidebarProps {
   onAgentNavigate?: (tabId: string, sessionId: number) => void;
   /** Agents section: kill one terminal (PTY + pane cleanup). */
   onAgentKill?: (tabId: string, sessionId: number) => void;
+  /** History section: a recovery launch was queued — reveal the project's grid. */
+  onHistoryLaunch?: (tabId: string) => void;
 }
 
 const SIDEBAR_MIN_WIDTH = 180;
@@ -102,6 +106,7 @@ export function Sidebar({
   onStopAll,
   onAgentNavigate,
   onAgentKill,
+  onHistoryLaunch,
 }: SidebarProps) {
   const [width, setWidth] = useState(loadSavedWidth);
   const [isDragging, setIsDragging] = useState(false);
@@ -219,6 +224,7 @@ export function Sidebar({
           onStopAll={onStopAll}
           onAgentNavigate={onAgentNavigate}
           onAgentKill={onAgentKill}
+          onHistoryLaunch={onHistoryLaunch}
         />
       </div>
 
@@ -247,10 +253,11 @@ export function Sidebar({
 /*  TAB BAR                                                          */
 /* ================================================================ */
 
-type SidebarTabId = "general" | "infra" | "settings";
+type SidebarTabId = "general" | "history" | "infra" | "settings";
 
 const SIDEBAR_TABS: { id: SidebarTabId; label: string; icon: React.ElementType }[] = [
   { id: "general", label: "General", icon: Home },
+  { id: "history", label: "History", icon: History },
   { id: "infra", label: "Infra", icon: Package },
   { id: "settings", label: "Settings", icon: Settings },
 ];
@@ -307,6 +314,7 @@ function ConfigTab({
   onStopAll,
   onAgentNavigate,
   onAgentKill,
+  onHistoryLaunch,
 }: {
   activeSidebarTab: SidebarTabId;
   theme?: "dark" | "light";
@@ -316,6 +324,7 @@ function ConfigTab({
   onStopAll?: () => void;
   onAgentNavigate?: (tabId: string, sessionId: number) => void;
   onAgentKill?: (tabId: string, sessionId: number) => void;
+  onHistoryLaunch?: (tabId: string) => void;
 }) {
   switch (activeSidebarTab) {
     case "general":
@@ -326,6 +335,8 @@ function ConfigTab({
           <GitRepositorySection />
         </>
       );
+    case "history":
+      return <HistorySection onLaunch={onHistoryLaunch} />;
     case "infra":
       return (
         <>
