@@ -19,6 +19,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 }));
 
 import { UtilityPanel } from "../UtilityPanel";
+import { useNotesStore } from "@/stores/useNotesStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 
 const invokeMock = vi.mocked(invoke);
@@ -98,6 +99,8 @@ describe("UtilityPanel", () => {
     invokeMock.mockReset();
     mockInvoke();
     useWorkspaceStore.setState({ tabs: [buildTab()] });
+    // Notes live in a module-level zustand store — reset so tests don't leak.
+    useNotesStore.setState({ notes: [], activeNoteId: null });
     // The processes poll skips when the window is unfocused; happy-dom is headless.
     vi.spyOn(document, "hasFocus").mockReturnValue(true);
   });
@@ -126,6 +129,22 @@ describe("UtilityPanel", () => {
     render(<UtilityPanel panel="notes" width={320} onResize={() => {}} onClose={() => {}} />);
     expect(screen.getByText("Notes")).toBeInTheDocument();
     expect(screen.getByText("No notes yet.")).toBeInTheDocument();
+  });
+
+  it("live-renders markdown in the Notes panel while typing, with no Preview toggle", async () => {
+    useNotesStore.setState({
+      notes: [{ id: "n1", title: "Note", content: "", createdAt: 0, updatedAt: 0 }],
+      activeNoteId: "n1",
+    });
+    render(<UtilityPanel panel="notes" width={320} onResize={() => {}} onClose={() => {}} />);
+
+    fireEvent.change(screen.getByPlaceholderText("Jot something down..."), {
+      target: { value: "# Hello" },
+    });
+
+    // findBy* absorbs the deferred (useDeferredValue) preview re-render.
+    expect(await screen.findByRole("heading", { name: "Hello" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /preview/i })).toBeNull();
   });
 
   it("calls onClose from the header close button", () => {

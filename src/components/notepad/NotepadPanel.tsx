@@ -10,8 +10,9 @@ import { MarkdownEditor } from "@/components/shared/MarkdownEditor";
 import { useNotesStore } from "@/stores/useNotesStore";
 
 /**
- * Right-pane Notepad view. Shows a horizontal strip of note tabs and a single
- * textarea for the active note's content.
+ * Right-pane Notepad view. Shows a horizontal strip of note tabs and, for the
+ * active note, a markdown editor with a live preview that re-renders as the
+ * user types.
  *
  * Notes are fully user-managed: created via the "New" button, deleted via the
  * X — nothing is auto-created or auto-removed behind the user's back.
@@ -242,8 +243,9 @@ export function NotepadPanel() {
           </div>
           <MarkdownEditor
             // Keying on the id ensures the editor remounts when switching
-            // tabs, so cursor position and edit/preview mode reset per note.
+            // tabs, so cursor position resets per note.
             key={activeNote.id}
+            live
             value={activeNote.content}
             onChange={handleContentChange}
             placeholder="Jot something down..."

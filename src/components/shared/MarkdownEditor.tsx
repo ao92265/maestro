@@ -1,5 +1,5 @@
 import { Eye, Pencil } from "lucide-react";
-import { forwardRef, useState } from "react";
+import { forwardRef, useDeferredValue, useState } from "react";
 import { MarkdownBody } from "@/components/git/shared/MarkdownBody";
 
 interface MarkdownEditorProps {
@@ -22,6 +22,13 @@ interface MarkdownEditorProps {
    * click away from editing); "edit" (default) when they came to write.
    */
   defaultMode?: "edit" | "preview";
+  /**
+   * Render a stacked editor + always-visible preview that re-renders on
+   * every keystroke; the Edit/Preview toggle is hidden. Pass
+   * heightClassName="min-h-0 flex-1" so both panes split the available
+   * height.
+   */
+  live?: boolean;
 }
 
 /**
@@ -29,6 +36,10 @@ interface MarkdownEditorProps {
  * Flavored Markdown (headings, tables, task lists, code blocks) via the
  * shared MarkdownBody renderer, so edited docs never read as a wall of
  * raw text. Use this for any user-editable markdown in the app.
+ *
+ * With `live`, the toggle is replaced by a stacked layout — textarea on top,
+ * live-updating preview below — for places (like the Notes panel) where
+ * formatting should appear as the user types.
  */
 export const MarkdownEditor = forwardRef<HTMLTextAreaElement, MarkdownEditorProps>(
   function MarkdownEditor(
@@ -41,10 +52,42 @@ export const MarkdownEditor = forwardRef<HTMLTextAreaElement, MarkdownEditorProp
       textareaClassName = "",
       spellCheck = false,
       defaultMode = "edit",
+      live = false,
     },
     ref,
   ) {
     const [mode, setMode] = useState<"edit" | "preview">(defaultMode);
+    // Deferring the previewed text keeps typing responsive if the document
+    // grows large — the textarea updates immediately, the preview lags a tick.
+    const deferredValue = useDeferredValue(value);
+
+    const textareaEl = (
+      <textarea
+        ref={ref}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        spellCheck={spellCheck}
+        className={`w-full resize-none rounded border border-maestro-border bg-maestro-surface p-3 font-mono text-xs text-maestro-text placeholder:text-maestro-muted focus:border-maestro-accent focus:outline-none ${heightClassName} ${textareaClassName}`}
+      />
+    );
+
+    if (live) {
+      return (
+        <div className={`flex flex-col gap-2 ${className}`}>
+          {textareaEl}
+          <div
+            className={`w-full overflow-y-auto rounded border border-maestro-border bg-maestro-surface p-3 ${heightClassName}`}
+          >
+            {value.trim() ? (
+              <MarkdownBody content={deferredValue} />
+            ) : (
+              <p className="text-xs italic text-maestro-muted">Nothing to preview.</p>
+            )}
+          </div>
+        </div>
+      );
+    }
 
     const tabClass = (active: boolean) =>
       `flex items-center gap-1 rounded px-2 py-0.5 text-[11px] transition-colors ${
@@ -75,14 +118,7 @@ export const MarkdownEditor = forwardRef<HTMLTextAreaElement, MarkdownEditorProp
         </div>
 
         {mode === "edit" ? (
-          <textarea
-            ref={ref}
-            value={value}
-            onChange={(e) => onChange(e.target.value)}
-            placeholder={placeholder}
-            spellCheck={spellCheck}
-            className={`w-full resize-none rounded border border-maestro-border bg-maestro-surface p-3 font-mono text-xs text-maestro-text placeholder:text-maestro-muted focus:border-maestro-accent focus:outline-none ${heightClassName} ${textareaClassName}`}
-          />
+          textareaEl
         ) : (
           <div
             className={`w-full overflow-y-auto rounded border border-maestro-border bg-maestro-surface p-3 ${heightClassName}`}
