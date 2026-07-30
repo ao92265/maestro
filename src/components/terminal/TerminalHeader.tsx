@@ -21,6 +21,8 @@ export type AIProvider = "claude" | "gemini" | "codex" | "opencode" | "plain";
 interface TerminalHeaderProps {
   sessionId: number;
   sessionName?: string | null;
+  /** Session status — colors the header underline (working vs needs-input). */
+  status?: SessionStatus;
   provider?: AIProvider;
   branchName?: string;
   showLaunch?: boolean;
@@ -54,6 +56,7 @@ const providerConfig: Record<AIProvider, { icon: IconComponent; label: string }>
 export const TerminalHeader = memo(function TerminalHeader({
   sessionId,
   sessionName,
+  status,
   provider = "claude",
   branchName = "...",
   showLaunch = false,
@@ -205,8 +208,17 @@ export const TerminalHeader = memo(function TerminalHeader({
 
   const adaptive = getAdaptiveClasses();
 
+  // Status-colored underline: accent while the agent works, yellow when it
+  // waits for the user's input (same palette as ThinkingIndicator's dots).
+  const statusBorder =
+    status === "working"
+      ? "border-maestro-accent/70"
+      : status === "needs-input"
+        ? "border-maestro-yellow"
+        : "border-maestro-border";
+
   return (
-    <div className={`no-select flex ${adaptive.headerHeight} shrink-0 items-center ${adaptive.gapSize} border-b border-maestro-border bg-maestro-surface ${hasMoveHandle ? "pl-6 pr-2" : "px-2"}`}>
+    <div className={`no-select flex ${adaptive.headerHeight} shrink-0 items-center ${adaptive.gapSize} border-b ${statusBorder} bg-maestro-surface ${hasMoveHandle ? "pl-6 pr-2" : "px-2"}`}>
       {/* Left cluster */}
       <div className={`flex min-w-0 flex-1 items-center ${adaptive.gapSize}`}>
         {/* AI provider icon + dropdown */}

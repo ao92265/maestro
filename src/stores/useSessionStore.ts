@@ -59,6 +59,15 @@ interface SessionStatusPayload {
 }
 
 /**
+ * Raw wire payload for `session-status-changed`. The Claude Stop hook emits
+ * "AwaitingInput" (agent ended its turn, user's move); it is normalized to
+ * NeedsInput before it reaches the store, so it never appears in a session.
+ */
+type RawSessionStatusPayload = Omit<SessionStatusPayload, "status"> & {
+  status: BackendSessionStatus | "AwaitingInput";
+};
+
+/**
  * Zustand store slice for session metadata (not PTY I/O -- that lives in terminal.ts).
  *
  * @property sessions - Authoritative list of sessions fetched from the backend.
@@ -329,8 +338,24 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     try {
       if (!activeUnlisten) {
         if (!pendingInit) {
-          pendingInit = listen<SessionStatusPayload>("session-status-changed", (event) => {
-            const { session_id, project_path, status, message, needs_input_prompt } = event.payload;
+          pendingInit = listen<RawSessionStatusPayload>("session-status-changed", (event) => {
+            const { session_id, project_path, message, needs_input_prompt } = event.payload;
+
+            // Normalize the Stop-hook signal: treat "AwaitingInput" as
+            // NeedsInput, but never downgrade an explicit terminal state
+            // (Done/Error) or a startup Timeout the agent/frontend already set.
+            let status: BackendSessionStatus;
+            if (event.payload.status === "AwaitingInput") {
+              const existing = get().sessions.find(
+                (s) => s.id === session_id && s.project_path === project_path
+              );
+              if (existing && ["Done", "Error", "Timeout"].includes(existing.status)) {
+                return;
+              }
+              status = "NeedsInput";
+            } else {
+              status = event.payload.status;
+            }
 
             // Check if session exists in store
             const sessionExists = get().sessions.some(
@@ -341,7 +366,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
               // Buffer this status update - it will be applied when the session is added
               const bufferKey = statusBufferKey(session_id, project_path);
               console.log(`[SessionStore] Buffering status for non-existent session. Key: '${bufferKey}'`);
-              pendingStatusUpdates.set(bufferKey, event.payload);
+              pendingStatusUpdates.set(bufferKey, { ...event.payload, status });
               return;
             }
 

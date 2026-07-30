@@ -594,6 +594,30 @@ async fn handle_hook_stop(
         (hook_emit)(event);
     }
 
+    // The Stop hook fires when the agent ends its turn and control returns to
+    // the user. Surface that as an "AwaitingInput" status so the UI can flag
+    // the terminal as waiting for a reply. The frontend normalizes it to
+    // NeedsInput unless the agent already reported a terminal state
+    // (Done/Error) via MCP.
+    let project_path = {
+        let projects = state.session_projects.read().await;
+        projects.get(&maestro_session_id).cloned()
+    };
+    if let Some(project_path) = project_path {
+        (state.emit_fn)(SessionStatusPayload {
+            session_id: maestro_session_id,
+            project_path,
+            status: "AwaitingInput".to_string(),
+            message: "Waiting for your input".to_string(),
+            needs_input_prompt: None,
+        });
+    } else {
+        info!(
+            "[HOOK] stop: session {} not registered, skipping status emit",
+            maestro_session_id
+        );
+    }
+
     StatusCode::OK
 }
 
@@ -757,6 +781,42 @@ mod tests {
             post_hook(addr, "/hook/session-start", Some("inst-secret"), body).await,
             400
         );
+    }
+
+    #[tokio::test]
+    async fn stop_hook_emits_awaiting_input_for_registered_session() {
+        let (emit_fn, events) = test_emit_fn();
+        let (addr, projects, _pend) = start_test_http_server("inst-secret", emit_fn).await;
+
+        // post_hook always sends X-Maestro-Session: 1
+        projects.write().await.insert(1, "/path/project".to_string());
+
+        let body = serde_json::json!({
+            "session_id": "claude-uuid",
+            "hook_event_name": "Stop",
+        });
+        assert_eq!(post_hook(addr, "/hook/stop", Some("inst-secret"), body).await, 200);
+
+        let emitted = events.lock().unwrap();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].session_id, 1);
+        assert_eq!(emitted[0].project_path, "/path/project");
+        assert_eq!(emitted[0].status, "AwaitingInput");
+        assert_eq!(emitted[0].needs_input_prompt, None);
+    }
+
+    #[tokio::test]
+    async fn stop_hook_skips_status_emit_for_unregistered_session() {
+        let (emit_fn, events) = test_emit_fn();
+        let (addr, _p, _pend) = start_test_http_server("inst-secret", emit_fn).await;
+
+        let body = serde_json::json!({
+            "session_id": "claude-uuid",
+            "hook_event_name": "Stop",
+        });
+        assert_eq!(post_hook(addr, "/hook/stop", Some("inst-secret"), body).await, 200);
+
+        assert!(events.lock().unwrap().is_empty());
     }
 
     // ── Hash tests ──────────────────────────────────────────────────

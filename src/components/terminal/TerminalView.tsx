@@ -566,6 +566,21 @@ export const TerminalView = memo(function TerminalView({
           }
           return;
         }
+        // Enter while the agent awaits a reply: the user is responding, so
+        // flip the indicator back to Working before output resumes. Only the
+        // bare Enter key emits exactly "\r" — pastes and escape sequences
+        // never match, so they can't clear the needs-input flag.
+        if (data === "\r") {
+          const current = useSessionStore.getState().sessions.find((s) => s.id === sessionId);
+          if (current?.status === "NeedsInput") {
+            lastHeuristicStatus = "Working";
+            useSessionStore.getState().updateSession(sessionId, {
+              status: "Working",
+              statusMessage: undefined,
+              needsInputPrompt: undefined,
+            });
+          }
+        }
         writeStdin(sessionId, data).catch(console.error);
       });
 
@@ -832,6 +847,7 @@ export const TerminalView = memo(function TerminalView({
       {/* Rich header bar */}
       <TerminalHeader
         sessionId={sessionId}
+        status={effectiveStatus}
         provider={effectiveProvider}
         sessionName={sessionData?.name}
         branchName={effectiveBranch}
