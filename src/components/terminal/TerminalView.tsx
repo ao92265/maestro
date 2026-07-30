@@ -42,6 +42,8 @@ interface TerminalViewProps {
   terminalCount?: number;
   isZoomed?: boolean;
   onToggleZoom?: () => void;
+  /** Opens a native file picker and inserts the chosen paths like a drag-drop (owned by TerminalGrid). */
+  onAttachFiles?: () => void;
   /** Project name shown in bold before the session label (eagle view). */
   projectLabel?: string;
   /** Color for the project label — matches the tile border color. */
@@ -154,6 +156,7 @@ export const TerminalView = memo(function TerminalView({
   terminalCount = 1,
   isZoomed = false,
   onToggleZoom,
+  onAttachFiles,
   projectLabel,
   projectColor,
   hasMoveHandle = false,
@@ -882,6 +885,7 @@ export const TerminalView = memo(function TerminalView({
         <QuickActionPills
           onAction={handleQuickAction}
           onManageClick={handleManageClick}
+          onAttachClick={onAttachFiles}
         />
       )}
 

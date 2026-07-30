@@ -17,7 +17,7 @@ import {
 import { restrictToHorizontalAxis } from "@dnd-kit/modifiers";
 import { CSS } from "@dnd-kit/utilities";
 import { invoke } from "@tauri-apps/api/core";
-import { ask } from "@tauri-apps/plugin-dialog";
+import { ask, open } from "@tauri-apps/plugin-dialog";
 import { GripVertical } from "lucide-react";
 
 import { getBranchesWithWorktreeStatus, type BranchWithWorktreeStatus } from "@/lib/git";
@@ -452,6 +452,34 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     enabled: isActive && !eagleMode,
   });
 
+  /**
+   * Inserts file paths into a session's terminal input, shell-escaped.
+   * Shared by drag-and-drop and the attach-file button so both take the
+   * exact same code path.
+   */
+  const insertPathsIntoSession = useCallback((sessionId: number, paths: string[], slotId: string) => {
+    const escaped = shellEscapePaths(paths);
+    writeStdin(sessionId, escaped).catch(console.error);
+    // Focus the pane that received the paths so the user can keep typing
+    // right after the path. setFocusedSlotId updates the grid's focus ring;
+    // the direct DOM focus covers the already-focused pane (no isFocused
+    // transition for TerminalView's focus effect to react to).
+    setFocusedSlotId(slotId);
+    focusSlotTextarea(slotId);
+  }, []);
+
+  /**
+   * Opens the native file picker and inserts the chosen paths into the
+   * session, reusing the drag-drop insertion path above.
+   */
+  const handleAttachFiles = useCallback(async (sessionId: number, slotId: string) => {
+    const selected = await open({ multiple: true, title: "Attach Files" });
+    if (!selected) return; // user cancelled
+    const paths = Array.isArray(selected) ? selected : [selected];
+    if (paths.length === 0) return;
+    insertPathsIntoSession(sessionId, paths, slotId);
+  }, [insertPathsIntoSession]);
+
   // Drag-and-drop files from Finder/Explorer onto terminal panes.
   // Only the active project's grid handles window drop events — inactive
   // grids stay mounted (ZStack) and would otherwise swallow the drop.
@@ -460,16 +488,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   const { dropTargetSlotId, isDraggingFiles } = useTerminalDragDrop({
     slots,
     enabled: isActive || eagleMode,
-    onDrop: useCallback((sessionId: number, paths: string[], slotId: string) => {
-      const escaped = shellEscapePaths(paths);
-      writeStdin(sessionId, escaped).catch(console.error);
-      // Focus the pane that received the drop so the user can keep typing
-      // right after the path. setFocusedSlotId updates the grid's focus ring;
-      // the direct DOM focus covers the already-focused pane (no isFocused
-      // transition for TerminalView's focus effect to react to).
-      setFocusedSlotId(slotId);
-      focusSlotTextarea(slotId);
-    }, []),
+    onDrop: insertPathsIntoSession,
   });
 
   // Sync refs with state and report counts to parent
@@ -1455,6 +1474,9 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
             onToggleZoom={() =>
               eagleMode ? onEagleZoomToggle?.(sessionId) : handleToggleZoom(slot.id)
             }
+            onAttachFiles={() => {
+              handleAttachFiles(sessionId, slot.id).catch(console.error);
+            }}
             projectLabel={eagleMode ? projectName : undefined}
             projectColor={eagleMode ? eagleColor : undefined}
             hasMoveHandle={showReorderHandle}
@@ -1513,7 +1535,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       </DraggablePane>
     );
   // eslint-disable-next-line react-hooks/exhaustive-deps -- Deps cover all render-affecting state
-  }, [slots, focusedSlotId, isActive, isDraggingFiles, dropTargetSlotId, getFocusCallback, handleKill, handleToggleZoom, handleSwapSlots, projectPath, branches, isLoadingBranches, isGitRepo, hasManagedWorktree, repositories, workspaceType, effectiveRepoPath, onRepoChange, mcpServers, skills, plugins, handleCreateBranch, updateSlotCustomName, updateSlotMode, updateSlotBranch, updateSlotWorktreeMode, refreshBranches, toggleSlotMcp, toggleSlotSkill, toggleSlotPlugin, selectAllMcp, unselectAllMcp, selectAllPlugins, unselectAllPlugins, launchSlot, removeSlot, updateSlotResumeSession, eagleMode, eagleZoomedSessionId, eagleAnyZoomed, onEagleZoomToggle, projectName, eagleColor, tabId]);
+  }, [slots, focusedSlotId, isActive, isDraggingFiles, dropTargetSlotId, getFocusCallback, handleKill, handleToggleZoom, handleAttachFiles, handleSwapSlots, projectPath, branches, isLoadingBranches, isGitRepo, hasManagedWorktree, repositories, workspaceType, effectiveRepoPath, onRepoChange, mcpServers, skills, plugins, handleCreateBranch, updateSlotCustomName, updateSlotMode, updateSlotBranch, updateSlotWorktreeMode, refreshBranches, toggleSlotMcp, toggleSlotSkill, toggleSlotPlugin, selectAllMcp, unselectAllMcp, selectAllPlugins, unselectAllPlugins, launchSlot, removeSlot, updateSlotResumeSession, eagleMode, eagleZoomedSessionId, eagleAnyZoomed, onEagleZoomToggle, projectName, eagleColor, tabId]);
 
   const handleRatioChange = useCallback((nodeId: string, ratio: number) => {
     setLayoutTree((prev) => updateRatio(prev, nodeId, ratio));
@@ -1640,6 +1662,9 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
                 terminalCount={slots.length}
                 isZoomed={true}
                 onToggleZoom={() => handleToggleZoom(zoomedSlot.id)}
+                onAttachFiles={() => {
+                  handleAttachFiles(zoomedSlot.sessionId!, zoomedSlot.id).catch(console.error);
+                }}
               />
             ) : (
               <PreLaunchCard

@@ -1,4 +1,4 @@
-import { Plus } from "lucide-react";
+import { Paperclip, Plus } from "lucide-react";
 import { memo, useMemo } from "react";
 import { DynamicIcon } from "@/components/quickactions/DynamicIcon";
 import { useQuickActionStore } from "@/stores/useQuickActionStore";
@@ -8,9 +8,11 @@ interface QuickActionPillsProps {
   onAction?: (prompt: string) => void;
   /** Called when the manage quick actions button is clicked */
   onManageClick?: () => void;
+  /** Called when the attach-file button is clicked */
+  onAttachClick?: () => void;
 }
 
-export const QuickActionPills = memo(function QuickActionPills({ onAction, onManageClick }: QuickActionPillsProps) {
+export const QuickActionPills = memo(function QuickActionPills({ onAction, onManageClick, onAttachClick }: QuickActionPillsProps) {
   // Select raw actions array (stable reference) instead of calling getSortedActions()
   // which creates a new array on every call and causes infinite re-renders
   const actions = useQuickActionStore((s) => s.actions);
@@ -50,6 +52,15 @@ export const QuickActionPills = memo(function QuickActionPills({ onAction, onMan
         className={`inline-flex items-center justify-center rounded p-0.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text${!onManageClick ? " opacity-50 cursor-not-allowed" : ""}`}
       >
         <Plus size={11} />
+      </button>
+      <button
+        type="button"
+        onClick={onAttachClick}
+        disabled={!onAttachClick}
+        title="Attach file(s)"
+        className={`inline-flex items-center justify-center rounded p-0.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text${!onAttachClick ? " opacity-50 cursor-not-allowed" : ""}`}
+      >
+        <Paperclip size={11} />
       </button>
     </div>
   );
