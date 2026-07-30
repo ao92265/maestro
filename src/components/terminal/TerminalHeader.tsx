@@ -6,6 +6,7 @@ import {
   Expand,
   GitBranch,
   Minimize,
+  ParkingSquare,
   Sparkles,
   Terminal,
   X,
@@ -30,6 +31,8 @@ interface TerminalHeaderProps {
   terminalCount?: number;
   isZoomed?: boolean;
   onToggleZoom?: () => void;
+  /** Park this terminal: hide its pane without stopping the session. */
+  onPark?: () => void;
   zoomLevel?: number;
   onSetZoomLevel?: (level: number) => void;
   /** Project name shown in bold before the session label (eagle view). */
@@ -61,6 +64,7 @@ export const TerminalHeader = memo(function TerminalHeader({
   terminalCount = 1,
   isZoomed = false,
   onToggleZoom,
+  onPark,
   zoomLevel = 100,
   onSetZoomLevel,
   projectLabel,
@@ -285,6 +289,19 @@ export const TerminalHeader = memo(function TerminalHeader({
             className="rounded bg-maestro-green px-1.5 py-0.5 font-medium text-white transition-colors hover:bg-maestro-green/80 text-[9px]"
           >
             Launch
+          </button>
+        )}
+
+        {/* Park button — hide the pane without stopping the session */}
+        {onPark && (
+          <button
+            type="button"
+            onClick={() => onPark()}
+            className="rounded p-0.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-accent"
+            title="Park terminal (hide without stopping)"
+            aria-label={`Park session ${sessionId}`}
+          >
+            <ParkingSquare size={terminalCount <= 4 ? 14 : 12} />
           </button>
         )}
 

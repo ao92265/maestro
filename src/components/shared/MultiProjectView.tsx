@@ -5,11 +5,15 @@ import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { projectColorFor } from "@/lib/projectColor";
 import { useProjectColors } from "@/lib/useProjectColors";
 import { IdleLandingView } from "./IdleLandingView";
+import { ParkedShelf } from "../terminal/ParkedShelf";
 import { TerminalGrid, type TerminalGridHandle } from "../terminal/TerminalGrid";
 import { ThinkingIndicator } from "../terminal/ThinkingIndicator";
 
 /** Stable empty record so the names selector doesn't re-render grids while the bar is hidden. */
 const EMPTY_SESSION_NAMES: Record<number, string> = {};
+
+/** Stable empty array so the parked selector doesn't re-render grids outside eagle view. */
+const EMPTY_PARKED: number[] = [];
 
 interface MultiProjectViewProps {
   onSessionCountChange?: (tabId: string, slotCount: number, launchedCount: number) => void;
@@ -56,8 +60,16 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
 
   // Live session count drives the eagle grid's column count. Gated on
   // eagleView so session launches/kills don't re-render every project's grid
-  // while the eagle grid isn't even showing.
-  const liveSessionCount = useSessionStore((s) => (eagleView ? s.sessions.length : 0));
+  // while the eagle grid isn't even showing. Parked tiles are display:none,
+  // so they must not reserve grid columns.
+  const liveSessionCount = useSessionStore((s) =>
+    eagleView ? s.sessions.filter((x) => !s.parkedSessionIds.includes(x.id)).length : 0
+  );
+
+  // Parked sessions feed the eagle shelf and are skipped by the zoom tab bar.
+  const parkedSessionIds = useSessionStore((s) =>
+    eagleView ? s.parkedSessionIds : EMPTY_PARKED
+  );
 
   // Leaving eagle view always drops the zoom.
   useEffect(() => {
@@ -73,6 +85,9 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
     for (const tab of tabs) {
       if (!tab.sessionsLaunched) continue;
       for (const sessionId of tab.sessionIds) {
+        // Parked tiles are hidden — skipping them here also makes the
+        // stale-zoom guard below drop the zoom when a zoomed session parks.
+        if (parkedSessionIds.includes(sessionId)) continue;
         list.push({
           sessionId,
           projectName: tab.name,
@@ -81,7 +96,7 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
       }
     }
     return list;
-  }, [eagleView, tabs, projectColors]);
+  }, [eagleView, tabs, projectColors, parkedSessionIds]);
 
   // Session names for the tab labels. Derived record + shallow compare so the
   // raw sessions array (replaced on every status update) doesn't re-render
@@ -139,6 +154,15 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
   // no per-tab closure is needed.
   const handleEagleZoomToggle = useCallback((sessionId: number) => {
     setEagleZoom((prev) => (prev === sessionId ? null : sessionId));
+  }, []);
+
+  // Restore a parked terminal from the eagle shelf. Only the grid that owns
+  // the session accepts the focus call, same pattern as the zoom-focus effect.
+  const handleEagleUnpark = useCallback((sessionId: number) => {
+    useSessionStore.getState().unparkSession(sessionId);
+    for (const handle of gridRefs.current.values()) {
+      if (handle.focusSession(sessionId)) break;
+    }
   }, []);
 
   // Expose methods to parent
@@ -274,9 +298,16 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
   // grid items — no remount, scrollback and PTY wiring survive the toggle.
   const eagleColumns = Math.max(1, Math.ceil(Math.sqrt(Math.max(1, liveSessionCount))));
 
+  // The outer column wrapper is permanent (both modes) so toggling eagle view
+  // never changes the tree shape around the grids — that would remount every
+  // xterm. It is deliberately NOT positioned: eagle-zoomed panes and the zoom
+  // tab bar resolve their absolute positioning to App's <main>. The inner div
+  // keeps `relative` in the non-eagle branch — the ZStack's absolute inset-0
+  // project divs depend on it.
   return (
+    <div className="flex h-full w-full flex-col">
     <div
-      className={eagleView ? "h-full w-full bg-maestro-bg p-2" : "relative h-full w-full"}
+      className={eagleView ? "min-h-0 w-full flex-1 bg-maestro-bg p-2" : "relative min-h-0 w-full flex-1"}
       style={
         eagleView
           ? {
@@ -419,6 +450,9 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
           )}
         </div>
       ))}
+    </div>
+    {/* Eagle shelf: parked chips across ALL projects, labeled by project. */}
+    {eagleView && <ParkedShelf showProjectLabels onUnpark={handleEagleUnpark} />}
     </div>
   );
 });

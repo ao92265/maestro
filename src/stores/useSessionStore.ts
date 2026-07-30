@@ -69,8 +69,17 @@ interface SessionStatusPayload {
  */
 interface SessionState {
   sessions: SessionConfig[];
+  /**
+   * Sessions hidden ("parked") from the terminal grids. The PTY keeps
+   * running; only the pane is CSS-hidden. In-memory only — session IDs are
+   * ephemeral (reassigned each app launch), so persisting them to disk would
+   * hide unrelated future sessions that reuse the same numbers.
+   */
+  parkedSessionIds: number[];
   isLoading: boolean;
   error: string | null;
+  parkSession: (sessionId: number) => void;
+  unparkSession: (sessionId: number) => void;
   fetchSessions: () => Promise<void>;
   fetchSessionsForProject: (projectPath: string) => Promise<void>;
   addSession: (session: SessionConfig) => void;
@@ -122,14 +131,36 @@ function clearStartupTimeout(sessionId: number): void {
 
 export const useSessionStore = create<SessionState>()((set, get) => ({
   sessions: [],
+  parkedSessionIds: [],
   isLoading: false,
   error: null,
+
+  parkSession: (sessionId: number) => {
+    set((state) =>
+      state.parkedSessionIds.includes(sessionId)
+        ? state
+        : { parkedSessionIds: [...state.parkedSessionIds, sessionId] }
+    );
+  },
+
+  unparkSession: (sessionId: number) => {
+    set((state) => ({
+      parkedSessionIds: state.parkedSessionIds.filter((id) => id !== sessionId),
+    }));
+  },
 
   fetchSessions: async () => {
     set({ isLoading: true, error: null });
     try {
       const sessions = await invoke<SessionConfig[]>("get_sessions");
-      set({ sessions, isLoading: false });
+      set((state) => ({
+        sessions,
+        isLoading: false,
+        // Prune parked IDs that no longer exist in the fetched list
+        parkedSessionIds: state.parkedSessionIds.filter((id) =>
+          sessions.some((s) => s.id === id)
+        ),
+      }));
     } catch (err) {
       console.error("Failed to fetch sessions:", err);
       set({ error: String(err), isLoading: false });
@@ -142,7 +173,14 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       const sessions = await invoke<SessionConfig[]>("get_sessions_for_project", {
         projectPath,
       });
-      set({ sessions, isLoading: false });
+      set((state) => ({
+        sessions,
+        isLoading: false,
+        // Prune parked IDs that no longer exist in the fetched list
+        parkedSessionIds: state.parkedSessionIds.filter((id) =>
+          sessions.some((s) => s.id === id)
+        ),
+      }));
     } catch (err) {
       console.error("Failed to fetch sessions for project:", err);
       set({ error: String(err), isLoading: false });
@@ -257,6 +295,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
 
     set((state) => ({
       sessions: state.sessions.filter((s) => s.id !== sessionId),
+      parkedSessionIds: state.parkedSessionIds.filter((id) => id !== sessionId),
     }));
   },
 
@@ -269,6 +308,9 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       set((state) => ({
         sessions: state.sessions.filter(
           (s) => !removed.some((r) => r.id === s.id)
+        ),
+        parkedSessionIds: state.parkedSessionIds.filter(
+          (id) => !removed.some((r) => r.id === id)
         ),
       }));
       return removed;

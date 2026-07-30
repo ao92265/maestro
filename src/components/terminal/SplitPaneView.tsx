@@ -15,6 +15,12 @@ interface SplitPaneViewProps {
    * which keeps the xterm instances mounted (no remount, no lost scrollback).
    */
   eagleMode?: boolean;
+  /**
+   * Slots to CSS-hide (parked terminals). Hiding is className-only — the
+   * React element tree never changes shape, so the xterm instances stay
+   * mounted (same keep-alive trick as eagle mode's flattening).
+   */
+  hiddenSlotIds?: ReadonlySet<string>;
 }
 
 const MIN_RATIO = 0.15;
@@ -22,6 +28,13 @@ const MAX_RATIO = 0.85;
 
 function clampRatio(ratio: number): number {
   return Math.min(MAX_RATIO, Math.max(MIN_RATIO, ratio));
+}
+
+/** True when every leaf under `node` is hidden (the subtree occupies no space). */
+function subtreeAllHidden(node: TreeNode, hidden: ReadonlySet<string> | undefined): boolean {
+  if (!hidden || hidden.size === 0) return false;
+  if (node.type === "leaf") return hidden.has(node.slotId);
+  return subtreeAllHidden(node.children[0], hidden) && subtreeAllHidden(node.children[1], hidden);
 }
 
 /**
@@ -36,11 +49,18 @@ export function SplitPaneView({
   onRatioChange,
   onDragStateChange,
   eagleMode = false,
+  hiddenSlotIds,
 }: SplitPaneViewProps) {
   if (node.type === "leaf") {
     return (
       <div
-        className={eagleMode ? "contents" : "h-full w-full min-w-0 min-h-0 relative"}
+        className={
+          hiddenSlotIds?.has(node.slotId)
+            ? "hidden"
+            : eagleMode
+              ? "contents"
+              : "h-full w-full min-w-0 min-h-0 relative"
+        }
         data-slot-id={node.slotId}
       >
         {renderLeaf(node.slotId)}
@@ -49,6 +69,12 @@ export function SplitPaneView({
   }
 
   const isVertical = node.direction === "vertical";
+
+  // Hidden (parked) subtrees collapse out of the flex layout; when one side
+  // is hidden the other takes all the space. className/style only — the
+  // element tree keeps its shape so nothing remounts.
+  const h0 = subtreeAllHidden(node.children[0], hiddenSlotIds);
+  const h1 = subtreeAllHidden(node.children[1], hiddenSlotIds);
 
   // Use flexGrow proportional sharing so the 4px divider is naturally
   // subtracted from available space before children divide the remainder.
@@ -61,8 +87,12 @@ export function SplitPaneView({
       }
     >
       <div
-        style={eagleMode ? undefined : { flexGrow: node.ratio, flexShrink: 1, flexBasis: 0 }}
-        className={eagleMode ? "contents" : "min-w-0 min-h-0 overflow-hidden"}
+        style={
+          eagleMode || h0
+            ? undefined
+            : { flexGrow: h1 ? 1 : node.ratio, flexShrink: 1, flexBasis: 0 }
+        }
+        className={h0 ? "hidden" : eagleMode ? "contents" : "min-w-0 min-h-0 overflow-hidden"}
       >
         <SplitPaneView
           node={node.children[0]}
@@ -70,10 +100,11 @@ export function SplitPaneView({
           onRatioChange={onRatioChange}
           onDragStateChange={onDragStateChange}
           eagleMode={eagleMode}
+          hiddenSlotIds={hiddenSlotIds}
         />
       </div>
 
-      {!eagleMode && (
+      {!eagleMode && !h0 && !h1 && (
         <Divider
           direction={node.direction}
           nodeId={node.id}
@@ -83,8 +114,12 @@ export function SplitPaneView({
       )}
 
       <div
-        style={eagleMode ? undefined : { flexGrow: 1 - node.ratio, flexShrink: 1, flexBasis: 0 }}
-        className={eagleMode ? "contents" : "min-w-0 min-h-0 overflow-hidden"}
+        style={
+          eagleMode || h1
+            ? undefined
+            : { flexGrow: h0 ? 1 : 1 - node.ratio, flexShrink: 1, flexBasis: 0 }
+        }
+        className={h1 ? "hidden" : eagleMode ? "contents" : "min-w-0 min-h-0 overflow-hidden"}
       >
         <SplitPaneView
           node={node.children[1]}
@@ -92,6 +127,7 @@ export function SplitPaneView({
           onRatioChange={onRatioChange}
           onDragStateChange={onDragStateChange}
           eagleMode={eagleMode}
+          hiddenSlotIds={hiddenSlotIds}
         />
       </div>
     </div>

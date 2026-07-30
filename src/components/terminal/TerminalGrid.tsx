@@ -60,6 +60,7 @@ import { useWorkspaceStore, type RepositoryInfo, type WorkspaceType } from "@/st
 import { shellEscapePaths } from "@/lib/shellEscape";
 import { projectColorFor } from "@/lib/projectColor";
 import { useProjectColors } from "@/lib/useProjectColors";
+import { ParkedShelf } from "./ParkedShelf";
 import { PreLaunchCard, type SessionSlot } from "./PreLaunchCard";
 import { SplitPaneView } from "./SplitPaneView";
 import { createLeaf, splitLeaf, removeLeaf, updateRatio, collectSlotIds, findSiblingSlotId, buildGridTree, swapSlots, type TreeNode, type SplitDirection } from "./splitTree";
@@ -293,6 +294,20 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     return map;
   }, [allSessions]);
 
+  // Parked terminals: hidden from the grid (CSS-only, PTY keeps running).
+  // Selector returns the stored array reference; Sets are built in useMemo.
+  const parkedSessionIds = useSessionStore((s) => s.parkedSessionIds);
+  const parkedSet = useMemo(() => new Set(parkedSessionIds), [parkedSessionIds]);
+  const parkedSlotIds = useMemo(
+    () =>
+      new Set(
+        slots
+          .filter((s) => s.sessionId !== null && parkedSet.has(s.sessionId))
+          .map((s) => s.id),
+      ),
+    [slots, parkedSet],
+  );
+
   // Binary split tree layout (drives pane arrangement)
   const [layoutTree, setLayoutTree] = useState<TreeNode>(() => createLeaf(slots[0].id));
 
@@ -357,13 +372,24 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     setZoomTabOrder(tabId, arrayMove(displaySlotIds, from, to));
   }, [tabId, displaySlotIds, setZoomTabOrder]);
 
-  // Compute launched slots in tree order for keyboard navigation
+  // Compute launched slots in tree order for keyboard navigation.
+  // Parked panes are hidden, so Cmd+1-9 and cycling skip them.
   const launchedSlots = useMemo(() => {
     const slotMap = new Map(slots.map((s) => [s.id, s]));
     return orderedSlotIds
       .map((id) => slotMap.get(id))
-      .filter((s): s is SessionSlot => s != null && s.sessionId !== null);
-  }, [slots, orderedSlotIds]);
+      .filter(
+        (s): s is SessionSlot =>
+          s != null && s.sessionId !== null && !parkedSet.has(s.sessionId),
+      );
+  }, [slots, orderedSlotIds, parkedSet]);
+
+  // Zoom navigation order with parked panes removed — they are unreachable
+  // while hidden (the shelf is the only way back).
+  const visibleDisplaySlotIds = useMemo(
+    () => displaySlotIds.filter((id) => !parkedSlotIds.has(id)),
+    [displaySlotIds, parkedSlotIds],
+  );
 
   // Map focusedSlotId to an index in launchedSlots
   const focusedIndex = useMemo(() => {
@@ -424,24 +450,25 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     onToggleZoomFocused: useCallback(() => {
       const targetId = focusedSlotId ?? slotsRef.current[0]?.id;
       if (!targetId) return;
+      if (parkedSlotIds.has(targetId)) return; // parked panes can't be zoomed
       setZoomedSlotId((prev) => (prev === targetId ? null : targetId));
-    }, [focusedSlotId]),
+    }, [focusedSlotId, parkedSlotIds]),
     onZoomedNext: useCallback(() => {
       setZoomedSlotId((prev) => {
         if (!prev) return prev;
-        const idx = displaySlotIds.indexOf(prev);
+        const idx = visibleDisplaySlotIds.indexOf(prev);
         if (idx < 0) return prev;
-        return displaySlotIds[(idx + 1) % displaySlotIds.length];
+        return visibleDisplaySlotIds[(idx + 1) % visibleDisplaySlotIds.length];
       });
-    }, [displaySlotIds]),
+    }, [visibleDisplaySlotIds]),
     onZoomedPrev: useCallback(() => {
       setZoomedSlotId((prev) => {
         if (!prev) return prev;
-        const idx = displaySlotIds.indexOf(prev);
+        const idx = visibleDisplaySlotIds.indexOf(prev);
         if (idx < 0) return prev;
-        return displaySlotIds[(idx - 1 + displaySlotIds.length) % displaySlotIds.length];
+        return visibleDisplaySlotIds[(idx - 1 + visibleDisplaySlotIds.length) % visibleDisplaySlotIds.length];
       });
-    }, [displaySlotIds]),
+    }, [visibleDisplaySlotIds]),
     // When a terminal is zoomed the tab strip is the navigation UI, so
     // Alt+Left/Right should cycle tabs (handled in capture phase so xterm
     // doesn't swallow them). In normal split-pane mode Alt+Arrow stays as
@@ -1100,10 +1127,19 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     return true;
   }, [handleKill]);
 
+  /** Unpark a session if it is parked — focus/zoom targets must be visible. */
+  const unparkIfParked = (sessionId: number) => {
+    const store = useSessionStore.getState();
+    if (store.parkedSessionIds.includes(sessionId)) {
+      store.unparkSession(sessionId);
+    }
+  };
+
   /** Focus the pane running a session. False if this grid doesn't own it. */
   const focusSession = useCallback((sessionId: number): boolean => {
     const slot = slotsRef.current.find((s) => s.sessionId === sessionId);
     if (!slot) return false;
+    unparkIfParked(sessionId);
     // Leave zoom if a different pane is zoomed, so the target is visible.
     setZoomedSlotId((prev) => (prev === slot.id ? prev : null));
     setFocusedSlotId(slot.id);
@@ -1115,12 +1151,42 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   const zoomSession = useCallback((sessionId: number): boolean => {
     const slot = slotsRef.current.find((s) => s.sessionId === sessionId);
     if (!slot) return false;
+    unparkIfParked(sessionId);
     // Set (not toggle): repeated calls stay zoomed on the same pane, and any
     // other pane's zoom is replaced.
     setZoomedSlotId(slot.id);
     setFocusedSlotId(slot.id);
     focusSlotTextarea(slot.id);
     return true;
+  }, []);
+
+  /**
+   * Parks a launched pane: hides it from the grid (CSS-only — the PTY and
+   * xterm instance keep running) and moves zoom/focus off it. Never calls
+   * killSession — restoring via the shelf brings the terminal back intact.
+   */
+  const handlePark = useCallback((slotId: string) => {
+    const slot = slotsRef.current.find((s) => s.id === slotId);
+    if (!slot || slot.sessionId === null) return;
+    useSessionStore.getState().parkSession(slot.sessionId);
+    setZoomedSlotId((prev) => (prev === slotId ? null : prev));
+    if (focusedSlotId === slotId) {
+      const parked = useSessionStore.getState().parkedSessionIds;
+      const fallback = slotsRef.current.find(
+        (s) => s.id !== slotId && s.sessionId !== null && !parked.includes(s.sessionId),
+      );
+      setFocusedSlotId(fallback ? fallback.id : findSiblingSlotId(layoutTree, slotId));
+    }
+  }, [focusedSlotId, layoutTree]);
+
+  /** Restores a parked session's pane to the grid and focuses it. */
+  const handleUnpark = useCallback((sessionId: number) => {
+    useSessionStore.getState().unparkSession(sessionId);
+    const slot = slotsRef.current.find((s) => s.sessionId === sessionId);
+    if (!slot) return;
+    setZoomedSlotId(null);
+    setFocusedSlotId(slot.id);
+    focusSlotTextarea(slot.id);
   }, []);
 
   // Keep closePaneRef in sync with latest handleKill/removeSlot
@@ -1474,6 +1540,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
             onToggleZoom={() =>
               eagleMode ? onEagleZoomToggle?.(sessionId) : handleToggleZoom(slot.id)
             }
+            onPark={() => handlePark(slot.id)}
             onAttachFiles={() => {
               handleAttachFiles(sessionId, slot.id).catch(console.error);
             }}
@@ -1535,7 +1602,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       </DraggablePane>
     );
   // eslint-disable-next-line react-hooks/exhaustive-deps -- Deps cover all render-affecting state
-  }, [slots, focusedSlotId, isActive, isDraggingFiles, dropTargetSlotId, getFocusCallback, handleKill, handleToggleZoom, handleAttachFiles, handleSwapSlots, projectPath, branches, isLoadingBranches, isGitRepo, hasManagedWorktree, repositories, workspaceType, effectiveRepoPath, onRepoChange, mcpServers, skills, plugins, handleCreateBranch, updateSlotCustomName, updateSlotMode, updateSlotBranch, updateSlotWorktreeMode, refreshBranches, toggleSlotMcp, toggleSlotSkill, toggleSlotPlugin, selectAllMcp, unselectAllMcp, selectAllPlugins, unselectAllPlugins, launchSlot, removeSlot, updateSlotResumeSession, eagleMode, eagleZoomedSessionId, eagleAnyZoomed, onEagleZoomToggle, projectName, eagleColor, tabId]);
+  }, [slots, focusedSlotId, isActive, isDraggingFiles, dropTargetSlotId, getFocusCallback, handleKill, handleToggleZoom, handlePark, handleAttachFiles, handleSwapSlots, projectPath, branches, isLoadingBranches, isGitRepo, hasManagedWorktree, repositories, workspaceType, effectiveRepoPath, onRepoChange, mcpServers, skills, plugins, handleCreateBranch, updateSlotCustomName, updateSlotMode, updateSlotBranch, updateSlotWorktreeMode, refreshBranches, toggleSlotMcp, toggleSlotSkill, toggleSlotPlugin, selectAllMcp, unselectAllMcp, selectAllPlugins, unselectAllPlugins, launchSlot, removeSlot, updateSlotResumeSession, eagleMode, eagleZoomedSessionId, eagleAnyZoomed, onEagleZoomToggle, projectName, eagleColor, tabId]);
 
   const handleRatioChange = useCallback((nodeId: string, ratio: number) => {
     setLayoutTree((prev) => updateRatio(prev, nodeId, ratio));
@@ -1590,7 +1657,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     if (!zoomedSlot) {
       setZoomedSlotId(null);
     } else {
-      const orderedSlots = displaySlotIds.map((id) => slots.find((s) => s.id === id)).filter(Boolean) as SessionSlot[];
+      const orderedSlots = visibleDisplaySlotIds.map((id) => slots.find((s) => s.id === id)).filter(Boolean) as SessionSlot[];
       const zoomedIndex = orderedSlots.findIndex(s => s.id === zoomedSlotId);
 
       return (
@@ -1662,6 +1729,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
                 terminalCount={slots.length}
                 isZoomed={true}
                 onToggleZoom={() => handleToggleZoom(zoomedSlot.id)}
+                onPark={() => handlePark(zoomedSlot.id)}
                 onAttachFiles={() => {
                   handleAttachFiles(zoomedSlot.sessionId!, zoomedSlot.id).catch(console.error);
                 }}
@@ -1704,26 +1772,44 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
               </div>
             )}
           </div>
+
+          {/* Parked terminals stay reachable from zoom-in view (unpark exits zoom) */}
+          <ParkedShelf projectPath={projectPath} onUnpark={handleUnpark} />
         </div>
       );
     }
   }
 
+  // Both wrappers exist in BOTH modes (display:contents in eagle) so toggling
+  // eagle view never changes the element tree shape — a structural difference
+  // would remount every xterm and lose all scrollback. The shelf only ever
+  // appends/removes as a trailing sibling, which leaves the split tree alone.
+  const allParked =
+    !eagleMode && slots.every((s) => s.sessionId !== null && parkedSet.has(s.sessionId));
   return (
     <div
       className={
         eagleMode
           ? "contents"
-          : `flex h-full bg-maestro-bg p-2 ${isDragging ? "split-dragging" : ""}`
+          : `flex h-full flex-col bg-maestro-bg p-2 ${isDragging ? "split-dragging" : ""}`
       }
     >
-      <SplitPaneView
-        node={layoutTree}
-        renderLeaf={renderLeaf}
-        onRatioChange={handleRatioChange}
-        onDragStateChange={setIsDragging}
-        eagleMode={eagleMode}
-      />
+      <div className={eagleMode ? "contents" : "relative flex min-h-0 flex-1"}>
+        <SplitPaneView
+          node={layoutTree}
+          renderLeaf={renderLeaf}
+          onRatioChange={handleRatioChange}
+          onDragStateChange={setIsDragging}
+          eagleMode={eagleMode}
+          hiddenSlotIds={parkedSlotIds}
+        />
+        {allParked && (
+          <div className="absolute inset-0 flex items-center justify-center text-sm text-maestro-muted">
+            All terminals parked — click a chip below to restore
+          </div>
+        )}
+      </div>
+      {!eagleMode && <ParkedShelf projectPath={projectPath} onUnpark={handleUnpark} />}
     </div>
   );
 });
