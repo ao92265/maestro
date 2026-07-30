@@ -184,6 +184,15 @@ export const TerminalView = memo(function TerminalView({
   );
   const effectiveStatus = sessionData ? mapStatus(sessionData.status) : status;
   const effectiveProvider = sessionData ? mapAiMode(sessionData.mode) : "claude";
+
+  // Warning flag: user-toggled yellow chrome (header + tab strip), synced via
+  // the session store so it shows in every view.
+  const isFlagged = useSessionStore((s) => s.flaggedSessionIds.includes(sessionId));
+  const toggleSessionFlag = useSessionStore((s) => s.toggleSessionFlag);
+  const handleToggleFlag = useCallback(
+    () => toggleSessionFlag(sessionId),
+    [toggleSessionFlag, sessionId],
+  );
   const hasSessionWorktree = Boolean(sessionData?.worktreePath);
   const projectPath = sessionData?.workingDirectory ?? sessionData?.projectPath ?? "";
 
@@ -863,10 +872,20 @@ export const TerminalView = memo(function TerminalView({
         projectLabel={projectLabel}
         projectColor={projectColor}
         hasMoveHandle={hasMoveHandle}
+        isFlagged={isFlagged}
+        onToggleFlag={handleToggleFlag}
       />
 
-      {/* Tab bar */}
-      <div className="flex shrink-0 items-center gap-0.5 border-b border-neutral-800 bg-neutral-900/50 px-2">
+      {/* Tab bar — clicking its background or the already-active tab toggles
+          the warning flag (yellow), in sync with the header above. */}
+      <div
+        className={`flex shrink-0 cursor-pointer items-center gap-0.5 border-b border-neutral-800 ${isFlagged ? "warning-flag" : "bg-neutral-900/50"} px-2`}
+        onClick={(e) => {
+          if ((e.target as HTMLElement).closest("button")) return;
+          handleToggleFlag();
+        }}
+        title={isFlagged ? "Click to clear warning flag" : "Click to flag as warning"}
+      >
         <button
           type="button"
           className={`px-2.5 py-1 text-[11px] font-medium transition-colors ${
@@ -874,7 +893,7 @@ export const TerminalView = memo(function TerminalView({
               ? "border-b-2 border-blue-500 text-neutral-200"
               : "text-neutral-500 hover:text-neutral-300"
           }`}
-          onClick={() => setActiveTab("terminal")}
+          onClick={() => (activeTab === "terminal" ? handleToggleFlag() : setActiveTab("terminal"))}
         >
           Terminal
         </button>
@@ -885,7 +904,7 @@ export const TerminalView = memo(function TerminalView({
               ? "border-b-2 border-blue-500 text-neutral-200"
               : "text-neutral-500 hover:text-neutral-300"
           }`}
-          onClick={() => setActiveTab("activity")}
+          onClick={() => (activeTab === "activity" ? handleToggleFlag() : setActiveTab("activity"))}
         >
           Activity
         </button>
@@ -896,7 +915,7 @@ export const TerminalView = memo(function TerminalView({
               ? "border-b-2 border-blue-500 text-neutral-200"
               : "text-neutral-500 hover:text-neutral-300"
           }`}
-          onClick={() => setActiveTab("graph")}
+          onClick={() => (activeTab === "graph" ? handleToggleFlag() : setActiveTab("graph"))}
         >
           Graph
         </button>

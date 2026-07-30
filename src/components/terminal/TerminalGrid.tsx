@@ -2058,6 +2058,12 @@ function ZoomTab({
     isDragging,
   } = useSortable({ id: slotId });
 
+  // Warning flag (display only — clicking still selects/exits zoom): keeps
+  // the yellow marker visible for terminals hidden behind the zoomed one.
+  const isFlagged = useSessionStore(
+    (s) => sessionId !== null && s.flaggedSessionIds.includes(sessionId),
+  );
+
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
@@ -2073,6 +2079,7 @@ function ZoomTab({
       onClick={onSelect}
       className={`
         flex shrink-0 items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors
+        ${isFlagged ? 'warning-flag' : ''}
         ${isActive
           ? 'bg-maestro-accent/15 text-maestro-accent'
           : 'text-maestro-muted hover:bg-maestro-card hover:text-maestro-text'

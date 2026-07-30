@@ -111,6 +111,20 @@
   }
 }
 
+/* ── Warning flag (yellow terminal chrome) ──
+   Applied to a terminal's header, tab strip, and zoom tab when the user flags
+   it by clicking the header or tab strip. Solid yellow background; descendant
+   text/icons forced dark for contrast (inputs excluded — the rename field has
+   its own dark background). */
+.warning-flag {
+  background-color: rgb(var(--maestro-yellow)) !important;
+  border-color: rgb(var(--maestro-yellow)) !important;
+}
+.warning-flag,
+.warning-flag *:not(input) {
+  color: rgb(20 20 24 / 0.9) !important;
+}
+
 /* ── Split Pane Dividers ── */
 
 .split-divider {

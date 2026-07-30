@@ -85,10 +85,17 @@ interface SessionState {
    * hide unrelated future sessions that reuse the same numbers.
    */
   parkedSessionIds: number[];
+  /**
+   * Sessions the user flagged as "warning" by clicking the terminal header or
+   * tab strip — their chrome renders yellow. In-memory only, same rationale
+   * as parkedSessionIds: session IDs are reassigned each app launch.
+   */
+  flaggedSessionIds: number[];
   isLoading: boolean;
   error: string | null;
   parkSession: (sessionId: number) => void;
   unparkSession: (sessionId: number) => void;
+  toggleSessionFlag: (sessionId: number) => void;
   fetchSessions: () => Promise<void>;
   fetchSessionsForProject: (projectPath: string) => Promise<void>;
   addSession: (session: SessionConfig) => void;
@@ -141,6 +148,7 @@ function clearStartupTimeout(sessionId: number): void {
 export const useSessionStore = create<SessionState>()((set, get) => ({
   sessions: [],
   parkedSessionIds: [],
+  flaggedSessionIds: [],
   isLoading: false,
   error: null,
 
@@ -158,6 +166,14 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     }));
   },
 
+  toggleSessionFlag: (sessionId: number) => {
+    set((state) => ({
+      flaggedSessionIds: state.flaggedSessionIds.includes(sessionId)
+        ? state.flaggedSessionIds.filter((id) => id !== sessionId)
+        : [...state.flaggedSessionIds, sessionId],
+    }));
+  },
+
   fetchSessions: async () => {
     set({ isLoading: true, error: null });
     try {
@@ -165,8 +181,11 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       set((state) => ({
         sessions,
         isLoading: false,
-        // Prune parked IDs that no longer exist in the fetched list
+        // Prune parked/flagged IDs that no longer exist in the fetched list
         parkedSessionIds: state.parkedSessionIds.filter((id) =>
+          sessions.some((s) => s.id === id)
+        ),
+        flaggedSessionIds: state.flaggedSessionIds.filter((id) =>
           sessions.some((s) => s.id === id)
         ),
       }));
@@ -185,8 +204,11 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       set((state) => ({
         sessions,
         isLoading: false,
-        // Prune parked IDs that no longer exist in the fetched list
+        // Prune parked/flagged IDs that no longer exist in the fetched list
         parkedSessionIds: state.parkedSessionIds.filter((id) =>
+          sessions.some((s) => s.id === id)
+        ),
+        flaggedSessionIds: state.flaggedSessionIds.filter((id) =>
           sessions.some((s) => s.id === id)
         ),
       }));
@@ -305,6 +327,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     set((state) => ({
       sessions: state.sessions.filter((s) => s.id !== sessionId),
       parkedSessionIds: state.parkedSessionIds.filter((id) => id !== sessionId),
+      flaggedSessionIds: state.flaggedSessionIds.filter((id) => id !== sessionId),
     }));
   },
 
@@ -319,6 +342,9 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
           (s) => !removed.some((r) => r.id === s.id)
         ),
         parkedSessionIds: state.parkedSessionIds.filter(
+          (id) => !removed.some((r) => r.id === id)
+        ),
+        flaggedSessionIds: state.flaggedSessionIds.filter(
           (id) => !removed.some((r) => r.id === id)
         ),
       }));

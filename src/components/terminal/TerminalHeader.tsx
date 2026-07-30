@@ -43,6 +43,10 @@ interface TerminalHeaderProps {
   projectColor?: string;
   /** Reserve space at the left for the pane's drag handle overlay. */
   hasMoveHandle?: boolean;
+  /** Warning flag: renders the header yellow (toggled by clicking it). */
+  isFlagged?: boolean;
+  /** Toggle the warning flag — fired on clicks outside interactive controls. */
+  onToggleFlag?: () => void;
 }
 
 const providerConfig: Record<AIProvider, { icon: IconComponent; label: string }> = {
@@ -73,6 +77,8 @@ export const TerminalHeader = memo(function TerminalHeader({
   projectLabel,
   projectColor,
   hasMoveHandle = false,
+  isFlagged = false,
+  onToggleFlag,
 }: TerminalHeaderProps) {
   const { icon: ProviderIcon, label: providerLabel } = providerConfig[provider];
   const [showZoomMenu, setShowZoomMenu] = useState(false);
@@ -217,8 +223,20 @@ export const TerminalHeader = memo(function TerminalHeader({
         ? "border-maestro-yellow"
         : "border-maestro-border";
 
+  // Toggle the warning flag on plain header clicks; clicks on buttons/inputs
+  // (park, zoom, kill, rename field, …) keep their own actions.
+  const handleHeaderClick = (e: React.MouseEvent) => {
+    if (!onToggleFlag) return;
+    if ((e.target as HTMLElement).closest("button, input")) return;
+    onToggleFlag();
+  };
+
   return (
-    <div className={`no-select flex ${adaptive.headerHeight} shrink-0 items-center ${adaptive.gapSize} border-b ${statusBorder} bg-maestro-surface ${hasMoveHandle ? "pl-6 pr-2" : "px-2"}`}>
+    <div
+      className={`no-select flex ${adaptive.headerHeight} shrink-0 items-center ${adaptive.gapSize} border-b ${statusBorder} ${isFlagged ? "warning-flag" : "bg-maestro-surface"} ${hasMoveHandle ? "pl-6 pr-2" : "px-2"} ${onToggleFlag ? "cursor-pointer" : ""}`}
+      onClick={handleHeaderClick}
+      title={onToggleFlag ? (isFlagged ? "Click to clear warning flag" : "Click to flag as warning") : undefined}
+    >
       {/* Left cluster */}
       <div className={`flex min-w-0 flex-1 items-center ${adaptive.gapSize}`}>
         {/* AI provider icon + dropdown */}
@@ -266,7 +284,11 @@ export const TerminalHeader = memo(function TerminalHeader({
         ) : (
           <span
             className={`shrink-0 cursor-text font-medium text-maestro-text ${adaptive.sessionLabelSize}`}
-            onClick={startEditingName}
+            onClick={(e) => {
+              // Renaming, not flag-toggling — keep the click off the header.
+              e.stopPropagation();
+              startEditingName();
+            }}
           >
             {sessionName || defaultLabel}
           </span>
