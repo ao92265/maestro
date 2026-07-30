@@ -37,7 +37,7 @@ function setTabs(tabs: Array<{ id: string; name: string; active: boolean }>) {
 
 describe("useWorkspaceStore reorder actions", () => {
   beforeEach(() => {
-    useWorkspaceStore.setState({ tabs: [] });
+    useWorkspaceStore.setState({ tabs: [], zoomTabOrders: {} });
   });
 
   describe("reorderTabs", () => {
@@ -141,6 +141,29 @@ describe("useWorkspaceStore reorder actions", () => {
       const movedTab = useWorkspaceStore.getState().tabs.find((t) => t.id === "a");
       expect(movedTab?.name).toBe("A");
       expect(movedTab?.active).toBe(true);
+    });
+  });
+
+  describe("setZoomTabOrder", () => {
+    it("sets the zoom tab order for a tab", () => {
+      useWorkspaceStore.getState().setZoomTabOrder("tab-1", ["s2", "s1", "s3"]);
+
+      expect(useWorkspaceStore.getState().zoomTabOrders["tab-1"]).toEqual(["s2", "s1", "s3"]);
+    });
+
+    it("overwrites an existing order", () => {
+      useWorkspaceStore.getState().setZoomTabOrder("tab-1", ["s1", "s2"]);
+      useWorkspaceStore.getState().setZoomTabOrder("tab-1", ["s2", "s1"]);
+
+      expect(useWorkspaceStore.getState().zoomTabOrders["tab-1"]).toEqual(["s2", "s1"]);
+    });
+
+    it("keeps orders for different tabs independent", () => {
+      useWorkspaceStore.getState().setZoomTabOrder("tab-1", ["s1", "s2"]);
+      useWorkspaceStore.getState().setZoomTabOrder("tab-2", ["x2", "x1"]);
+
+      expect(useWorkspaceStore.getState().zoomTabOrders["tab-1"]).toEqual(["s1", "s2"]);
+      expect(useWorkspaceStore.getState().zoomTabOrders["tab-2"]).toEqual(["x2", "x1"]);
     });
   });
 });

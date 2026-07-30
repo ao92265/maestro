@@ -53,6 +53,12 @@ export type WorkspaceTab = {
 /** Read-only slice of the workspace store; persisted to disk via Zustand `persist`. */
 type WorkspaceState = {
   tabs: WorkspaceTab[];
+  /**
+   * Zoom tab strip display order per workspace tab id (values are slot ids).
+   * Runtime-only: excluded from persistence (`partialize` only persists `tabs`)
+   * because slot ids are ephemeral per app run — sessions never survive restart.
+   */
+  zoomTabOrders: Record<string, string[]>;
 };
 
 /**
@@ -78,6 +84,8 @@ type WorkspaceActions = {
   reorderTabs: (activeId: string, overId: string) => void;
   /** Move a tab one position left or right. Used by keyboard shortcut. */
   moveTab: (tabId: string, direction: "left" | "right") => void;
+  /** Set the zoom tab strip display order (slot ids) for a workspace tab. */
+  setZoomTabOrder: (tabId: string, order: string[]) => void;
   /** Re-scan repositories for all multi-repo tabs after rehydration. */
   rehydrateRepositories: () => Promise<void>;
 };
@@ -188,6 +196,7 @@ export const useWorkspaceStore = create<WorkspaceState & WorkspaceActions>()(
   persist(
     (set, get) => ({
       tabs: [],
+      zoomTabOrders: {},
 
       openProject: async (path: string) => {
         const { tabs } = get();
@@ -377,6 +386,10 @@ export const useWorkspaceStore = create<WorkspaceState & WorkspaceActions>()(
         const newIndex = direction === "left" ? index - 1 : index + 1;
         if (newIndex < 0 || newIndex >= tabs.length) return;
         set({ tabs: arrayMove(tabs, index, newIndex) });
+      },
+
+      setZoomTabOrder: (tabId: string, order: string[]) => {
+        set({ zoomTabOrders: { ...get().zoomTabOrders, [tabId]: order } });
       },
 
       rehydrateRepositories: async () => {

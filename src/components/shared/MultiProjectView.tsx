@@ -288,7 +288,13 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
               Terminal {zoomedIndex + 1}/{eagleSessions.length}
             </span>
             <div className="h-3.5 w-px bg-maestro-border" />
-            <div className="flex flex-1 gap-0.5 overflow-x-auto">
+            <div
+              className="scrollbar-none flex flex-1 gap-0.5 overflow-x-auto"
+              onWheel={(e) => {
+                // Vertical wheel input scrolls the strip horizontally (scrollbar is hidden).
+                if (e.deltaY !== 0) e.currentTarget.scrollLeft += e.deltaY;
+              }}
+            >
               {eagleSessions.map((session, index) => {
                 const isActive = session.sessionId === eagleZoom;
                 const label =

@@ -1,5 +1,21 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, type ReactNode } from "react";
 
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  arrayMove,
+  horizontalListSortingStrategy,
+  useSortable,
+} from "@dnd-kit/sortable";
+import { restrictToHorizontalAxis } from "@dnd-kit/modifiers";
+import { CSS } from "@dnd-kit/utilities";
 import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { GripVertical } from "lucide-react";
@@ -233,6 +249,9 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
 
   const addSessionToProject = useWorkspaceStore((s) => s.addSessionToProject);
   const removeSessionFromProject = useWorkspaceStore((s) => s.removeSessionFromProject);
+  const setZoomTabOrder = useWorkspaceStore((s) => s.setZoomTabOrder);
+  // Array reference is stable per tab (only replaced by setZoomTabOrder), so no useShallow needed.
+  const zoomTabOrder = useWorkspaceStore((s) => (tabId ? s.zoomTabOrders[tabId] : undefined));
   const worktreeBasePath = useWorkspaceStore((s) =>
     tabId ? s.tabs.find((t) => t.id === tabId)?.worktreeBasePath ?? null : null
   );
@@ -308,6 +327,34 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   // Ordered slot IDs from the split tree (defines Cmd+1-9 ordering)
   const orderedSlotIds = useMemo(() => collectSlotIds(layoutTree), [layoutTree]);
 
+  // Zoom tab strip display order: the user-dragged order (store) wins; slots
+  // not in the stored order keep tree order (Array.sort is stable). Self-heals:
+  // killed slots drop out, newly added slots append in tree order. Only the
+  // zoom strip and Alt+Arrow cycling use this — grid layout stays tree-ordered.
+  const displaySlotIds = useMemo(() => {
+    if (!zoomTabOrder?.length) return orderedSlotIds;
+    const rank = new Map(zoomTabOrder.map((id, i) => [id, i]));
+    return [...orderedSlotIds].sort(
+      (a, b) => (rank.get(a) ?? Infinity) - (rank.get(b) ?? Infinity),
+    );
+  }, [orderedSlotIds, zoomTabOrder]);
+
+  // Drag-to-reorder for the zoom tab strip (same dnd-kit setup as ProjectTabs).
+  const zoomTabSensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: { distance: 5 },
+    })
+  );
+
+  const handleZoomTabDragEnd = useCallback((event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!tabId || !over || active.id === over.id) return;
+    const from = displaySlotIds.indexOf(active.id as string);
+    const to = displaySlotIds.indexOf(over.id as string);
+    if (from === -1 || to === -1) return;
+    setZoomTabOrder(tabId, arrayMove(displaySlotIds, from, to));
+  }, [tabId, displaySlotIds, setZoomTabOrder]);
+
   // Compute launched slots in tree order for keyboard navigation
   const launchedSlots = useMemo(() => {
     const slotMap = new Map(slots.map((s) => [s.id, s]));
@@ -380,19 +427,19 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     onZoomedNext: useCallback(() => {
       setZoomedSlotId((prev) => {
         if (!prev) return prev;
-        const idx = orderedSlotIds.indexOf(prev);
+        const idx = displaySlotIds.indexOf(prev);
         if (idx < 0) return prev;
-        return orderedSlotIds[(idx + 1) % orderedSlotIds.length];
+        return displaySlotIds[(idx + 1) % displaySlotIds.length];
       });
-    }, [orderedSlotIds]),
+    }, [displaySlotIds]),
     onZoomedPrev: useCallback(() => {
       setZoomedSlotId((prev) => {
         if (!prev) return prev;
-        const idx = orderedSlotIds.indexOf(prev);
+        const idx = displaySlotIds.indexOf(prev);
         if (idx < 0) return prev;
-        return orderedSlotIds[(idx - 1 + orderedSlotIds.length) % orderedSlotIds.length];
+        return displaySlotIds[(idx - 1 + displaySlotIds.length) % displaySlotIds.length];
       });
-    }, [orderedSlotIds]),
+    }, [displaySlotIds]),
     // When a terminal is zoomed the tab strip is the navigation UI, so
     // Alt+Left/Right should cycle tabs (handled in capture phase so xterm
     // doesn't swallow them). In normal split-pane mode Alt+Arrow stays as
@@ -1499,7 +1546,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     if (!zoomedSlot) {
       setZoomedSlotId(null);
     } else {
-      const orderedSlots = orderedSlotIds.map((id) => slots.find((s) => s.id === id)).filter(Boolean) as SessionSlot[];
+      const orderedSlots = displaySlotIds.map((id) => slots.find((s) => s.id === id)).filter(Boolean) as SessionSlot[];
       const zoomedIndex = orderedSlots.findIndex(s => s.id === zoomedSlotId);
 
       return (
@@ -1510,37 +1557,43 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
               Terminal {zoomedIndex + 1}/{orderedSlots.length}
             </span>
             <div className="h-3.5 w-px bg-maestro-border" />
-            <div className="flex flex-1 gap-0.5 overflow-x-auto">
-              {orderedSlots.map((slot, index) => {
-                const isActive = slot.id === zoomedSlotId;
-                const hasSession = slot.sessionId !== null;
-                const liveName = slot.sessionId !== null ? sessionNameById.get(slot.sessionId) : undefined;
-                const label = liveName?.trim() || slot.customName.trim() || `Terminal ${index + 1}`;
+            <div
+              className="scrollbar-none flex flex-1 gap-0.5 overflow-x-auto"
+              onWheel={(e) => {
+                // Vertical wheel input scrolls the strip horizontally (scrollbar is hidden).
+                if (e.deltaY !== 0) e.currentTarget.scrollLeft += e.deltaY;
+              }}
+            >
+              <DndContext
+                sensors={zoomTabSensors}
+                collisionDetection={closestCenter}
+                modifiers={[restrictToHorizontalAxis]}
+                onDragEnd={handleZoomTabDragEnd}
+              >
+                <SortableContext
+                  items={orderedSlots.map((s) => s.id)}
+                  strategy={horizontalListSortingStrategy}
+                >
+                  {orderedSlots.map((slot, index) => {
+                    const isActive = slot.id === zoomedSlotId;
+                    const liveName = slot.sessionId !== null ? sessionNameById.get(slot.sessionId) : undefined;
+                    const label = liveName?.trim() || slot.customName.trim() || `Terminal ${index + 1}`;
 
-                return (
-                  <button
-                    key={slot.id}
-                    onClick={() => handleToggleZoom(slot.id)}
-                    className={`
-                      flex shrink-0 items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors
-                      ${isActive
-                        ? 'bg-maestro-accent/15 text-maestro-accent'
-                        : 'text-maestro-muted hover:bg-maestro-card hover:text-maestro-text'
-                      }
-                    `}
-                    title={isActive ? `${label} (click to exit zoom)` : `Switch to ${label}`}
-                  >
-                    <span className="font-mono text-[10px] opacity-60">{index + 1}</span>
-                    <span className="max-w-[180px] truncate">{label}</span>
-                    {hasSession && slot.sessionId !== null && (
-                      <>
-                        <ThinkingIndicator sessionId={slot.sessionId} size={3} />
-                        <span className="h-1.5 w-1.5 rounded-full bg-maestro-green" />
-                      </>
-                    )}
-                  </button>
-                );
-              })}
+                    return (
+                      <ZoomTab
+                        key={slot.id}
+                        slotId={slot.id}
+                        index={index}
+                        isActive={isActive}
+                        label={label}
+                        hasSession={slot.sessionId !== null}
+                        sessionId={slot.sessionId}
+                        onSelect={() => handleToggleZoom(slot.id)}
+                      />
+                    );
+                  })}
+                </SortableContext>
+              </DndContext>
             </div>
             <button
               onClick={() => handleToggleZoom(zoomedSlotId)}
@@ -1771,5 +1824,70 @@ function DraggablePane({
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * Single tab of the zoomed-terminal navigation strip, drag-reorderable via
+ * dnd-kit (same pattern as ProjectTabs' TabItem). PointerSensor's 5px
+ * activation constraint lets plain clicks through to onSelect.
+ */
+function ZoomTab({
+  slotId,
+  index,
+  isActive,
+  label,
+  hasSession,
+  sessionId,
+  onSelect,
+}: {
+  slotId: string;
+  index: number;
+  isActive: boolean;
+  label: string;
+  hasSession: boolean;
+  sessionId: number | null;
+  onSelect: () => void;
+}) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: slotId });
+
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.5 : 1,
+  };
+
+  return (
+    <button
+      ref={setNodeRef}
+      style={style}
+      {...attributes}
+      {...listeners}
+      onClick={onSelect}
+      className={`
+        flex shrink-0 items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors
+        ${isActive
+          ? 'bg-maestro-accent/15 text-maestro-accent'
+          : 'text-maestro-muted hover:bg-maestro-card hover:text-maestro-text'
+        }
+      `}
+      title={isActive ? `${label} (click to exit zoom)` : `Switch to ${label}`}
+    >
+      <span className="font-mono text-[10px] opacity-60">{index + 1}</span>
+      <span className="max-w-[180px] truncate">{label}</span>
+      {hasSession && sessionId !== null && (
+        <>
+          <ThinkingIndicator sessionId={sessionId} size={3} />
+          <span className="h-1.5 w-1.5 rounded-full bg-maestro-green" />
+        </>
+      )}
+    </button>
   );
 }
