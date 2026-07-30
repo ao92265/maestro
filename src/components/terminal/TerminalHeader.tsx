@@ -36,6 +36,8 @@ interface TerminalHeaderProps {
   projectLabel?: string;
   /** Color for the project label — matches the tile border color. */
   projectColor?: string;
+  /** Reserve space at the left for the pane's drag handle overlay. */
+  hasMoveHandle?: boolean;
 }
 
 const providerConfig: Record<AIProvider, { icon: IconComponent; label: string }> = {
@@ -63,6 +65,7 @@ export const TerminalHeader = memo(function TerminalHeader({
   onSetZoomLevel,
   projectLabel,
   projectColor,
+  hasMoveHandle = false,
 }: TerminalHeaderProps) {
   const { icon: ProviderIcon, label: providerLabel } = providerConfig[provider];
   const [showZoomMenu, setShowZoomMenu] = useState(false);
@@ -199,7 +202,7 @@ export const TerminalHeader = memo(function TerminalHeader({
   const adaptive = getAdaptiveClasses();
 
   return (
-    <div className={`no-select flex ${adaptive.headerHeight} shrink-0 items-center ${adaptive.gapSize} border-b border-maestro-border bg-maestro-surface px-2`}>
+    <div className={`no-select flex ${adaptive.headerHeight} shrink-0 items-center ${adaptive.gapSize} border-b border-maestro-border bg-maestro-surface ${hasMoveHandle ? "pl-6 pr-2" : "px-2"}`}>
       {/* Left cluster */}
       <div className={`flex min-w-0 flex-1 items-center ${adaptive.gapSize}`}>
         {/* AI provider icon + dropdown */}

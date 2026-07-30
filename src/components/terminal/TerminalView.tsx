@@ -46,6 +46,8 @@ interface TerminalViewProps {
   projectLabel?: string;
   /** Color for the project label — matches the tile border color. */
   projectColor?: string;
+  /** Reserve header space for the pane's drag handle overlay. */
+  hasMoveHandle?: boolean;
 }
 
 /**
@@ -154,6 +156,7 @@ export const TerminalView = memo(function TerminalView({
   onToggleZoom,
   projectLabel,
   projectColor,
+  hasMoveHandle = false,
 }: TerminalViewProps) {
   const sessionData = useSessionStore(
     useShallow((s) => {
@@ -830,6 +833,7 @@ export const TerminalView = memo(function TerminalView({
         onSetZoomLevel={setZoomLevel}
         projectLabel={projectLabel}
         projectColor={projectColor}
+        hasMoveHandle={hasMoveHandle}
       />
 
       {/* Tab bar */}

@@ -1405,7 +1405,12 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       </div>
     );
 
-    const showReorderHandle = slots.length > 1 && !eagleMode;
+    // Eagle hides pre-launch slots, so only launched panes count there; while
+    // eagle-zoomed all other tiles are visibility:hidden, so handles are moot.
+    const launchedCount = slots.filter((s) => s.sessionId !== null).length;
+    const showReorderHandle = eagleMode
+      ? launchedCount > 1 && !eagleAnyZoomed
+      : slots.length > 1;
     const isEagleZoomed =
       eagleMode && slot.sessionId !== null && eagleZoomedSessionId === slot.sessionId;
     const isEagleObscured = eagleMode && eagleAnyZoomed && !isEagleZoomed;
@@ -1416,6 +1421,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       return (
         <DraggablePane
           slotId={slot.id}
+          gridId={tabId}
           showHandle={showReorderHandle}
           onSwap={handleSwapSlots}
           eagleMode={eagleMode}
@@ -1437,6 +1443,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
             }
             projectLabel={eagleMode ? projectName : undefined}
             projectColor={eagleMode ? eagleColor : undefined}
+            hasMoveHandle={showReorderHandle}
           />
           {dropOverlay}
         </DraggablePane>
@@ -1446,6 +1453,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     return (
       <DraggablePane
         slotId={slot.id}
+        gridId={tabId}
         showHandle={showReorderHandle}
         onSwap={handleSwapSlots}
         eagleMode={eagleMode}
@@ -1491,7 +1499,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       </DraggablePane>
     );
   // eslint-disable-next-line react-hooks/exhaustive-deps -- Deps cover all render-affecting state
-  }, [slots, focusedSlotId, isActive, isDraggingFiles, dropTargetSlotId, getFocusCallback, handleKill, handleToggleZoom, handleSwapSlots, projectPath, branches, isLoadingBranches, isGitRepo, hasManagedWorktree, repositories, workspaceType, effectiveRepoPath, onRepoChange, mcpServers, skills, plugins, handleCreateBranch, updateSlotCustomName, updateSlotMode, updateSlotBranch, updateSlotWorktreeMode, refreshBranches, toggleSlotMcp, toggleSlotSkill, toggleSlotPlugin, selectAllMcp, unselectAllMcp, selectAllPlugins, unselectAllPlugins, launchSlot, removeSlot, updateSlotResumeSession, eagleMode, eagleZoomedSessionId, eagleAnyZoomed, onEagleZoomToggle, projectName, eagleColor]);
+  }, [slots, focusedSlotId, isActive, isDraggingFiles, dropTargetSlotId, getFocusCallback, handleKill, handleToggleZoom, handleSwapSlots, projectPath, branches, isLoadingBranches, isGitRepo, hasManagedWorktree, repositories, workspaceType, effectiveRepoPath, onRepoChange, mcpServers, skills, plugins, handleCreateBranch, updateSlotCustomName, updateSlotMode, updateSlotBranch, updateSlotWorktreeMode, refreshBranches, toggleSlotMcp, toggleSlotSkill, toggleSlotPlugin, selectAllMcp, unselectAllMcp, selectAllPlugins, unselectAllPlugins, launchSlot, removeSlot, updateSlotResumeSession, eagleMode, eagleZoomedSessionId, eagleAnyZoomed, onEagleZoomToggle, projectName, eagleColor, tabId]);
 
   const handleRatioChange = useCallback((nodeId: string, ratio: number) => {
     setLayoutTree((prev) => updateRatio(prev, nodeId, ratio));
@@ -1696,6 +1704,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
  */
 function DraggablePane({
   slotId,
+  gridId,
   showHandle,
   onSwap,
   children,
@@ -1705,6 +1714,8 @@ function DraggablePane({
   eagleObscured = false,
 }: {
   slotId: string;
+  /** Owning grid (tab) id — scopes eagle drags to same-project tiles. */
+  gridId?: string;
   showHandle: boolean;
   onSwap: (srcSlotId: string, destSlotId: string) => void;
   children: ReactNode;
@@ -1728,8 +1739,15 @@ function DraggablePane({
       setIsDragging(true);
 
       // Outline every other pane so the user can see they're valid drop targets.
+      // In eagle mode only same-grid tiles are real targets (cross-grid swaps
+      // no-op in swapSlots), so scope the selector to the owning grid.
       const allWrappers = Array.from(
-        document.querySelectorAll<HTMLElement>("[data-slot-id]"),
+        document.querySelectorAll<HTMLElement>(
+          eagleMode && gridId
+            ? // window.CSS: the bare name is shadowed by dnd-kit's CSS import.
+              `[data-slot-id][data-grid-id="${window.CSS.escape(gridId)}"]`
+            : "[data-slot-id]",
+        ),
       );
       const decorate = (el: HTMLElement, hovered: boolean) => {
         el.style.outline = hovered
@@ -1749,7 +1767,9 @@ function DraggablePane({
 
       const findTarget = (clientX: number, clientY: number): HTMLElement | null => {
         const elem = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
-        return elem?.closest("[data-slot-id]") as HTMLElement | null;
+        const target = elem?.closest("[data-slot-id]") as HTMLElement | null;
+        if (eagleMode && gridId && target?.dataset.gridId !== gridId) return null;
+        return target;
       };
 
       const onMove = (ev: PointerEvent) => {
@@ -1776,7 +1796,7 @@ function DraggablePane({
       window.addEventListener("pointerup", onUp);
       window.addEventListener("pointercancel", onUp);
     },
-    [slotId, onSwap],
+    [slotId, onSwap, eagleMode, gridId],
   );
 
   // Eagle view restyles this container purely with CSS so the children
@@ -1803,6 +1823,7 @@ function DraggablePane({
       // is display:contents, whose rect is 0x0 — carrying the id here keeps
       // file drag-and-drop hit-testing working on the visible tile box.
       data-slot-id={eagleMode && !eagleHidden ? slotId : undefined}
+      data-grid-id={eagleMode && !eagleHidden ? gridId : undefined}
       style={
         eagleMode && !eagleHidden && eagleObscured
           ? { visibility: "hidden" }
