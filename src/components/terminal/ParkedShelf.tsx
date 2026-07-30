@@ -22,6 +22,28 @@ function basenameOf(path: string): string {
   return segments[segments.length - 1] || path;
 }
 
+/**
+ * Chip border per status. Parked terminals stay parked (WhatsApp-archive
+ * semantics), but a chip whose agent stopped and wants the user turns
+ * yellow and pulses; errors turn red; explicit Done turns green.
+ */
+function chipBorderClass(status: BackendSessionStatus): string {
+  switch (status) {
+    case "NeedsInput":
+      return "parked-chip-attention";
+    case "Error":
+    case "Timeout":
+      return "border-maestro-red";
+    case "Done":
+      return "border-maestro-green";
+    default:
+      return "border-maestro-border";
+  }
+}
+
+/** Statuses that make the shelf itself call for the user's eye. */
+const ATTENTION_STATUSES: BackendSessionStatus[] = ["NeedsInput", "Error", "Timeout"];
+
 interface ParkedShelfProps {
   /** When given, only parked sessions of this project are shown (per-project grid). */
   projectPath?: string;
@@ -51,9 +73,19 @@ export function ParkedShelf({ projectPath, onUnpark, showProjectLabels = false }
 
   if (parkedSessions.length === 0) return null;
 
+  const hasAttention = parkedSessions.some((sess) => ATTENTION_STATUSES.includes(sess.status));
+
   return (
-    <div className="flex h-8 shrink-0 items-center gap-1.5 overflow-x-auto border-t border-maestro-border bg-maestro-surface px-2">
-      <span className="shrink-0 text-[10px] font-medium uppercase tracking-wider text-maestro-muted">
+    <div
+      className={`flex h-8 shrink-0 items-center gap-1.5 overflow-x-auto border-t bg-maestro-surface px-2 ${
+        hasAttention ? "border-maestro-yellow/60" : "border-maestro-border"
+      }`}
+    >
+      <span
+        className={`shrink-0 text-[10px] font-medium uppercase tracking-wider ${
+          hasAttention ? "text-maestro-yellow" : "text-maestro-muted"
+        }`}
+      >
         Parked
       </span>
       {parkedSessions.map((sess) => {
@@ -63,7 +95,7 @@ export function ParkedShelf({ projectPath, onUnpark, showProjectLabels = false }
             key={sess.id}
             type="button"
             onClick={() => onUnpark(sess.id)}
-            className="flex shrink-0 items-center gap-1.5 rounded-full border border-maestro-border bg-maestro-card px-2.5 py-0.5 text-xs text-maestro-text transition-colors hover:border-maestro-accent"
+            className={`flex shrink-0 items-center gap-1.5 rounded-full border bg-maestro-card px-2.5 py-0.5 text-xs text-maestro-text transition-colors hover:border-maestro-accent ${chipBorderClass(sess.status)}`}
             title="Restore terminal"
           >
             <span className={`h-1.5 w-1.5 rounded-full ${STATUS_DOT[sess.status] ?? STATUS_DOT.Idle}`} />

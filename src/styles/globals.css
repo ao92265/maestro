@@ -316,12 +316,31 @@
   animation: pod-wake 600ms ease-out forwards;
 }
 
+/* Parked-shelf chip demanding attention (agent finished its turn / needs
+   input while parked). Border stays yellow even where animations are
+   disabled (Linux, reduced motion) so the signal survives. */
+@keyframes parked-attention {
+  0%,
+  100% {
+    box-shadow: 0 0 6px rgb(var(--maestro-yellow) / 0.25);
+  }
+  50% {
+    box-shadow: 0 0 14px rgb(var(--maestro-yellow) / 0.55);
+  }
+}
+
+.parked-chip-attention {
+  border-color: rgb(var(--maestro-yellow));
+  animation: parked-attention 1.6s ease-in-out infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .animate-breathe,
   .animate-edge-dash,
   .animate-glow,
   .animate-pod-wake,
   .animate-thinking-dot,
+  .parked-chip-attention,
   .terminal-cell-starting {
     animation: none;
     transform: none;
@@ -358,8 +377,10 @@
 .platform-linux .animate-breathe,
 .platform-linux .animate-edge-dash,
 .platform-linux .animate-glow,
-.platform-linux .animate-thinking-dot {
+.platform-linux .animate-thinking-dot,
+.platform-linux .parked-chip-attention {
   animation: none;
+  box-shadow: none;
 }
 
 /* Remove backdrop-blur on modal overlays */

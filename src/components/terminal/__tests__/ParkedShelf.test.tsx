@@ -8,15 +8,24 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import { ParkedShelf } from "../ParkedShelf";
-import { useSessionStore, type SessionConfig } from "@/stores/useSessionStore";
+import {
+  useSessionStore,
+  type BackendSessionStatus,
+  type SessionConfig,
+} from "@/stores/useSessionStore";
 
-function session(id: number, projectPath: string, name: string | null = null): SessionConfig {
+function session(
+  id: number,
+  projectPath: string,
+  name: string | null = null,
+  status: BackendSessionStatus = "Working"
+): SessionConfig {
   return {
     id,
     mode: "Claude",
     name,
     branch: null,
-    status: "Working",
+    status,
     worktree_path: null,
     project_path: projectPath,
   };
@@ -83,5 +92,31 @@ describe("ParkedShelf", () => {
     render(<ParkedShelf showProjectLabels onUnpark={vi.fn()} />);
 
     expect(screen.getByText("alpha")).toBeInTheDocument();
+  });
+
+  it("pulses a chip and tints the shelf when a parked agent needs input", () => {
+    useSessionStore.setState({
+      sessions: [session(1, "C:/proj", "Waiting", "NeedsInput"), session(2, "C:/proj", "Busy")],
+      parkedSessionIds: [1, 2],
+    });
+
+    render(<ParkedShelf onUnpark={vi.fn()} />);
+
+    const waitingChip = screen.getByText("Waiting").closest("button");
+    const busyChip = screen.getByText("Busy").closest("button");
+    expect(waitingChip?.className).toContain("parked-chip-attention");
+    expect(busyChip?.className).not.toContain("parked-chip-attention");
+    expect(screen.getByText("Parked").className).toContain("text-maestro-yellow");
+  });
+
+  it("keeps the shelf neutral while parked agents are only working", () => {
+    useSessionStore.setState({
+      sessions: [session(1, "C:/proj", "Busy")],
+      parkedSessionIds: [1],
+    });
+
+    render(<ParkedShelf onUnpark={vi.fn()} />);
+
+    expect(screen.getByText("Parked").className).toContain("text-maestro-muted");
   });
 });
