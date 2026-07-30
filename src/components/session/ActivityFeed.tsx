@@ -12,14 +12,19 @@ export function ActivityFeed({
   maxHeight = "300px",
 }: ActivityFeedProps) {
   const session = useActivityStore((state) => state.getSession(sessionId));
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Auto-scroll to the newest event by scrolling ONLY this container.
+  // Do not use scrollIntoView here: it scrolls every scrollable ancestor
+  // (including overflow-hidden terminal cells), shifting the whole layout up.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
   }, [session.events.length]);
 
   return (
     <div
+      ref={scrollRef}
       style={{ maxHeight, overflow: "auto" }}
       className="font-mono text-xs space-y-0.5 p-2 bg-neutral-900/50 rounded border border-neutral-800"
     >
@@ -31,7 +36,6 @@ export function ActivityFeed({
       {session.events.map((event, i) => (
         <EventRow key={`${event.timestamp}-${i}`} event={event} />
       ))}
-      <div ref={bottomRef} />
     </div>
   );
 }
