@@ -395,15 +395,14 @@ function App() {
     [selectTab],
   );
 
-  // Sidebar Agents section: jump to a terminal (leave eagle view — the target
-  // pane may be hidden behind an eagle zoom overlay there — then activate its
-  // project tab and focus its pane once the switch has committed to the DOM).
+  // Sidebar Agents section: zoom into a terminal. In eagle view the eagle zoom
+  // overlay is used (panes stay mounted); otherwise activate the project tab
+  // and zoom its pane once the tab switch has committed to the DOM.
   const handleAgentNavigate = useCallback(
     (tabId: string, sessionId: number) => {
-      setEagleView(false);
       selectTab(tabId);
       requestAnimationFrame(() => {
-        multiProjectRef.current?.focusSessionInProject(tabId, sessionId);
+        multiProjectRef.current?.zoomSessionInProject(tabId, sessionId);
       });
     },
     [selectTab],

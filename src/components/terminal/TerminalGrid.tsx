@@ -158,6 +158,8 @@ export interface TerminalGridHandle {
   refreshBranches: () => void;
   /** Focus the pane running the given session. Returns false if this grid doesn't own it. */
   focusSession: (sessionId: number) => boolean;
+  /** Zoom into the pane running the given session (and focus it). Returns false if this grid doesn't own it. */
+  zoomSession: (sessionId: number) => boolean;
   /** Kill the given session and clean up its pane. Returns false if this grid doesn't own it. */
   killSessionById: (sessionId: number) => boolean;
 }
@@ -1090,6 +1092,18 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     return true;
   }, []);
 
+  /** Zoom into the pane running a session (and focus it). False if this grid doesn't own it. */
+  const zoomSession = useCallback((sessionId: number): boolean => {
+    const slot = slotsRef.current.find((s) => s.sessionId === sessionId);
+    if (!slot) return false;
+    // Set (not toggle): repeated calls stay zoomed on the same pane, and any
+    // other pane's zoom is replaced.
+    setZoomedSlotId(slot.id);
+    setFocusedSlotId(slot.id);
+    focusSlotTextarea(slot.id);
+    return true;
+  }, []);
+
   // Keep closePaneRef in sync with latest handleKill/removeSlot
   closePaneRef.current = () => {
     const targetId = focusedSlotId ?? slotsRef.current[0]?.id;
@@ -1366,8 +1380,8 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
 
   useImperativeHandle(
     ref,
-    () => ({ addSession, launchAll, refreshBranches, focusSession, killSessionById }),
-    [addSession, launchAll, refreshBranches, focusSession, killSessionById],
+    () => ({ addSession, launchAll, refreshBranches, focusSession, zoomSession, killSessionById }),
+    [addSession, launchAll, refreshBranches, focusSession, zoomSession, killSessionById],
   );
 
   // Handle zoom toggle for a slot

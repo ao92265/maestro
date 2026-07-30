@@ -68,7 +68,7 @@ interface SidebarProps {
   isStoppingAll?: boolean;
   /** Stop all running sessions in the active project. */
   onStopAll?: () => void;
-  /** Agents section: jump to a terminal (activate its tab + focus its pane). */
+  /** Agents section: zoom into a terminal (focused single-terminal view + keyboard focus). */
   onAgentNavigate?: (tabId: string, sessionId: number) => void;
   /** Agents section: kill one terminal (PTY + pane cleanup). */
   onAgentKill?: (tabId: string, sessionId: number) => void;
@@ -366,7 +366,7 @@ const badgeBaseClass =
 /**
  * Live hierarchical view of every running agent across all open projects:
  * Project → Terminal (session) → Subagents (Task tool invocations).
- * Terminals can be killed or jumped to (double-click); subagents are
+ * Terminals can be killed or zoomed into (click); subagents are
  * display-only — they live inside the parent Claude process.
  */
 function AgentsSection({
@@ -483,8 +483,8 @@ function AgentsSection({
                     <div key={session.id} className="ml-2">
                       <div
                         className="group flex cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 hover:bg-maestro-border/30"
-                        onDoubleClick={() => onNavigate?.(tab.id, session.id)}
-                        title={`${name} — double-click to open this terminal`}
+                        onClick={() => onNavigate?.(tab.id, session.id)}
+                        title={`${name} — click to zoom into this terminal`}
                       >
                         <span className="flex-1 truncate text-xs text-maestro-text">{name}</span>
                         <span className={`${badgeBaseClass} ${badge.cls}`}>{badge.label}</span>
@@ -494,10 +494,6 @@ function AgentsSection({
                             e.stopPropagation();
                             void handleKillClick(tab.id, session.id, name);
                           }}
-                          // dblclick is a separate event that would bubble to the
-                          // row's onDoubleClick and navigate to the terminal
-                          // being killed — swallow it here.
-                          onDoubleClick={(e) => e.stopPropagation()}
                           className="shrink-0 rounded p-0.5 text-maestro-muted opacity-0 transition-opacity hover:bg-red-500/15 hover:text-red-400 group-hover:opacity-100"
                           title="Kill this terminal"
                           aria-label={`Kill ${name}`}

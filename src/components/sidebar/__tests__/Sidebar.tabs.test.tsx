@@ -21,6 +21,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import { Sidebar } from "../Sidebar";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
+import { useSessionStore } from "@/stores/useSessionStore";
 
 const invokeMock = vi.mocked(invoke);
 
@@ -86,6 +87,7 @@ describe("Sidebar tab bar", () => {
     mockInvoke();
     localStorage.clear();
     useWorkspaceStore.setState({ tabs: [buildTab()] });
+    useSessionStore.setState({ sessions: [] });
   });
 
   it("renders the three tabs with General active by default", () => {
@@ -125,5 +127,29 @@ describe("Sidebar tab bar", () => {
     localStorage.setItem("maestro-sidebar-tab", "memory");
     render(<Sidebar />);
     expect(screen.getByText("Agents")).toBeInTheDocument();
+  });
+
+  it("clicking a terminal row in Agents navigates to it", () => {
+    useWorkspaceStore.setState({
+      tabs: [buildTab({ sessionIds: [1], sessionsLaunched: true })],
+    });
+    // project_path must match the tab's projectPath or sessionsForTab drops the row.
+    useSessionStore.setState({
+      sessions: [
+        {
+          id: 1,
+          mode: "Claude",
+          name: "My agent",
+          branch: null,
+          status: "Working",
+          worktree_path: null,
+          project_path: "C:\\git\\maestro",
+        },
+      ],
+    });
+    const onNavigate = vi.fn();
+    render(<Sidebar onAgentNavigate={onNavigate} />);
+    fireEvent.click(screen.getByText("My agent"));
+    expect(onNavigate).toHaveBeenCalledWith("tab-1", 1);
   });
 });

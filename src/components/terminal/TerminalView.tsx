@@ -426,6 +426,11 @@ export const TerminalView = memo(function TerminalView({
       term.loadAddon(unicode11Addon);
       term.unicode.activeVersion = "11";
       term.open(container);
+      // Mounted as the focused pane (e.g. the zoom branch remounts this view
+      // with isFocused already true): grab keyboard focus now. The parent's
+      // focusSlotTextarea helper can fire before the async init creates the
+      // xterm textarea, and the isFocused effect ran while termRef was null.
+      if (isFocused) term.focus();
 
       // GPU-accelerated rendering (must be loaded after open())
       // Try WebGL first, fall back to Canvas2D (much faster than DOM on Linux)

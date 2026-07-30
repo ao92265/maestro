@@ -28,6 +28,8 @@ export interface MultiProjectViewHandle {
   refreshBranchesInActiveProject: () => void;
   /** Focus the pane running the given session. False if that grid isn't mounted or doesn't own it. */
   focusSessionInProject: (tabId: string, sessionId: number) => boolean;
+  /** Zoom into the pane running the given session (eagle zoom in eagle view, per-project zoom otherwise). False if no grid owns it. */
+  zoomSessionInProject: (tabId: string, sessionId: number) => boolean;
   /** Kill the given session (with full pane cleanup). False if that grid isn't mounted or doesn't own it. */
   killSessionInProject: (tabId: string, sessionId: number) => boolean;
 }
@@ -178,10 +180,22 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
     focusSessionInProject: (tabId: string, sessionId: number) => {
       return gridRefs.current.get(tabId)?.focusSession(sessionId) ?? false;
     },
+    zoomSessionInProject: (tabId: string, sessionId: number) => {
+      if (eagleView) {
+        setEagleZoom(sessionId);
+        // Focus directly too: if this session is ALREADY eagle-zoomed the
+        // focus-follows-zoom effect won't re-run (state unchanged).
+        for (const handle of gridRefs.current.values()) {
+          if (handle.focusSession(sessionId)) break;
+        }
+        return true;
+      }
+      return gridRefs.current.get(tabId)?.zoomSession(sessionId) ?? false;
+    },
     killSessionInProject: (tabId: string, sessionId: number) => {
       return gridRefs.current.get(tabId)?.killSessionById(sessionId) ?? false;
     },
-  }), [tabs, setSessionsLaunched]);
+  }), [tabs, setSessionsLaunched, eagleView]);
 
   // Create stable callbacks per tab to avoid infinite re-render loops
   // The callbacks are memoized by tab.id so they don't change on every render
