@@ -250,23 +250,21 @@ export function TopBar({
             <StickyNote size={14} />
           </button>
         )}
-        {/* Git panel is per-project, so it's meaningless while eagle view
-            mixes every project's terminals — hide the button there. */}
-        {!eagleView && (
-          <button
-            type="button"
-            onClick={onToggleGitPanel}
-            className={`rounded p-1.5 transition-colors ${
-              gitPanelOpen
-                ? "text-maestro-accent hover:bg-maestro-accent/10"
-                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
-            }`}
-            aria-label="Git"
-            title="Git"
-          >
-            <GitMerge size={14} />
-          </button>
-        )}
+        {/* Git panel — in eagle view it becomes a per-project carousel
+            (swipe between one git card per open project). */}
+        <button
+          type="button"
+          onClick={onToggleGitPanel}
+          className={`rounded p-1.5 transition-colors ${
+            gitPanelOpen
+              ? "text-maestro-accent hover:bg-maestro-accent/10"
+              : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
+          }`}
+          aria-label="Git"
+          title="Git"
+        >
+          <GitMerge size={14} />
+        </button>
       </div>
 
       {/* Window controls - hidden on macOS (custom traffic lights in row) or when hideWindowControls */}

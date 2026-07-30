@@ -78,6 +78,10 @@ function App() {
   const multiProjectRef = useRef<MultiProjectViewHandle>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [gitPanelOpen, setGitPanelOpen] = useState(false);
+  // Git-panel tab (commits/branches/…) is deliberately a single app-level
+  // state shared across eagle carousel cards: swiping keeps you on the same
+  // tab for every project. Per-repo selections are cleared by GitGraphPanel
+  // whenever repoPath changes, so no per-project tab state is needed.
   const [gitPanelTab, setGitPanelTab] = useState<GitPanelTab>("status");
   const [sessionCounts, setSessionCounts] = useState<
     Map<string, { slotCount: number; launchedCount: number }>
@@ -86,6 +90,8 @@ function App() {
   const [currentBranch, setCurrentBranch] = useState<string | undefined>(undefined);
   // Eagle view: one flat grid of every project's terminals at once
   const [eagleView, setEagleView] = useState(false);
+  // Eagle view git carousel: index of the project whose git panel card shows.
+  const [eagleGitIndex, setEagleGitIndex] = useState(0);
   // Right-side utility panel (Memory / Processes), opened from the top bar.
   // One at a time: opening one replaces the other.
   const [utilityPanel, setUtilityPanel] = useState<UtilityPanelKind | null>(null);
@@ -238,8 +244,39 @@ function App() {
   const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
   const macTitleBarPadding = useMacTitleBarPadding();
   const activeTab = tabs.find((tab) => tab.active) ?? null;
-  const activeProjectPath = activeTab?.projectPath;
-  const activeRepoPath = activeTab?.selectedRepoPath ?? activeProjectPath;
+
+  // Eagle view git carousel: the git panel shows one project card at a time.
+  // The index is clamped as a derivation (not an effect) so closing tabs can
+  // never leave it out of bounds; zero tabs → null target → the panel's
+  // "open a git repository" empty state. Outside eagle view this collapses to
+  // the active tab, so non-eagle behavior is unchanged.
+  const clampedEagleGitIndex = tabs.length === 0 ? 0 : Math.min(eagleGitIndex, tabs.length - 1);
+  const gitTargetTab = eagleView ? (tabs[clampedEagleGitIndex] ?? null) : activeTab;
+  const gitRepoPath = gitTargetTab ? (gitTargetTab.selectedRepoPath ?? gitTargetTab.projectPath) : undefined;
+
+  // Entering eagle view starts the carousel on the currently active project.
+  useEffect(() => {
+    if (!eagleView) return;
+    const ts = useWorkspaceStore.getState().tabs;
+    const idx = ts.findIndex((t) => t.active);
+    if (idx >= 0) setEagleGitIndex(idx);
+  }, [eagleView]);
+
+  // Swipe between carousel cards with wraparound. `getState()` keeps these
+  // callbacks stable (mirrors switchToNextTab/switchToPrevTab semantics).
+  const handleEagleGitPrev = useCallback(() => {
+    setEagleGitIndex((i) => {
+      const n = useWorkspaceStore.getState().tabs.length;
+      return n === 0 ? 0 : (Math.min(i, n - 1) - 1 + n) % n;
+    });
+  }, []);
+
+  const handleEagleGitNext = useCallback(() => {
+    setEagleGitIndex((i) => {
+      const n = useWorkspaceStore.getState().tabs.length;
+      return n === 0 ? 0 : (Math.min(i, n - 1) + 1) % n;
+    });
+  }, []);
 
   // Trackpad two-finger horizontal swipe to switch project tabs
   const switchToNextTab = useCallback(() => {
@@ -265,22 +302,22 @@ function App() {
   const [isRefreshingGit, setIsRefreshingGit] = useState(false);
 
   const handleRefreshGit = useCallback(async () => {
-    if (!activeRepoPath) return;
+    if (!gitRepoPath) return;
     setIsRefreshingGit(true);
     try {
-      await fetchCommits(activeRepoPath);
+      await fetchCommits(gitRepoPath);
     } finally {
       setIsRefreshingGit(false);
     }
-  }, [activeRepoPath, fetchCommits]);
+  }, [gitRepoPath, fetchCommits]);
 
   useEffect(() => {
     let cancelled = false;
-    if (!activeRepoPath) {
+    if (!gitRepoPath) {
       setCurrentBranch(undefined);
       return () => {};
     }
-    getDeduplicatedCurrentBranch(activeRepoPath)
+    getDeduplicatedCurrentBranch(gitRepoPath)
       .then((branch) => {
         if (!cancelled) setCurrentBranch(branch);
       })
@@ -291,7 +328,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [activeRepoPath]);
+  }, [gitRepoPath]);
 
   // Rehydrate multi-repo tabs after store rehydration
   useEffect(() => {
@@ -446,14 +483,13 @@ function App() {
 
   // Ctrl/Cmd+2 always lands the panel on the Status tab when toggling open.
   // Manual tab switches while the panel is open are preserved until the next open.
-  // No-op in eagle view, where the per-project git panel is hidden entirely.
+  // Works in eagle view too, where the panel is a per-project carousel.
   const handleToggleGitPanel = useCallback(() => {
-    if (eagleView) return;
     setGitPanelOpen((prev) => {
       if (!prev) setGitPanelTab("status");
       return !prev;
     });
-  }, [eagleView]);
+  }, []);
 
   useAppKeyboard({
     onAddSession: handleAddSessionShortcut,
@@ -548,18 +584,19 @@ function App() {
             />
 
             {/* Git panel header - inline at same level as TopBar.
-                Hidden (like the panel itself) while eagle view is on. */}
-            {gitPanelOpen && !eagleView && (
+                In eagle view it describes the carousel-selected project. */}
+            {gitPanelOpen && (
               <div
                 className="flex h-10 shrink-0 items-center border-l border-maestro-border px-3 gap-2 bg-maestro-bg"
                 style={{ width: rightPanelWidth }}
               >
                 <GitFork size={14} className="text-maestro-muted" />
-                {activeTab?.workspaceType === "multi-repo" && activeTab.selectedRepoPath && (
+                {gitTargetTab?.workspaceType === "multi-repo" && gitTargetTab.selectedRepoPath && (
                   <span className="text-xs font-medium text-maestro-accent">
                     {
-                      activeTab.repositories.find((r) => r.path === activeTab.selectedRepoPath)
-                        ?.name
+                      gitTargetTab.repositories.find(
+                        (r) => r.path === gitTargetTab.selectedRepoPath,
+                      )?.name
                     }
                   </span>
                 )}
@@ -572,7 +609,7 @@ function App() {
                   </span>
                 )}
                 <div className="flex-1" />
-                {activeRepoPath && (
+                {gitRepoPath && (
                   <button
                     type="button"
                     onClick={handleRefreshGit}
@@ -616,21 +653,27 @@ function App() {
               />
             )}
 
-            {/* Git graph panel (optional right side). Closed (not unmounted)
-                during eagle view — it shows a single project's repo, which is
-                meaningless there — and restored when eagle view is left. */}
+            {/* Git graph panel (optional right side). Stays mounted when
+                closed (width 0 + inert) so its state survives toggling. In
+                eagle view it becomes a carousel: one project card at a time,
+                switched via the EagleProjectSwitcher strip — the git stores
+                are singletons, so exactly one panel is ever mounted. */}
             <GitGraphPanel
-              open={gitPanelOpen && !eagleView}
+              open={gitPanelOpen}
               onClose={() => setGitPanelOpen(false)}
-              repoPath={activeRepoPath ?? null}
+              repoPath={gitRepoPath ?? null}
               currentBranch={currentBranch ?? null}
-              repositories={activeTab?.repositories ?? []}
-              workspaceType={activeTab?.workspaceType ?? "single-repo"}
-              onRepoChange={(path) => activeTab && setSelectedRepo(activeTab.id, path)}
+              repositories={gitTargetTab?.repositories ?? []}
+              workspaceType={gitTargetTab?.workspaceType ?? "single-repo"}
+              onRepoChange={(path) => gitTargetTab && setSelectedRepo(gitTargetTab.id, path)}
               activeTab={gitPanelTab}
               onActiveTabChange={setGitPanelTab}
               width={rightPanelWidth}
               onResize={handleRightPanelResize}
+              eagleProjects={eagleView ? eagleProjects : undefined}
+              eagleIndex={clampedEagleGitIndex}
+              onEaglePrev={handleEagleGitPrev}
+              onEagleNext={handleEagleGitNext}
             />
           </div>
 

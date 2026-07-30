@@ -11,6 +11,7 @@ import { useGitStore } from "../../stores/useGitStore";
 import type { RepositoryInfo, WorkspaceType } from "../../stores/useWorkspaceStore";
 import { CommitDetailPanel } from "./CommitDetailPanel";
 import { DiscussionDetailPanel } from "./discussions/DiscussionDetailPanel";
+import { EagleProjectSwitcher } from "./EagleProjectSwitcher";
 import { GitPanelContent } from "./GitPanelContent";
 import { GITHUB_TABS, type GitPanelTab, GitPanelTabs } from "./GitPanelTabs";
 import { IssueDetailPanel } from "./issues/IssueDetailPanel";
@@ -32,6 +33,13 @@ interface GitGraphPanelProps {
   /** Width shared with the other right-docked panels (see App). */
   width: number;
   onResize: (width: number) => void;
+  /** Eagle-view carousel: when set, a switcher strip renders above the panel
+   *  content to swipe between per-project git cards. All four props must be
+   *  provided together; undefined = normal single-project mode. */
+  eagleProjects?: Array<{ tabId: string; name: string; color: string }>;
+  eagleIndex?: number;
+  onEaglePrev?: () => void;
+  onEagleNext?: () => void;
 }
 
 export function GitGraphPanel({
@@ -46,6 +54,10 @@ export function GitGraphPanel({
   onActiveTabChange,
   width,
   onResize,
+  eagleProjects,
+  eagleIndex,
+  onEaglePrev,
+  onEagleNext,
 }: GitGraphPanelProps) {
   const [isResizing, setIsResizing] = useState(false);
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
@@ -237,7 +249,7 @@ export function GitGraphPanel({
       tabIndex={open ? undefined : -1}
       {...(!open ? ({ inert: "" } as { inert: "" }) : {})}
       style={{ width: open ? width : 0 }}
-      className={`relative z-30 flex min-w-0 shrink-0 flex-row border-l border-maestro-border bg-maestro-surface overflow-hidden ${
+      className={`relative z-30 flex min-w-0 shrink-0 flex-col border-l border-maestro-border bg-maestro-surface overflow-hidden ${
         isResizing ? "" : "transition-all duration-200"
       } ${open ? "" : "border-l-0"}`}
     >
@@ -252,124 +264,143 @@ export function GitGraphPanel({
           onDraggingChange={setIsResizing}
         />
       )}
-      {/* PR Detail panel - full width when shown */}
-      {showPRDetail ? (
-        <div className="flex min-w-[320px] flex-1 flex-col">
-          <PullRequestDetailPanel repoPath={repoPath} onClose={handleClosePRDetail} />
-        </div>
-      ) : showIssueDetail ? (
-        <div className="flex min-w-[320px] flex-1 flex-col">
-          <IssueDetailPanel repoPath={repoPath} onClose={handleCloseIssueDetail} />
-        </div>
-      ) : showDiscussionDetail ? (
-        <div className="flex min-w-[320px] flex-1 flex-col">
-          <DiscussionDetailPanel repoPath={repoPath} onClose={handleCloseDiscussionDetail} />
-        </div>
-      ) : (
-        <>
-          {/* Main panel */}
+      {/* Eagle-view carousel strip — full width above the panel row, so it
+          stays reachable even when a detail panel fills the row below. */}
+      {open &&
+        eagleProjects &&
+        eagleProjects.length > 0 &&
+        eagleIndex !== undefined &&
+        onEaglePrev &&
+        onEagleNext && (
+          <EagleProjectSwitcher
+            projects={eagleProjects}
+            index={eagleIndex}
+            onPrev={onEaglePrev}
+            onNext={onEagleNext}
+          />
+        )}
+      {/* Panel row: main content / detail panels / repo rail. In normal mode
+          nothing renders above it, so layout matches the old flex-row aside. */}
+      <div className="flex min-h-0 min-w-0 flex-1 flex-row overflow-hidden">
+        {/* PR Detail panel - full width when shown */}
+        {showPRDetail ? (
           <div className="flex min-w-[320px] flex-1 flex-col">
-            {/* Tabs — shown whenever the panel is open */}
-            <GitPanelTabs
-              activeTab={activeTab}
-              onTabChange={handleTabChange}
-              prCount={openPRCount}
-              issueCount={openIssueCount}
-            />
-
-            {/* Content */}
-            {!hasRepo ? (
-              // Empty state - no repo
-              <div className="flex flex-1 items-center justify-center px-4 text-center">
-                <div className="flex flex-col items-center gap-3">
-                  <GitFork
-                    size={32}
-                    className="animate-breathe text-maestro-muted/30"
-                    strokeWidth={1}
-                  />
-                  <p className="text-xs text-maestro-muted/60">
-                    Open a git repository to view commits
-                  </p>
-                </div>
-              </div>
-            ) : isGhError ? (
-              // gh CLI not installed
-              <div className="flex flex-1 items-center justify-center px-4 text-center">
-                <div className="flex flex-col items-center gap-3">
-                  <Terminal size={32} className="text-maestro-muted/30" strokeWidth={1} />
-                  <p className="text-xs text-maestro-muted/60">GitHub CLI not found</p>
-                  <a
-                    href="https://cli.github.com"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-xs text-maestro-accent hover:underline"
-                  >
-                    Install GitHub CLI
-                  </a>
-                </div>
-              </div>
-            ) : showAuthPrompt ? (
-              // Not authenticated
-              <div className="flex flex-1 items-center justify-center px-4 text-center">
-                <div className="flex flex-col items-center gap-3">
-                  <AlertCircle size={32} className="text-maestro-yellow/50" strokeWidth={1} />
-                  <p className="text-xs text-maestro-muted/60">Not authenticated with GitHub</p>
-                  <p className="text-[10px] text-maestro-muted/40">
-                    Run <code className="rounded bg-maestro-card px-1 py-0.5">gh auth login</code>{" "}
-                    in your terminal
-                  </p>
-                  <button
-                    type="button"
-                    onClick={() => repoPath && checkAuth(repoPath)}
-                    disabled={isCheckingAuth}
-                    className="mt-1 flex items-center gap-1.5 rounded bg-maestro-card px-3 py-1 text-xs text-maestro-muted/60 transition-colors hover:bg-maestro-border hover:text-maestro-text disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    {isCheckingAuth && <Loader2 size={12} className="animate-spin" />}
-                    {isCheckingAuth ? "Checking..." : "Retry"}
-                  </button>
-                </div>
-              </div>
-            ) : (
-              // Tab content
-              <GitPanelContent
-                activeTab={activeTab}
-                repoPath={repoPath!}
-                currentBranch={currentBranch}
-                onSelectCommit={handleSelectCommit}
-                selectedCommitHash={selectedNode?.commit.hash ?? null}
-                onSelectPR={handleSelectPR}
-                selectedPRNumber={selectedPRNumber}
-                onSelectIssue={handleSelectIssue}
-                selectedIssueNumber={selectedIssueNumber}
-                onSelectDiscussion={handleSelectDiscussion}
-                selectedDiscussionNumber={selectedDiscussionNumber}
-              />
-            )}
+            <PullRequestDetailPanel repoPath={repoPath} onClose={handleClosePRDetail} />
           </div>
-
-          {/* Commit Detail panel */}
-          {selectedNode && repoPath && activeTab === "commits" && (
-            <div className="w-60 shrink-0">
-              <CommitDetailPanel
-                node={selectedNode}
-                repoPath={repoPath}
-                onClose={handleCloseDetail}
-                onCreateBranchAtCommit={handleCreateBranchAtCommit}
-                onCheckoutCommit={handleCheckoutCommit}
+        ) : showIssueDetail ? (
+          <div className="flex min-w-[320px] flex-1 flex-col">
+            <IssueDetailPanel repoPath={repoPath} onClose={handleCloseIssueDetail} />
+          </div>
+        ) : showDiscussionDetail ? (
+          <div className="flex min-w-[320px] flex-1 flex-col">
+            <DiscussionDetailPanel repoPath={repoPath} onClose={handleCloseDiscussionDetail} />
+          </div>
+        ) : (
+          <>
+            {/* Main panel */}
+            <div className="flex min-w-[320px] flex-1 flex-col">
+              {/* Tabs — shown whenever the panel is open */}
+              <GitPanelTabs
+                activeTab={activeTab}
+                onTabChange={handleTabChange}
+                prCount={openPRCount}
+                issueCount={openIssueCount}
               />
-            </div>
-          )}
-        </>
-      )}
 
-      {/* Repo rail for multi-repo workspaces — right edge */}
-      {workspaceType === "multi-repo" && (
-        <RepoRail
-          repositories={repositories}
-          selectedRepoPath={repoPath}
-          onSelectRepo={onRepoChange}
-        />
-      )}
+              {/* Content */}
+              {!hasRepo ? (
+                // Empty state - no repo
+                <div className="flex flex-1 items-center justify-center px-4 text-center">
+                  <div className="flex flex-col items-center gap-3">
+                    <GitFork
+                      size={32}
+                      className="animate-breathe text-maestro-muted/30"
+                      strokeWidth={1}
+                    />
+                    <p className="text-xs text-maestro-muted/60">
+                      Open a git repository to view commits
+                    </p>
+                  </div>
+                </div>
+              ) : isGhError ? (
+                // gh CLI not installed
+                <div className="flex flex-1 items-center justify-center px-4 text-center">
+                  <div className="flex flex-col items-center gap-3">
+                    <Terminal size={32} className="text-maestro-muted/30" strokeWidth={1} />
+                    <p className="text-xs text-maestro-muted/60">GitHub CLI not found</p>
+                    <a
+                      href="https://cli.github.com"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-xs text-maestro-accent hover:underline"
+                    >
+                      Install GitHub CLI
+                    </a>
+                  </div>
+                </div>
+              ) : showAuthPrompt ? (
+                // Not authenticated
+                <div className="flex flex-1 items-center justify-center px-4 text-center">
+                  <div className="flex flex-col items-center gap-3">
+                    <AlertCircle size={32} className="text-maestro-yellow/50" strokeWidth={1} />
+                    <p className="text-xs text-maestro-muted/60">Not authenticated with GitHub</p>
+                    <p className="text-[10px] text-maestro-muted/40">
+                      Run <code className="rounded bg-maestro-card px-1 py-0.5">gh auth login</code>{" "}
+                      in your terminal
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => repoPath && checkAuth(repoPath)}
+                      disabled={isCheckingAuth}
+                      className="mt-1 flex items-center gap-1.5 rounded bg-maestro-card px-3 py-1 text-xs text-maestro-muted/60 transition-colors hover:bg-maestro-border hover:text-maestro-text disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {isCheckingAuth && <Loader2 size={12} className="animate-spin" />}
+                      {isCheckingAuth ? "Checking..." : "Retry"}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                // Tab content
+                <GitPanelContent
+                  activeTab={activeTab}
+                  repoPath={repoPath!}
+                  currentBranch={currentBranch}
+                  onSelectCommit={handleSelectCommit}
+                  selectedCommitHash={selectedNode?.commit.hash ?? null}
+                  onSelectPR={handleSelectPR}
+                  selectedPRNumber={selectedPRNumber}
+                  onSelectIssue={handleSelectIssue}
+                  selectedIssueNumber={selectedIssueNumber}
+                  onSelectDiscussion={handleSelectDiscussion}
+                  selectedDiscussionNumber={selectedDiscussionNumber}
+                />
+              )}
+            </div>
+
+            {/* Commit Detail panel */}
+            {selectedNode && repoPath && activeTab === "commits" && (
+              <div className="w-60 shrink-0">
+                <CommitDetailPanel
+                  node={selectedNode}
+                  repoPath={repoPath}
+                  onClose={handleCloseDetail}
+                  onCreateBranchAtCommit={handleCreateBranchAtCommit}
+                  onCheckoutCommit={handleCheckoutCommit}
+                />
+              </div>
+            )}
+          </>
+        )}
+
+        {/* Repo rail for multi-repo workspaces — right edge */}
+        {workspaceType === "multi-repo" && (
+          <RepoRail
+            repositories={repositories}
+            selectedRepoPath={repoPath}
+            onSelectRepo={onRepoChange}
+          />
+        )}
+      </div>
     </aside>
   );
 }
