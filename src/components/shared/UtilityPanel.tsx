@@ -1,4 +1,4 @@
-import { Activity, Brain, StickyNote, X } from "lucide-react";
+import { Activity, Brain, StickyNote, Sunrise, X } from "lucide-react";
 import {
   PanelResizeHandle,
   RIGHT_PANEL_MAX_WIDTH,
@@ -7,13 +7,15 @@ import {
 import { NotepadPanel } from "@/components/notepad/NotepadPanel";
 import { MemorySection } from "@/components/sidebar/MemorySection";
 import { ProcessesSection } from "@/components/sidebar/ProcessesSection";
+import { StandupPanel } from "@/components/standup/StandupPanel";
 
-export type UtilityPanelKind = "memory" | "processes" | "notes";
+export type UtilityPanelKind = "memory" | "processes" | "notes" | "standup";
 
 const PANEL_META: Record<UtilityPanelKind, { title: string; icon: React.ElementType }> = {
   memory: { title: "Memory", icon: Brain },
   processes: { title: "Processes", icon: Activity },
   notes: { title: "Notes", icon: StickyNote },
+  standup: { title: "Standup", icon: Sunrise },
 };
 
 /**
@@ -65,7 +67,13 @@ export function UtilityPanel({
         <NotepadPanel />
       ) : (
         <div className="flex-1 overflow-y-auto px-2.5 py-3">
-          {panel === "memory" ? <MemorySection /> : <ProcessesSection />}
+          {panel === "memory" ? (
+            <MemorySection />
+          ) : panel === "processes" ? (
+            <ProcessesSection />
+          ) : (
+            <StandupPanel />
+          )}
         </div>
       )}
     </aside>

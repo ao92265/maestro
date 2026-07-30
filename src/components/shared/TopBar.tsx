@@ -9,6 +9,7 @@ import {
   Plus,
   Square,
   StickyNote,
+  Sunrise,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -53,6 +54,9 @@ interface TopBarProps {
   /** Right-side Notes panel */
   notesPanelOpen?: boolean;
   onToggleNotesPanel?: () => void;
+  /** Right-side Standup panel */
+  standupPanelOpen?: boolean;
+  onToggleStandupPanel?: () => void;
 }
 
 export function TopBar({
@@ -75,6 +79,8 @@ export function TopBar({
   onToggleProcessesPanel,
   notesPanelOpen = false,
   onToggleNotesPanel,
+  standupPanelOpen = false,
+  onToggleStandupPanel,
 }: TopBarProps) {
   const appWindow = useMemo(() => getCurrentWindow(), []);
 
@@ -248,6 +254,21 @@ export function TopBar({
             title="Notes"
           >
             <StickyNote size={14} />
+          </button>
+        )}
+        {onToggleStandupPanel && (
+          <button
+            type="button"
+            onClick={onToggleStandupPanel}
+            className={`rounded p-1.5 transition-colors ${
+              standupPanelOpen
+                ? "text-maestro-accent hover:bg-maestro-accent/10"
+                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
+            }`}
+            aria-label="Standup"
+            title="Standup — daily report per project"
+          >
+            <Sunrise size={14} />
           </button>
         )}
         {/* Git panel — in eagle view it becomes a per-project carousel

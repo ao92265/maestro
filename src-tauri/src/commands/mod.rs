@@ -11,6 +11,7 @@ pub mod memory;
 pub mod plugin;
 pub mod processes;
 pub mod session;
+pub mod standup;
 pub mod system;
 pub mod terminal;
 pub mod update;

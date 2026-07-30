@@ -399,6 +399,9 @@ pub fn run() {
             // Hooks commands
             commands::hooks::write_session_hooks_config,
             commands::hooks::remove_session_hooks_config,
+            // Standup report commands
+            commands::standup::generate_standup_report,
+            commands::standup::load_standup_report,
             // CLI commands
             commands::cli::install_cli,
             commands::cli::uninstall_cli,

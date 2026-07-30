@@ -480,6 +480,29 @@ impl Git {
         Ok(commits)
     }
 
+    /// Raw `git log` text since a date (or phrase like "3 days ago"), across
+    /// all branches, one line per commit. Used as model context for the
+    /// standup report — deliberately plain text, not a parsed struct.
+    pub async fn commit_log_text_since(
+        &self,
+        since: &str,
+        max_count: usize,
+    ) -> Result<String, GitError> {
+        let since_arg = format!("--since={}", since);
+        let count_arg = format!("--max-count={}", max_count);
+        let output = self
+            .run(&[
+                "log",
+                "--all",
+                &since_arg,
+                &count_arg,
+                "--date=short",
+                "--pretty=format:%ad %h %an: %s",
+            ])
+            .await?;
+        Ok(output.stdout)
+    }
+
     /// Checks out a branch by name.
     ///
     /// For local branches, uses `git checkout <name>`.

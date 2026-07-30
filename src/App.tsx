@@ -37,6 +37,7 @@ import { initActivityListener, stopActivityListener } from "./stores/useActivity
 import { initAgentListener, stopAgentListener } from "./stores/useAgentStore";
 import { useGitStore } from "./stores/useGitStore";
 import { useTerminalSettingsStore } from "./stores/useTerminalSettingsStore";
+import { useStandupStore } from "@/stores/useStandupStore";
 import { useUpdateStore } from "./stores/useUpdateStore";
 
 const DEFAULT_SESSION_COUNT = 6;
@@ -240,6 +241,20 @@ function App() {
     const interval = setInterval(checkForUpdates, checkIntervalMinutes * 60 * 1000);
     return () => clearInterval(interval);
   }, [autoCheckEnabled, checkIntervalMinutes, checkForUpdates]);
+
+  // Standup scheduler: a minute tick that fires the daily report generation
+  // once the configured local time has passed (at most once per day; the
+  // store gates on lastRunDate). Only runs while the app is open.
+  const maybeRunScheduledStandup = useStandupStore((s) => s.maybeRunScheduled);
+  useEffect(() => {
+    const tick = () => {
+      const openTabs = useWorkspaceStore.getState().tabs;
+      maybeRunScheduledStandup(openTabs.map((t) => t.selectedRepoPath ?? t.projectPath));
+    };
+    tick();
+    const interval = setInterval(tick, 60_000);
+    return () => clearInterval(interval);
+  }, [maybeRunScheduledStandup]);
 
   const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
   const macTitleBarPadding = useMacTitleBarPadding();
@@ -592,6 +607,8 @@ function App() {
               onToggleProcessesPanel={() => handleToggleUtilityPanel("processes")}
               notesPanelOpen={utilityPanel === "notes"}
               onToggleNotesPanel={() => handleToggleUtilityPanel("notes")}
+              standupPanelOpen={utilityPanel === "standup"}
+              onToggleStandupPanel={() => handleToggleUtilityPanel("standup")}
             />
 
             {/* Git panel header - inline at same level as TopBar.
