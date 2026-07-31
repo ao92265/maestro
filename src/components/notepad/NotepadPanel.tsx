@@ -138,17 +138,23 @@ export function NotepadPanel() {
     }
   };
 
-  // Debounced persistence: the store writes to disk on every setContent, so
-  // buffer keystrokes and flush at most every 400ms (and on tab switch,
-  // delete, and unmount so nothing is lost).
+  // Debounced persistence with a max wait: the store writes to disk on every
+  // setContent, so buffer keystrokes and flush after a 400ms pause — but
+  // never hold a buffer older than 400ms. A pure trailing-edge debounce
+  // re-arms on every keystroke, so continuous typing would keep the entire
+  // burst unpersisted until the first pause (a crash/force-quit then loses
+  // all of it, not just the last 400ms). Also flushed on tab switch, delete,
+  // and unmount.
   const pendingRef = useRef<{ id: string; value: string } | null>(null);
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const firstPendingAtRef = useRef<number | null>(null);
 
   const flushPending = useCallback(() => {
     if (flushTimerRef.current) {
       clearTimeout(flushTimerRef.current);
       flushTimerRef.current = null;
     }
+    firstPendingAtRef.current = null;
     if (pendingRef.current) {
       setContent(pendingRef.current.id, pendingRef.current.value);
       pendingRef.current = null;
@@ -160,6 +166,12 @@ export function NotepadPanel() {
   const handleContentChange = (value: string) => {
     if (!activeNote) return;
     pendingRef.current = { id: activeNote.id, value };
+    const now = Date.now();
+    firstPendingAtRef.current ??= now;
+    if (now - firstPendingAtRef.current >= 400) {
+      flushPending();
+      return;
+    }
     if (flushTimerRef.current) clearTimeout(flushTimerRef.current);
     flushTimerRef.current = setTimeout(flushPending, 400);
   };
