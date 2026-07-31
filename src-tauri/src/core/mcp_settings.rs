@@ -97,12 +97,17 @@ pub struct McpStatusView {
 }
 
 /// Servers injected by Maestro itself for session status reporting.
-/// Matches exactly the names `mcp_config_writer` writes: the current
-/// "maestro-status" entry, legacy per-session "maestro-status-N" entries, and
-/// the original "maestro" name. Deliberately NOT a blanket `maestro-` prefix:
-/// a user's own server named e.g. "maestro-tools" stays manageable.
+/// Matches exactly the names `mcp_config_writer` writes or wrote: the current
+/// "maestro-status" entry, legacy per-session "maestro-status-N" and
+/// "maestro-N" (numeric suffix) entries, and the original "maestro" name.
+/// Deliberately NOT a blanket `maestro-` prefix: a user's own server named
+/// e.g. "maestro-tools" stays manageable.
 pub fn is_internal_server(name: &str) -> bool {
-    name == "maestro" || name == "maestro-status" || name.starts_with("maestro-status-")
+    if name == "maestro" || name == "maestro-status" || name.starts_with("maestro-status-") {
+        return true;
+    }
+    name.strip_prefix("maestro-")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn claude_json_path() -> Result<PathBuf, String> {
@@ -645,8 +650,12 @@ mod tests {
         assert!(is_internal_server("maestro"));
         assert!(is_internal_server("maestro-status"));
         assert!(is_internal_server("maestro-status-3"));
+        // Legacy per-session numeric entries are Maestro's own.
+        assert!(is_internal_server("maestro-1"));
+        assert!(is_internal_server("maestro-42"));
         // A user's own server that merely shares the prefix stays manageable.
         assert!(!is_internal_server("maestro-tools"));
+        assert!(!is_internal_server("maestro-1a"));
         assert!(!is_internal_server("playwright"));
     }
 

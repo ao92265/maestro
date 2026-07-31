@@ -193,42 +193,14 @@ fn custom_server_to_json(server: &McpCustomServer) -> Value {
 
 /// Checks if a server entry should be removed when updating the MCP config.
 ///
-/// Removes:
-/// 1. The single "maestro-status" entry (will be replaced with updated config)
-/// 2. Legacy per-session "maestro-status-*" entries (cleanup from old approach)
-/// 3. Legacy "maestro-*" entries (cleanup from old approach)
-/// 4. Legacy "maestro" entry (bare entry without session ID)
-///
-/// This follows the Swift pattern: ONE MCP entry per project, session ID in env vars.
-/// Each Claude instance spawns its own MCP server process with the env vars from when
-/// it read the config.
+/// Delegates to `mcp_settings::is_internal_server`, the single tested
+/// definition of "Maestro's own entry" ("maestro", "maestro-status", legacy
+/// "maestro-status-N"). Deliberately NOT a blanket `maestro-` prefix: a user's
+/// own server named e.g. "maestro-tools" must survive session launches.
 fn should_remove_server(name: &str, _config: &Value, _session_id: u32) -> bool {
-    // Remove the single maestro-status entry (we'll add an updated one)
-    if name == "maestro-status" {
-        log::debug!("[MCP] should_remove_server('{}') = true (single maestro-status entry)", name);
-        return true;
-    }
-
-    // Remove legacy per-session entries (cleanup from old per-session approach)
-    if name.starts_with("maestro-status-") {
-        log::debug!("[MCP] should_remove_server('{}') = true (legacy per-session entry)", name);
-        return true;
-    }
-
-    // Remove legacy "maestro-{N}" entries
-    if name.starts_with("maestro-") && name != "maestro-status" {
-        log::debug!("[MCP] should_remove_server('{}') = true (legacy maestro-N entry)", name);
-        return true;
-    }
-
-    // Remove the legacy bare "maestro" entry
-    if name == "maestro" {
-        log::debug!("[MCP] should_remove_server('{}') = true (legacy bare maestro entry)", name);
-        return true;
-    }
-
-    log::debug!("[MCP] should_remove_server('{}') = false (keeping)", name);
-    false
+    let internal = crate::core::mcp_settings::is_internal_server(name);
+    log::debug!("[MCP] should_remove_server('{}') = {}", name, internal);
+    internal
 }
 
 /// Merges new MCP servers with an existing `.mcp.json` file.
@@ -506,42 +478,56 @@ pub async fn write_opencode_mcp_config(
 }
 
 /// Merges new MCP servers with an existing `opencode.json` file.
+///
+/// Starts from the existing file's root so every non-`mcp` key the user has
+/// (`$schema`, `theme`, `model`, `permission`, `keybinds`, ...) survives the
+/// rewrite — `opencode.json` is OpenCode's MAIN config file, not just an MCP
+/// manifest. Only the `mcp` key is rebuilt.
 fn merge_with_opencode_existing(
     opencode_path: &Path,
     new_servers: HashMap<String, Value>,
     _session_id: u32,
 ) -> Result<Value, String> {
-    let mut final_servers = new_servers;
-
-    if opencode_path.exists() {
+    let mut root = if opencode_path.exists() {
         let content = std::fs::read_to_string(opencode_path)
             .map_err(|e| format!("Failed to read existing opencode.json: {}", e))?;
 
         match serde_json::from_str::<serde_json::Value>(&content) {
-            Ok(existing) => {
-                if let Some(existing_mcp) = existing.get("mcp").and_then(|m| m.as_object()) {
-                    log::debug!(
-                        "Merging with existing opencode.json, {} existing servers",
-                        existing_mcp.len()
-                    );
-
-                    for (name, config) in existing_mcp {
-                        if !name.starts_with("maestro-") {
-                            final_servers.insert(name.clone(), config.clone());
-                        }
-                    }
-                }
+            Ok(existing) if existing.is_object() => existing,
+            Ok(_) => {
+                log::warn!("Existing opencode.json is not a JSON object, will overwrite");
+                json!({})
             }
             Err(e) => {
                 log::warn!(
                     "Failed to parse existing opencode.json: {}, will overwrite",
                     e
                 );
+                json!({})
+            }
+        }
+    } else {
+        json!({})
+    };
+
+    // New (Maestro-injected) servers first; existing user entries override on
+    // name collision, matching the pre-existing precedence. Maestro's own
+    // entries are never carried forward — new_servers has the fresh one.
+    let mut final_servers: serde_json::Map<String, Value> = new_servers.into_iter().collect();
+    if let Some(existing_mcp) = root.get("mcp").and_then(|m| m.as_object()) {
+        log::debug!(
+            "Merging with existing opencode.json, {} existing servers",
+            existing_mcp.len()
+        );
+        for (name, config) in existing_mcp {
+            if !crate::core::mcp_settings::is_internal_server(name) {
+                final_servers.insert(name.clone(), config.clone());
             }
         }
     }
 
-    Ok(json!({ "mcp": final_servers }))
+    root["mcp"] = Value::Object(final_servers);
+    Ok(root)
 }
 
 /// Removes Maestro server entries from `opencode.json`.
@@ -561,21 +547,30 @@ pub async fn remove_opencode_mcp_config(working_dir: &Path, session_id: u32) -> 
         .await
         .map_err(|e| format!("Failed to read opencode.json: {}", e))?;
 
-    let parsed: serde_json::Value = serde_json::from_str(&content)
+    let mut root: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse opencode.json: {}", e))?;
 
-    let mut mcp_obj = parsed.get("mcp").and_then(|m| m.as_object()).cloned().unwrap_or_default();
-
-    // Remove maestro-status entry
-    mcp_obj.remove("maestro-status");
-
-    // Write back
-    let output = if mcp_obj.is_empty() {
-        serde_json::to_string_pretty(&json!({}))
-    } else {
-        serde_json::to_string_pretty(&json!({ "mcp": mcp_obj }))
+    // Remove only Maestro's own entry, preserving every other key in the file
+    // (opencode.json holds the user's main OpenCode settings — it must never
+    // be truncated to `{}` here).
+    let mut removed = false;
+    if let Some(mcp) = root.get_mut("mcp").and_then(|m| m.as_object_mut()) {
+        removed = mcp.remove("maestro-status").is_some();
+        let now_empty = mcp.is_empty();
+        if now_empty {
+            if let Some(obj) = root.as_object_mut() {
+                obj.remove("mcp");
+            }
+        }
     }
-    .map_err(|e| format!("Failed to serialize opencode.json: {}", e))?;
+
+    if !removed {
+        // Nothing of ours in the file — don't rewrite it at all.
+        return Ok(());
+    }
+
+    let output = serde_json::to_string_pretty(&root)
+        .map_err(|e| format!("Failed to serialize opencode.json: {}", e))?;
 
     atomic_write(&opencode_path, &output).await?;
 
@@ -620,10 +615,12 @@ pub async fn remove_session_mcp_config(working_dir: &Path, session_id: u32) -> R
             log::debug!("Removed maestro-status MCP config from {:?} (session {})", mcp_path, session_id);
         }
 
-        // Also clean up any legacy per-session entries that might exist
+        // Also clean up any legacy per-session entries that might exist.
+        // Uses is_internal_server, NOT a blanket "maestro-" prefix: a user's
+        // own server named e.g. "maestro-tools" must survive session teardown.
         let legacy_keys: Vec<String> = servers
             .keys()
-            .filter(|k| k.starts_with("maestro-status-") || k.starts_with("maestro-") || *k == "maestro")
+            .filter(|k| crate::core::mcp_settings::is_internal_server(k))
             .cloned()
             .collect();
 
@@ -936,5 +933,132 @@ mod tests {
         assert!(servers.contains_key("other-server"), "other-server should be preserved");
         // New entry should be present
         assert!(servers.contains_key("maestro-status"), "new maestro-status entry should be present");
+    }
+
+    #[test]
+    fn test_merge_keeps_user_server_with_maestro_prefix() {
+        let dir = tempdir().unwrap();
+        let mcp_path = dir.path().join(".mcp.json");
+
+        // A user-owned server that merely shares the "maestro-" prefix must
+        // survive a session launch (regression: blanket prefix deleted it).
+        let existing = json!({
+            "mcpServers": {
+                "maestro-tools": {
+                    "type": "stdio",
+                    "command": "/usr/bin/maestro-tools",
+                    "args": [],
+                    "env": { "SECRET": "keep-me" }
+                }
+            }
+        });
+        std::fs::write(&mcp_path, serde_json::to_string(&existing).unwrap()).unwrap();
+
+        let mut new_servers = HashMap::new();
+        new_servers.insert(
+            "maestro-status".to_string(),
+            json!({ "type": "stdio", "command": "/usr/bin/maestro-status", "args": [] }),
+        );
+
+        let result = merge_with_existing(&mcp_path, new_servers, 7).unwrap();
+        let servers = result["mcpServers"].as_object().unwrap();
+
+        assert!(
+            servers.contains_key("maestro-tools"),
+            "user server 'maestro-tools' must survive session launch"
+        );
+        assert_eq!(servers["maestro-tools"]["env"]["SECRET"], "keep-me");
+        assert!(servers.contains_key("maestro-status"));
+    }
+
+    #[tokio::test]
+    async fn test_remove_session_config_keeps_user_server_with_maestro_prefix() {
+        let dir = tempdir().unwrap();
+        let mcp_path = dir.path().join(".mcp.json");
+
+        let existing = json!({
+            "mcpServers": {
+                "maestro-status": { "type": "stdio", "command": "/usr/bin/maestro-status", "args": [] },
+                "maestro-tools": { "type": "stdio", "command": "/usr/bin/maestro-tools", "args": [] }
+            }
+        });
+        std::fs::write(&mcp_path, serde_json::to_string(&existing).unwrap()).unwrap();
+
+        remove_session_mcp_config(dir.path(), 7).await.unwrap();
+
+        let read_back: Value =
+            serde_json::from_str(&std::fs::read_to_string(&mcp_path).unwrap()).unwrap();
+        let servers = read_back["mcpServers"].as_object().unwrap();
+        assert!(
+            !servers.contains_key("maestro-status"),
+            "maestro-status should be cleaned up"
+        );
+        assert!(
+            servers.contains_key("maestro-tools"),
+            "user server 'maestro-tools' must survive session teardown"
+        );
+    }
+
+    #[test]
+    fn test_opencode_merge_preserves_non_mcp_keys() {
+        let dir = tempdir().unwrap();
+        let opencode_path = dir.path().join("opencode.json");
+
+        // opencode.json is OpenCode's MAIN config file — every non-`mcp` key
+        // must round-trip (regression: file was rebuilt as bare {"mcp": ...}).
+        let existing = json!({
+            "$schema": "https://opencode.ai/config.json",
+            "theme": "tokyonight",
+            "model": "anthropic/claude-sonnet-4-5",
+            "permission": { "edit": "ask" },
+            "mcp": {
+                "playwright": { "type": "local", "command": ["npx", "playwright-mcp"] }
+            }
+        });
+        std::fs::write(&opencode_path, serde_json::to_string(&existing).unwrap()).unwrap();
+
+        let mut new_servers = HashMap::new();
+        new_servers.insert(
+            "maestro-status".to_string(),
+            json!({ "type": "local", "command": ["/usr/bin/maestro-status"] }),
+        );
+
+        let result = merge_with_opencode_existing(&opencode_path, new_servers, 3).unwrap();
+
+        assert_eq!(result["$schema"], "https://opencode.ai/config.json");
+        assert_eq!(result["theme"], "tokyonight");
+        assert_eq!(result["model"], "anthropic/claude-sonnet-4-5");
+        assert_eq!(result["permission"]["edit"], "ask");
+        let servers = result["mcp"].as_object().unwrap();
+        assert!(servers.contains_key("playwright"), "existing user server preserved");
+        assert!(servers.contains_key("maestro-status"), "maestro entry added");
+    }
+
+    #[tokio::test]
+    async fn test_remove_opencode_config_preserves_non_mcp_keys() {
+        let dir = tempdir().unwrap();
+        let opencode_path = dir.path().join("opencode.json");
+
+        // Removing our only entry must NOT truncate the file to {} —
+        // the user's settings live at the root.
+        let existing = json!({
+            "theme": "tokyonight",
+            "keybinds": { "leader": "space" },
+            "mcp": {
+                "maestro-status": { "type": "local", "command": ["/usr/bin/maestro-status"] }
+            }
+        });
+        std::fs::write(&opencode_path, serde_json::to_string(&existing).unwrap()).unwrap();
+
+        remove_opencode_mcp_config(dir.path(), 3).await.unwrap();
+
+        let read_back: Value =
+            serde_json::from_str(&std::fs::read_to_string(&opencode_path).unwrap()).unwrap();
+        assert_eq!(read_back["theme"], "tokyonight");
+        assert_eq!(read_back["keybinds"]["leader"], "space");
+        assert!(
+            read_back.get("mcp").is_none(),
+            "empty mcp object should be dropped, not kept as clutter"
+        );
     }
 }
