@@ -52,41 +52,47 @@ impl Utf8Decoder {
 
     /// Decodes bytes, buffering incomplete trailing sequences.
     ///
-    /// Returns a valid UTF-8 string. Any bytes that form an incomplete
-    /// sequence at the end of `input` are buffered for the next call.
+    /// Returns a valid UTF-8 string. Invalid bytes are replaced with U+FFFD
+    /// and decoding continues AFTER them — they are never buffered (buffering
+    /// them made a single bad byte swallow the whole remaining stream). Only
+    /// a genuinely incomplete trailing sequence — at most 3 bytes — is kept
+    /// for the next call. Mirrors process_manager::Utf8Decoder.
     fn decode(&mut self, input: &[u8]) -> String {
         // Prepend any previously incomplete bytes
         let mut data = std::mem::take(&mut self.incomplete);
         data.extend_from_slice(input);
 
-        // Find the last valid UTF-8 boundary
-        let valid_up_to = Self::find_valid_boundary(&data);
+        let mut out = String::with_capacity(data.len());
+        let mut rest: &[u8] = &data;
 
-        // Buffer any trailing incomplete sequence
-        if valid_up_to < data.len() {
-            self.incomplete = data[valid_up_to..].to_vec();
-        }
-
-        // Convert valid portion (guaranteed valid UTF-8)
-        String::from_utf8(data[..valid_up_to].to_vec())
-            .unwrap_or_else(|_| String::from_utf8_lossy(&data[..valid_up_to]).into_owned())
-    }
-
-    /// Finds the byte index up to which the data is valid UTF-8.
-    fn find_valid_boundary(data: &[u8]) -> usize {
-        match std::str::from_utf8(data) {
-            Ok(_) => data.len(),
-            Err(e) => {
-                let valid = e.valid_up_to();
-                // Check if error is due to incomplete sequence at end
-                if e.error_len().is_none() {
-                    valid // Incomplete sequence - buffer it
-                } else {
-                    // Invalid byte - skip it and continue
-                    valid + e.error_len().unwrap_or(1)
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(s) => {
+                    out.push_str(s);
+                    break;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    // Exact (borrowed) conversion: these bytes are certified
+                    // valid UTF-8 by the error above.
+                    out.push_str(&String::from_utf8_lossy(&rest[..valid]));
+                    match e.error_len() {
+                        Some(len) => {
+                            out.push('\u{FFFD}');
+                            rest = &rest[valid + len..];
+                        }
+                        None => {
+                            // Incomplete trailing sequence — finish on the
+                            // next chunk.
+                            self.incomplete = rest[valid..].to_vec();
+                            break;
+                        }
+                    }
                 }
             }
         }
+
+        out
     }
 }
 

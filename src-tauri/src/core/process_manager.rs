@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use dashmap::DashMap;
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Notify;
 
@@ -38,41 +38,48 @@ impl Utf8Decoder {
 
     /// Decodes bytes, buffering incomplete trailing sequences.
     ///
-    /// Returns a valid UTF-8 string. Any bytes that form an incomplete
-    /// sequence at the end of `input` are buffered for the next call.
+    /// Returns a valid UTF-8 string. Invalid bytes are replaced with U+FFFD
+    /// and decoding continues AFTER them — they are never buffered. (Buffering
+    /// from the first invalid byte onward made a single bad byte swallow the
+    /// whole remaining stream: unbounded memory growth and quadratic
+    /// re-copying on any non-UTF-8 output.) Only a genuinely incomplete
+    /// trailing sequence — at most 3 bytes — is kept for the next call.
     pub fn decode(&mut self, input: &[u8]) -> String {
         // Prepend any previously incomplete bytes
         let mut data = std::mem::take(&mut self.incomplete);
         data.extend_from_slice(input);
 
-        // Find the last valid UTF-8 boundary
-        let valid_up_to = Self::find_valid_boundary(&data);
+        let mut out = String::with_capacity(data.len());
+        let mut rest: &[u8] = &data;
 
-        // Buffer any trailing incomplete sequence
-        if valid_up_to < data.len() {
-            self.incomplete = data[valid_up_to..].to_vec();
-        }
-
-        // Convert valid portion (guaranteed valid UTF-8)
-        String::from_utf8(data[..valid_up_to].to_vec())
-            .unwrap_or_else(|_| String::from_utf8_lossy(&data[..valid_up_to]).into_owned())
-    }
-
-    /// Finds the byte index up to which the data is valid UTF-8.
-    fn find_valid_boundary(data: &[u8]) -> usize {
-        match std::str::from_utf8(data) {
-            Ok(_) => data.len(),
-            Err(e) => {
-                let valid = e.valid_up_to();
-                // Check if error is due to incomplete sequence at end
-                if e.error_len().is_none() {
-                    valid // Incomplete sequence - buffer it
-                } else {
-                    // Invalid byte - skip it and continue
-                    valid + e.error_len().unwrap_or(1)
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(s) => {
+                    out.push_str(s);
+                    break;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    // Exact (borrowed) conversion: these bytes are certified
+                    // valid UTF-8 by the error above.
+                    out.push_str(&String::from_utf8_lossy(&rest[..valid]));
+                    match e.error_len() {
+                        Some(len) => {
+                            out.push('\u{FFFD}');
+                            rest = &rest[valid + len..];
+                        }
+                        None => {
+                            // Incomplete trailing sequence — finish on the
+                            // next chunk.
+                            self.incomplete = rest[valid..].to_vec();
+                            break;
+                        }
+                    }
                 }
             }
         }
+
+        out
     }
 }
 
@@ -84,6 +91,11 @@ struct PtySession {
     master: Mutex<Box<dyn MasterPty + Send>>,
     /// PID of the child process (shell).
     child_pid: i32,
+    /// Child handle — kept so `kill_session` can reap the process via
+    /// `try_wait`/`wait`. Dropping it without waiting leaves a zombie on Unix
+    /// (and `kill(pid, 0)` then reports the zombie as alive forever, forcing
+    /// every close through the full 3s grace period + spurious SIGKILL).
+    child: Mutex<Box<dyn Child + Send + Sync>>,
     /// Process group ID for signal delivery (Unix only). portable-pty calls
     /// setsid() on spawn, so the child becomes a session+group leader (PGID == child PID).
     /// We capture this from master.process_group_leader() for correctness.
@@ -469,6 +481,7 @@ impl ProcessManager {
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
             child_pid,
+            child: Mutex::new(child),
             #[cfg(unix)]
             pgid,
             shutdown,
@@ -562,8 +575,19 @@ impl ProcessManager {
 
         let pid = session.child_pid;
 
+        // Take the child handle out of the session so the process can be
+        // REAPED, not just signaled. `libc::kill(pid, 0)` succeeds on a zombie
+        // forever, so a poll based on it can never observe the exit — every
+        // close then burns the full grace period and logs a spurious SIGKILL,
+        // and the zombie lingers for the app's lifetime.
+        let child = session
+            .child
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         #[cfg(unix)]
         {
+            let mut child = child;
             let pgid = session.pgid;
 
             // Send SIGTERM to the process group (negative pgid targets the group)
@@ -575,14 +599,16 @@ impl ProcessManager {
                 );
             }
 
-            // Wait up to 3 seconds for the lead process to exit
+            // Wait up to 3 seconds for the shell to exit, reaping it as soon
+            // as it does. An Err from try_wait is treated as "gone".
             let exited = tokio::time::timeout(std::time::Duration::from_secs(3), async {
                 loop {
-                    let result = unsafe { libc::kill(pid, 0) };
-                    if result != 0 {
-                        return; // Process gone
+                    match child.try_wait() {
+                        Ok(None) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                        Ok(Some(_)) | Err(_) => return,
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             })
             .await;
@@ -597,6 +623,19 @@ impl ProcessManager {
                     );
                 }
                 log::warn!("Session {session_id} (pid={pid}, pgid={pgid}) required SIGKILL");
+
+                // Reap the SIGKILLed shell so it doesn't linger as a zombie.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    loop {
+                        match child.try_wait() {
+                            Ok(None) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            }
+                            Ok(Some(_)) | Err(_) => return,
+                        }
+                    }
+                })
+                .await;
             }
         }
 
@@ -613,6 +652,14 @@ impl ProcessManager {
             if let Err(e) = result {
                 log::warn!("Failed to taskkill session {session_id} (pid={pid}): {e}");
             }
+
+            // Release the process handle off the async runtime (wait() blocks;
+            // taskkill /F above makes it near-instant).
+            let mut child = child;
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = child.wait();
+            })
+            .await;
         }
 
         // Signal the tokio event emitter to shut down
@@ -673,5 +720,52 @@ impl ProcessManager {
         }
 
         Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Utf8Decoder;
+
+    #[test]
+    fn decode_passes_valid_utf8_through() {
+        let mut d = Utf8Decoder::new();
+        assert_eq!(d.decode("hello café 世界".as_bytes()), "hello café 世界");
+        assert!(d.incomplete.is_empty());
+    }
+
+    #[test]
+    fn decode_buffers_incomplete_trailing_sequence() {
+        let mut d = Utf8Decoder::new();
+        let bytes = "é".as_bytes(); // 2 bytes: 0xC3 0xA9
+        assert_eq!(d.decode(&bytes[..1]), "");
+        assert_eq!(d.decode(&bytes[1..]), "é");
+        assert!(d.incomplete.is_empty());
+    }
+
+    #[test]
+    fn decode_replaces_invalid_bytes_and_continues() {
+        // Regression: an invalid byte used to push the whole remaining chunk
+        // into the incomplete buffer, so nothing after it was ever emitted.
+        let mut d = Utf8Decoder::new();
+        let out = d.decode(b"ok\xFFrest");
+        assert_eq!(out, "ok\u{FFFD}rest");
+        assert!(d.incomplete.is_empty());
+    }
+
+    #[test]
+    fn decode_does_not_accumulate_on_binary_stream() {
+        // Regression: latin-1/binary streams grew the buffer by ~chunk size per
+        // call (quadratic re-copying, output never emitted).
+        let mut d = Utf8Decoder::new();
+        let chunk: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        for _ in 0..50 {
+            d.decode(&chunk);
+            assert!(
+                d.incomplete.len() <= 3,
+                "incomplete buffer must stay bounded, got {}",
+                d.incomplete.len()
+            );
+        }
     }
 }
