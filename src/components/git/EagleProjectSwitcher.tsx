@@ -40,7 +40,7 @@ export function EagleProjectSwitcher({
 
   return (
     <div
-      className="flex h-9 shrink-0 items-center gap-2 border-b border-maestro-border bg-maestro-bg px-2"
+      className="flex h-12 shrink-0 items-center gap-2.5 border-b border-maestro-border bg-maestro-bg px-3"
       onWheel={handleWheel}
     >
       <button
@@ -52,7 +52,7 @@ export function EagleProjectSwitcher({
       >
         <ChevronLeft size={14} />
       </button>
-      <div className="flex min-w-0 flex-1 flex-col items-center">
+      <div className="flex min-w-0 flex-1 flex-col items-center gap-1 py-1.5">
         <div className="flex min-w-0 items-center gap-1.5">
           <span
             className="h-2 w-2 shrink-0 rounded-full"
@@ -61,7 +61,7 @@ export function EagleProjectSwitcher({
           <span className="truncate text-xs font-medium text-maestro-text">{current?.name}</span>
         </div>
         {projects.length >= 2 && (
-          <div className="flex gap-1">
+          <div className="flex gap-1.5">
             {projects.map((p, i) => (
               <span
                 key={p.tabId}
