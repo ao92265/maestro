@@ -228,6 +228,22 @@ interface GitHubState {
 const DEFAULT_PR_SEARCH = "author:@me";
 const DEFAULT_ISSUE_SEARCH = "assignee:@me";
 
+/**
+ * Late-response guard: each fetch slot records the id of its newest request,
+ * and a response only lands while it is still the newest. `gh` calls take
+ * 1-3s, so switching repos mid-flight otherwise lets the PREVIOUS repo's
+ * slow response overwrite the current repo's data (last-to-RESOLVE wins,
+ * not last-requested).
+ */
+const fetchTokens = {
+  prs: 0,
+  prDetail: 0,
+  issues: 0,
+  issueDetail: 0,
+  discussions: 0,
+  discussionDetail: 0,
+};
+
 export const useGitHubStore = create<GitHubState>()((set, get) => ({
   // Initial state
   authStatus: null,
@@ -278,6 +294,7 @@ export const useGitHubStore = create<GitHubState>()((set, get) => ({
   ) => {
     const filter = state ?? get().prFilter;
     const searchQuery = search !== undefined ? search : get().prSearch;
+    const token = ++fetchTokens.prs;
     set({
       isPRsLoading: true,
       prsError: null,
@@ -291,22 +308,27 @@ export const useGitHubStore = create<GitHubState>()((set, get) => ({
         limit: 50,
         search: searchQuery.trim() ? searchQuery.trim() : null,
       });
+      if (token !== fetchTokens.prs) return; // superseded by a newer fetch
       set({ pullRequests, isPRsLoading: false });
     } catch (err) {
+      if (token !== fetchTokens.prs) return;
       console.error("Failed to fetch PRs:", err);
       set({ prsError: String(err), isPRsLoading: false, pullRequests: [] });
     }
   },
 
   fetchPullRequestDetail: async (repoPath: string, number: number) => {
+    const token = ++fetchTokens.prDetail;
     set({ isLoadingPRDetail: true });
     try {
       const selectedPR = await invoke<PullRequestDetail>("github_get_pr", {
         repoPath,
         number,
       });
+      if (token !== fetchTokens.prDetail) return;
       set({ selectedPR, isLoadingPRDetail: false });
     } catch (err) {
+      if (token !== fetchTokens.prDetail) return;
       console.error("Failed to fetch PR detail:", err);
       set({ isLoadingPRDetail: false });
     }
@@ -374,6 +396,7 @@ export const useGitHubStore = create<GitHubState>()((set, get) => ({
   ) => {
     const filter = state ?? get().issueFilter;
     const searchQuery = search !== undefined ? search : get().issueSearch;
+    const token = ++fetchTokens.issues;
     set({
       isIssuesLoading: true,
       issuesError: null,
@@ -387,22 +410,27 @@ export const useGitHubStore = create<GitHubState>()((set, get) => ({
         limit: 50,
         search: searchQuery.trim() ? searchQuery.trim() : null,
       });
+      if (token !== fetchTokens.issues) return; // superseded by a newer fetch
       set({ issues, isIssuesLoading: false });
     } catch (err) {
+      if (token !== fetchTokens.issues) return;
       console.error("Failed to fetch issues:", err);
       set({ issuesError: String(err), isIssuesLoading: false, issues: [] });
     }
   },
 
   fetchDiscussions: async (repoPath: string) => {
+    const token = ++fetchTokens.discussions;
     set({ isDiscussionsLoading: true, discussionsError: null });
     try {
       const discussions = await invoke<DiscussionInfo[]>(
         "github_list_discussions",
         { repoPath, limit: 25 }
       );
+      if (token !== fetchTokens.discussions) return; // superseded by a newer fetch
       set({ discussions, isDiscussionsLoading: false, discussionsEnabled: true });
     } catch (err) {
+      if (token !== fetchTokens.discussions) return;
       const errorStr = String(err);
       console.error("Failed to fetch discussions:", err);
       if (errorStr.includes("not enabled")) {
@@ -422,14 +450,17 @@ export const useGitHubStore = create<GitHubState>()((set, get) => ({
   },
 
   fetchIssueDetail: async (repoPath: string, number: number) => {
+    const token = ++fetchTokens.issueDetail;
     set({ isLoadingIssueDetail: true });
     try {
       const selectedIssue = await invoke<IssueDetail>("github_get_issue", {
         repoPath,
         number,
       });
+      if (token !== fetchTokens.issueDetail) return;
       set({ selectedIssue, isLoadingIssueDetail: false });
     } catch (err) {
+      if (token !== fetchTokens.issueDetail) return;
       console.error("Failed to fetch issue detail:", err);
       set({ isLoadingIssueDetail: false });
     }
@@ -460,14 +491,17 @@ export const useGitHubStore = create<GitHubState>()((set, get) => ({
   },
 
   fetchDiscussionDetail: async (repoPath: string, number: number) => {
+    const token = ++fetchTokens.discussionDetail;
     set({ isLoadingDiscussionDetail: true });
     try {
       const selectedDiscussion = await invoke<DiscussionDetail>(
         "github_get_discussion",
         { repoPath, number }
       );
+      if (token !== fetchTokens.discussionDetail) return;
       set({ selectedDiscussion, isLoadingDiscussionDetail: false });
     } catch (err) {
+      if (token !== fetchTokens.discussionDetail) return;
       console.error("Failed to fetch discussion detail:", err);
       set({ isLoadingDiscussionDetail: false });
     }
