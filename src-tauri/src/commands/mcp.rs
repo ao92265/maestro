@@ -10,7 +10,7 @@ use tauri::{AppHandle, State};
 use tauri_plugin_store::StoreExt;
 
 use crate::core::mcp_config_writer;
-use crate::core::mcp_manager::{McpManager, McpServerConfig};
+use crate::core::mcp_manager::{McpManager, McpServerConfig, McpServerSource};
 use crate::core::mcp_settings::{self, McpScope, McpStatusView};
 use crate::core::status_server::StatusServer;
 
@@ -303,11 +303,21 @@ pub async fn write_session_mcp_config(
     // disable lists in ~/.claude.json) are excluded even if the session slot
     // still has them ticked — copying them into the session .mcp.json would
     // sidestep the very list the toggle wrote.
+    //
+    // Only Project-scope servers are written back into the project's own
+    // .mcp.json. User/local-scope servers live in ~/.claude.json and are
+    // already visible to the CLI from there; copying them (including their
+    // env secrets) into a file that is commonly committed would leak them
+    // permanently — the cleanup path only removes Maestro's own entries.
     let disabled = mcp_settings::disabled_server_names(&canonical);
     let all_discovered = mcp_state.get_project_servers(&canonical);
     let enabled_discovered: Vec<_> = all_discovered
         .into_iter()
-        .filter(|s| enabled_server_names.contains(&s.name) && !disabled.contains(&s.name))
+        .filter(|s| {
+            s.source == McpServerSource::Project
+                && enabled_server_names.contains(&s.name)
+                && !disabled.contains(&s.name)
+        })
         .collect();
 
     // Get enabled custom servers
@@ -368,12 +378,18 @@ pub async fn write_opencode_mcp_config(
     let instance_id = status_server.instance_id();
 
     // Get full server configs for enabled discovered servers, excluding
-    // servers disabled for this project (see write_session_mcp_config).
+    // servers disabled for this project and non-Project scopes (see
+    // write_session_mcp_config — the same permanent-injection concern applies
+    // to opencode.json, which teardown never strips user entries from).
     let disabled = mcp_settings::disabled_server_names(&canonical);
     let all_discovered = mcp_state.get_project_servers(&canonical);
     let enabled_discovered: Vec<_> = all_discovered
         .into_iter()
-        .filter(|s| enabled_server_names.contains(&s.name) && !disabled.contains(&s.name))
+        .filter(|s| {
+            s.source == McpServerSource::Project
+                && enabled_server_names.contains(&s.name)
+                && !disabled.contains(&s.name)
+        })
         .collect();
 
     // Get enabled custom servers
