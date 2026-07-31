@@ -1196,12 +1196,17 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     }
   }, [focusedSlotId, layoutTree]);
 
-  /** Restores a parked session's pane to the grid and focuses it. */
+  /**
+   * Restores a parked session's pane into the view the user is in: while a
+   * terminal is zoomed the restored one takes over the zoom view (the user
+   * stays in zoom-in), otherwise it reappears in the split grid. Focused
+   * either way.
+   */
   const handleUnpark = useCallback((sessionId: number) => {
     useSessionStore.getState().unparkSession(sessionId);
     const slot = slotsRef.current.find((s) => s.sessionId === sessionId);
     if (!slot) return;
-    setZoomedSlotId(null);
+    setZoomedSlotId((prev) => (prev === null ? null : slot.id));
     setFocusedSlotId(slot.id);
     focusSlotTextarea(slot.id);
   }, []);
@@ -1865,7 +1870,8 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
             )}
           </div>
 
-          {/* Parked terminals stay reachable from zoom-in view (unpark exits zoom) */}
+          {/* Parked terminals stay reachable from zoom-in view (unpark makes
+              the restored terminal the zoomed one — the user stays in zoom) */}
           <ParkedShelf projectPath={projectPath} onUnpark={handleUnpark} />
         </div>
       );

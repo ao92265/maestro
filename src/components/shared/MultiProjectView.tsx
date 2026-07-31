@@ -210,10 +210,15 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
     setEagleZoom((prev) => (prev === sessionId ? null : sessionId));
   }, []);
 
-  // Restore a parked terminal from the eagle shelf. Only the grid that owns
-  // the session accepts the focus call, same pattern as the zoom-focus effect.
+  // Restore a parked terminal from the eagle shelf into the view the user is
+  // in: while eagle-zoomed the restored terminal takes over the zoom (its
+  // tile would otherwise stay hidden behind the zoom overlay and the click
+  // would appear to do nothing); otherwise it reappears as a grid tile. Only
+  // the grid that owns the session accepts the focus call, same pattern as
+  // the zoom-focus effect.
   const handleEagleUnpark = useCallback((sessionId: number) => {
     useSessionStore.getState().unparkSession(sessionId);
+    setEagleZoom((prev) => (prev === null ? null : sessionId));
     for (const handle of gridRefs.current.values()) {
       if (handle.focusSession(sessionId)) break;
     }
