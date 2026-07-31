@@ -718,6 +718,9 @@ function App() {
                 }
                 multiProjectRef.current?.launchAllInActiveProject();
               }}
+              onNavigateToSession={(tabId, sessionId) => {
+                multiProjectRef.current?.navigateToSession(tabId, sessionId);
+              }}
             />
           </div>
         </div>

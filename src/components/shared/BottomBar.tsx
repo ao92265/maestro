@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { Play, UserRound } from "lucide-react";
 import { UsageBar } from "./UsageBar";
 import { SystemMetrics } from "./SystemMetrics";
+import { TerminalNavigator } from "./TerminalNavigator";
 import { useClaudeAccountStore } from "@/stores/useClaudeAccountStore";
 
 interface BottomBarProps {
@@ -12,6 +13,8 @@ interface BottomBarProps {
   /** Number of actually running sessions */
   launchedCount: number;
   onLaunchAll: () => void;
+  /** Footer navigator: bring the given session in front of the user. */
+  onNavigateToSession: (tabId: string, sessionId: number) => void;
 }
 
 export function BottomBar({
@@ -19,6 +22,7 @@ export function BottomBar({
   slotCount,
   launchedCount,
   onLaunchAll,
+  onNavigateToSession,
 }: BottomBarProps) {
   const hasUnlaunchedSlots = slotCount > launchedCount;
   const unlaunchedCount = slotCount - launchedCount;
@@ -31,15 +35,18 @@ export function BottomBar({
 
   return (
     <div className="no-select relative flex h-11 items-center justify-center gap-3 px-4">
-      {account?.email && (
-        <div
-          className="absolute left-4 top-1/2 -translate-y-1/2 flex items-center gap-1.5 text-[11px] text-maestro-muted/70 max-w-[40%] truncate"
-          title={`Claude Code account: ${account.email}`}
-        >
-          <UserRound size={12} className="shrink-0" />
-          <span className="truncate">{account.email}</span>
-        </div>
-      )}
+      <div className="absolute left-4 top-1/2 flex max-w-[40%] -translate-y-1/2 items-center gap-2">
+        <TerminalNavigator onNavigate={onNavigateToSession} />
+        {account?.email && (
+          <div
+            className="flex min-w-0 items-center gap-1.5 text-[11px] text-maestro-muted/70"
+            title={`Claude Code account: ${account.email}`}
+          >
+            <UserRound size={12} className="shrink-0" />
+            <span className="truncate">{account.email}</span>
+          </div>
+        )}
+      </div>
       {(hasUnlaunchedSlots || !inGridView) && (
         <button
           type="button"
