@@ -9,6 +9,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use super::config_recovery::read_json_or_recover;
+use super::mcp_config_writer::{atomic_write, dir_lock};
 
 /// Builds the hooks configuration JSON for a session.
 ///
@@ -93,6 +94,12 @@ pub async fn write_session_hooks_config(
             .map_err(|e| format!("Failed to create .claude directory: {}", e))?;
     }
 
+    // Serialize against the plugin writer: both read-modify-write the same
+    // settings.local.json, and unsynchronized tasks either resurrect each
+    // other's removed keys or interleave truncating writes into corrupt JSON.
+    let lock = dir_lock(&claude_dir);
+    let _guard = lock.lock().await;
+
     // Read existing settings or start fresh. A corrupt settings.local.json is
     // moved aside and treated as empty so launching self-heals instead of
     // erroring on every future session.
@@ -103,13 +110,12 @@ pub async fn write_session_hooks_config(
     let hooks = build_hooks_config(session_id, status_port, instance_id);
     config["hooks"] = hooks;
 
-    // Write back
+    // Write back atomically (temp file + rename) so a concurrent reader never
+    // sees a truncated file.
     let content = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("Failed to serialize hooks config: {}", e))?;
 
-    tokio::fs::write(&settings_path, content)
-        .await
-        .map_err(|e| format!("Failed to write settings.local.json: {}", e))?;
+    atomic_write(&settings_path, &content).await?;
 
     log::debug!(
         "Wrote session {} hooks config to {:?} (port={}, instance={})",
@@ -131,10 +137,15 @@ pub async fn write_session_hooks_config(
 ///
 /// * `working_dir` - Directory containing the `.claude/settings.local.json` file
 pub async fn remove_session_hooks_config(working_dir: &Path) -> Result<(), String> {
-    let settings_path = working_dir.join(".claude/settings.local.json");
+    let claude_dir = working_dir.join(".claude");
+    let settings_path = claude_dir.join("settings.local.json");
     if !settings_path.exists() {
         return Ok(());
     }
+
+    // Serialize against the plugin writer (see write_session_hooks_config).
+    let lock = dir_lock(&claude_dir);
+    let _guard = lock.lock().await;
 
     let content = tokio::fs::read_to_string(&settings_path)
         .await
@@ -150,13 +161,11 @@ pub async fn remove_session_hooks_config(working_dir: &Path) -> Result<(), Strin
         }
     }
 
-    // Write back the updated config
+    // Write back the updated config atomically
     let output = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("Failed to serialize config: {}", e))?;
 
-    tokio::fs::write(&settings_path, output)
-        .await
-        .map_err(|e| format!("Failed to write settings.local.json: {}", e))?;
+    atomic_write(&settings_path, &output).await?;
 
     Ok(())
 }

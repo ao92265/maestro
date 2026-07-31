@@ -33,12 +33,17 @@ pub(crate) fn dir_lock(dir: &Path) -> Arc<Mutex<()>> {
 }
 
 /// Write content to a file atomically: write to a temp file in the same directory, then rename.
-async fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
+///
+/// `pub(crate)` so the other config writers that share files with external
+/// tools (hook_config_writer / plugin_config_writer on settings.local.json)
+/// use the same temp-file+rename pattern instead of a truncating write.
+pub(crate) async fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
     let parent = path.parent().ok_or("No parent directory")?;
-    let temp_path = parent.join(format!(
-        ".mcp.json.tmp.{}",
-        std::process::id()
-    ));
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("No file name")?;
+    let temp_path = parent.join(format!("{}.tmp.{}", file_name, std::process::id()));
 
     tokio::fs::write(&temp_path, content)
         .await
