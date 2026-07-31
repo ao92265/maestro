@@ -35,11 +35,40 @@ interface ThinkingIndicatorProps {
  *
  * Animation: dots fade in/out with a staggered delay while `Working`.
  * Idle:      dots stay subtle and static (no animation cost).
- * NeedsInput: dots tint yellow to flag user action required.
+ * NeedsInput: dots tint red to flag user action required.
  *
  * Performance: pure CSS keyframes — no React render loop. Respects
  * `prefers-reduced-motion` via the global rule in globals.css.
  */
+/**
+ * Live status dot for a session (tab strips, chips): blue while working, red
+ * when the agent waits for the user (pulsing), green when done, muted idle.
+ * Replaces the previously hardcoded green dots so "your turn" reads at a
+ * glance from any tab strip.
+ */
+export const SessionStatusDot = memo(function SessionStatusDot({
+  sessionId,
+  className = "",
+}: {
+  sessionId: number;
+  className?: string;
+}) {
+  const status = useSessionStore((s) => s.sessions.find((x) => x.id === sessionId)?.status);
+  const color =
+    status === "Working"
+      ? "bg-maestro-blue"
+      : status === "NeedsInput"
+        ? "bg-maestro-accent animate-pulse"
+        : status === "Done"
+          ? "bg-maestro-green"
+          : status === "Error" || status === "Timeout"
+            ? "bg-maestro-red"
+            : status === "Starting"
+              ? "bg-maestro-orange"
+              : "bg-maestro-muted/40";
+  return <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${color} ${className}`} />;
+});
+
 export const ThinkingIndicator = memo(function ThinkingIndicator({
   sessionId,
   size = 3.5,
@@ -59,9 +88,9 @@ export const ThinkingIndicator = memo(function ThinkingIndicator({
 
   const dotColor =
     activity === "thinking"
-      ? "bg-maestro-accent"
+      ? "bg-maestro-blue"
       : activity === "needs-input"
-        ? "bg-maestro-yellow"
+        ? "bg-maestro-accent"
         : "bg-maestro-muted/40";
 
   const animate = activity === "thinking";

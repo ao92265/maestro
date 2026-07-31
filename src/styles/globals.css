@@ -18,7 +18,8 @@
     --maestro-muted: 130 130 142; /* #82828e — secondary text */
 
     /* Accent & status — constant across themes */
-    --maestro-accent: 255 26 58; /* #ff1a3a — neon red, brand */
+    --maestro-accent: 255 26 58; /* #ff1a3a — neon red, brand; signals "needs your input" */
+    --maestro-blue: 59 130 246; /* #3b82f6 — working / focused */
     --maestro-green: 63 185 80; /* #3fb950 */
     --maestro-red: 220 38 38; /* #dc2626 — error red, distinct from neon accent */
     --maestro-orange: 245 158 11; /* #f59e0b — matches design spec */
@@ -205,17 +206,18 @@
 }
 
 .terminal-cell-working {
-  border-color: rgb(var(--maestro-accent));
+  border-color: rgb(var(--maestro-blue));
   box-shadow:
-    0 0 12px rgb(var(--maestro-accent) / 0.4),
-    0 0 24px rgb(var(--maestro-accent) / 0.2);
+    0 0 12px rgb(var(--maestro-blue) / 0.4),
+    0 0 24px rgb(var(--maestro-blue) / 0.2);
 }
 
+/* Red = the agent finished its turn and waits for the user. */
 .terminal-cell-needs-input {
-  border-color: rgb(var(--maestro-yellow));
+  border-color: rgb(var(--maestro-accent));
   box-shadow:
-    0 0 12px rgb(var(--maestro-yellow) / 0.5),
-    0 0 24px rgb(var(--maestro-yellow) / 0.25);
+    0 0 12px rgb(var(--maestro-accent) / 0.5),
+    0 0 24px rgb(var(--maestro-accent) / 0.25);
 }
 
 .terminal-cell-done {
@@ -233,7 +235,7 @@
 }
 
 .terminal-cell-focused {
-  border-color: rgb(var(--maestro-accent));
+  border-color: rgb(var(--maestro-blue));
 }
 
 /* ── Animations ── */
@@ -331,20 +333,20 @@
 }
 
 /* Parked-shelf chip demanding attention (agent finished its turn / needs
-   input while parked). Border stays yellow even where animations are
+   input while parked). Border stays red even where animations are
    disabled (Linux, reduced motion) so the signal survives. */
 @keyframes parked-attention {
   0%,
   100% {
-    box-shadow: 0 0 6px rgb(var(--maestro-yellow) / 0.25);
+    box-shadow: 0 0 6px rgb(var(--maestro-accent) / 0.25);
   }
   50% {
-    box-shadow: 0 0 14px rgb(var(--maestro-yellow) / 0.55);
+    box-shadow: 0 0 14px rgb(var(--maestro-accent) / 0.55);
   }
 }
 
 .parked-chip-attention {
-  border-color: rgb(var(--maestro-yellow));
+  border-color: rgb(var(--maestro-accent));
   animation: parked-attention 1.6s ease-in-out infinite;
 }
 

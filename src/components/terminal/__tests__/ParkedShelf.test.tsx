@@ -106,7 +106,7 @@ describe("ParkedShelf", () => {
     const busyChip = screen.getByText("Busy").closest("button");
     expect(waitingChip?.className).toContain("parked-chip-attention");
     expect(busyChip?.className).not.toContain("parked-chip-attention");
-    expect(screen.getByText("Parked").className).toContain("text-maestro-yellow");
+    expect(screen.getByText("Parked").className).toContain("text-maestro-accent");
   });
 
   it("keeps the shelf neutral while parked agents are only working", () => {

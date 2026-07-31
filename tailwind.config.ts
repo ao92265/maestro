@@ -17,6 +17,7 @@ export default {
           text: rgb("text"),
           muted: rgb("muted"),
           accent: rgb("accent"),
+          blue: rgb("blue"),
           green: rgb("green"),
           red: rgb("red"),
           orange: rgb("orange"),

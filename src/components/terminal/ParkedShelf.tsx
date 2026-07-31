@@ -9,8 +9,8 @@ import { ThinkingIndicator } from "./ThinkingIndicator";
 const STATUS_DOT: Record<BackendSessionStatus, string> = {
   Starting: "bg-orange-400",
   Idle: "bg-maestro-muted",
-  Working: "bg-maestro-accent",
-  NeedsInput: "bg-yellow-500",
+  Working: "bg-maestro-blue",
+  NeedsInput: "bg-maestro-accent",
   Done: "bg-maestro-green",
   Error: "bg-red-500",
   Timeout: "bg-red-500",
@@ -25,7 +25,7 @@ function basenameOf(path: string): string {
 /**
  * Chip border per status. Parked terminals stay parked (WhatsApp-archive
  * semantics), but a chip whose agent stopped and wants the user turns
- * yellow and pulses; errors turn red; explicit Done turns green.
+ * red and pulses; errors turn dark red; explicit Done turns green.
  */
 function chipBorderClass(status: BackendSessionStatus): string {
   switch (status) {
@@ -78,12 +78,12 @@ export function ParkedShelf({ projectPath, onUnpark, showProjectLabels = false }
   return (
     <div
       className={`flex h-8 shrink-0 items-center gap-1.5 overflow-x-auto border-t bg-maestro-surface px-2 ${
-        hasAttention ? "border-maestro-yellow/60" : "border-maestro-border"
+        hasAttention ? "border-maestro-accent/60" : "border-maestro-border"
       }`}
     >
       <span
         className={`shrink-0 text-[10px] font-medium uppercase tracking-wider ${
-          hasAttention ? "text-maestro-yellow" : "text-maestro-muted"
+          hasAttention ? "text-maestro-accent" : "text-maestro-muted"
         }`}
       >
         Parked

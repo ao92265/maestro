@@ -21,8 +21,8 @@ const COL_GAP = 80;
 const SESSION_STATUS_BADGES: Record<BackendSessionStatus, { label: string; cls: string }> = {
   Starting: { label: "STARTING", cls: "bg-orange-500/15 text-orange-400" },
   Idle: { label: "IDLE", cls: "bg-maestro-muted/15 text-maestro-muted" },
-  Working: { label: "WORKING", cls: "bg-maestro-accent/15 text-maestro-accent" },
-  NeedsInput: { label: "NEEDS INPUT", cls: "bg-yellow-500/15 text-yellow-500" },
+  Working: { label: "WORKING", cls: "bg-maestro-blue/15 text-maestro-blue" },
+  NeedsInput: { label: "NEEDS INPUT", cls: "bg-maestro-accent/15 text-maestro-accent" },
   Done: { label: "DONE", cls: "bg-maestro-green/15 text-maestro-green" },
   Error: { label: "ERROR", cls: "bg-red-500/15 text-red-400" },
   Timeout: { label: "TIMEOUT", cls: "bg-red-500/15 text-red-400" },
@@ -34,7 +34,7 @@ const badgeBaseClass =
 /** Badge for a subagent node — same classes as the sidebar's agent rows. */
 function agentBadge(agent: SubagentInfo): { label: string; cls: string } {
   return agent.completedAt === null
-    ? { label: "RUNNING", cls: "bg-maestro-accent/15 text-maestro-accent animate-pulse" }
+    ? { label: "RUNNING", cls: "bg-maestro-blue/15 text-maestro-blue animate-pulse" }
     : agent.success === false
       ? { label: "FAILED", cls: "bg-red-500/15 text-red-400" }
       : { label: "DONE", cls: "bg-maestro-green/15 text-maestro-green" };
@@ -42,7 +42,7 @@ function agentBadge(agent: SubagentInfo): { label: string; cls: string } {
 
 /** Edge color via CSS vars so the light theme (swapped vars) keeps working. */
 function edgeStroke(agent: SubagentInfo): string {
-  if (agent.completedAt === null) return "rgb(var(--maestro-accent))";
+  if (agent.completedAt === null) return "rgb(var(--maestro-blue))";
   if (agent.success === false) return "rgb(var(--maestro-red))";
   return "rgb(var(--maestro-border))";
 }

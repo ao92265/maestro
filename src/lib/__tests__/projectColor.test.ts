@@ -17,6 +17,16 @@ describe("projectColorFor", () => {
   it("is deterministic for the same name", () => {
     expect(projectColorFor("maestro")).toBe(projectColorFor("maestro"));
   });
+
+  it("never assigns a red-ish hue (red is reserved for needs-input status)", () => {
+    // 200 arbitrary names — every hue must stay inside the allowed 30°..330°
+    // arc, leaving the red band around 0°/360° to the status borders.
+    for (let i = 0; i < 200; i++) {
+      const hue = hueOf(projectColorFor(`project-${i}`));
+      expect(hue).toBeGreaterThanOrEqual(30);
+      expect(hue).toBeLessThan(330);
+    }
+  });
 });
 
 describe("resolveProjectColors", () => {
@@ -35,15 +45,15 @@ describe("resolveProjectColors", () => {
   });
 
   it("re-seats one of two different names whose hues clash", () => {
-    // "maestro" and "core" hash to the identical hue (335) — without
+    // "core" (245) and "api" (224) land within 30° of each other — without
     // resolution their borders would be indistinguishable.
-    const a = hueOf(projectColorFor("maestro"));
-    const b = hueOf(projectColorFor("core"));
+    const a = hueOf(projectColorFor("core"));
+    const b = hueOf(projectColorFor("api"));
     expect(circularDistance(a, b)).toBeLessThan(30);
 
-    const colors = resolveProjectColors(["maestro", "core"]);
-    const resolvedA = hueOf(colors.get("maestro")!);
-    const resolvedB = hueOf(colors.get("core")!);
+    const colors = resolveProjectColors(["core", "api"]);
+    const resolvedA = hueOf(colors.get("core")!);
+    const resolvedB = hueOf(colors.get("api")!);
     expect(circularDistance(resolvedA, resolvedB)).toBeGreaterThanOrEqual(30);
   });
 
@@ -67,10 +77,21 @@ describe("resolveProjectColors", () => {
   });
 
   it("terminates on pathologically large clashing sets", () => {
-    // 30 names cannot all be 30° apart (max 12) — must still return quickly
-    // with a color for every name.
+    // 30 names cannot all be 30° apart (max 10 in the allowed arc) — must
+    // still return quickly with a color for every name.
     const names = Array.from({ length: 30 }, (_, i) => `project-${i}`);
     const colors = resolveProjectColors(names);
     expect(colors.size).toBe(30);
+  });
+
+  it("keeps re-seated colors out of the red band too", () => {
+    // Force many re-seats; every resolved hue must stay in the allowed arc.
+    const names = Array.from({ length: 30 }, (_, i) => `project-${i}`);
+    const colors = resolveProjectColors(names);
+    for (const color of colors.values()) {
+      const hue = hueOf(color);
+      expect(hue).toBeGreaterThanOrEqual(30);
+      expect(hue).toBeLessThan(330);
+    }
   });
 });

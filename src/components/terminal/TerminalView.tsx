@@ -849,8 +849,14 @@ export const TerminalView = memo(function TerminalView({
     <div
       className={`terminal-cell flex h-full flex-col bg-maestro-bg ${cellStatusClass(effectiveStatus)} ${isFocused ? "terminal-cell-focused" : ""}`}
       // Eagle view: paint the cell's own border in the project color (one
-      // border per tile) — session status still reads from the glow classes.
-      style={projectColor ? { borderColor: projectColor } : undefined}
+      // border per tile) — except when the agent needs the user or errored,
+      // where the red status border must stay visible (inline style would
+      // otherwise override the status class).
+      style={
+        projectColor && effectiveStatus !== "needs-input" && effectiveStatus !== "error"
+          ? { borderColor: projectColor }
+          : undefined
+      }
       onClick={onFocus}
     >
       {/* Rich header bar */}

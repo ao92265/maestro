@@ -9,26 +9,41 @@
 /**
  * Two hues closer than this (circular distance in degrees) are considered a
  * clash — at the fixed saturation/lightness they are too similar to tell
- * apart at a glance. 30° still allows up to 12 clearly distinct projects.
+ * apart at a glance. 30° still allows up to 10 clearly distinct projects
+ * within the allowed (non-red) arc.
  */
 const HUE_CLASH_DISTANCE = 30;
 
 /**
  * Probe step used to re-seat a clashing hue. 137° ≈ the golden angle, which
- * spreads successive probes evenly around the hue wheel, and is coprime with
- * 360 so repeated probing eventually visits every hue.
+ * spreads successive probes evenly around the allowed arc, and is coprime
+ * with its span so repeated probing eventually visits every hue.
  */
 const HUE_PROBE_STEP = 137;
 
 /** Bounded so pathological sets (many near-identical names) can't loop long. */
 const MAX_PROBES = 24;
 
+/**
+ * Red is reserved for session status ("agent needs your input" borders), so
+ * project colors may never look red. Hues are confined to the arc
+ * [ALLOWED_HUE_MIN, ALLOWED_HUE_MIN + ALLOWED_HUE_SPAN) — i.e. 30°..330° —
+ * which excludes the red band around 0°/360°.
+ */
+const ALLOWED_HUE_MIN = 30;
+const ALLOWED_HUE_SPAN = 300;
+
+/** Wrap an arbitrary offset into the allowed (non-red) hue arc. */
+function allowedHue(offset: number): number {
+  return ALLOWED_HUE_MIN + (((offset % ALLOWED_HUE_SPAN) + ALLOWED_HUE_SPAN) % ALLOWED_HUE_SPAN);
+}
+
 function hueFor(name: string): number {
   let hash = 0;
   for (let i = 0; i < name.length; i++) {
     hash = (hash * 31 + name.charCodeAt(i)) | 0;
   }
-  return ((hash % 360) + 360) % 360;
+  return allowedHue(hash);
 }
 
 function hslFor(hue: number): string {
@@ -77,7 +92,7 @@ export function resolveProjectColors(names: Iterable<string>): Map<string, strin
       probes < MAX_PROBES &&
       claimed.some((taken) => hueDistance(taken, hue) < HUE_CLASH_DISTANCE)
     ) {
-      hue = (hue + HUE_PROBE_STEP) % 360;
+      hue = allowedHue(hue - ALLOWED_HUE_MIN + HUE_PROBE_STEP);
       probes++;
     }
     claimed.push(hue);

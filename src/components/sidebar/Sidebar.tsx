@@ -364,8 +364,8 @@ function ConfigTab({
 const SESSION_STATUS_BADGES: Record<BackendSessionStatus, { label: string; cls: string }> = {
   Starting: { label: "STARTING", cls: "bg-orange-500/15 text-orange-400" },
   Idle: { label: "IDLE", cls: "bg-maestro-muted/15 text-maestro-muted" },
-  Working: { label: "WORKING", cls: "bg-maestro-accent/15 text-maestro-accent" },
-  NeedsInput: { label: "NEEDS INPUT", cls: "bg-yellow-500/15 text-yellow-500" },
+  Working: { label: "WORKING", cls: "bg-maestro-blue/15 text-maestro-blue" },
+  NeedsInput: { label: "NEEDS INPUT", cls: "bg-maestro-accent/15 text-maestro-accent" },
   Done: { label: "DONE", cls: "bg-maestro-green/15 text-maestro-green" },
   Error: { label: "ERROR", cls: "bg-red-500/15 text-red-400" },
   Timeout: { label: "TIMEOUT", cls: "bg-red-500/15 text-red-400" },

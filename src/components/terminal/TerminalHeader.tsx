@@ -214,13 +214,13 @@ export const TerminalHeader = memo(function TerminalHeader({
 
   const adaptive = getAdaptiveClasses();
 
-  // Status-colored underline: accent while the agent works, yellow when it
+  // Status-colored underline: blue while the agent works, red when it
   // waits for the user's input (same palette as ThinkingIndicator's dots).
   const statusBorder =
     status === "working"
-      ? "border-maestro-accent/70"
+      ? "border-maestro-blue/70"
       : status === "needs-input"
-        ? "border-maestro-yellow"
+        ? "border-maestro-accent"
         : "border-maestro-border";
 
   // Toggle the warning flag on plain header clicks; clicks on buttons/inputs
