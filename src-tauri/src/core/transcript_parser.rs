@@ -88,7 +88,9 @@ fn summarize_tool_input(tool_name: &str, input: &Value) -> String {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        "Task" => {
+        // Subagent spawn — the tool was renamed "Task" -> "Agent" in newer
+        // Claude Code versions; transcripts may contain either.
+        "Task" | "Agent" => {
             let desc = input
                 .get("description")
                 .and_then(|v| v.as_str())
@@ -301,7 +303,7 @@ fn parse_assistant_message(session_id: u32, obj: &Value) -> Vec<ClaudeEvent> {
                         timestamp: timestamp.clone(),
                     });
                 }
-                "Task" => {
+                "Task" | "Agent" => {
                     let description = input
                         .get("description")
                         .and_then(|v| v.as_str())
@@ -493,6 +495,30 @@ mod tests {
             assert_eq!(agent_type, "Explore");
             assert_eq!(agent_id, "toolu_task1");
             assert_eq!(description, "Search for auth code");
+        }
+    }
+
+    /// Newer Claude Code versions renamed the subagent tool "Task" -> "Agent";
+    /// both spellings must produce a SubagentSpawned event.
+    #[test]
+    fn test_parse_agent_tool_spawns_subagent() {
+        let line = r#"{"parentUuid":"uuid-user-1","isSidechain":false,"type":"assistant","message":{"model":"claude-fable-5","id":"msg_004","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_agent1","name":"Agent","input":{"description":"Map feedback code","prompt":"Explore the repo","subagent_type":"general-purpose","run_in_background":true}}],"usage":{"input_tokens":200,"output_tokens":30}},"uuid":"uuid-asst-4","timestamp":"2026-07-31T10:00:15.000Z"}"#;
+        let events = parse_transcript_line(7, line);
+
+        let spawn_event = events
+            .iter()
+            .find(|e| matches!(e, ClaudeEvent::SubagentSpawned { .. }));
+        assert!(spawn_event.is_some(), "Should have a SubagentSpawned event");
+        if let Some(ClaudeEvent::SubagentSpawned {
+            agent_type,
+            agent_id,
+            description,
+            ..
+        }) = spawn_event
+        {
+            assert_eq!(agent_type, "general-purpose");
+            assert_eq!(agent_id, "toolu_agent1");
+            assert_eq!(description, "Map feedback code");
         }
     }
 
