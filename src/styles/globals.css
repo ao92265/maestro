@@ -126,6 +126,103 @@
   color: rgb(20 20 24 / 0.9) !important;
 }
 
+/* ── Notes in-place editor (TipTap) ──
+   Typography mirrors MarkdownBody's scale so a note reads the same while
+   being written as anywhere it is rendered. */
+.notes-editor {
+  cursor: text;
+}
+
+.notes-editor .tiptap {
+  min-height: 100%;
+  font-size: 12px;
+  line-height: 1.6;
+  color: rgb(var(--maestro-text));
+  caret-color: rgb(var(--maestro-blue));
+}
+
+.notes-editor .tiptap > * + * {
+  margin-top: 0.4rem;
+}
+
+.notes-editor .tiptap h1 {
+  font-size: 1.4em;
+  font-weight: 600;
+}
+
+.notes-editor .tiptap h2 {
+  font-size: 1.2em;
+  font-weight: 600;
+}
+
+.notes-editor .tiptap h3,
+.notes-editor .tiptap h4,
+.notes-editor .tiptap h5,
+.notes-editor .tiptap h6 {
+  font-size: 1.05em;
+  font-weight: 600;
+}
+
+.notes-editor .tiptap ul {
+  list-style: disc;
+  padding-left: 1.25rem;
+}
+
+.notes-editor .tiptap ol {
+  list-style: decimal;
+  padding-left: 1.25rem;
+}
+
+.notes-editor .tiptap li + li {
+  margin-top: 0.15rem;
+}
+
+.notes-editor .tiptap code {
+  background: rgb(var(--maestro-bg));
+  border-radius: 3px;
+  padding: 0.1em 0.35em;
+  font-size: 0.92em;
+}
+
+.notes-editor .tiptap pre {
+  background: rgb(var(--maestro-bg));
+  border-radius: 4px;
+  padding: 0.5rem;
+  overflow-x: auto;
+}
+
+.notes-editor .tiptap pre code {
+  background: none;
+  padding: 0;
+}
+
+.notes-editor .tiptap blockquote {
+  border-left: 2px solid rgb(var(--maestro-border));
+  padding-left: 0.6rem;
+  color: rgb(var(--maestro-muted));
+  font-style: italic;
+}
+
+.notes-editor .tiptap hr {
+  border: none;
+  border-top: 1px solid rgb(var(--maestro-border));
+  margin: 0.75rem 0;
+}
+
+.notes-editor .tiptap a {
+  color: rgb(var(--maestro-accent));
+  text-decoration: underline;
+}
+
+/* Placeholder shown while the note is empty. */
+.notes-editor .tiptap p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  float: left;
+  height: 0;
+  pointer-events: none;
+  color: rgb(var(--maestro-muted) / 0.6);
+}
+
 /* ── Split Pane Dividers ── */
 
 .split-divider {

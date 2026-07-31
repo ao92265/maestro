@@ -1,18 +1,19 @@
 import { Plus, Trash2, X } from "lucide-react";
 import {
   type KeyboardEvent,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
-import { MarkdownEditor } from "@/components/shared/MarkdownEditor";
+import { NotesEditor } from "@/components/notepad/NotesEditor";
 import { useNotesStore } from "@/stores/useNotesStore";
 
 /**
  * Right-pane Notepad view. Shows a horizontal strip of note tabs and, for the
- * active note, a markdown editor with a live preview that re-renders as the
- * user types.
+ * active note, an in-place WYSIWYG markdown editor — formatting renders where
+ * you type, no separate preview pane.
  *
  * Notes are fully user-managed: created via the "New" button, deleted via the
  * X — nothing is auto-created or auto-removed behind the user's back.
@@ -137,13 +138,35 @@ export function NotepadPanel() {
     }
   };
 
+  // Debounced persistence: the store writes to disk on every setContent, so
+  // buffer keystrokes and flush at most every 400ms (and on tab switch,
+  // delete, and unmount so nothing is lost).
+  const pendingRef = useRef<{ id: string; value: string } | null>(null);
+  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const flushPending = useCallback(() => {
+    if (flushTimerRef.current) {
+      clearTimeout(flushTimerRef.current);
+      flushTimerRef.current = null;
+    }
+    if (pendingRef.current) {
+      setContent(pendingRef.current.id, pendingRef.current.value);
+      pendingRef.current = null;
+    }
+  }, [setContent]);
+
+  useEffect(() => flushPending, [flushPending]);
+
   const handleContentChange = (value: string) => {
     if (!activeNote) return;
-    setContent(activeNote.id, value);
+    pendingRef.current = { id: activeNote.id, value };
+    if (flushTimerRef.current) clearTimeout(flushTimerRef.current);
+    flushTimerRef.current = setTimeout(flushPending, 400);
   };
 
   const handleDelete = (id: string) => {
     if (suppressClickRef.current) return;
+    flushPending();
     // Notes can contain useful content — confirm before nuking.
     const note = notes.find((n) => n.id === id);
     const title = note?.title ?? "this note";
@@ -153,6 +176,7 @@ export function NotepadPanel() {
 
   const handleSelect = (id: string) => {
     if (suppressClickRef.current) return;
+    flushPending();
     setActiveNote(id);
   };
 
@@ -241,16 +265,14 @@ export function NotepadPanel() {
               <Trash2 size={11} />
             </button>
           </div>
-          <MarkdownEditor
+          <NotesEditor
             // Keying on the id ensures the editor remounts when switching
-            // tabs, so cursor position resets per note.
+            // tabs, so each note keeps its own document/undo history.
             key={activeNote.id}
-            live
-            value={activeNote.content}
+            initialContent={activeNote.content}
             onChange={handleContentChange}
             placeholder="Jot something down..."
-            className="min-h-0 flex-1 px-3 py-2"
-            heightClassName="min-h-0 flex-1"
+            className="min-h-0 flex-1 overflow-y-auto px-3 py-2"
           />
         </div>
       ) : (

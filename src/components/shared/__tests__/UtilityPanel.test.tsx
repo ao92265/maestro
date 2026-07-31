@@ -131,20 +131,21 @@ describe("UtilityPanel", () => {
     expect(screen.getByText("No notes yet.")).toBeInTheDocument();
   });
 
-  it("live-renders markdown in the Notes panel while typing, with no Preview toggle", async () => {
+  it("renders note markdown formatted inside the editable surface itself", async () => {
     useNotesStore.setState({
-      notes: [{ id: "n1", title: "Note", content: "", createdAt: 0, updatedAt: 0 }],
+      notes: [{ id: "n1", title: "Note", content: "# Hello", createdAt: 0, updatedAt: 0 }],
       activeNoteId: "n1",
     });
     render(<UtilityPanel panel="notes" width={320} onResize={() => {}} onClose={() => {}} />);
 
-    fireEvent.change(screen.getByPlaceholderText("Jot something down..."), {
-      target: { value: "# Hello" },
-    });
+    // The markdown renders as a real heading INSIDE the contenteditable —
+    // formatting happens where you type, not in a separate preview pane.
+    const heading = await screen.findByRole("heading", { name: "Hello" });
+    expect(heading.closest('[contenteditable="true"]')).not.toBeNull();
 
-    // findBy* absorbs the deferred (useDeferredValue) preview re-render.
-    expect(await screen.findByRole("heading", { name: "Hello" })).toBeInTheDocument();
+    // The old two-pane implementation is gone: no Preview toggle, no textarea.
     expect(screen.queryByRole("button", { name: /preview/i })).toBeNull();
+    expect(document.querySelector("textarea")).toBeNull();
   });
 
   it("calls onClose from the header close button", () => {
