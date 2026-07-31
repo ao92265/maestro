@@ -47,7 +47,10 @@ export function NotesEditor({
     ],
     content: initialContent,
     onUpdate: ({ editor }) => {
-      onChange((editor.storage.markdown as MarkdownStorage).getMarkdown());
+      // tiptap-markdown's typings don't augment TipTap v3's Storage type, so
+      // the markdown storage has to be asserted explicitly.
+      const storage = editor.storage as unknown as { markdown: MarkdownStorage };
+      onChange(storage.markdown.getMarkdown());
     },
     editorProps: {
       attributes: {
