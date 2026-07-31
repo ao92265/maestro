@@ -66,7 +66,7 @@ import { PreLaunchCard, type SessionSlot } from "./PreLaunchCard";
 import { SplitPaneView } from "./SplitPaneView";
 import { createLeaf, splitLeaf, removeLeaf, updateRatio, collectSlotIds, findSiblingSlotId, buildGridTree, swapSlots, type TreeNode, type SplitDirection } from "./splitTree";
 import { TerminalView } from "./TerminalView";
-import { ThinkingIndicator } from "./ThinkingIndicator";
+import { SessionStatusDot, ThinkingIndicator } from "./ThinkingIndicator";
 
 /** Stable empty arrays to avoid infinite re-render loops in Zustand selectors. */
 const EMPTY_MCP_SERVERS: McpServerConfig[] = [];
@@ -164,6 +164,8 @@ export interface TerminalGridHandle {
   zoomSession: (sessionId: number) => boolean;
   /** Kill the given session and clean up its pane. Returns false if this grid doesn't own it. */
   killSessionById: (sessionId: number) => boolean;
+  /** Whether this grid is currently showing its per-project zoom-in view. */
+  isZoomed: () => boolean;
 }
 
 /**
@@ -213,6 +215,12 @@ interface TerminalGridProps {
   eagleAnyZoomed?: boolean;
   /** Toggles eagle zoom for a session (owned by MultiProjectView). */
   onEagleZoomToggle?: (sessionId: number) => void;
+  /**
+   * Total visible (unparked) tiles across ALL projects in eagle view. The
+   * move handle must show whenever the global grid has 2+ tiles — the old
+   * per-project count hid it in the common 1-terminal-per-project layout.
+   */
+  eagleTileCount?: number;
 }
 
 /**
@@ -245,6 +253,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     eagleZoomedSessionId = null,
     eagleAnyZoomed = false,
     onEagleZoomToggle,
+    eagleTileCount = 0,
   },
   ref,
 ) {
@@ -1469,8 +1478,16 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
 
   useImperativeHandle(
     ref,
-    () => ({ addSession, launchAll, refreshBranches, focusSession, zoomSession, killSessionById }),
-    [addSession, launchAll, refreshBranches, focusSession, zoomSession, killSessionById],
+    () => ({
+      addSession,
+      launchAll,
+      refreshBranches,
+      focusSession,
+      zoomSession,
+      killSessionById,
+      isZoomed: () => zoomedSlotId !== null,
+    }),
+    [addSession, launchAll, refreshBranches, focusSession, zoomSession, killSessionById, zoomedSlotId],
   );
 
   // ── History-tab launches ─────────────────────────────────────────
@@ -1537,6 +1554,15 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     setLayoutTree((prev) => swapSlots(prev, srcSlotId, destSlotId));
   }, []);
 
+  /**
+   * Eagle view: dropping a tile onto another project's tile reorders the
+   * project tabs (tile order = tab order × per-project pane order, so
+   * cross-project placement can only be expressed as a tab move).
+   */
+  const handleEagleCrossReorder = useCallback((srcTabId: string, destTabId: string) => {
+    useWorkspaceStore.getState().reorderTabs(srcTabId, destTabId);
+  }, []);
+
   // Stable per-project accent color for eagle mode tiles (clash-resolved
   // against the other open projects).
   const projectColors = useProjectColors();
@@ -1558,11 +1584,11 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       </div>
     );
 
-    // Eagle hides pre-launch slots, so only launched panes count there; while
+    // Eagle counts tiles across ALL projects (eagleTileCount) — the common
+    // 1-terminal-per-project layout must still be reorderable; while
     // eagle-zoomed all other tiles are visibility:hidden, so handles are moot.
-    const launchedCount = slots.filter((s) => s.sessionId !== null).length;
     const showReorderHandle = eagleMode
-      ? launchedCount > 1 && !eagleAnyZoomed
+      ? eagleTileCount > 1 && !eagleAnyZoomed
       : slots.length > 1;
     const isEagleZoomed =
       eagleMode && slot.sessionId !== null && eagleZoomedSessionId === slot.sessionId;
@@ -1577,10 +1603,12 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
           gridId={tabId}
           showHandle={showReorderHandle}
           onSwap={handleSwapSlots}
+          onCrossGridReorder={handleEagleCrossReorder}
           eagleMode={eagleMode}
           eagleHidden={false}
           eagleZoomed={isEagleZoomed}
           eagleObscured={isEagleObscured}
+          eagleReserveShelf={parkedSessionIds.length > 0}
         >
           <TerminalView
             key={slot.id}
@@ -1613,6 +1641,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
         gridId={tabId}
         showHandle={showReorderHandle}
         onSwap={handleSwapSlots}
+        onCrossGridReorder={handleEagleCrossReorder}
         eagleMode={eagleMode}
         eagleHidden={eagleMode}
         eagleZoomed={false}
@@ -1656,7 +1685,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       </DraggablePane>
     );
   // eslint-disable-next-line react-hooks/exhaustive-deps -- Deps cover all render-affecting state
-  }, [slots, focusedSlotId, isActive, isDraggingFiles, dropTargetSlotId, getFocusCallback, handleKill, handleToggleZoom, handlePark, handleAttachFiles, handleSwapSlots, projectPath, branches, isLoadingBranches, isGitRepo, hasManagedWorktree, repositories, workspaceType, effectiveRepoPath, onRepoChange, mcpServers, skills, plugins, handleCreateBranch, updateSlotCustomName, updateSlotMode, updateSlotBranch, updateSlotWorktreeMode, refreshBranches, toggleSlotMcp, toggleSlotSkill, toggleSlotPlugin, selectAllMcp, unselectAllMcp, selectAllPlugins, unselectAllPlugins, launchSlot, removeSlot, updateSlotResumeSession, eagleMode, eagleZoomedSessionId, eagleAnyZoomed, onEagleZoomToggle, projectName, eagleColor, tabId]);
+  }, [slots, focusedSlotId, isActive, isDraggingFiles, dropTargetSlotId, getFocusCallback, handleKill, handleToggleZoom, handlePark, handleAttachFiles, handleSwapSlots, handleEagleCrossReorder, projectPath, branches, isLoadingBranches, isGitRepo, hasManagedWorktree, repositories, workspaceType, effectiveRepoPath, onRepoChange, mcpServers, skills, plugins, handleCreateBranch, updateSlotCustomName, updateSlotMode, updateSlotBranch, updateSlotWorktreeMode, refreshBranches, toggleSlotMcp, toggleSlotSkill, toggleSlotPlugin, selectAllMcp, unselectAllMcp, selectAllPlugins, unselectAllPlugins, launchSlot, removeSlot, updateSlotResumeSession, eagleMode, eagleZoomedSessionId, eagleAnyZoomed, onEagleZoomToggle, projectName, eagleColor, tabId, eagleTileCount, parkedSessionIds]);
 
   const handleRatioChange = useCallback((nodeId: string, ratio: number) => {
     setLayoutTree((prev) => updateRatio(prev, nodeId, ratio));
@@ -1754,6 +1783,11 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
                         hasSession={slot.sessionId !== null}
                         sessionId={slot.sessionId}
                         onSelect={() => handleToggleZoom(slot.id)}
+                        onToggleFlag={
+                          slot.sessionId !== null
+                            ? () => useSessionStore.getState().toggleSessionFlag(slot.sessionId!)
+                            : undefined
+                        }
                       />
                     );
                   })}
@@ -1886,17 +1920,21 @@ function DraggablePane({
   gridId,
   showHandle,
   onSwap,
+  onCrossGridReorder,
   children,
   eagleMode = false,
   eagleHidden = false,
   eagleZoomed = false,
   eagleObscured = false,
+  eagleReserveShelf = false,
 }: {
   slotId: string;
-  /** Owning grid (tab) id — scopes eagle drags to same-project tiles. */
+  /** Owning grid (tab) id — identifies the source project for eagle drops. */
   gridId?: string;
   showHandle: boolean;
   onSwap: (srcSlotId: string, destSlotId: string) => void;
+  /** Eagle view: tile dropped onto another project's tile → reorder tabs. */
+  onCrossGridReorder?: (srcTabId: string, destTabId: string) => void;
   children: ReactNode;
   /** Eagle view: this pane is a tile of the global all-projects grid. */
   eagleMode?: boolean;
@@ -1906,6 +1944,8 @@ function DraggablePane({
   eagleZoomed?: boolean;
   /** Eagle view: another pane is zoomed — stop painting under its overlay. */
   eagleObscured?: boolean;
+  /** Eagle view while zoomed: leave room for the parked shelf (h-8) below. */
+  eagleReserveShelf?: boolean;
 }) {
   const [isDragging, setIsDragging] = useState(false);
 
@@ -1918,19 +1958,17 @@ function DraggablePane({
       setIsDragging(true);
 
       // Outline every other pane so the user can see they're valid drop targets.
-      // In eagle mode only same-grid tiles are real targets (cross-grid swaps
-      // no-op in swapSlots), so scope the selector to the owning grid.
+      // In eagle mode every visible tile (any project) is a target: same-grid
+      // drops swap panes, cross-grid drops reorder the project tabs. The
+      // [data-grid-id] filter keeps 0×0 display:contents leaf wrappers out.
       const allWrappers = Array.from(
         document.querySelectorAll<HTMLElement>(
-          eagleMode && gridId
-            ? // window.CSS: the bare name is shadowed by dnd-kit's CSS import.
-              `[data-slot-id][data-grid-id="${window.CSS.escape(gridId)}"]`
-            : "[data-slot-id]",
+          eagleMode ? "[data-slot-id][data-grid-id]" : "[data-slot-id]",
         ),
       );
       const decorate = (el: HTMLElement, hovered: boolean) => {
         el.style.outline = hovered
-          ? "2px solid rgb(var(--maestro-accent))"
+          ? "2px solid rgb(var(--maestro-blue))"
           : "1px dashed rgb(var(--maestro-border))";
         el.style.outlineOffset = "-2px";
       };
@@ -1947,7 +1985,8 @@ function DraggablePane({
       const findTarget = (clientX: number, clientY: number): HTMLElement | null => {
         const elem = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
         const target = elem?.closest("[data-slot-id]") as HTMLElement | null;
-        if (eagleMode && gridId && target?.dataset.gridId !== gridId) return null;
+        // Eagle: only visible tiles (which carry data-grid-id) are targets.
+        if (eagleMode && !target?.dataset.gridId) return null;
         return target;
       };
 
@@ -1968,14 +2007,21 @@ function DraggablePane({
         setIsDragging(false);
         const target = findTarget(ev.clientX, ev.clientY);
         const dest = target?.getAttribute("data-slot-id");
-        if (dest && dest !== slotId) onSwap(slotId, dest);
+        if (!dest || dest === slotId) return;
+        const destGridId = target?.dataset.gridId;
+        if (eagleMode && gridId && destGridId && destGridId !== gridId) {
+          // Different project: express the move as a project-tab reorder.
+          onCrossGridReorder?.(gridId, destGridId);
+        } else {
+          onSwap(slotId, dest);
+        }
       };
 
       window.addEventListener("pointermove", onMove);
       window.addEventListener("pointerup", onUp);
       window.addEventListener("pointercancel", onUp);
     },
-    [slotId, onSwap, eagleMode, gridId],
+    [slotId, onSwap, onCrossGridReorder, eagleMode, gridId],
   );
 
   // Eagle view restyles this container purely with CSS so the children
@@ -1992,8 +2038,11 @@ function DraggablePane({
   const eagleClass = eagleHidden
     ? "hidden"
     : eagleZoomed
-      ? // top-8 leaves room for MultiProjectView's global tab bar (h-8, z-50).
-        "absolute inset-x-0 bottom-0 top-8 z-40 bg-maestro-bg p-2 min-h-0 min-w-0"
+      ? // top-8 leaves room for MultiProjectView's global tab bar (h-8, z-50);
+        // bottom-8 leaves the parked shelf (h-8) visible when chips exist.
+        `absolute inset-x-0 top-8 z-40 bg-maestro-bg p-2 min-h-0 min-w-0 ${
+          eagleReserveShelf ? "bottom-8" : "bottom-0"
+        }`
       : "relative h-full w-full min-h-0 min-w-0 overflow-hidden rounded-md";
   return (
     <div
@@ -2013,10 +2062,14 @@ function DraggablePane({
       {showHandle && (
         <div
           onPointerDown={startDrag}
-          title="Drag to swap with another pane"
+          title={
+            eagleMode
+              ? "Drag to swap panes — drop on another project to reorder projects"
+              : "Drag to swap with another pane"
+          }
           className={`absolute left-1 top-1 z-20 flex h-5 w-4 items-center justify-center rounded transition-colors hover:bg-maestro-card/80 hover:text-maestro-text ${
             isDragging
-              ? "cursor-grabbing text-maestro-accent"
+              ? "cursor-grabbing text-maestro-blue"
               : "cursor-grab text-maestro-muted/40"
           }`}
         >
@@ -2040,6 +2093,7 @@ function ZoomTab({
   hasSession,
   sessionId,
   onSelect,
+  onToggleFlag,
 }: {
   slotId: string;
   index: number;
@@ -2048,6 +2102,8 @@ function ZoomTab({
   hasSession: boolean;
   sessionId: number | null;
   onSelect: () => void;
+  /** Clicking the already-active tab toggles the warning flag (header parity). */
+  onToggleFlag?: () => void;
 }) {
   const {
     attributes,
@@ -2058,8 +2114,8 @@ function ZoomTab({
     isDragging,
   } = useSortable({ id: slotId });
 
-  // Warning flag (display only — clicking still selects/exits zoom): keeps
-  // the yellow marker visible for terminals hidden behind the zoomed one.
+  // Warning flag: visible on the tab, and toggleable by clicking the
+  // already-active tab (matches the header / TerminalView tab bar behavior).
   const isFlagged = useSessionStore(
     (s) => sessionId !== null && s.flaggedSessionIds.includes(sessionId),
   );
@@ -2076,23 +2132,29 @@ function ZoomTab({
       style={style}
       {...attributes}
       {...listeners}
-      onClick={onSelect}
+      onClick={isActive && onToggleFlag ? onToggleFlag : onSelect}
       className={`
         flex shrink-0 items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors
         ${isFlagged ? 'warning-flag' : ''}
         ${isActive
-          ? 'bg-maestro-accent/15 text-maestro-accent'
+          ? 'bg-maestro-blue/15 text-maestro-blue'
           : 'text-maestro-muted hover:bg-maestro-card hover:text-maestro-text'
         }
       `}
-      title={isActive ? `${label} (click to exit zoom)` : `Switch to ${label}`}
+      title={
+        isActive
+          ? onToggleFlag
+            ? `${label} (click to ${isFlagged ? "clear" : "set"} warning flag)`
+            : `${label} (click to exit zoom)`
+          : `Switch to ${label}`
+      }
     >
       <span className="font-mono text-[10px] opacity-60">{index + 1}</span>
       <span className="max-w-[180px] truncate">{label}</span>
       {hasSession && sessionId !== null && (
         <>
           <ThinkingIndicator sessionId={sessionId} size={3} />
-          <span className="h-1.5 w-1.5 rounded-full bg-maestro-green" />
+          <SessionStatusDot sessionId={sessionId} />
         </>
       )}
     </button>
