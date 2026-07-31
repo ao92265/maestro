@@ -456,7 +456,11 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     }, [launchedSlots, focusedIndex]),
     onSplitVertical: useCallback(() => handleSplit("vertical"), [handleSplit]),
     onSplitHorizontal: useCallback(() => handleSplit("horizontal"), [handleSplit]),
-    onClosePane: closePaneRef.current,
+    // Dereference the ref at call time, not render time: closePaneRef.current
+    // is reassigned further down the render body, so passing its value here
+    // hands the hook the closure from the PREVIOUS render (stale focusedSlotId
+    // — Cmd/Ctrl+W would close the pane focused one render ago).
+    onClosePane: useCallback(() => closePaneRef.current(), []),
     onToggleZoomFocused: useCallback(() => {
       const targetId = focusedSlotId ?? slotsRef.current[0]?.id;
       if (!targetId) return;
