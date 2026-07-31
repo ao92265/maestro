@@ -41,6 +41,11 @@ pub struct TranscriptWatcher {
 struct WatcherState {
     _watcher: RecommendedWatcher,
     task_handle: JoinHandle<()>,
+    /// The transcript file this watcher tails — compared on re-registration
+    /// so a session that mints a NEW transcript (e.g. `/clear`, or exiting and
+    /// relaunching `claude` in the same terminal) replaces the stale watcher
+    /// instead of being ignored.
+    transcript_path: PathBuf,
 }
 
 impl TranscriptWatcher {
@@ -55,14 +60,32 @@ impl TranscriptWatcher {
     /// Start watching a transcript JSONL file for a given session.
     ///
     /// Reads any existing content first (catch-up), then watches for new
-    /// writes using `notify`. If the session is already being watched, this
-    /// is a no-op.
+    /// writes using `notify`. Re-registering the same session with the same
+    /// path is a no-op; re-registering with a DIFFERENT path (Claude Code
+    /// minted a new transcript for this terminal — `/clear`, or exit + rerun
+    /// `claude`) replaces the stale watcher so the activity feed keeps
+    /// working.
     pub fn start_watching(&self, session_id: u32, transcript_path: PathBuf) {
-        if self.watchers.contains_key(&session_id) {
-            log::warn!(
-                "TranscriptWatcher: session {session_id} is already being watched, ignoring"
+        // Clone the stored path out so the DashMap read guard is released
+        // before stop_watching removes the entry (same-key remove while
+        // holding a Ref would deadlock).
+        let existing_path = self
+            .watchers
+            .get(&session_id)
+            .map(|state| state.transcript_path.clone());
+        if let Some(old_path) = existing_path {
+            if old_path == transcript_path {
+                log::debug!(
+                    "TranscriptWatcher: session {session_id} already watching this transcript, ignoring"
+                );
+                return;
+            }
+            log::info!(
+                "TranscriptWatcher: session {session_id} switched transcript ({} -> {}), replacing watcher",
+                old_path.display(),
+                transcript_path.display()
             );
-            return;
+            self.stop_watching(session_id);
         }
 
         if self.watchers.len() >= MAX_WATCHED_SESSIONS {
@@ -132,6 +155,7 @@ impl TranscriptWatcher {
             WatcherState {
                 _watcher: watcher,
                 task_handle,
+                transcript_path: transcript_path.clone(),
             },
         );
 
@@ -570,5 +594,62 @@ mod tests {
         // 11. Cleanup: stop watching and verify it was removed
         watcher.stop_watching(1);
         assert!(watcher.watched_sessions().is_empty());
+    }
+
+    /// Regression: re-registering a session with a NEW transcript path (what
+    /// happens on `/clear` or exiting and relaunching `claude` in the same
+    /// terminal) must replace the stale watcher — it used to be ignored,
+    /// permanently killing the activity feed for that terminal.
+    #[tokio::test]
+    async fn test_start_watching_replaces_watcher_on_new_transcript_path() {
+        use std::time::Duration;
+
+        let (event_bus, captured) = test_event_bus();
+        let watcher = TranscriptWatcher::new(event_bus);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("a.jsonl");
+        std::fs::write(&path_a, "").unwrap();
+        let path_a = path_a.canonicalize().unwrap();
+        watcher.start_watching(1, path_a.clone());
+
+        // Same path again: no-op, still exactly one watcher.
+        watcher.start_watching(1, path_a);
+        assert_eq!(watcher.watched_sessions(), vec![1]);
+
+        // New transcript file for the same Maestro session.
+        let path_b = dir.path().join("b.jsonl");
+        {
+            let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"after clear"}]},"uuid":"msg-b1","timestamp":"2026-02-24T10:00:00Z"}"#;
+            let mut f = std::fs::File::create(&path_b).unwrap();
+            writeln!(f, "{}", line).unwrap();
+            f.flush().unwrap();
+        }
+        let path_b = path_b.canonicalize().unwrap();
+        watcher.start_watching(1, path_b);
+        assert_eq!(watcher.watched_sessions(), vec![1]);
+
+        // The catch-up read of the REPLACEMENT file must deliver its events.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            {
+                let events = captured.lock().unwrap();
+                if events.iter().any(|e| matches!(
+                    e,
+                    ClaudeEvent::UserMessage { text, .. } if text == "after clear"
+                )) {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "Timed out waiting for event from replacement transcript. Got {:?}",
+                        *events
+                    );
+                }
+            }
+        }
+
+        watcher.stop_watching(1);
     }
 }

@@ -6,6 +6,7 @@ use tauri::{AppHandle, State};
 
 use crate::core::session_manager::SessionManager;
 use crate::core::status_server::StatusServer;
+use crate::core::transcript_watcher::TranscriptWatcher;
 use crate::core::{BackendCapabilities, BackendType, ProcessManager, PtyError};
 
 /// Backend information returned to the frontend.
@@ -152,12 +153,15 @@ pub async fn resize_pty(
 
 /// Exposes `ProcessManager::kill_session` to the frontend.
 /// Gracefully terminates the PTY session (SIGTERM, then SIGKILL after 3s).
-/// Also unregisters the session from the status server.
+/// Also unregisters the session from the status server and stops the
+/// transcript watcher so its notify handle and tokio task are released
+/// (entries otherwise accumulate until the watcher cap refuses new sessions).
 #[tauri::command]
 pub async fn kill_session(
     state: State<'_, ProcessManager>,
     session_mgr: State<'_, SessionManager>,
     status_server: State<'_, Arc<StatusServer>>,
+    transcript_watcher: State<'_, Arc<TranscriptWatcher>>,
     session_id: u32,
 ) -> Result<(), PtyError> {
     // Kill the PTY session
@@ -166,6 +170,9 @@ pub async fn kill_session(
 
     // Unregister the session from the status server so it stops accepting updates
     status_server.unregister_session(session_id).await;
+
+    // Release the transcript watcher entry for this terminal
+    transcript_watcher.stop_watching(session_id);
 
     // Log for debugging
     let _project_path = session_mgr
