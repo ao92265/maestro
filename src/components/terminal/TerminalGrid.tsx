@@ -2114,6 +2114,21 @@ function ZoomTab({
     isDragging,
   } = useSortable({ id: slotId });
 
+  // The strip scrolls horizontally with a hidden scrollbar, so a tab activated
+  // by keyboard (Alt+Arrow / number keys) can sit outside the visible range.
+  // "nearest" on both axes limits the scroll to the strip itself.
+  const nodeRef = useRef<HTMLElement | null>(null);
+  const combinedRef = useCallback(
+    (node: HTMLElement | null) => {
+      setNodeRef(node);
+      nodeRef.current = node;
+    },
+    [setNodeRef],
+  );
+  useEffect(() => {
+    if (isActive) nodeRef.current?.scrollIntoView?.({ inline: "nearest", block: "nearest" });
+  }, [isActive]);
+
   // Warning flag: visible on the tab, and toggleable by clicking the
   // already-active tab (matches the header / TerminalView tab bar behavior).
   const isFlagged = useSessionStore(
@@ -2128,7 +2143,7 @@ function ZoomTab({
 
   return (
     <button
-      ref={setNodeRef}
+      ref={combinedRef}
       style={style}
       {...attributes}
       {...listeners}

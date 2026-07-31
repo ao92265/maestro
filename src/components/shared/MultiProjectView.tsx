@@ -563,6 +563,21 @@ function EagleZoomTab({
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({ id: sessionId });
 
+  // The strip scrolls horizontally with a hidden scrollbar, so a tab activated
+  // by keyboard (Alt+Arrow) can sit outside the visible range. "nearest" on
+  // both axes limits the scroll to the strip itself.
+  const nodeRef = useRef<HTMLElement | null>(null);
+  const combinedRef = useCallback(
+    (node: HTMLElement | null) => {
+      setNodeRef(node);
+      nodeRef.current = node;
+    },
+    [setNodeRef],
+  );
+  useEffect(() => {
+    if (isActive) nodeRef.current?.scrollIntoView?.({ inline: "nearest", block: "nearest" });
+  }, [isActive]);
+
   const isFlagged = useSessionStore((s) => s.flaggedSessionIds.includes(sessionId));
   const handleClick = isActive
     ? () => useSessionStore.getState().toggleSessionFlag(sessionId)
@@ -582,7 +597,7 @@ function EagleZoomTab({
 
   return (
     <button
-      ref={setNodeRef}
+      ref={combinedRef}
       style={style}
       {...attributes}
       {...listeners}
