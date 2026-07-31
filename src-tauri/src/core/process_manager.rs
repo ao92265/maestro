@@ -110,10 +110,12 @@ struct PtySession {
 struct Inner {
     sessions: DashMap<u32, PtySession>,
     next_id: AtomicU32,
-    /// Tracks last spawn time on Windows to prevent rapid consecutive spawns
-    /// that may cause terminal spawning loops (Bug #76).
+    /// Tracks last spawn time on Windows to pace rapid consecutive spawns
+    /// that may cause terminal spawning loops (Bug #76). A tokio Mutex so the
+    /// guard can be held across the pacing sleep, serializing concurrent
+    /// spawns instead of rejecting them.
     #[cfg(windows)]
-    last_spawn_time: Mutex<std::time::Instant>,
+    last_spawn_time: tokio::sync::Mutex<std::time::Instant>,
 }
 
 /// Owns and manages all PTY sessions for the application lifetime.
@@ -141,7 +143,7 @@ impl ProcessManager {
                 sessions: DashMap::new(),
                 next_id: AtomicU32::new(1),
                 #[cfg(windows)]
-                last_spawn_time: Mutex::new(std::time::Instant::now()),
+                last_spawn_time: tokio::sync::Mutex::new(std::time::Instant::now()),
             }),
         }
     }
@@ -160,32 +162,32 @@ impl ProcessManager {
     /// - `MAESTRO_SESSION_ID` is automatically set to the session ID
     /// - Additional env vars can be passed via the `env` parameter (e.g., `MAESTRO_PROJECT_HASH`)
     ///
-    /// # Windows Debouncing
-    /// On Windows, rapid consecutive spawn calls (within 500ms) are rejected to prevent
-    /// terminal spawning loops (Bug #76).
-    pub fn spawn_shell(
+    /// # Windows Pacing
+    /// On Windows, rapid consecutive spawn calls (within 500ms) are paced —
+    /// serialized with a minimum 500ms gap — to prevent terminal spawning
+    /// loops (Bug #76). Rejecting them outright broke legitimate back-to-back
+    /// launches ("Launch All" with Plain-mode slots spawns in tens of ms).
+    pub async fn spawn_shell(
         &self,
         app_handle: AppHandle,
         cwd: Option<String>,
         env: Option<HashMap<String, String>>,
     ) -> Result<u32, PtyError> {
-        // Windows spawn debounce: prevent rapid consecutive spawns (Bug #76)
+        // Windows spawn pacing (Bug #76). Holding the tokio lock across the
+        // sleep is what serializes concurrent callers — releasing it to sleep
+        // would let two callers compute the same remainder and race.
         #[cfg(windows)]
         {
-            let mut last = self
-                .inner
-                .last_spawn_time
-                .lock()
-                .map_err(|e| PtyError::spawn_failed(format!("Spawn time lock poisoned: {e}")))?;
+            let mut last = self.inner.last_spawn_time.lock().await;
             let elapsed = last.elapsed();
-            if elapsed < std::time::Duration::from_millis(500) {
-                log::warn!(
-                    "Windows spawn debounce: rejecting spawn attempt {}ms after previous spawn",
-                    elapsed.as_millis()
+            let min_gap = std::time::Duration::from_millis(500);
+            if elapsed < min_gap {
+                let wait = min_gap - elapsed;
+                log::info!(
+                    "Windows spawn pacing: delaying spawn by {}ms after previous spawn",
+                    wait.as_millis()
                 );
-                return Err(PtyError::spawn_failed(
-                    "Too rapid spawn attempts - please wait before spawning another session",
-                ));
+                tokio::time::sleep(wait).await;
             }
             *last = std::time::Instant::now();
         }

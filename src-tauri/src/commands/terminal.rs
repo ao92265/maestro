@@ -120,7 +120,7 @@ pub async fn spawn_shell(
         None
     };
     let pm = state.inner().clone();
-    pm.spawn_shell(app_handle, canonical_cwd, env)
+    pm.spawn_shell(app_handle, canonical_cwd, env).await
 }
 
 /// Exposes `ProcessManager::write_stdin` to the frontend.
