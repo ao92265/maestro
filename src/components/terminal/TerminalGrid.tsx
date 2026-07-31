@@ -499,7 +499,10 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
    * exact same code path.
    */
   const insertPathsIntoSession = useCallback((sessionId: number, paths: string[], slotId: string) => {
-    const escaped = shellEscapePaths(paths);
+    // Trailing space separates this insertion from whatever comes next —
+    // without it two consecutive drops produce adjacent quoted strings
+    // ('/a/one.png''/b/two.png') that shells join into one bogus path.
+    const escaped = `${shellEscapePaths(paths)} `;
     writeStdin(sessionId, escaped).catch(console.error);
     // Focus the pane that received the paths so the user can keep typing
     // right after the path. setFocusedSlotId updates the grid's focus ring;
