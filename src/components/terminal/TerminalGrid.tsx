@@ -468,21 +468,26 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       setZoomedSlotId((prev) => (prev === targetId ? null : targetId));
     }, [focusedSlotId, parkedSlotIds]),
     onZoomedNext: useCallback(() => {
-      setZoomedSlotId((prev) => {
-        if (!prev) return prev;
-        const idx = visibleDisplaySlotIds.indexOf(prev);
-        if (idx < 0) return prev;
-        return visibleDisplaySlotIds[(idx + 1) % visibleDisplaySlotIds.length];
-      });
-    }, [visibleDisplaySlotIds]),
+      if (!zoomedSlotId) return;
+      const idx = visibleDisplaySlotIds.indexOf(zoomedSlotId);
+      if (idx < 0) return;
+      const next = visibleDisplaySlotIds[(idx + 1) % visibleDisplaySlotIds.length];
+      setZoomedSlotId(next);
+      // Focus follows the zoomed terminal — the zoom view no longer remounts
+      // (which used to force focus via a fresh isFocused render).
+      setFocusedSlotId(next);
+      focusSlotTextarea(next);
+    }, [zoomedSlotId, visibleDisplaySlotIds]),
     onZoomedPrev: useCallback(() => {
-      setZoomedSlotId((prev) => {
-        if (!prev) return prev;
-        const idx = visibleDisplaySlotIds.indexOf(prev);
-        if (idx < 0) return prev;
-        return visibleDisplaySlotIds[(idx - 1 + visibleDisplaySlotIds.length) % visibleDisplaySlotIds.length];
-      });
-    }, [visibleDisplaySlotIds]),
+      if (!zoomedSlotId) return;
+      const idx = visibleDisplaySlotIds.indexOf(zoomedSlotId);
+      if (idx < 0) return;
+      const prev =
+        visibleDisplaySlotIds[(idx - 1 + visibleDisplaySlotIds.length) % visibleDisplaySlotIds.length];
+      setZoomedSlotId(prev);
+      setFocusedSlotId(prev);
+      focusSlotTextarea(prev);
+    }, [zoomedSlotId, visibleDisplaySlotIds]),
     // When a terminal is zoomed the tab strip is the navigation UI, so
     // Alt+Left/Right should cycle tabs (handled in capture phase so xterm
     // doesn't swallow them). In normal split-pane mode Alt+Arrow stays as
@@ -1554,8 +1559,15 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
 
   // Handle zoom toggle for a slot
   const handleToggleZoom = useCallback((slotId: string) => {
-    setZoomedSlotId(prev => prev === slotId ? null : slotId);
-  }, []);
+    const zoomingIn = zoomedSlotId !== slotId;
+    setZoomedSlotId(zoomingIn ? slotId : null);
+    if (zoomingIn) {
+      // Zooming in focuses the zoomed terminal (parity with the old
+      // dedicated zoom render, which hardcoded isFocused).
+      setFocusedSlotId(slotId);
+      focusSlotTextarea(slotId);
+    }
+  }, [zoomedSlotId]);
 
   // Esc deliberately does NOT exit zoom: the focused terminal needs it
   // (e.g. interrupting Claude). Exit via the header button or Cmd/Ctrl+1.
@@ -1602,12 +1614,14 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     // Eagle counts tiles across ALL projects (eagleTileCount) — the common
     // 1-terminal-per-project layout must still be reorderable; while
     // eagle-zoomed all other tiles are visibility:hidden, so handles are moot.
+    // Same while per-project zoomed: only the zoomed pane is visible.
     const showReorderHandle = eagleMode
       ? eagleTileCount > 1 && !eagleAnyZoomed
-      : slots.length > 1;
+      : slots.length > 1 && zoomedSlotId === null;
     const isEagleZoomed =
       eagleMode && slot.sessionId !== null && eagleZoomedSessionId === slot.sessionId;
     const isEagleObscured = eagleMode && eagleAnyZoomed && !isEagleZoomed;
+    const isSlotZoomed = eagleMode ? isEagleZoomed : zoomedSlotId === slot.id;
 
     if (slot.sessionId !== null) {
       // TS narrowing on slot.sessionId doesn't survive into the closure below.
@@ -1633,7 +1647,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
             onFocus={getFocusCallback(slot.id)}
             onKill={handleKill}
             terminalCount={slots.length}
-            isZoomed={isEagleZoomed}
+            isZoomed={isSlotZoomed}
             onToggleZoom={() =>
               eagleMode ? onEagleZoomToggle?.(sessionId) : handleToggleZoom(slot.id)
             }
@@ -1694,13 +1708,13 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
         onLaunch={() => launchSlot(slot.id)}
         onRemove={() => removeSlot(slot.id)}
         onResumeSessionChange={(sessionId) => updateSlotResumeSession(slot.id, sessionId)}
-        isZoomed={false}
+        isZoomed={isSlotZoomed}
         onToggleZoom={() => handleToggleZoom(slot.id)}
       />
       </DraggablePane>
     );
   // eslint-disable-next-line react-hooks/exhaustive-deps -- Deps cover all render-affecting state
-  }, [slots, focusedSlotId, isActive, isDraggingFiles, dropTargetSlotId, getFocusCallback, handleKill, handleToggleZoom, handlePark, handleAttachFiles, handleSwapSlots, handleEagleCrossReorder, projectPath, branches, isLoadingBranches, isGitRepo, hasManagedWorktree, repositories, workspaceType, effectiveRepoPath, onRepoChange, mcpServers, skills, plugins, handleCreateBranch, updateSlotCustomName, updateSlotMode, updateSlotBranch, updateSlotWorktreeMode, refreshBranches, toggleSlotMcp, toggleSlotSkill, toggleSlotPlugin, selectAllMcp, unselectAllMcp, selectAllPlugins, unselectAllPlugins, launchSlot, removeSlot, updateSlotResumeSession, eagleMode, eagleZoomedSessionId, eagleAnyZoomed, onEagleZoomToggle, projectName, eagleColor, tabId, eagleTileCount, parkedSessionIds]);
+  }, [slots, focusedSlotId, isActive, isDraggingFiles, dropTargetSlotId, getFocusCallback, handleKill, handleToggleZoom, handlePark, handleAttachFiles, handleSwapSlots, handleEagleCrossReorder, projectPath, branches, isLoadingBranches, isGitRepo, hasManagedWorktree, repositories, workspaceType, effectiveRepoPath, onRepoChange, mcpServers, skills, plugins, handleCreateBranch, updateSlotCustomName, updateSlotMode, updateSlotBranch, updateSlotWorktreeMode, refreshBranches, toggleSlotMcp, toggleSlotSkill, toggleSlotPlugin, selectAllMcp, unselectAllMcp, selectAllPlugins, unselectAllPlugins, launchSlot, removeSlot, updateSlotResumeSession, eagleMode, eagleZoomedSessionId, eagleAnyZoomed, onEagleZoomToggle, projectName, eagleColor, tabId, eagleTileCount, parkedSessionIds, zoomedSlotId]);
 
   const handleRatioChange = useCallback((nodeId: string, ratio: number) => {
     setLayoutTree((prev) => updateRatio(prev, nodeId, ratio));
@@ -1747,142 +1761,17 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     );
   }
 
-  // If a terminal is zoomed, show only that one at full screen with navigation bar.
-  // Suspended in eagle mode: this branch swaps the element tree (remounting the
-  // xterm instances), while eagle view needs every pane to stay mounted.
-  if (zoomedSlotId && !eagleMode) {
-    const zoomedSlot = slots.find(s => s.id === zoomedSlotId);
-    if (!zoomedSlot) {
-      setZoomedSlotId(null);
-    } else {
-      const orderedSlots = visibleDisplaySlotIds.map((id) => slots.find((s) => s.id === id)).filter(Boolean) as SessionSlot[];
-      const zoomedIndex = orderedSlots.findIndex(s => s.id === zoomedSlotId);
-
-      return (
-        <div className="relative flex h-full flex-col bg-maestro-bg">
-          {/* Top Navigation Bar */}
-          <div className="flex h-8 shrink-0 items-center gap-2 border-b border-maestro-border bg-maestro-surface px-3">
-            <span className="text-[11px] font-medium uppercase tracking-wider text-maestro-muted">
-              Terminal {zoomedIndex + 1}/{orderedSlots.length}
-            </span>
-            <div className="h-3.5 w-px bg-maestro-border" />
-            <div
-              className="scrollbar-none flex flex-1 gap-0.5 overflow-x-auto"
-              onWheel={(e) => {
-                // Vertical wheel input scrolls the strip horizontally (scrollbar is hidden).
-                if (e.deltaY !== 0) e.currentTarget.scrollLeft += e.deltaY;
-              }}
-            >
-              <DndContext
-                sensors={zoomTabSensors}
-                collisionDetection={closestCenter}
-                modifiers={[restrictToHorizontalAxis]}
-                onDragEnd={handleZoomTabDragEnd}
-              >
-                <SortableContext
-                  items={orderedSlots.map((s) => s.id)}
-                  strategy={horizontalListSortingStrategy}
-                >
-                  {orderedSlots.map((slot, index) => {
-                    const isActive = slot.id === zoomedSlotId;
-                    const liveName = slot.sessionId !== null ? sessionNameById.get(slot.sessionId) : undefined;
-                    const label = liveName?.trim() || slot.customName.trim() || `Terminal ${index + 1}`;
-
-                    return (
-                      <ZoomTab
-                        key={slot.id}
-                        slotId={slot.id}
-                        index={index}
-                        isActive={isActive}
-                        label={label}
-                        hasSession={slot.sessionId !== null}
-                        sessionId={slot.sessionId}
-                        onSelect={() => handleToggleZoom(slot.id)}
-                        onToggleFlag={
-                          slot.sessionId !== null
-                            ? () => useSessionStore.getState().toggleSessionFlag(slot.sessionId!)
-                            : undefined
-                        }
-                      />
-                    );
-                  })}
-                </SortableContext>
-              </DndContext>
-            </div>
-            <button
-              onClick={() => handleToggleZoom(zoomedSlotId)}
-              className="rounded p-0.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text"
-              title="Exit zoom"
-            >
-              <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-              </svg>
-            </button>
-          </div>
-
-          {/* Zoomed Terminal Content */}
-          <div className="flex-1 p-2 animate-in zoom-in-95 duration-300 relative" data-slot-id={zoomedSlotId}>
-            {zoomedSlot.sessionId !== null ? (
-              <TerminalView
-                key={zoomedSlot.id}
-                sessionId={zoomedSlot.sessionId}
-                isFocused={true}
-                onFocus={() => setFocusedSlotId(zoomedSlot.id)}
-                onKill={handleKill}
-                terminalCount={slots.length}
-                isZoomed={true}
-                onToggleZoom={() => handleToggleZoom(zoomedSlot.id)}
-                onPark={() => handlePark(zoomedSlot.id)}
-                onAttachFiles={() => {
-                  handleAttachFiles(zoomedSlot.sessionId!, zoomedSlot.id).catch(console.error);
-                }}
-              />
-            ) : (
-              <PreLaunchCard
-                key={zoomedSlot.id}
-                slot={zoomedSlot}
-                projectPath={projectPath ?? ""}
-                branches={branches}
-                isLoadingBranches={isLoadingBranches}
-                isGitRepo={isGitRepo}
-                mcpServers={mcpServers}
-                skills={skills}
-                plugins={plugins}
-                hasManagedWorktree={hasManagedWorktree}
-                onCreateBranch={handleCreateBranch}
-                onCustomNameChange={(name) => updateSlotCustomName(zoomedSlot.id, name)}
-                onModeChange={(mode) => updateSlotMode(zoomedSlot.id, mode)}
-                onBranchChange={(branch) => updateSlotBranch(zoomedSlot.id, branch)}
-                onWorktreeModeChange={(mode) => updateSlotWorktreeMode(zoomedSlot.id, mode)}
-                onRefreshBranches={refreshBranches}
-                onMcpToggle={(serverName) => toggleSlotMcp(zoomedSlot.id, serverName)}
-                onSkillToggle={(skillId) => toggleSlotSkill(zoomedSlot.id, skillId)}
-                onPluginToggle={(pluginId) => toggleSlotPlugin(zoomedSlot.id, pluginId)}
-                onMcpSelectAll={() => selectAllMcp(zoomedSlot.id)}
-                onMcpUnselectAll={() => unselectAllMcp(zoomedSlot.id)}
-                onPluginsSelectAll={() => selectAllPlugins(zoomedSlot.id)}
-                onPluginsUnselectAll={() => unselectAllPlugins(zoomedSlot.id)}
-                onLaunch={() => launchSlot(zoomedSlot.id)}
-                onRemove={() => removeSlot(zoomedSlot.id)}
-                onResumeSessionChange={(sessionId) => updateSlotResumeSession(zoomedSlot.id, sessionId)}
-                isZoomed={true}
-                onToggleZoom={() => handleToggleZoom(zoomedSlot.id)}
-              />
-            )}
-            {isDraggingFiles && dropTargetSlotId === zoomedSlotId && zoomedSlot.sessionId !== null && (
-              <div className="drop-zone-overlay">
-                <span>Drop to paste path</span>
-              </div>
-            )}
-          </div>
-
-          {/* Parked terminals stay reachable from zoom-in view (unpark makes
-              the restored terminal the zoomed one — the user stays in zoom) */}
-          <ParkedShelf projectPath={projectPath} onUnpark={handleUnpark} />
-        </div>
-      );
-    }
+  // Stale-zoom guard: if the zoomed slot disappeared (killed/removed), drop
+  // the zoom. Render-phase state reset — React re-renders immediately.
+  if (zoomedSlotId && !eagleMode && !slots.some((s) => s.id === zoomedSlotId)) {
+    setZoomedSlotId(null);
   }
+  // Per-project zoom is CSS-only: the SAME element tree renders in both
+  // states (SplitPaneView overlays the zoomed host and hides the others), so
+  // zooming in/out never remounts an xterm. Only the navigation strip mounts
+  // and unmounts — it holds no terminal state.
+  const zoomActive =
+    !eagleMode && zoomedSlotId !== null && slots.some((s) => s.id === zoomedSlotId);
 
   // Both wrappers exist in BOTH modes (display:contents in eagle) so toggling
   // eagle view never changes the element tree shape — a structural difference
@@ -1895,10 +1784,81 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       className={
         eagleMode
           ? "contents"
-          : `flex h-full flex-col bg-maestro-bg p-2 ${isDragging ? "split-dragging" : ""}`
+          : `flex h-full flex-col bg-maestro-bg ${zoomActive ? "" : "p-2"} ${isDragging ? "split-dragging" : ""}`
       }
     >
-      <div className={eagleMode ? "contents" : "relative flex min-h-0 flex-1"}>
+      {zoomActive &&
+        (() => {
+          const orderedSlots = visibleDisplaySlotIds
+            .map((id) => slots.find((s) => s.id === id))
+            .filter(Boolean) as SessionSlot[];
+          const zoomedIndex = orderedSlots.findIndex((s) => s.id === zoomedSlotId);
+          return (
+            <div className="flex h-8 shrink-0 items-center gap-2 border-b border-maestro-border bg-maestro-surface px-3">
+              <span className="text-[11px] font-medium uppercase tracking-wider text-maestro-muted">
+                Terminal {zoomedIndex + 1}/{orderedSlots.length}
+              </span>
+              <div className="h-3.5 w-px bg-maestro-border" />
+              <div
+                className="scrollbar-none flex flex-1 gap-0.5 overflow-x-auto"
+                onWheel={(e) => {
+                  // Vertical wheel input scrolls the strip horizontally (scrollbar is hidden).
+                  if (e.deltaY !== 0) e.currentTarget.scrollLeft += e.deltaY;
+                }}
+              >
+                <DndContext
+                  sensors={zoomTabSensors}
+                  collisionDetection={closestCenter}
+                  modifiers={[restrictToHorizontalAxis]}
+                  onDragEnd={handleZoomTabDragEnd}
+                >
+                  <SortableContext
+                    items={orderedSlots.map((s) => s.id)}
+                    strategy={horizontalListSortingStrategy}
+                  >
+                    {orderedSlots.map((slot, index) => {
+                      const isTabActive = slot.id === zoomedSlotId;
+                      const liveName = slot.sessionId !== null ? sessionNameById.get(slot.sessionId) : undefined;
+                      const label = liveName?.trim() || slot.customName.trim() || `Terminal ${index + 1}`;
+
+                      return (
+                        <ZoomTab
+                          key={slot.id}
+                          slotId={slot.id}
+                          index={index}
+                          isActive={isTabActive}
+                          label={label}
+                          hasSession={slot.sessionId !== null}
+                          sessionId={slot.sessionId}
+                          onSelect={() => handleToggleZoom(slot.id)}
+                          onToggleFlag={
+                            slot.sessionId !== null
+                              ? () => useSessionStore.getState().toggleSessionFlag(slot.sessionId!)
+                              : undefined
+                          }
+                        />
+                      );
+                    })}
+                  </SortableContext>
+                </DndContext>
+              </div>
+              <button
+                onClick={() => handleToggleZoom(zoomedSlotId!)}
+                className="rounded p-0.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text"
+                title="Exit zoom"
+              >
+                <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+          );
+        })()}
+      <div
+        className={
+          eagleMode ? "contents" : `relative flex min-h-0 flex-1 ${zoomActive ? "p-2" : ""}`
+        }
+      >
         <SplitPaneView
           node={layoutTree}
           renderLeaf={renderLeaf}
@@ -1906,6 +1866,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
           onDragStateChange={setIsDragging}
           eagleMode={eagleMode}
           hiddenSlotIds={parkedSlotIds}
+          zoomedSlotId={zoomActive ? zoomedSlotId : null}
         />
         {allParked && (
           <div className="absolute inset-0 flex items-center justify-center text-sm text-maestro-muted">
@@ -1913,6 +1874,8 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
           </div>
         )}
       </div>
+      {/* Parked terminals stay reachable from the zoom-in view too (unpark
+          makes the restored terminal the zoomed one — the user stays in zoom) */}
       {!eagleMode && <ParkedShelf projectPath={projectPath} onUnpark={handleUnpark} />}
     </div>
   );

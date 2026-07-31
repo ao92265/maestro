@@ -104,6 +104,37 @@ describe("SplitPaneView", () => {
     expect(probeMounts).toBe(2);
   });
 
+  it("zooms a slot via CSS only — overlay + invisible siblings, nothing remounts", () => {
+    probeMounts = 0;
+    const renderLeaf = (slotId: string) => <Probe id={slotId} />;
+    const common = {
+      renderLeaf,
+      onRatioChange: vi.fn(),
+      onDragStateChange: vi.fn(),
+    };
+
+    const { container, rerender, getByTestId } = render(
+      <SplitPaneView node={vsplit("A", "B")} {...common} />,
+    );
+    expect(probeMounts).toBe(2);
+    const probeA = getByTestId("probe-A");
+
+    // Zoom in on A.
+    rerender(<SplitPaneView node={vsplit("A", "B")} {...common} zoomedSlotId="A" />);
+
+    const hostA = container.querySelector('[data-slot-id="A"]') as HTMLElement;
+    const hostB = container.querySelector('[data-slot-id="B"]') as HTMLElement;
+    expect(hostA.className).toContain("inset-0");
+    expect(hostB.className).toContain("invisible");
+    expect(container.querySelector(".split-divider")).toBeNull();
+
+    // Zoom back out: same instances, divider returns.
+    rerender(<SplitPaneView node={vsplit("A", "B")} {...common} zoomedSlotId={null} />);
+    expect(getByTestId("probe-A")).toBe(probeA);
+    expect(probeMounts).toBe(2);
+    expect(container.querySelector(".split-divider-vertical")).not.toBeNull();
+  });
+
   it("renders leaf hosts as display:contents in eagle mode (no dividers)", () => {
     const { container } = render(
       <SplitPaneView

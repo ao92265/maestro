@@ -21,6 +21,14 @@ interface SplitPaneViewProps {
    * mounted (same keep-alive trick as eagle mode's flattening).
    */
   hiddenSlotIds?: ReadonlySet<string>;
+  /**
+   * Per-project zoom: when set, this slot's host overlays the whole container
+   * (inset-0) and every other host turns visibility:hidden — again CSS-only,
+   * so zooming in/out never remounts an xterm (the old dedicated zoom render
+   * swapped the element tree and wiped every pane's scrollback). Ignored in
+   * eagle mode, which has its own zoom mechanism.
+   */
+  zoomedSlotId?: string | null;
 }
 
 const MIN_RATIO = 0.15;
@@ -215,10 +223,13 @@ export function SplitPaneView({
   onDragStateChange,
   eagleMode = false,
   hiddenSlotIds,
+  zoomedSlotId = null,
 }: SplitPaneViewProps) {
   const leaves: LeafBox[] = [];
   const dividers: DividerBox[] = [];
   collectBoxes(node, FULL_RECT, hiddenSlotIds, leaves, dividers);
+
+  const zoomActive = !eagleMode && zoomedSlotId !== null;
 
   // Leaves keep the tree's in-order traversal order — in eagle mode the DOM
   // order IS the grid tile order, and keeping it identical in both modes
@@ -228,6 +239,11 @@ export function SplitPaneView({
     <div className={eagleMode ? "contents" : "relative h-full w-full min-h-0 min-w-0"}>
       {leaves.map(({ slotId, rect }) => {
         const isHidden = hiddenSlotIds?.has(slotId) ?? false;
+        const isZoomed = zoomActive && slotId === zoomedSlotId;
+        // While zoomed, the other panes keep their layout rect but stop
+        // painting (visibility) — they're behind an opaque overlay, and
+        // keeping their size stable avoids a refit storm on zoom-out.
+        const isObscured = zoomActive && slotId !== zoomedSlotId;
         return (
           <div
             key={slotId}
@@ -237,15 +253,18 @@ export function SplitPaneView({
                 ? "hidden"
                 : eagleMode
                   ? "contents"
-                  : "absolute min-w-0 min-h-0 overflow-hidden"
+                  : isZoomed
+                    ? "absolute inset-0 min-w-0 min-h-0 overflow-hidden"
+                    : `absolute min-w-0 min-h-0 overflow-hidden${isObscured ? " invisible" : ""}`
             }
-            style={isHidden || eagleMode ? undefined : rectStyle(rect)}
+            style={isHidden || eagleMode || isZoomed ? undefined : rectStyle(rect)}
           >
             {renderLeaf(slotId)}
           </div>
         );
       })}
       {!eagleMode &&
+        !zoomActive &&
         dividers.map((d) => (
           <Divider
             key={d.nodeId}
