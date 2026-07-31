@@ -106,8 +106,10 @@ export function useTerminalKeyboard({
       if (!modifierKey) return;
 
       // Cmd/Ctrl+D: split pane (Shift = horizontal, no Shift = vertical)
-      // Works even with 0 launched terminals (splits pre-launch cards too)
-      if (event.key === "d" && !event.altKey) {
+      // Works even with 0 launched terminals (splits pre-launch cards too).
+      // Match on event.code: with Shift held, event.key is "D", so a
+      // lowercase key comparison would make the horizontal split unreachable.
+      if (event.code === "KeyD" && !event.altKey) {
         event.preventDefault();
         event.stopImmediatePropagation();
         if (event.shiftKey) {

@@ -166,3 +166,54 @@ describe("useTerminalKeyboard Alt+Arrow tab navigation", () => {
     expect(onZoomedNext).not.toHaveBeenCalled();
   });
 });
+
+describe("useTerminalKeyboard split shortcuts", () => {
+  function renderSplitHook() {
+    const onSplitVertical = vi.fn();
+    const onSplitHorizontal = vi.fn();
+    renderHook(() =>
+      useTerminalKeyboard({
+        terminalCount: 2,
+        focusedIndex: 0,
+        onFocusTerminal: vi.fn(),
+        onCycleNext: vi.fn(),
+        onCyclePrevious: vi.fn(),
+        onSplitVertical,
+        onSplitHorizontal,
+      }),
+    );
+    return { onSplitVertical, onSplitHorizontal };
+  }
+
+  // metaKey AND ctrlKey both set so the test passes regardless of what
+  // isMac() reports for the test environment.
+  function dispatchSplit(shift: boolean) {
+    const ev = new KeyboardEvent("keydown", {
+      key: shift ? "D" : "d",
+      code: "KeyD",
+      ctrlKey: true,
+      metaKey: true,
+      shiftKey: shift,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(ev);
+    return ev;
+  }
+
+  it("fires onSplitVertical on Cmd/Ctrl+D", () => {
+    const { onSplitVertical, onSplitHorizontal } = renderSplitHook();
+    dispatchSplit(false);
+    expect(onSplitVertical).toHaveBeenCalledTimes(1);
+    expect(onSplitHorizontal).not.toHaveBeenCalled();
+  });
+
+  it("fires onSplitHorizontal on Cmd/Ctrl+Shift+D (event.key is 'D', not 'd')", () => {
+    // Regression: matching on event.key === "d" made the Shift variant
+    // unreachable — with Shift held the key value is uppercase "D".
+    const { onSplitVertical, onSplitHorizontal } = renderSplitHook();
+    dispatchSplit(true);
+    expect(onSplitHorizontal).toHaveBeenCalledTimes(1);
+    expect(onSplitVertical).not.toHaveBeenCalled();
+  });
+});

@@ -642,7 +642,9 @@ export const TerminalView = memo(function TerminalView({
 
         // Cmd/Ctrl+D (with or without Shift): split pane — block xterm so 'd' isn't sent to PTY.
         // The DOM event bubbles to window where useTerminalKeyboard handles it.
-        if (event.key === "d" && (event.metaKey || event.ctrlKey) && !event.altKey && event.type === "keydown") {
+        // event.code, not event.key: with Shift held the key is "D", which a
+        // lowercase comparison would miss and hand the keystroke to xterm.
+        if (event.code === "KeyD" && (event.metaKey || event.ctrlKey) && !event.altKey && event.type === "keydown") {
           return false;
         }
 
