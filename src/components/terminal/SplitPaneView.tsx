@@ -1,4 +1,4 @@
-import { useCallback, useRef, type ReactNode } from "react";
+import { useCallback, useRef, type CSSProperties, type ReactNode } from "react";
 
 import type { TreeNode } from "./splitTree";
 
@@ -9,10 +9,10 @@ interface SplitPaneViewProps {
   onDragStateChange: (dragging: boolean) => void;
   /**
    * Eagle view: flatten this tree out of the layout entirely.
-   * Split containers, leaf wrappers and dividers stop participating in
-   * layout (`display: contents` / hidden dividers) so every pane becomes a
-   * direct item of the global eagle grid — WITHOUT changing the React tree,
-   * which keeps the xterm instances mounted (no remount, no lost scrollback).
+   * Leaf hosts stop participating in layout (`display: contents`, no
+   * dividers) so every pane becomes a direct item of the global eagle grid —
+   * WITHOUT changing the React tree, which keeps the xterm instances mounted
+   * (no remount, no lost scrollback).
    */
   eagleMode?: boolean;
   /**
@@ -25,6 +25,8 @@ interface SplitPaneViewProps {
 
 const MIN_RATIO = 0.15;
 const MAX_RATIO = 0.85;
+/** Thickness of the draggable divider (matches .split-divider-* in CSS). */
+const DIVIDER_PX = 4;
 
 function clampRatio(ratio: number): number {
   return Math.min(MAX_RATIO, Math.max(MIN_RATIO, ratio));
@@ -38,10 +40,173 @@ function subtreeAllHidden(node: TreeNode, hidden: ReadonlySet<string> | undefine
 }
 
 /**
- * Recursive renderer for the binary split tree.
+ * A length/offset expressed as a fraction of the root container plus a pixel
+ * adjustment (the pixels account for the divider thickness consumed at each
+ * split boundary).
+ */
+interface Affine {
+  f: number;
+  px: number;
+}
+
+interface Rect {
+  left: Affine;
+  top: Affine;
+  width: Affine;
+  height: Affine;
+}
+
+interface LeafBox {
+  slotId: string;
+  rect: Rect;
+}
+
+interface DividerBox {
+  nodeId: string;
+  direction: "horizontal" | "vertical";
+  /** The divider bar itself. */
+  rect: Rect;
+  /** The full rect of the split node — ratio math during drag needs it. */
+  region: Rect;
+}
+
+const FULL_RECT: Rect = {
+  left: { f: 0, px: 0 },
+  top: { f: 0, px: 0 },
+  width: { f: 1, px: 0 },
+  height: { f: 1, px: 0 },
+};
+
+function scaled(a: Affine, k: number, pxAdjust: number): Affine {
+  return { f: a.f * k, px: a.px * k + pxAdjust };
+}
+
+/**
+ * In-order walk computing every leaf's rectangle and every divider's
+ * rectangle. Hidden (parked) subtrees stay in the output — their leaves must
+ * keep rendering (display:none) so nothing remounts — but they yield their
+ * space to the visible sibling and paint no divider.
+ */
+function collectBoxes(
+  node: TreeNode,
+  rect: Rect,
+  hidden: ReadonlySet<string> | undefined,
+  leaves: LeafBox[],
+  dividers: DividerBox[],
+): void {
+  if (node.type === "leaf") {
+    leaves.push({ slotId: node.slotId, rect });
+    return;
+  }
+
+  const h0 = subtreeAllHidden(node.children[0], hidden);
+  const h1 = subtreeAllHidden(node.children[1], hidden);
+
+  // A fully hidden side yields the whole rect to the other; no divider.
+  if (h0 || h1) {
+    collectBoxes(node.children[0], rect, hidden, leaves, dividers);
+    collectBoxes(node.children[1], rect, hidden, leaves, dividers);
+    return;
+  }
+
+  const r = node.ratio;
+  if (node.direction === "vertical") {
+    // left + r*width — where the divider's center line sits.
+    const boundary: Affine = {
+      f: rect.left.f + rect.width.f * r,
+      px: rect.left.px + rect.width.px * r,
+    };
+    dividers.push({
+      nodeId: node.id,
+      direction: node.direction,
+      region: rect,
+      rect: {
+        left: { f: boundary.f, px: boundary.px - DIVIDER_PX / 2 },
+        top: rect.top,
+        width: { f: 0, px: DIVIDER_PX },
+        height: rect.height,
+      },
+    });
+    collectBoxes(
+      node.children[0],
+      { ...rect, width: scaled(rect.width, r, -DIVIDER_PX / 2) },
+      hidden,
+      leaves,
+      dividers,
+    );
+    collectBoxes(
+      node.children[1],
+      {
+        ...rect,
+        left: { f: boundary.f, px: boundary.px + DIVIDER_PX / 2 },
+        width: scaled(rect.width, 1 - r, -DIVIDER_PX / 2),
+      },
+      hidden,
+      leaves,
+      dividers,
+    );
+  } else {
+    const boundary: Affine = {
+      f: rect.top.f + rect.height.f * r,
+      px: rect.top.px + rect.height.px * r,
+    };
+    dividers.push({
+      nodeId: node.id,
+      direction: node.direction,
+      region: rect,
+      rect: {
+        left: rect.left,
+        top: { f: boundary.f, px: boundary.px - DIVIDER_PX / 2 },
+        width: rect.width,
+        height: { f: 0, px: DIVIDER_PX },
+      },
+    });
+    collectBoxes(
+      node.children[0],
+      { ...rect, height: scaled(rect.height, r, -DIVIDER_PX / 2) },
+      hidden,
+      leaves,
+      dividers,
+    );
+    collectBoxes(
+      node.children[1],
+      {
+        ...rect,
+        top: { f: boundary.f, px: boundary.px + DIVIDER_PX / 2 },
+        height: scaled(rect.height, 1 - r, -DIVIDER_PX / 2),
+      },
+      hidden,
+      leaves,
+      dividers,
+    );
+  }
+}
+
+function affineCss(a: Affine): string {
+  if (a.px === 0) return `${a.f * 100}%`;
+  return `calc(${a.f * 100}% + ${a.px}px)`;
+}
+
+function rectStyle(rect: Rect): CSSProperties {
+  return {
+    left: affineCss(rect.left),
+    top: affineCss(rect.top),
+    width: affineCss(rect.width),
+    height: affineCss(rect.height),
+  };
+}
+
+/**
+ * Renders the binary split tree as a FLAT list of absolutely positioned leaf
+ * hosts (keyed by slotId) plus divider bars, with every rectangle computed
+ * from the tree geometry.
  *
- * - SplitNode → flex container with a draggable divider between two children
- * - LeafNode → calls `renderLeaf(slotId)`
+ * Flat-and-keyed is deliberate: with the previous nested-flexbox rendering,
+ * swapping two slots moved the keyed pane between different parent elements,
+ * which React can only do by unmounting — both xterms were disposed, wiping
+ * scrollback and dropping any PTY output emitted during the remount window.
+ * Here a swap only changes each host's inline style, so the live terminals
+ * are never torn down by layout changes.
  */
 export function SplitPaneView({
   node,
@@ -51,97 +216,55 @@ export function SplitPaneView({
   eagleMode = false,
   hiddenSlotIds,
 }: SplitPaneViewProps) {
-  if (node.type === "leaf") {
-    return (
-      <div
-        className={
-          hiddenSlotIds?.has(node.slotId)
-            ? "hidden"
-            : eagleMode
-              ? "contents"
-              : "h-full w-full min-w-0 min-h-0 relative"
-        }
-        data-slot-id={node.slotId}
-      >
-        {renderLeaf(node.slotId)}
-      </div>
-    );
-  }
+  const leaves: LeafBox[] = [];
+  const dividers: DividerBox[] = [];
+  collectBoxes(node, FULL_RECT, hiddenSlotIds, leaves, dividers);
 
-  const isVertical = node.direction === "vertical";
-
-  // Hidden (parked) subtrees collapse out of the flex layout; when one side
-  // is hidden the other takes all the space. className/style only — the
-  // element tree keeps its shape so nothing remounts.
-  const h0 = subtreeAllHidden(node.children[0], hiddenSlotIds);
-  const h1 = subtreeAllHidden(node.children[1], hiddenSlotIds);
-
-  // Use flexGrow proportional sharing so the 4px divider is naturally
-  // subtracted from available space before children divide the remainder.
+  // Leaves keep the tree's in-order traversal order — in eagle mode the DOM
+  // order IS the grid tile order, and keeping it identical in both modes
+  // means toggling eagle view never reorders (or otherwise touches) the
+  // mounted pane elements.
   return (
-    <div
-      className={
-        eagleMode
-          ? "contents"
-          : `flex ${isVertical ? "flex-row" : "flex-col"} h-full w-full min-w-0 min-h-0`
-      }
-    >
-      <div
-        style={
-          eagleMode || h0
-            ? undefined
-            : { flexGrow: h1 ? 1 : node.ratio, flexShrink: 1, flexBasis: 0 }
-        }
-        className={h0 ? "hidden" : eagleMode ? "contents" : "min-w-0 min-h-0 overflow-hidden"}
-      >
-        <SplitPaneView
-          node={node.children[0]}
-          renderLeaf={renderLeaf}
-          onRatioChange={onRatioChange}
-          onDragStateChange={onDragStateChange}
-          eagleMode={eagleMode}
-          hiddenSlotIds={hiddenSlotIds}
-        />
-      </div>
-
-      {!eagleMode && !h0 && !h1 && (
-        <Divider
-          direction={node.direction}
-          nodeId={node.id}
-          onRatioChange={onRatioChange}
-          onDragStateChange={onDragStateChange}
-        />
-      )}
-
-      <div
-        style={
-          eagleMode || h1
-            ? undefined
-            : { flexGrow: h0 ? 1 : 1 - node.ratio, flexShrink: 1, flexBasis: 0 }
-        }
-        className={h1 ? "hidden" : eagleMode ? "contents" : "min-w-0 min-h-0 overflow-hidden"}
-      >
-        <SplitPaneView
-          node={node.children[1]}
-          renderLeaf={renderLeaf}
-          onRatioChange={onRatioChange}
-          onDragStateChange={onDragStateChange}
-          eagleMode={eagleMode}
-          hiddenSlotIds={hiddenSlotIds}
-        />
-      </div>
+    <div className={eagleMode ? "contents" : "relative h-full w-full min-h-0 min-w-0"}>
+      {leaves.map(({ slotId, rect }) => {
+        const isHidden = hiddenSlotIds?.has(slotId) ?? false;
+        return (
+          <div
+            key={slotId}
+            data-slot-id={slotId}
+            className={
+              isHidden
+                ? "hidden"
+                : eagleMode
+                  ? "contents"
+                  : "absolute min-w-0 min-h-0 overflow-hidden"
+            }
+            style={isHidden || eagleMode ? undefined : rectStyle(rect)}
+          >
+            {renderLeaf(slotId)}
+          </div>
+        );
+      })}
+      {!eagleMode &&
+        dividers.map((d) => (
+          <Divider
+            key={d.nodeId}
+            box={d}
+            onRatioChange={onRatioChange}
+            onDragStateChange={onDragStateChange}
+          />
+        ))}
     </div>
   );
 }
 
 interface DividerProps {
-  direction: "horizontal" | "vertical";
-  nodeId: string;
+  box: DividerBox;
   onRatioChange: (nodeId: string, ratio: number) => void;
   onDragStateChange: (dragging: boolean) => void;
 }
 
-function Divider({ direction, nodeId, onRatioChange, onDragStateChange }: DividerProps) {
+function Divider({ box, onRatioChange, onDragStateChange }: DividerProps) {
   const dividerRef = useRef<HTMLDivElement>(null);
 
   const handleMouseDown = useCallback(
@@ -152,22 +275,28 @@ function Divider({ direction, nodeId, onRatioChange, onDragStateChange }: Divide
       const divider = dividerRef.current;
       if (!divider) return;
 
-      const parent = divider.parentElement;
-      if (!parent) return;
+      // The flat container — all rects are fractions of it.
+      const container = divider.parentElement;
+      if (!container) return;
 
       onDragStateChange(true);
 
-      const isVertical = direction === "vertical";
+      const isVertical = box.direction === "vertical";
+      const { region } = box;
 
       const handleMouseMove = (moveEvent: MouseEvent) => {
-        const rect = parent.getBoundingClientRect();
+        const rect = container.getBoundingClientRect();
         let ratio: number;
         if (isVertical) {
-          ratio = (moveEvent.clientX - rect.left) / rect.width;
+          const regionLeft = rect.left + region.left.f * rect.width + region.left.px;
+          const regionWidth = region.width.f * rect.width + region.width.px;
+          ratio = (moveEvent.clientX - regionLeft) / regionWidth;
         } else {
-          ratio = (moveEvent.clientY - rect.top) / rect.height;
+          const regionTop = rect.top + region.top.f * rect.height + region.top.px;
+          const regionHeight = region.height.f * rect.height + region.height.px;
+          ratio = (moveEvent.clientY - regionTop) / regionHeight;
         }
-        onRatioChange(nodeId, clampRatio(ratio));
+        onRatioChange(box.nodeId, clampRatio(ratio));
       };
 
       const handleMouseUp = () => {
@@ -179,15 +308,16 @@ function Divider({ direction, nodeId, onRatioChange, onDragStateChange }: Divide
       window.addEventListener("mousemove", handleMouseMove);
       window.addEventListener("mouseup", handleMouseUp);
     },
-    [direction, nodeId, onRatioChange, onDragStateChange],
+    [box, onRatioChange, onDragStateChange],
   );
 
-  const isVertical = direction === "vertical";
+  const isVertical = box.direction === "vertical";
 
   return (
     <div
       ref={dividerRef}
-      className={`split-divider ${isVertical ? "split-divider-vertical" : "split-divider-horizontal"}`}
+      className={`split-divider absolute ${isVertical ? "split-divider-vertical" : "split-divider-horizontal"}`}
+      style={rectStyle(box.rect)}
       onMouseDown={handleMouseDown}
     />
   );

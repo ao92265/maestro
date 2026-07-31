@@ -1564,7 +1564,10 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   const handleSwapSlots = useCallback((srcSlotId: string, destSlotId: string) => {
     if (!srcSlotId || !destSlotId || srcSlotId === destSlotId) return;
     setLayoutTree((prev) => swapSlots(prev, srcSlotId, destSlotId));
-  }, []);
+    // SplitPaneView may reorder the keyed pane hosts in the DOM to match the
+    // new traversal order, which blurs a focused terminal — restore it.
+    if (focusedSlotId) focusSlotTextarea(focusedSlotId);
+  }, [focusedSlotId]);
 
   /**
    * Eagle view: dropping a tile onto another project's tile reorders the
