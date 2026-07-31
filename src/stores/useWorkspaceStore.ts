@@ -4,6 +4,7 @@ import { create } from "zustand";
 import { createJSONStorage, persist, type StateStorage } from "zustand/middleware";
 import { arrayMove } from "@dnd-kit/sortable";
 import { killSession } from "@/lib/terminal";
+import { useSessionStore } from "@/stores/useSessionStore";
 
 // --- Types ---
 
@@ -281,9 +282,11 @@ export const useWorkspaceStore = create<WorkspaceState & WorkspaceActions>()(
                 }
               }
             });
-          // Remove sessions from backend SessionManager to prevent orphan accumulation
-          invoke("remove_sessions_for_project", { projectPath: tabToClose.projectPath })
-            .catch((err: unknown) => console.error("Failed to remove sessions on tab close:", err));
+          // Remove sessions from backend SessionManager AND prune the frontend
+          // session store (sessions/parkedSessionIds/flaggedSessionIds) —
+          // a raw invoke here left ghost rows behind: stale parked chips in the
+          // eagle shelf and dead sessions the agent store never pruned.
+          void useSessionStore.getState().removeSessionsForProject(tabToClose.projectPath);
         }
 
         const remaining = get().tabs.filter((t) => t.id !== id);
