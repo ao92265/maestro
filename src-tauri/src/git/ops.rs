@@ -1008,56 +1008,62 @@ impl Git {
         Ok(entries)
     }
 
-    /// Parses `git status --porcelain=v1 --untracked-files=all` into
+    /// Parses `git status --porcelain=v1 -z --untracked-files=all` into
     /// (staged, unstaged, untracked) lists.
     ///
-    /// Each non-untracked line is `XY <path>` or `XY <orig> -> <new>`.
-    /// `X` is the index status (staged), `Y` is the worktree status (unstaged).
-    /// Untracked lines start with `??`.
+    /// `-z` is required for correctness, not just convenience: without it git
+    /// C-quotes any path containing non-ASCII bytes or spaces (e.g.
+    /// `"caf\303\251.txt"`), and that literal quoted string would flow back
+    /// into discard/remove/diff as a pathspec that matches nothing. With `-z`
+    /// records are NUL-separated and never quoted.
+    ///
+    /// Each record is `XY <path>`; a rename/copy record is followed by ONE
+    /// extra NUL-separated field holding the ORIGINAL path. Untracked records
+    /// start with `??`.
     pub async fn working_tree_changes(
         &self,
     ) -> Result<(Vec<FileStatusEntry>, Vec<FileStatusEntry>, Vec<String>), GitError> {
         let out = self
-            .run(&["status", "--porcelain=v1", "--untracked-files=all"])
+            .run(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])
             .await?;
 
         let mut staged = Vec::new();
         let mut unstaged = Vec::new();
         let mut untracked = Vec::new();
 
-        for line in out.stdout.lines() {
-            if line.len() < 3 {
+        let mut records = out.stdout.split('\0');
+        while let Some(record) = records.next() {
+            if record.len() < 3 {
                 continue;
             }
-            let bytes = line.as_bytes();
+            let bytes = record.as_bytes();
             let x = bytes[0] as char;
             let y = bytes[1] as char;
-            let rest = &line[3..];
+            let path = &record[3..];
 
             if x == '?' && y == '?' {
-                untracked.push(rest.to_string());
+                untracked.push(path.to_string());
                 continue;
             }
 
-            // Split on " -> " for rename/copy entries.
-            let (path, old_path) = if let Some(idx) = rest.find(" -> ") {
-                let old = rest[..idx].to_string();
-                let new = rest[idx + 4..].to_string();
-                (new, Some(old))
+            // Rename/copy entries carry the original path as the next
+            // NUL-separated record.
+            let old_path = if x == 'R' || x == 'C' || y == 'R' || y == 'C' {
+                records.next().map(|orig| orig.to_string())
             } else {
-                (rest.to_string(), None)
+                None
             };
 
             if x != ' ' && x != '?' {
                 staged.push(FileStatusEntry {
-                    path: path.clone(),
+                    path: path.to_string(),
                     status: classify_status(x),
                     old_path: old_path.clone(),
                 });
             }
             if y != ' ' && y != '?' {
                 unstaged.push(FileStatusEntry {
-                    path,
+                    path: path.to_string(),
                     status: classify_status(y),
                     old_path,
                 });
@@ -1636,6 +1642,55 @@ mod tests {
         assert!(unstaged.iter().any(|f| f.path == "README.md"
             && f.status == FileStatusKind::Modified));
         assert_eq!(untracked, vec!["untracked.txt".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_working_tree_changes_unquoted_special_paths() {
+        let (dir, git) = create_test_repo().await;
+
+        // Paths git C-quotes in non-`-z` porcelain output: spaces and
+        // non-ASCII bytes. Regression: the quoted string (`"caf\303\251.txt"`)
+        // used to flow back into discard/remove as a pathspec matching nothing.
+        tokio::fs::write(dir.path().join("with space.txt"), "tracked")
+            .await
+            .unwrap();
+        git.run(&["add", "with space.txt"]).await.unwrap();
+        git.run(&["commit", "-m", "add spaced file"]).await.unwrap();
+        tokio::fs::write(dir.path().join("with space.txt"), "changed")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("café.txt"), "junk")
+            .await
+            .unwrap();
+
+        let (_, unstaged, untracked) = git.working_tree_changes().await.unwrap();
+        assert!(
+            unstaged.iter().any(|f| f.path == "with space.txt"),
+            "space-containing path must come back verbatim, got {:?}",
+            unstaged
+        );
+        assert_eq!(untracked, vec!["café.txt".to_string()]);
+
+        // The unquoted path must round-trip into discard and actually revert.
+        git.discard_file("with space.txt", None).await.unwrap();
+        let content = tokio::fs::read_to_string(dir.path().join("with space.txt"))
+            .await
+            .unwrap();
+        assert_eq!(content, "tracked");
+    }
+
+    #[tokio::test]
+    async fn test_working_tree_changes_rename_records_old_path() {
+        let (_dir, git) = create_test_repo().await;
+        git.run(&["mv", "README.md", "MOVED README.md"]).await.unwrap();
+
+        let (staged, _, _) = git.working_tree_changes().await.unwrap();
+        let entry = staged
+            .iter()
+            .find(|f| f.status == FileStatusKind::Renamed)
+            .expect("rename entry present");
+        assert_eq!(entry.path, "MOVED README.md");
+        assert_eq!(entry.old_path.as_deref(), Some("README.md"));
     }
 
     // ── stash_list ───────────────────────────────────────────────────
