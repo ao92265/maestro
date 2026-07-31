@@ -57,6 +57,19 @@ describe("ActivityFeed auto-scroll", () => {
     expect(scrollIntoViewSpy).not.toHaveBeenCalled();
   });
 
+  it("renders without looping for a session with no recorded activity", () => {
+    // Regression guard: getSession must return a stable reference for unknown
+    // sessions. A fresh object per call makes the zustand selector's snapshot
+    // change on every read and React throws "Maximum update depth exceeded".
+    useActivityStore.setState({ sessions: {} });
+
+    render(<ActivityFeed sessionId={42} maxHeight="100%" />);
+
+    expect(
+      screen.getByText("Waiting for session activity...")
+    ).toBeInTheDocument();
+  });
+
   it("assigns scrollTop on the feed's own container when events change", () => {
     const setScrollTop = vi.fn();
     const originalScrollTop = Object.getOwnPropertyDescriptor(
