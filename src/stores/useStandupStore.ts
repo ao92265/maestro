@@ -28,8 +28,15 @@ interface StandupState {
   scheduleTime: string;
   /** Local date (YYYY-MM-DD) of the last scheduled run — prevents refiring. */
   lastRunDate: string | null;
+  /**
+   * Custom prompt template for the headless run (persisted). `null` means
+   * "use the built-in default". Placeholders: {project} {date} {since}
+   * {commits} {sessions}.
+   */
+  promptTemplate: string | null;
   setScheduleEnabled: (enabled: boolean) => void;
   setScheduleTime: (time: string) => void;
+  setPromptTemplate: (template: string | null) => void;
   /** Load today's saved report from disk if the project has none in memory. */
   loadToday: (repoPath: string) => Promise<void>;
   /** Generate (or regenerate) the report for one project. */
@@ -72,9 +79,11 @@ export const useStandupStore = create<StandupState>()(
       scheduleEnabled: false,
       scheduleTime: "08:30",
       lastRunDate: null,
+      promptTemplate: null,
 
       setScheduleEnabled: (enabled) => set({ scheduleEnabled: enabled }),
       setScheduleTime: (time) => set({ scheduleTime: time }),
+      setPromptTemplate: (template) => set({ promptTemplate: template }),
 
       loadToday: async (repoPath) => {
         const existing = get().reports[repoPath];
@@ -112,6 +121,7 @@ export const useStandupStore = create<StandupState>()(
         try {
           const report = await invoke<StandupReport>("generate_standup_report", {
             projectPath: repoPath,
+            promptTemplate: get().promptTemplate,
           });
           set((state) => ({
             reports: {
@@ -155,6 +165,7 @@ export const useStandupStore = create<StandupState>()(
         scheduleEnabled: state.scheduleEnabled,
         scheduleTime: state.scheduleTime,
         lastRunDate: state.lastRunDate,
+        promptTemplate: state.promptTemplate,
       }),
     }
   )

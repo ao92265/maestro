@@ -195,10 +195,10 @@ async fn run_claude_print(project_path: &str, prompt: String) -> Result<String, 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Build the standup prompt from the gathered material.
-fn build_prompt(project_name: &str, date: &str, since: &str, commits: &str, sessions: &str) -> String {
-    format!(
-        r#"You are writing a daily standup report for the developer working in this repository. Use ONLY the material below; never invent work that is not evidenced by it.
+/// Built-in prompt template. Users may override it from the Standup panel;
+/// `{project}`, `{date}`, `{since}`, `{commits}` and `{sessions}` are
+/// substituted before the prompt is sent to `claude -p`.
+pub const DEFAULT_PROMPT_TEMPLATE: &str = r#"You are writing a daily standup report for the developer working in this repository. Use ONLY the material below; never invent work that is not evidenced by it.
 
 Output exactly this GitHub-flavored markdown structure, with no preamble and no surrounding code fence:
 
@@ -229,20 +229,50 @@ MATERIAL (covers work since {since}):
 
 == Agent sessions (Claude conversations in this project) ==
 {sessions}
-"#,
-        project = project_name,
-        date = date,
-        since = since,
-        commits = if commits.trim().is_empty() { "(none)" } else { commits },
-        sessions = if sessions.trim().is_empty() { "(none)" } else { sessions },
-    )
+"#;
+
+/// Build the standup prompt from the gathered material. A non-empty custom
+/// template replaces the built-in one; both use the same placeholders.
+fn build_prompt(
+    template: Option<&str>,
+    project_name: &str,
+    date: &str,
+    since: &str,
+    commits: &str,
+    sessions: &str,
+) -> String {
+    let template = match template {
+        Some(t) if !t.trim().is_empty() => t,
+        _ => DEFAULT_PROMPT_TEMPLATE,
+    };
+    template
+        .replace("{project}", project_name)
+        .replace("{date}", date)
+        .replace("{since}", since)
+        .replace(
+            "{commits}",
+            if commits.trim().is_empty() { "(none)" } else { commits },
+        )
+        .replace(
+            "{sessions}",
+            if sessions.trim().is_empty() { "(none)" } else { sessions },
+        )
+}
+
+/// The built-in prompt template, for the panel's editor prefill / reset.
+#[tauri::command]
+pub fn get_default_standup_prompt() -> String {
+    DEFAULT_PROMPT_TEMPLATE.to_string()
 }
 
 /// Generate the standup report for one project and persist it as
 /// `<data>/standups/<project>/<today>.md`. The window starts at the date of
 /// the newest previous report, or 3 days ago when none exists.
 #[tauri::command]
-pub async fn generate_standup_report(project_path: String) -> Result<StandupReport, String> {
+pub async fn generate_standup_report(
+    project_path: String,
+    prompt_template: Option<String>,
+) -> Result<StandupReport, String> {
     let canonical = std::fs::canonicalize(&project_path)
         .unwrap_or_else(|_| PathBuf::from(&project_path))
         .to_string_lossy()
@@ -297,6 +327,7 @@ pub async fn generate_standup_report(project_path: String) -> Result<StandupRepo
         .unwrap_or_else(|| canonical.clone());
 
     let prompt = build_prompt(
+        prompt_template.as_deref(),
         &project_name,
         &today,
         &since,
@@ -411,8 +442,28 @@ mod tests {
 
     #[test]
     fn build_prompt_substitutes_placeholders_for_empty_material() {
-        let p = build_prompt("maestro", "2026-07-30", "2026-07-28", "", "");
+        let p = build_prompt(None, "maestro", "2026-07-30", "2026-07-28", "", "");
         assert!(p.contains("maestro"));
         assert!(p.contains("(none)"));
+        assert!(!p.contains("{project}"));
+    }
+
+    #[test]
+    fn build_prompt_uses_custom_template_with_placeholders() {
+        let p = build_prompt(
+            Some("Report for {project} on {date}: {commits} / {sessions}"),
+            "maestro",
+            "2026-07-31",
+            "2026-07-30",
+            "abc fix bug",
+            "",
+        );
+        assert_eq!(p, "Report for maestro on 2026-07-31: abc fix bug / (none)");
+    }
+
+    #[test]
+    fn build_prompt_falls_back_to_default_on_blank_template() {
+        let p = build_prompt(Some("   "), "maestro", "2026-07-31", "2026-07-30", "", "");
+        assert!(p.contains("## TL;DR"));
     }
 }

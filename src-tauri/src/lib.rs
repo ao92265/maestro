@@ -401,6 +401,7 @@ pub fn run() {
             commands::hooks::remove_session_hooks_config,
             // Standup report commands
             commands::standup::generate_standup_report,
+            commands::standup::get_default_standup_prompt,
             commands::standup::load_standup_report,
             // CLI commands
             commands::cli::install_cli,

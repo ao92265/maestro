@@ -71,6 +71,7 @@ describe("useStandupStore", () => {
     expect(useStandupStore.getState().lastRunDate).toBe(localDateString(new Date()));
     expect(invokeMock).toHaveBeenCalledWith("generate_standup_report", {
       projectPath: "C:/git/proj",
+      promptTemplate: null,
     });
 
     invokeMock.mockClear();
