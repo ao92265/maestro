@@ -365,8 +365,12 @@ pub struct ClaudeAccount {
     pub subscription_type: Option<String>,
 }
 
-/// Subset of `claude auth status` JSON we care about.
+/// Subset of `claude auth status` JSON we care about. The CLI emits
+/// camelCase keys ({"loggedIn": …, "subscriptionType": …}) — without the
+/// rename every field silently fell back to its default and the account
+/// always read as logged out.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ClaudeAuthStatus {
     #[serde(default)]
     logged_in: bool,
@@ -433,8 +437,12 @@ pub async fn get_claude_account() -> Result<ClaudeAccount, String> {
         }
     };
 
-    if let Ok(mut guard) = ACCOUNT_CACHE.lock() {
-        *guard = Some(account.clone());
+    // Only cache a logged-in result: pinning a transient CLI failure (or a
+    // parse miss) would report "logged out" for the whole app lifetime.
+    if account.logged_in {
+        if let Ok(mut guard) = ACCOUNT_CACHE.lock() {
+            *guard = Some(account.clone());
+        }
     }
     Ok(account)
 }
