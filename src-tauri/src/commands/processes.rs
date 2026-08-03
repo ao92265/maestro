@@ -7,14 +7,14 @@
 //! deltas are computed across successive polls.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use tauri::State;
 
 use crate::core::process_manager::ProcessManager;
-use crate::core::windows_process::{StdCommandExt, TokioCommandExt};
+use crate::core::windows_process::TokioCommandExt;
 
 /// Command-line substring matching only applies to watchlist entries at least
 /// this long. Short entries like "go" would otherwise match unrelated command
@@ -30,8 +30,9 @@ const MAX_CMD_LEN: usize = 400;
 const MAX_ANCESTRY_HOPS: usize = 64;
 
 /// Shared process probe. Wrapped in a `Mutex` so the refresh delta between
-/// successive polls yields accurate per-process CPU readings.
-pub struct ProcessScanState(pub Mutex<System>);
+/// successive polls yields accurate per-process CPU readings; `Arc` so the
+/// scan can run on the blocking pool without holding Tauri state.
+pub struct ProcessScanState(pub Arc<Mutex<System>>);
 
 impl ProcessScanState {
     /// Create the probe. CPUs are refreshed once so the CPU count is known
@@ -39,7 +40,7 @@ impl ProcessScanState {
     pub fn new() -> Self {
         let mut sys = System::new();
         sys.refresh_cpu_all();
-        Self(Mutex::new(sys))
+        Self(Arc::new(Mutex::new(sys)))
     }
 }
 
@@ -160,13 +161,13 @@ fn parse_lsof_listening(output: &str) -> Vec<(u32, u16)> {
 /// of a new dependency, mirroring how this module already shells out to
 /// `taskkill`/`docker`. Any failure (tool missing, non-zero exit, parse miss)
 /// degrades to an empty map, so port info is simply absent rather than fatal.
-fn listening_ports_by_pid() -> HashMap<u32, Vec<u16>> {
+async fn listening_ports_by_pid() -> HashMap<u32, Vec<u16>> {
     #[cfg(windows)]
     let pairs: Vec<(u32, u16)> = {
-        let mut cmd = std::process::Command::new("netstat");
+        let mut cmd = tokio::process::Command::new("netstat");
         cmd.args(["-ano", "-p", "TCP"]);
         cmd.hide_console_window();
-        match cmd.output() {
+        match cmd.output().await {
             Ok(o) if o.status.success() => {
                 parse_netstat_listening(&String::from_utf8_lossy(&o.stdout))
             }
@@ -176,10 +177,10 @@ fn listening_ports_by_pid() -> HashMap<u32, Vec<u16>> {
 
     #[cfg(unix)]
     let pairs: Vec<(u32, u16)> = {
-        let mut cmd = std::process::Command::new("lsof");
+        let mut cmd = tokio::process::Command::new("lsof");
         cmd.args(["-nP", "-iTCP", "-sTCP:LISTEN"]);
         cmd.hide_console_window();
-        match cmd.output() {
+        match cmd.output().await {
             Ok(o) if o.status.success() => parse_lsof_listening(&String::from_utf8_lossy(&o.stdout)),
             _ => Vec::new(),
         }
@@ -204,7 +205,7 @@ fn listening_ports_by_pid() -> HashMap<u32, Vec<u16>> {
 /// are trimmed and lowercased here so the matching rules are enforced in one
 /// place. Maestro's own process is always excluded.
 #[tauri::command]
-pub fn list_dev_processes(
+pub async fn list_dev_processes(
     watchlist: Vec<String>,
     state: State<'_, ProcessScanState>,
     process_manager: State<'_, ProcessManager>,
@@ -222,95 +223,103 @@ pub fn list_dev_processes(
 
     // Scan listening ports before taking the sysinfo lock — this shells out and
     // we must not hold the mutex across it.
-    let ports_by_pid = listening_ports_by_pid();
-
-    let mut sys = state
-        .0
-        .lock()
-        .map_err(|e| format!("Process scan state poisoned: {e}"))?;
-
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::new()
-            .with_cpu()
-            .with_memory()
-            .with_cmd(UpdateKind::Always)
-            .with_cwd(UpdateKind::Always),
-    );
-
-    let cpu_count = sys.cpus().len().max(1) as f32;
+    let ports_by_pid = listening_ports_by_pid().await;
 
     // Roots for the "spawned by Maestro" badge: the app itself plus every
     // PTY shell it launched.
-    let mut maestro_roots: HashSet<Pid> = process_manager
-        .tracked_pids()
-        .into_iter()
-        .filter(|pid| *pid > 0)
-        .map(|pid| Pid::from_u32(pid as u32))
-        .collect();
-    maestro_roots.insert(own_pid);
+    let tracked_pids = process_manager.tracked_pids();
+    let sys_state = Arc::clone(&state.0);
 
-    let parent_of: HashMap<Pid, Pid> = sys
-        .processes()
-        .iter()
-        .filter_map(|(pid, p)| p.parent().map(|pp| (*pid, pp)))
-        .collect();
+    // The full process-table refresh (cmdline + cwd of every OS process) takes
+    // long enough to stutter the UI, and this used to run inline on the main
+    // thread on every 3-second poll. Keep it off the async runtime too.
+    tokio::task::spawn_blocking(move || -> Result<Vec<DevProcess>, String> {
+        let mut sys = sys_state
+            .lock()
+            .map_err(|e| format!("Process scan state poisoned: {e}"))?;
 
-    let mut out = Vec::new();
-    for (pid, process) in sys.processes() {
-        if *pid == own_pid {
-            continue;
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::new()
+                .with_cpu()
+                .with_memory()
+                .with_cmd(UpdateKind::Always)
+                .with_cwd(UpdateKind::Always),
+        );
+
+        let cpu_count = sys.cpus().len().max(1) as f32;
+
+        let mut maestro_roots: HashSet<Pid> = tracked_pids
+            .into_iter()
+            .filter(|pid| *pid > 0)
+            .map(|pid| Pid::from_u32(pid as u32))
+            .collect();
+        maestro_roots.insert(own_pid);
+
+        let parent_of: HashMap<Pid, Pid> = sys
+            .processes()
+            .iter()
+            .filter_map(|(pid, p)| p.parent().map(|pp| (*pid, pp)))
+            .collect();
+
+        let mut out = Vec::new();
+        for (pid, process) in sys.processes() {
+            if *pid == own_pid {
+                continue;
+            }
+
+            let name_lower = process.name().to_string_lossy().to_lowercase();
+            let name_stem = name_lower.strip_suffix(".exe").unwrap_or(&name_lower);
+
+            let cmd_joined = process
+                .cmd()
+                .iter()
+                .map(|c| c.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let cmd_lower = cmd_joined.to_lowercase();
+
+            let Some(matched) = match_watchlist(name_stem, &cmd_lower, &watchlist) else {
+                continue;
+            };
+
+            let is_maestro = {
+                let mut cur = *pid;
+                let mut hops = 0;
+                loop {
+                    if maestro_roots.contains(&cur) {
+                        break true;
+                    }
+                    match parent_of.get(&cur) {
+                        Some(pp) if hops < MAX_ANCESTRY_HOPS && *pp != cur => {
+                            cur = *pp;
+                            hops += 1;
+                        }
+                        _ => break false,
+                    }
+                }
+            };
+
+            out.push(DevProcess {
+                pid: pid.as_u32(),
+                parent_pid: process.parent().map(|p| p.as_u32()),
+                name: name_stem.to_string(),
+                cmd: truncate_lossy(&cmd_joined, MAX_CMD_LEN),
+                cwd: process.cwd().map(|p| p.to_string_lossy().into_owned()),
+                memory_bytes: process.memory(),
+                cpu_percent: process.cpu_usage() / cpu_count,
+                run_time_secs: process.run_time(),
+                is_maestro,
+                matched,
+                ports: ports_by_pid.get(&pid.as_u32()).cloned().unwrap_or_default(),
+            });
         }
 
-        let name_lower = process.name().to_string_lossy().to_lowercase();
-        let name_stem = name_lower.strip_suffix(".exe").unwrap_or(&name_lower);
-
-        let cmd_joined = process
-            .cmd()
-            .iter()
-            .map(|c| c.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let cmd_lower = cmd_joined.to_lowercase();
-
-        let Some(matched) = match_watchlist(name_stem, &cmd_lower, &watchlist) else {
-            continue;
-        };
-
-        let is_maestro = {
-            let mut cur = *pid;
-            let mut hops = 0;
-            loop {
-                if maestro_roots.contains(&cur) {
-                    break true;
-                }
-                match parent_of.get(&cur) {
-                    Some(pp) if hops < MAX_ANCESTRY_HOPS && *pp != cur => {
-                        cur = *pp;
-                        hops += 1;
-                    }
-                    _ => break false,
-                }
-            }
-        };
-
-        out.push(DevProcess {
-            pid: pid.as_u32(),
-            parent_pid: process.parent().map(|p| p.as_u32()),
-            name: name_stem.to_string(),
-            cmd: truncate_lossy(&cmd_joined, MAX_CMD_LEN),
-            cwd: process.cwd().map(|p| p.to_string_lossy().into_owned()),
-            memory_bytes: process.memory(),
-            cpu_percent: process.cpu_usage() / cpu_count,
-            run_time_secs: process.run_time(),
-            is_maestro,
-            matched,
-            ports: ports_by_pid.get(&pid.as_u32()).cloned().unwrap_or_default(),
-        });
-    }
-
-    Ok(out)
+        Ok(out)
+    })
+    .await
+    .map_err(|e| format!("Process scan task failed: {e}"))?
 }
 
 /// Kills a process and its whole descendant tree.
