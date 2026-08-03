@@ -30,6 +30,12 @@ pub struct ClaudeSessionInfo {
     pub started_at: String,
     pub last_active: String,
     pub git_branch: Option<String>,
+    /// Directory the conversation ran in, as recorded in the transcript.
+    ///
+    /// `claude --resume <id>` only finds a session when the shell's cwd maps to
+    /// the same `~/.claude/projects/<encoded-cwd>/` directory the transcript
+    /// lives in, so a resume launch must run here and nowhere else.
+    pub cwd: Option<String>,
 }
 
 /// System XML tags that indicate a non-user message (should be skipped entirely).
@@ -125,6 +131,29 @@ pub(crate) fn encode_project_path(project_path: &str) -> String {
         .collect()
 }
 
+/// Canonicalizes `project_path` into the form Claude Code encodes, falling back
+/// to the input when the path no longer exists.
+///
+/// On Windows `fs::canonicalize` returns an extended-length path
+/// (`\\?\C:\git\maestro`). Feeding that straight into [`encode_project_path`]
+/// yielded `----C--git-maestro` — four leading dashes for `\\?\` — which is a
+/// directory that never exists, so every session lookup silently returned an
+/// empty list on Windows. Strip the prefix before encoding.
+fn canonical_project_path(project_path: &str) -> String {
+    let canonical = fs::canonicalize(project_path)
+        .unwrap_or_else(|_| PathBuf::from(project_path))
+        .to_string_lossy()
+        .into_owned();
+
+    #[cfg(windows)]
+    let canonical = match canonical.strip_prefix(r"\\?\") {
+        Some(stripped) => stripped.to_string(),
+        None => canonical,
+    };
+
+    canonical
+}
+
 /// Converts a project path to Claude's session directory
 /// `~/.claude/projects/<encoded-path>/`.
 fn project_path_to_claude_dir(project_path: &str) -> Option<PathBuf> {
@@ -178,6 +207,7 @@ fn parse_session_file(path: &Path) -> Option<ClaudeSessionInfo> {
     let mut git_branch: Option<String> = None;
     let mut started_at: Option<String> = None;
     let mut first_prompt: Option<String> = None;
+    let mut cwd: Option<String> = None;
 
     for (i, line) in reader.lines().enumerate() {
         if i >= MAX_LINES_SCANNED {
@@ -210,6 +240,11 @@ fn parse_session_file(path: &Path) -> Option<ClaudeSessionInfo> {
         if started_at.is_none() {
             if let Some(ts) = val.get("timestamp").and_then(|v| v.as_str()) {
                 started_at = Some(ts.to_string());
+            }
+        }
+        if cwd.is_none() {
+            if let Some(dir) = val.get("cwd").and_then(|v| v.as_str()) {
+                cwd = Some(dir.to_string());
             }
         }
 
@@ -253,7 +288,7 @@ fn parse_session_file(path: &Path) -> Option<ClaudeSessionInfo> {
         }
 
         // Stop early if we have everything
-        if session_id.is_some() && first_prompt.is_some() {
+        if session_id.is_some() && first_prompt.is_some() && cwd.is_some() {
             break;
         }
     }
@@ -277,12 +312,18 @@ fn parse_session_file(path: &Path) -> Option<ClaudeSessionInfo> {
     let mtime = metadata.modified().ok().unwrap_or(SystemTime::UNIX_EPOCH);
     let last_active: DateTime<Utc> = mtime.into();
 
+    // A recorded cwd that no longer exists (deleted worktree) cannot host a
+    // resume — the shell would fail to spawn there — so drop it and let the
+    // caller fall back to the project path.
+    let cwd = cwd.filter(|dir| Path::new(dir).is_dir());
+
     Some(ClaudeSessionInfo {
         session_id,
         first_prompt,
         started_at: started_at.unwrap_or_default(),
         last_active: last_active.to_rfc3339(),
         git_branch,
+        cwd,
     })
 }
 
@@ -296,10 +337,7 @@ pub async fn delete_claude_session(
         return Err(format!("Invalid session id: {session_id}"));
     }
 
-    let canonical = fs::canonicalize(&project_path)
-        .unwrap_or_else(|_| PathBuf::from(&project_path))
-        .to_string_lossy()
-        .into_owned();
+    let canonical = canonical_project_path(&project_path);
 
     let claude_dir = project_path_to_claude_dir(&canonical)
         .ok_or_else(|| "Could not determine home directory".to_string())?;
@@ -326,10 +364,7 @@ pub async fn delete_claude_session(
 #[tauri::command]
 pub async fn list_claude_sessions(project_path: String) -> Result<Vec<ClaudeSessionInfo>, String> {
     // Canonicalize the project path for consistent matching
-    let canonical = fs::canonicalize(&project_path)
-        .unwrap_or_else(|_| PathBuf::from(&project_path))
-        .to_string_lossy()
-        .into_owned();
+    let canonical = canonical_project_path(&project_path);
 
     let claude_dir = project_path_to_claude_dir(&canonical)
         .ok_or_else(|| "Could not determine home directory".to_string())?;
@@ -425,6 +460,34 @@ mod tests {
             encode_project_path("/a-b_c/d_e-f"),
             "-a-b_c-d_e-f"
         );
+    }
+
+    // ---- canonical_project_path ------------------------------------------
+
+    #[test]
+    fn canonical_path_encodes_to_the_directory_claude_actually_uses() {
+        // Regression: on Windows fs::canonicalize returns `\\?\C:\...`, which
+        // encoded to `----C--...` and made every lookup miss. The encoded form
+        // must never start with the four dashes that prefix produces.
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = tmp.path().to_string_lossy().into_owned();
+        let encoded = encode_project_path(&canonical_project_path(&raw));
+        assert!(
+            !encoded.starts_with("----"),
+            "verbatim prefix leaked into encoded dir: {encoded}"
+        );
+        assert!(
+            project_path_to_claude_dir(&canonical_project_path(&raw)).is_some(),
+            "expected a resolvable claude dir"
+        );
+    }
+
+    #[test]
+    fn canonical_path_falls_back_to_input_when_missing() {
+        // A path that cannot be canonicalized is passed through unchanged so
+        // lookups still target a deterministic directory.
+        let missing = "/definitely/not/a/real/path-xyz";
+        assert_eq!(canonical_project_path(missing), missing);
     }
 
     // ---- extract_prompt_text ---------------------------------------------
@@ -567,6 +630,33 @@ mod tests {
         let path = tmp.path().join("abc.jsonl");
         fs::write(&path, r#"{"type":"user","message":{"content":"hi"}}"#).unwrap();
         assert!(parse_session_file(&path).is_none());
+    }
+
+    #[test]
+    fn parse_keeps_cwd_when_the_directory_still_exists() {
+        // The resume launch runs in this directory, so it must survive parsing.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_string_lossy().replace('\\', "\\\\");
+        let path = tmp.path().join("abc.jsonl");
+        let jsonl = format!(
+            r#"{{"sessionId":"abc","cwd":"{dir}","type":"user","message":{{"content":"hi"}}}}"#
+        );
+        fs::write(&path, &jsonl).unwrap();
+        let info = parse_session_file(&path).expect("parsed");
+        let expected = tmp.path().to_string_lossy().into_owned();
+        assert_eq!(info.cwd, Some(expected));
+    }
+
+    #[test]
+    fn parse_drops_cwd_when_the_directory_is_gone() {
+        // Deleted worktree: spawning a shell there would fail, so the caller
+        // must fall back to the project path instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("abc.jsonl");
+        let jsonl = r#"{"sessionId":"abc","cwd":"/gone/worktree-xyz","type":"user","message":{"content":"hi"}}"#;
+        fs::write(&path, jsonl).unwrap();
+        let info = parse_session_file(&path).expect("parsed");
+        assert_eq!(info.cwd, None);
     }
 
     #[test]

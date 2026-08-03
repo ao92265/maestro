@@ -199,6 +199,12 @@ export interface ClaudeSessionInfo {
   started_at: string;
   last_active: string;
   git_branch: string | null;
+  /**
+   * Directory the conversation ran in, or null when it no longer exists.
+   * `claude --resume` only finds a session from this directory, so a resume
+   * launch must use it as the working directory.
+   */
+  cwd: string | null;
 }
 
 /** Lists previous Claude Code sessions for a project from Claude's native storage. */

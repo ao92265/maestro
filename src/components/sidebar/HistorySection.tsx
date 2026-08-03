@@ -84,10 +84,27 @@ export function HistorySection({ onLaunch }: HistorySectionProps) {
       [tab.id]: { loading: true, conversations: [], worktrees: [] },
     }));
     const repoPath = tab.selectedRepoPath ?? tab.projectPath;
-    const [conversations, worktrees] = await Promise.all([
-      listClaudeSessions(repoPath).catch(() => [] as ClaudeSessionInfo[]),
-      listWorktrees(repoPath).catch(() => [] as WorktreeInfo[]),
-    ]);
+    const worktrees = await listWorktrees(repoPath).catch(() => [] as WorktreeInfo[]);
+
+    // Claude files transcripts per working directory, so a session that ran in
+    // a worktree lives under that worktree's directory — not the repo's. Scan
+    // the repo and every worktree, otherwise all branch work is invisible here.
+    const searchPaths = [repoPath, ...worktrees.filter((w) => !w.is_bare).map((w) => w.path)];
+    const perPath = await Promise.all(
+      searchPaths.map((path) => listClaudeSessions(path).catch(() => [] as ClaudeSessionInfo[]))
+    );
+
+    // A session resumed in a different directory is written to both, so dedupe
+    // on id (keeping the most recent) to avoid duplicate rows and React keys.
+    const byId = new Map<string, ClaudeSessionInfo>();
+    for (const conv of perPath.flat()) {
+      const seen = byId.get(conv.session_id);
+      if (!seen || conv.last_active > seen.last_active) byId.set(conv.session_id, conv);
+    }
+    const conversations = [...byId.values()].sort((a, b) =>
+      b.last_active.localeCompare(a.last_active)
+    );
+
     setHistory((prev) => ({
       ...prev,
       [tab.id]: { loading: false, conversations, worktrees },
@@ -107,14 +124,15 @@ export function HistorySection({ onLaunch }: HistorySectionProps) {
     (
       tab: WorkspaceTab,
       resumeSessionId: string | null,
-      worktree: WorktreeInfo | undefined
+      workingDir: string | null,
+      branch: string | null
     ) => {
       requestLaunch({
         tabId: tab.id,
         mode: "Claude",
         resumeSessionId,
-        workingDirOverride: worktree?.path ?? null,
-        branch: worktree?.branch ?? null,
+        workingDirOverride: workingDir,
+        branch,
       });
       setSessionsLaunched(tab.id, true);
       onLaunch?.(tab.id);
@@ -172,15 +190,22 @@ export function HistorySection({ onLaunch }: HistorySectionProps) {
                       </p>
                     ) : (
                       conversations.map((conv) => {
-                        const worktree = conv.git_branch
-                          ? worktrees.find((w) => w.branch === conv.git_branch)
-                          : undefined;
                         return (
                           <button
                             key={conv.session_id}
                             type="button"
-                            onClick={() => queueLaunch(tab, conv.session_id, worktree)}
-                            title="Resume this conversation in a new terminal"
+                            // Resume in the conversation's own directory —
+                            // `claude --resume` cannot find the session from
+                            // anywhere else. Null means the directory is gone,
+                            // so fall back to the project path.
+                            onClick={() =>
+                              queueLaunch(tab, conv.session_id, conv.cwd, conv.git_branch)
+                            }
+                            title={
+                              conv.cwd
+                                ? `Resume this conversation in ${conv.cwd}`
+                                : "Original directory is gone — this conversation may not resume"
+                            }
                             className="group mb-0.5 flex w-full items-start gap-1.5 rounded px-1 py-1 text-left transition-colors hover:bg-maestro-surface"
                           >
                             <RotateCcw
@@ -216,7 +241,7 @@ export function HistorySection({ onLaunch }: HistorySectionProps) {
                         <button
                           key={worktree.path}
                           type="button"
-                          onClick={() => queueLaunch(tab, null, worktree)}
+                          onClick={() => queueLaunch(tab, null, worktree.path, worktree.branch)}
                           title={`Launch an agent in ${worktree.path}`}
                           className="group mb-0.5 flex w-full items-center gap-1.5 rounded px-1 py-1 text-left transition-colors hover:bg-maestro-surface"
                         >

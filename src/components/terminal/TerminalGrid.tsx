@@ -1536,6 +1536,11 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       branch: launch.branch,
       resumeSessionId: launch.resumeSessionId,
       workingDirOverride: launch.workingDirOverride,
+      // The History tab always names the exact directory to run in. Reusing the
+      // pristine slot would otherwise inherit its worktreeMode, and any mode but
+      // "project" sends launchSlotInner into prepareSessionWorktree — moving the
+      // session into a worktree where `claude --resume` cannot find the session.
+      worktreeMode: "project",
     };
     autoLaunchSlotIdRef.current = slot.id;
     if (reusable) {

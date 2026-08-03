@@ -42,9 +42,12 @@ function buildTab(overrides: Partial<WorkspaceTab> = {}): WorkspaceTab {
   };
 }
 
+/** The conversation in the mock ran inside the feature worktree, not the repo. */
+const WORKTREE_PATH = "C:\\worktrees\\feat-login";
+
 /** Routes the global invoke mock by command; unknown commands resolve empty. */
 function mockInvoke() {
-  invokeMock.mockImplementation(async (cmd: string) => {
+  invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
     switch (cmd) {
       case "list_context_docs":
         return [
@@ -76,8 +79,10 @@ function mockInvoke() {
       case "get_project_plugins":
       case "refresh_project_plugins":
         return { skills: [], plugins: [] };
-      // History tab reads
+      // History tab reads. Claude files transcripts per working directory, so
+      // this conversation only shows up if the worktree is scanned too.
       case "list_claude_sessions":
+        if (args?.projectPath !== WORKTREE_PATH) return [];
         return [
           {
             session_id: "11111111-2222-3333-4444-555555555555",
@@ -85,6 +90,7 @@ function mockInvoke() {
             started_at: "2026-07-29T08:00:00Z",
             last_active: "2026-07-29T09:00:00Z",
             git_branch: "feat/login",
+            cwd: WORKTREE_PATH,
           },
         ];
       case "git_worktree_list":
@@ -97,7 +103,7 @@ function mockInvoke() {
             is_main_worktree: true,
           },
           {
-            path: "C:\\worktrees\\feat-login",
+            path: WORKTREE_PATH,
             head: "def456",
             branch: "feat/login",
             is_bare: false,
@@ -158,7 +164,7 @@ describe("Sidebar tab bar", () => {
     expect(screen.getByText("Agents")).toBeInTheDocument();
   });
 
-  it("History tab lists past conversations and queues a resume launch", async () => {
+  it("History tab lists worktree conversations and resumes in their own directory", async () => {
     usePendingLaunchStore.setState({ pending: null });
     const onHistoryLaunch = vi.fn();
     render(<Sidebar onHistoryLaunch={onHistoryLaunch} />);
@@ -170,17 +176,66 @@ describe("Sidebar tab bar", () => {
     const conversation = await screen.findByText("Fix the login bug");
     fireEvent.click(conversation);
 
-    // The launch is queued with the conversation paired to its worktree
+    // `claude --resume` only finds the session from the directory it ran in,
+    // so the launch must target the recorded cwd — never a derived worktree.
     expect(usePendingLaunchStore.getState().pending).toMatchObject({
       tabId: "tab-1",
       mode: "Claude",
       resumeSessionId: "11111111-2222-3333-4444-555555555555",
-      workingDirOverride: "C:\\worktrees\\feat-login",
+      workingDirOverride: WORKTREE_PATH,
       branch: "feat/login",
     });
     // The project grid is set to mount, and App is asked to reveal it
     expect(useWorkspaceStore.getState().tabs[0].sessionsLaunched).toBe(true);
     expect(onHistoryLaunch).toHaveBeenCalledWith("tab-1");
+  });
+
+  it("History tab scans the repo and every worktree for conversations", async () => {
+    render(<Sidebar />);
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    fireEvent.click(screen.getByRole("button", { name: /maestro/ }));
+
+    await screen.findByText("Fix the login bug");
+    const scanned = invokeMock.mock.calls
+      .filter(([cmd]) => cmd === "list_claude_sessions")
+      .map(([, args]) => (args as { projectPath: string }).projectPath);
+    expect(scanned).toContain("C:\\git\\maestro");
+    expect(scanned).toContain(WORKTREE_PATH);
+  });
+
+  it("History tab falls back to the project path when the directory is gone", async () => {
+    usePendingLaunchStore.setState({ pending: null });
+    // A deleted worktree: the backend nulls out cwd so the shell can still spawn.
+    // Override only the History reads — other sections feed shared stores that
+    // outlive the test, so they must keep their well-formed shapes.
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "list_claude_sessions") {
+        return [
+          {
+            session_id: "99999999-8888-7777-6666-555555555555",
+            first_prompt: "Work in a deleted worktree",
+            started_at: "2026-07-29T08:00:00Z",
+            last_active: "2026-07-29T09:00:00Z",
+            git_branch: "feat/gone",
+            cwd: null,
+          },
+        ];
+      }
+      if (cmd === "git_worktree_list") return [];
+      return base(cmd, args);
+    });
+
+    render(<Sidebar />);
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    fireEvent.click(screen.getByRole("button", { name: /maestro/ }));
+
+    fireEvent.click(await screen.findByText("Work in a deleted worktree"));
+
+    expect(usePendingLaunchStore.getState().pending).toMatchObject({
+      resumeSessionId: "99999999-8888-7777-6666-555555555555",
+      workingDirOverride: null,
+    });
   });
 
   it("History tab launches an agent into a surviving worktree", async () => {
