@@ -55,6 +55,7 @@ import { useMcpStore } from "@/stores/useMcpStore";
 import { useWorktreeSettingsStore } from "@/stores/useWorktreeSettingsStore";
 import { usePluginStore } from "@/stores/usePluginStore";
 import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
+import { useActivityStore } from "@/stores/useActivityStore";
 import { useSessionStore } from "@/stores/useSessionStore";
 import type { AiMode } from "@/stores/useSessionStore";
 import { useWorkspaceStore, type RepositoryInfo, type WorkspaceType } from "@/stores/useWorkspaceStore";
@@ -147,6 +148,9 @@ function createEmptySlot(
     enabledMcpServers: mcpServers.map((s) => s.name), // All enabled by default
     enabledSkills: skills.map((s) => s.id), // All enabled by default
     enabledPlugins: plugins.filter((p) => p.enabled_by_default).map((p) => p.id),
+    mcpDefaultsApplied: mcpServers.length > 0,
+    skillsDefaultsApplied: skills.length > 0,
+    pluginsDefaultsApplied: plugins.length > 0,
   };
 }
 
@@ -591,14 +595,20 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     fetchPlugins(projectPath).catch(console.error);
   }, [projectPath, isActive, fetchMcpServers, fetchPlugins]);
 
-  // Update slot enabled MCP servers when servers are fetched
+  // Update slot enabled MCP servers when servers are fetched.
+  // Refill only slots created before the first fetch landed (flag unset AND
+  // list still empty) — after that, an empty list is the user's explicit
+  // "Unselect All" and refetches must not revert it.
   useEffect(() => {
     if (mcpServers.length > 0) {
       setSlots((prev) =>
         prev.map((slot) => {
-          // Only update if the slot has no enabled servers (fresh slot)
-          if (slot.enabledMcpServers.length === 0) {
-            return { ...slot, enabledMcpServers: mcpServers.map((s) => s.name) };
+          if (!slot.mcpDefaultsApplied && slot.enabledMcpServers.length === 0) {
+            return {
+              ...slot,
+              enabledMcpServers: mcpServers.map((s) => s.name),
+              mcpDefaultsApplied: true,
+            };
           }
           return slot;
         })
@@ -606,21 +616,21 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     }
   }, [mcpServers]);
 
-  // Update slot enabled skills/plugins when they are fetched
+  // Update slot enabled skills/plugins when they are fetched (same
+  // fresh-slot-only rule as the MCP refill above)
   useEffect(() => {
     if (skills.length > 0 || plugins.length > 0) {
       setSlots((prev) =>
         prev.map((slot) => {
           let updated = slot;
-          // Only update if the slot has no enabled skills (fresh slot)
-          if (slot.enabledSkills.length === 0 && skills.length > 0) {
-            updated = { ...updated, enabledSkills: skills.map((s) => s.id) };
+          if (!slot.skillsDefaultsApplied && slot.enabledSkills.length === 0 && skills.length > 0) {
+            updated = { ...updated, enabledSkills: skills.map((s) => s.id), skillsDefaultsApplied: true };
           }
-          // Only update if the slot has no enabled plugins (fresh slot)
-          if (slot.enabledPlugins.length === 0 && plugins.length > 0) {
+          if (!slot.pluginsDefaultsApplied && slot.enabledPlugins.length === 0 && plugins.length > 0) {
             updated = {
               ...updated,
               enabledPlugins: plugins.filter((p) => p.enabled_by_default).map((p) => p.id),
+              pluginsDefaultsApplied: true,
             };
           }
           return updated;
@@ -1067,6 +1077,11 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
 
     // Remove session from the session store
     useSessionStore.getState().removeSession(sessionId);
+
+    // Drop the dead session's activity feed (session ids are never reused,
+    // so without this every killed terminal retains up to 500 events —
+    // including full subagent prompts — for the app's lifetime).
+    useActivityStore.getState().clearSession(sessionId);
 
     // Unregister session from the project
     if (tabId) {
@@ -1741,7 +1756,13 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     setLayoutTree((prev) => updateRatio(prev, nodeId, ratio));
   }, []);
 
-  if (error) {
+  // A launch failure must not unmount a grid with live sessions: every
+  // unmounted xterm loses its scrollback, and the full-screen card's Retry
+  // (which resets to a single fresh slot) would orphan the running PTYs.
+  // The card is reserved for grids with nothing running; otherwise the error
+  // renders as a dismissible toast over the intact grid (see main return).
+  const hasLiveSessions = slots.some((s) => s.sessionId !== null);
+  if (error && !hasLiveSessions) {
     return (
       // In eagle mode this renders as a labeled tile of the global grid
       // (the wrapper above is display:contents), not an anonymous full-flex div.
@@ -1898,6 +1919,21 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       {/* Parked terminals stay reachable from the zoom-in view too (unpark
           makes the restored terminal the zoomed one — the user stays in zoom) */}
       {!eagleMode && <ParkedShelf projectPath={projectPath} onUnpark={handleUnpark} />}
+      {/* Launch errors while sessions run: fixed-position toast (works under
+          the eagle display:contents wrapper too) instead of the full-screen
+          card, so the running terminals stay mounted. */}
+      {error && (
+        <div className="fixed bottom-4 right-4 z-50 flex items-center gap-3 rounded-md border border-maestro-border bg-maestro-surface px-3 py-2 shadow-lg">
+          <span className="text-sm text-maestro-red">{error}</span>
+          <button
+            type="button"
+            onClick={() => setError(null)}
+            className="rounded bg-maestro-border px-2 py-1 text-xs text-maestro-text hover:bg-maestro-muted/20"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
     </div>
   );
 });

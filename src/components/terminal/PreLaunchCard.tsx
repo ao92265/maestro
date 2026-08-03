@@ -56,6 +56,14 @@ export interface SessionSlot {
   enabledSkills: string[];
   /** IDs of enabled plugins for this session. */
   enabledPlugins: string[];
+  /**
+   * Whether default MCP/skill/plugin selections have been applied (at slot
+   * creation or by the post-fetch refill). Once true, an empty enabled list
+   * is the user's explicit "Unselect All" and must never be refilled.
+   */
+  mcpDefaultsApplied?: boolean;
+  skillsDefaultsApplied?: boolean;
+  pluginsDefaultsApplied?: boolean;
   /** Claude session UUID to resume, if resuming a previous session. */
   resumeSessionId?: string | null;
   /**
