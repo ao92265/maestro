@@ -35,7 +35,11 @@ export function BottomBar({
 
   return (
     <div className="no-select relative flex h-11 items-center justify-center gap-3 px-4">
-      <div className="absolute left-4 top-1/2 flex max-w-[40%] -translate-y-1/2 items-center gap-2">
+      {/* Centered with inset-y-0 + items-center rather than
+          top-1/2/-translate-y-1/2: a transform creates a stacking context, and
+          that would trap TerminalNavigator's drop-up below the terminal layers
+          (project wrapper z-10, zoomed pane z-40) no matter its own z-index. */}
+      <div className="absolute inset-y-0 left-4 flex max-w-[40%] items-center gap-2">
         <TerminalNavigator onNavigate={onNavigateToSession} />
         {account?.email && (
           <div
