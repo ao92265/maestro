@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use tauri::menu::{MenuBuilder, MenuItem, SubmenuBuilder};
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_cli::CliExt;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 /// Holds a CLI-argument project path captured at startup, before the frontend
 /// has mounted. The frontend drains this via [`take_pending_cli_path`] once it
@@ -141,6 +142,47 @@ pub fn run() {
                     }
                 }
                 _ => {}
+            }
+        })
+        .on_window_event(|window, event| {
+            // Confirm before quitting while terminals are still running.
+            // CloseRequested fires for the custom titlebar close button,
+            // Alt+F4, and taskbar close; with zero terminals the window
+            // closes silently. (The macOS app-menu Quit item bypasses
+            // CloseRequested entirely — known gap.)
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let count = window.state::<ProcessManager>().session_count();
+                if count == 0 {
+                    return;
+                }
+                api.prevent_close();
+                let win = window.clone();
+                window
+                    .dialog()
+                    .message(format!(
+                        "Quit Maestro? This will terminate {count} running terminal{}.",
+                        if count == 1 { "" } else { "s" }
+                    ))
+                    .title("Quit Maestro")
+                    .kind(MessageDialogKind::Warning)
+                    .buttons(MessageDialogButtons::YesNo)
+                    .show(move |confirmed| {
+                        if !confirmed {
+                            return;
+                        }
+                        let manager = win.state::<ProcessManager>().inner().clone();
+                        tauri::async_runtime::spawn(async move {
+                            // Kill the shells so they don't outlive the app,
+                            // then destroy() the window — destroy bypasses
+                            // CloseRequested, so this cannot re-prompt.
+                            if let Err(e) = manager.kill_all_sessions().await {
+                                log::warn!("Failed to kill sessions during quit: {e}");
+                            }
+                            if let Err(e) = win.destroy() {
+                                log::error!("Failed to destroy window during quit: {e}");
+                            }
+                        });
+                    });
             }
         })
         .manage(MarketplaceManager::new())

@@ -700,6 +700,11 @@ impl ProcessManager {
             .collect()
     }
 
+    /// Number of live PTY sessions currently tracked, across all projects.
+    pub fn session_count(&self) -> usize {
+        self.inner.sessions.len()
+    }
+
     /// Kills all active PTY sessions.
     ///
     /// This is used to clean up orphaned sessions when the frontend reloads.
