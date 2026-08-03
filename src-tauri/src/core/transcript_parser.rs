@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use super::claude_event::{ClaudeEvent, TokenUsage};
+use super::claude_event::{ClaudeEvent, SubagentToolStats, TokenUsage};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -108,6 +108,107 @@ fn summarize_tool_input(tool_name: &str, input: &Value) -> String {
 // Internal parsers
 // ---------------------------------------------------------------------------
 
+/// Join every `text` block of a message content array into one string.
+fn join_text_blocks(blocks: &[Value]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| {
+            if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                b.get("text").and_then(|t| t.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Pull the inner text of the first `<tag>…</tag>` pair out of `text`.
+///
+/// Task notifications are injected as a small XML-ish blob rather than JSON, so
+/// this is deliberately a plain string scan — no XML parser, no dependency, and
+/// a malformed blob simply yields `None`.
+fn tag_value(text: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..].find(&close)? + start;
+    Some(text[start..end].trim().to_string())
+}
+
+/// Flatten a tool_result `content` value into plain text.
+///
+/// It is an array of content blocks in the transcripts we have seen, but a bare
+/// string is legal too, and it is absent altogether on results that carry no
+/// metadata.
+fn extract_result_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => join_text_blocks(blocks),
+        _ => String::new(),
+    }
+}
+
+/// Whether an entry's `toolUseResult` is a sub-agent's, rather than some other
+/// tool's. Both foreground (`completed`) and background (`async_launched`)
+/// sub-agent results carry an `agentId` plus a `status`; ordinary tools carry
+/// neither, and older sub-agent results carry no metadata at all — those fall
+/// through to the watcher's bare completion synthesis.
+fn is_subagent_result(detail: &Value) -> bool {
+    detail.get("agentId").is_some() && detail.get("status").is_some()
+}
+
+/// Build a rich [`ClaudeEvent::SubagentCompleted`] from an entry's
+/// `toolUseResult` metadata.
+fn subagent_completed(
+    session_id: u32,
+    agent_id: &str,
+    is_error: bool,
+    detail: &Value,
+    timestamp: &str,
+) -> ClaudeEvent {
+    let str_field = |key: &str| {
+        detail
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let status = str_field("status");
+    // Only an explicit failure word counts as failure; anything else is passed
+    // through verbatim in `status` so an unrecognised one is displayed rather
+    // than silently recoded as success or failure.
+    let failed = matches!(status.as_deref(), Some("failed") | Some("error"));
+    let tool_stats = detail.get("toolStats").map(|s| {
+        let count = |key: &str| s.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+        SubagentToolStats {
+            read_count: count("readCount"),
+            search_count: count("searchCount"),
+            bash_count: count("bashCount"),
+            edit_file_count: count("editFileCount"),
+            lines_added: count("linesAdded"),
+            lines_removed: count("linesRemoved"),
+            other_tool_count: count("otherToolCount"),
+        }
+    });
+
+    ClaudeEvent::SubagentCompleted {
+        session_id,
+        agent_id: agent_id.to_string(),
+        success: !is_error && !failed,
+        report: extract_result_text(detail.get("content")),
+        status,
+        agent_type: str_field("agentType"),
+        model: str_field("resolvedModel"),
+        duration_ms: detail.get("totalDurationMs").and_then(|v| v.as_u64()),
+        total_tokens: detail.get("totalTokens").and_then(|v| v.as_u64()),
+        tool_use_count: detail.get("totalToolUseCount").and_then(|v| v.as_u64()),
+        tool_stats,
+        agent_run_id: str_field("agentId"),
+        timestamp: timestamp.to_string(),
+    }
+}
+
 fn extract_timestamp(obj: &Value) -> String {
     obj.get("timestamp")
         .and_then(|v| v.as_str())
@@ -126,38 +227,58 @@ fn parse_user_message(session_id: u32, obj: &Value) -> Vec<ClaudeEvent> {
     let uuid = extract_uuid(obj);
     let timestamp = extract_timestamp(obj);
 
-    let content_blocks = obj
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_array());
+    let content = obj.get("message").and_then(|m| m.get("content"));
+    let content_blocks = content.and_then(|c| c.as_array());
 
-    let text = content_blocks
-        .map(|blocks| {
-            blocks
-                .iter()
-                .filter_map(|b| {
-                    if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        b.get("text").and_then(|t| t.as_str())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
+    // Content is an array of blocks for ordinary messages, but a bare string for
+    // system-injected ones — task notifications among them — so read both shapes.
+    let text = match content {
+        Some(Value::String(s)) => s.clone(),
+        _ => content_blocks.map(|b| join_text_blocks(b)).unwrap_or_default(),
+    };
 
     let mut events = vec![ClaudeEvent::UserMessage {
         session_id,
         uuid,
-        text,
+        text: text.clone(),
         timestamp: timestamp.clone(),
     }];
+
+    // A background sub-agent's real completion arrives here, as a notification
+    // injected into the parent conversation: the tool_result it got back at
+    // launch time only said "started". The notification carries the agent's full
+    // report but none of the counters a foreground result has.
+    if text.contains("<task-notification>") {
+        if let Some(agent_id) = tag_value(&text, "tool-use-id") {
+            let status = tag_value(&text, "status");
+            let failed = matches!(status.as_deref(), Some("failed") | Some("error"));
+            events.push(ClaudeEvent::SubagentCompleted {
+                session_id,
+                agent_id,
+                success: !failed,
+                report: tag_value(&text, "result").unwrap_or_default(),
+                status,
+                agent_type: None,
+                model: None,
+                duration_ms: None,
+                total_tokens: None,
+                tool_use_count: None,
+                tool_stats: None,
+                agent_run_id: tag_value(&text, "task-id"),
+                timestamp: timestamp.clone(),
+            });
+        }
+    }
 
     // tool_result blocks close out an earlier tool_use with the same id.
     // The originating tool's name isn't present on the result block, so
     // tool_name is left empty; consumers match on tool_use_id.
     if let Some(blocks) = content_blocks {
+        // Sub-agent detail hangs off the entry, not the block. Claude Code
+        // writes at most one tool_result per entry (0 of 4070 entries across
+        // every transcript on this machine carried two), so it belongs to
+        // whichever result block this entry has.
+        let detail = obj.get("toolUseResult").filter(|v| v.is_object());
         for block in blocks {
             if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
                 continue;
@@ -174,6 +295,38 @@ fn parse_user_message(session_id: u32, obj: &Value) -> Vec<ClaudeEvent> {
                 .get("is_error")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+
+            // Pushed ahead of the ToolUseCompleted for the same id: the watcher
+            // treats a sub-agent event as the authoritative outcome and drops
+            // the generic completion that follows it.
+            if let Some(detail) = detail.filter(|d| is_subagent_result(d)) {
+                if detail.get("status").and_then(|v| v.as_str()) == Some("async_launched") {
+                    events.push(ClaudeEvent::SubagentLaunched {
+                        session_id,
+                        agent_id: tool_use_id.clone(),
+                        agent_run_id: detail
+                            .get("agentId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        model: detail
+                            .get("resolvedModel")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        timestamp: timestamp.clone(),
+                    });
+                } else {
+                    events.push(subagent_completed(
+                        session_id,
+                        &tool_use_id,
+                        is_error,
+                        detail,
+                        &timestamp,
+                    ));
+                }
+            }
+
             events.push(ClaudeEvent::ToolUseCompleted {
                 session_id,
                 tool_name: String::new(),
@@ -319,11 +472,25 @@ fn parse_assistant_message(session_id: u32, obj: &Value) -> Vec<ClaudeEvent> {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    // The brief, kept whole: it is the only record of what the
+                    // orchestrator actually asked for, and it is available here
+                    // at spawn time — long before any result comes back.
+                    let prompt = input
+                        .get("prompt")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let run_in_background = input
+                        .get("run_in_background")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     events.push(ClaudeEvent::SubagentSpawned {
                         session_id,
                         agent_type,
                         agent_id,
                         description,
+                        prompt,
+                        run_in_background,
                         timestamp: timestamp.clone(),
                     });
                 }
@@ -607,5 +774,177 @@ mod tests {
         let summary = summarize_tool_input("Bash", &input);
         assert!(summary.ends_with("..."));
         assert_eq!(summary.len(), 123); // 120 + "..."
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-agent detail: the brief down, the report back, and the counters
+    // -----------------------------------------------------------------------
+
+    /// The brief is the whole point of the spawn event: keep it verbatim, and
+    /// note whether this agent runs in the background (its result comes back
+    /// immediately and means nothing about completion).
+    #[test]
+    fn test_spawn_carries_prompt_and_background_flag() {
+        let line = r#"{"type":"assistant","message":{"model":"claude-fable-5","content":[{"type":"tool_use","id":"toolu_a","name":"Agent","input":{"description":"Plan #64","prompt":"You are the PLAN agent.\nDo not write code.","subagent_type":"general-purpose","run_in_background":true}}]},"uuid":"a1","timestamp":"2026-08-03T10:00:00Z"}"#;
+        let events = parse_transcript_line(1, line);
+
+        let spawn = events
+            .iter()
+            .find_map(|e| match e {
+                ClaudeEvent::SubagentSpawned {
+                    prompt,
+                    run_in_background,
+                    ..
+                } => Some((prompt, run_in_background)),
+                _ => None,
+            })
+            .expect("SubagentSpawned");
+        assert_eq!(spawn.0, "You are the PLAN agent.\nDo not write code.");
+        assert!(*spawn.1, "run_in_background should be carried through");
+    }
+
+    /// A foreground agent's tool_result carries everything: the report it sent
+    /// back plus the model, duration, tokens and per-tool counters.
+    #[test]
+    fn test_foreground_result_carries_report_and_counters() {
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_a","content":[{"type":"text","text":"agent-status: done"}]}]},"toolUseResult":{"status":"completed","agentId":"a4967701","agentType":"general-purpose","resolvedModel":"claude-fable-5","content":[{"type":"text","text":"agent-status: done"}],"totalDurationMs":1659000,"totalTokens":231047,"totalToolUseCount":57,"toolStats":{"readCount":10,"searchCount":3,"bashCount":0,"editFileCount":1,"linesAdded":137,"linesRemoved":0,"otherToolCount":4}},"uuid":"u1","timestamp":"2026-08-03T10:30:00Z"}"#;
+        let events = parse_transcript_line(1, line);
+
+        let done = events
+            .iter()
+            .find(|e| matches!(e, ClaudeEvent::SubagentCompleted { .. }))
+            .expect("SubagentCompleted");
+        if let ClaudeEvent::SubagentCompleted {
+            agent_id,
+            success,
+            report,
+            status,
+            agent_type,
+            model,
+            duration_ms,
+            total_tokens,
+            tool_use_count,
+            tool_stats,
+            agent_run_id,
+            ..
+        } = done
+        {
+            assert_eq!(agent_id, "toolu_a");
+            assert!(*success);
+            assert_eq!(report, "agent-status: done");
+            assert_eq!(status.as_deref(), Some("completed"));
+            assert_eq!(agent_type.as_deref(), Some("general-purpose"));
+            assert_eq!(model.as_deref(), Some("claude-fable-5"));
+            assert_eq!(*duration_ms, Some(1_659_000));
+            assert_eq!(*total_tokens, Some(231_047));
+            assert_eq!(*tool_use_count, Some(57));
+            assert_eq!(agent_run_id.as_deref(), Some("a4967701"));
+            let stats = tool_stats.as_ref().expect("toolStats");
+            assert_eq!(stats.read_count, 10);
+            assert_eq!(stats.edit_file_count, 1);
+            assert_eq!(stats.lines_added, 137);
+            assert_eq!(stats.other_tool_count, 4);
+        }
+    }
+
+    /// A background agent's result arrives at once with `async_launched`. It is
+    /// a launch acknowledgement, not a completion — reporting it as DONE would
+    /// mark every background agent finished the moment it started.
+    #[test]
+    fn test_async_launched_is_not_a_completion() {
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_b","content":"launched"}]},"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"a11070c","description":"Summarize docs","resolvedModel":"claude-opus-4-8[1m]","prompt":"Read the docs"},"uuid":"u2","timestamp":"2026-08-03T10:00:05Z"}"#;
+        let events = parse_transcript_line(1, line);
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ClaudeEvent::SubagentCompleted { .. })),
+            "async_launched must not complete the agent: {events:?}"
+        );
+        let launched = events
+            .iter()
+            .find(|e| matches!(e, ClaudeEvent::SubagentLaunched { .. }))
+            .expect("SubagentLaunched");
+        if let ClaudeEvent::SubagentLaunched {
+            agent_id,
+            agent_run_id,
+            model,
+            ..
+        } = launched
+        {
+            assert_eq!(agent_id, "toolu_b");
+            assert_eq!(agent_run_id, "a11070c");
+            assert_eq!(model, "claude-opus-4-8[1m]");
+        }
+    }
+
+    /// The background agent's real outcome comes back later as a notification
+    /// injected into the parent conversation, whose `<result>` is the report.
+    #[test]
+    fn test_task_notification_completes_a_background_agent() {
+        let line = r#"{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>a11070c</task-id>\n<tool-use-id>toolu_b</tool-use-id>\n<status>completed</status>\n<summary>Agent \"Summarize docs\" finished</summary>\n<result>Here is the context you asked for.\nSecond line.</result>\n</task-notification>"},"uuid":"u3","timestamp":"2026-08-03T10:09:18Z"}"#;
+        let events = parse_transcript_line(1, line);
+
+        let done = events
+            .iter()
+            .find(|e| matches!(e, ClaudeEvent::SubagentCompleted { .. }))
+            .expect("SubagentCompleted from the notification");
+        if let ClaudeEvent::SubagentCompleted {
+            agent_id,
+            success,
+            report,
+            status,
+            agent_run_id,
+            ..
+        } = done
+        {
+            assert_eq!(agent_id, "toolu_b", "keyed on the tool-use-id, not task-id");
+            assert!(*success);
+            assert_eq!(report, "Here is the context you asked for.\nSecond line.");
+            assert_eq!(status.as_deref(), Some("completed"));
+            assert_eq!(agent_run_id.as_deref(), Some("a11070c"));
+        }
+
+        // The notification body is also the user message text, so string-shaped
+        // content must not be dropped on the floor.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ClaudeEvent::UserMessage { text, .. } if text.contains("<task-notification>")
+        )));
+    }
+
+    /// Ordinary tools also write a `toolUseResult`; none of them is a sub-agent.
+    #[test]
+    fn test_ordinary_tool_result_emits_no_subagent_event() {
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_read","content":"file body"}]},"toolUseResult":{"type":"text","file":{"filePath":"/src/a.rs","numLines":10}},"uuid":"u4","timestamp":"2026-08-03T10:00:00Z"}"#;
+        let events = parse_transcript_line(1, line);
+
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                ClaudeEvent::SubagentCompleted { .. } | ClaudeEvent::SubagentLaunched { .. }
+            )),
+            "a Read result must not look like a sub-agent: {events:?}"
+        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ClaudeEvent::ToolUseCompleted { .. })));
+    }
+
+    /// A result with no metadata at all keeps working the old way: the watcher
+    /// still turns it into a bare completion via the pending-id fallback.
+    #[test]
+    fn test_result_without_metadata_leaves_completion_to_the_watcher() {
+        let events = parse_transcript_line(1, USER_MSG_TOOL_RESULT);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ClaudeEvent::SubagentCompleted { .. })),
+            "no metadata means the parser cannot know it was an agent"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ClaudeEvent::ToolUseCompleted { tool_use_id, .. } if tool_use_id == "toolu_task1"
+        )));
     }
 }

@@ -206,6 +206,10 @@ async fn reader_task(
     // tool_use ids of Task invocations whose result hasn't been seen yet;
     // lets us turn a generic tool_result into a SubagentCompleted event.
     let mut pending_task_ids: HashSet<String> = HashSet::new();
+    // Subset of the above that Claude launched in the background: their
+    // tool_result already came back with "async_launched", so the generic
+    // completion must not be mistaken for the agent finishing.
+    let mut async_task_ids: HashSet<String> = HashSet::new();
 
     while rx.recv().await.is_some() {
         // Coalesce rapid notifications: drain any buffered signals so we
@@ -218,6 +222,7 @@ async fn reader_task(
             byte_offset,
             &event_bus,
             &mut pending_task_ids,
+            &mut async_task_ids,
         );
     }
 
@@ -236,6 +241,9 @@ async fn reader_task(
 /// `SubagentCompleted`; all other `ToolUseCompleted` events are dropped here —
 /// the parser emits one per tool_result of every tool, and putting those on
 /// the bus would crowd real activity out of the frontend's capped event feed.
+/// `async_task_ids` holds the background agents among them, whose tool_result
+/// says only "launched", so their generic completion is skipped and the real one
+/// comes from the task notification the parser turns into `SubagentCompleted`.
 ///
 /// Returns the updated byte offset (pointing just past the last byte read).
 /// If the file does not exist, returns the same `byte_offset` without error.
@@ -245,6 +253,7 @@ fn read_new_lines(
     byte_offset: u64,
     event_bus: &EventBus,
     pending_task_ids: &mut HashSet<String>,
+    async_task_ids: &mut HashSet<String>,
 ) -> u64 {
     let file = match File::open(path) {
         Ok(f) => f,
@@ -286,17 +295,50 @@ fn read_new_lines(
                                 pending_task_ids.insert(agent_id.clone());
                                 event_bus.emit(event);
                             }
+                            // A background agent's tool_result comes back at
+                            // once, so the id stays pending: its completion
+                            // arrives later as a task notification.
+                            ClaudeEvent::SubagentLaunched { ref agent_id, .. } => {
+                                if pending_task_ids.contains(agent_id) {
+                                    async_task_ids.insert(agent_id.clone());
+                                    event_bus.emit(event);
+                                }
+                            }
+                            // The parser already resolved the outcome from the
+                            // transcript's own metadata; trust it over the
+                            // generic tool_result that follows.
+                            ClaudeEvent::SubagentCompleted { ref agent_id, .. } => {
+                                if pending_task_ids.remove(agent_id) {
+                                    async_task_ids.remove(agent_id);
+                                    event_bus.emit(event);
+                                }
+                            }
                             ClaudeEvent::ToolUseCompleted {
                                 tool_use_id,
                                 success,
                                 timestamp,
                                 ..
                             } => {
-                                if pending_task_ids.remove(&tool_use_id) {
+                                // Fallback for results carrying no sub-agent
+                                // metadata: a bare completion with no detail.
+                                // Skipped for background agents, which are still
+                                // running at this point.
+                                if !async_task_ids.contains(&tool_use_id)
+                                    && pending_task_ids.remove(&tool_use_id)
+                                {
                                     event_bus.emit(ClaudeEvent::SubagentCompleted {
                                         session_id,
                                         agent_id: tool_use_id,
                                         success,
+                                        report: String::new(),
+                                        status: None,
+                                        agent_type: None,
+                                        model: None,
+                                        duration_ms: None,
+                                        total_tokens: None,
+                                        tool_use_count: None,
+                                        tool_stats: None,
+                                        agent_run_id: None,
                                         timestamp,
                                     });
                                 }
@@ -345,7 +387,7 @@ mod tests {
         let path = file.path().to_path_buf();
         let (bus, collected) = test_event_bus();
 
-        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new());
+        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new());
 
         assert_eq!(new_offset, 0, "empty file should keep offset at 0");
         assert!(
@@ -363,7 +405,7 @@ mod tests {
         let path = file.path().to_path_buf();
         let (bus, collected) = test_event_bus();
 
-        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new());
+        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new());
 
         assert!(new_offset > 0, "offset should advance past the written line");
 
@@ -398,7 +440,7 @@ mod tests {
         let mut task_ids = HashSet::new();
 
         // First read picks up the first line.
-        let offset1 = read_new_lines(1, &path, 0, &bus, &mut task_ids);
+        let offset1 = read_new_lines(1, &path, 0, &bus, &mut task_ids, &mut HashSet::new());
         assert_eq!(
             collected.lock().unwrap().len(),
             1,
@@ -411,7 +453,7 @@ mod tests {
         file.flush().expect("flush");
 
         // Second read starts from offset1 and should only pick up the new line.
-        let offset2 = read_new_lines(1, &path, offset1, &bus, &mut task_ids);
+        let offset2 = read_new_lines(1, &path, offset1, &bus, &mut task_ids, &mut HashSet::new());
         assert!(
             offset2 > offset1,
             "offset should advance after reading second line"
@@ -447,7 +489,7 @@ mod tests {
         file.flush().unwrap();
 
         let (bus, collected) = test_event_bus();
-        read_new_lines(7, &file.path().to_path_buf(), 0, &bus, &mut HashSet::new());
+        read_new_lines(7, &file.path().to_path_buf(), 0, &bus, &mut HashSet::new(), &mut HashSet::new());
 
         let events = collected.lock().unwrap();
         // The Task's result surfaces as SubagentCompleted…
@@ -469,12 +511,141 @@ mod tests {
         );
     }
 
+    /// A background agent must stay RUNNING between its launch acknowledgement
+    /// and its task notification. Emitting a completion off the immediate
+    /// `async_launched` result would mark it done the moment it started.
+    #[test]
+    fn test_background_agent_completes_only_on_notification() {
+        let mut file = NamedTempFile::new().expect("create temp file");
+        let spawn = r#"{"type":"assistant","message":{"model":"claude-fable-5","content":[{"type":"tool_use","id":"toolu_bg","name":"Agent","input":{"description":"Summarize docs","prompt":"Read the docs","run_in_background":true}}]},"uuid":"a1","timestamp":"2026-08-03T10:00:00Z"}"#;
+        let launched = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bg","content":"launched"}]},"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"a11070c","resolvedModel":"claude-opus-4-8[1m]","prompt":"Read the docs"},"uuid":"u1","timestamp":"2026-08-03T10:00:05Z"}"#;
+        let notification = r#"{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>a11070c</task-id>\n<tool-use-id>toolu_bg</tool-use-id>\n<status>completed</status>\n<result>All done.</result>\n</task-notification>"},"uuid":"u2","timestamp":"2026-08-03T10:09:18Z"}"#;
+
+        let (bus, collected) = test_event_bus();
+        let mut pending = HashSet::new();
+        let mut async_ids = HashSet::new();
+
+        // The spawn and the launch ack: still running, no completion yet.
+        writeln!(file, "{spawn}").unwrap();
+        writeln!(file, "{launched}").unwrap();
+        file.flush().unwrap();
+        let offset = read_new_lines(
+            3,
+            &file.path().to_path_buf(),
+            0,
+            &bus,
+            &mut pending,
+            &mut async_ids,
+        );
+
+        {
+            let events = collected.lock().unwrap();
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, ClaudeEvent::SubagentCompleted { .. })),
+                "background agent must not be completed by its launch ack: {:?}",
+                *events
+            );
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    ClaudeEvent::SubagentLaunched { agent_id, model, .. }
+                        if agent_id == "toolu_bg" && model == "claude-opus-4-8[1m]"
+                )),
+                "expected SubagentLaunched, got {:?}",
+                *events
+            );
+        }
+        assert!(
+            pending.contains("toolu_bg"),
+            "the id stays pending while the agent runs"
+        );
+
+        // The notification: now, and only now, it completes — with its report.
+        writeln!(file, "{notification}").unwrap();
+        file.flush().unwrap();
+        read_new_lines(
+            3,
+            &file.path().to_path_buf(),
+            offset,
+            &bus,
+            &mut pending,
+            &mut async_ids,
+        );
+
+        let events = collected.lock().unwrap();
+        let completions: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, ClaudeEvent::SubagentCompleted { .. }))
+            .collect();
+        assert_eq!(completions.len(), 1, "exactly one completion: {:?}", *events);
+        if let ClaudeEvent::SubagentCompleted {
+            agent_id,
+            report,
+            success,
+            ..
+        } = completions[0]
+        {
+            assert_eq!(agent_id, "toolu_bg");
+            assert_eq!(report, "All done.");
+            assert!(*success);
+        }
+        assert!(pending.is_empty(), "the id is cleared once it completes");
+        assert!(async_ids.is_empty());
+    }
+
+    /// The rich completion the parser builds from transcript metadata replaces
+    /// the bare one the fallback would synthesise — not both.
+    #[test]
+    fn test_foreground_agent_completes_once_with_detail() {
+        let mut file = NamedTempFile::new().expect("create temp file");
+        let spawn = r#"{"type":"assistant","message":{"model":"claude-fable-5","content":[{"type":"tool_use","id":"toolu_fg","name":"Agent","input":{"description":"Review diff","prompt":"Review it","subagent_type":"general-purpose"}}]},"uuid":"a1","timestamp":"2026-08-03T10:00:00Z"}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_fg","content":[{"type":"text","text":"3 findings"}]}]},"toolUseResult":{"status":"completed","agentId":"aca8815","agentType":"general-purpose","resolvedModel":"claude-fable-5","content":[{"type":"text","text":"3 findings"}],"totalDurationMs":835000,"totalTokens":198699,"totalToolUseCount":49},"uuid":"u1","timestamp":"2026-08-03T10:14:00Z"}"#;
+        writeln!(file, "{spawn}").unwrap();
+        writeln!(file, "{result}").unwrap();
+        file.flush().unwrap();
+
+        let (bus, collected) = test_event_bus();
+        read_new_lines(
+            4,
+            &file.path().to_path_buf(),
+            0,
+            &bus,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+        );
+
+        let events = collected.lock().unwrap();
+        let completions: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, ClaudeEvent::SubagentCompleted { .. }))
+            .collect();
+        assert_eq!(
+            completions.len(),
+            1,
+            "the detailed completion must not be duplicated by the fallback: {:?}",
+            *events
+        );
+        if let ClaudeEvent::SubagentCompleted {
+            report,
+            total_tokens,
+            model,
+            ..
+        } = completions[0]
+        {
+            assert_eq!(report, "3 findings");
+            assert_eq!(*total_tokens, Some(198_699));
+            assert_eq!(model.as_deref(), Some("claude-fable-5"));
+        }
+    }
+
     #[test]
     fn test_read_nonexistent_file() {
         let path = PathBuf::from("/tmp/nonexistent_transcript_test_file_12345.jsonl");
         let (bus, collected) = test_event_bus();
 
-        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new());
+        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new());
 
         assert_eq!(
             new_offset, 0,

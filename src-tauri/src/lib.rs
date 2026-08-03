@@ -399,6 +399,8 @@ pub fn run() {
             // Hooks commands
             commands::hooks::write_session_hooks_config,
             commands::hooks::remove_session_hooks_config,
+            // Agent graph commands
+            commands::agents::export_agent_run,
             // Standup report commands
             commands::standup::generate_standup_report,
             commands::standup::get_default_standup_prompt,

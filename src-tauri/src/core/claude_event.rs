@@ -15,6 +15,22 @@ pub struct TokenUsage {
     pub cache_creation_input_tokens: u64,
 }
 
+/// Per-tool-family call counts a subagent reports when it finishes.
+///
+/// Mirrors the `toolStats` object inside a subagent tool_result's
+/// `toolUseResult`. Absent on older transcripts and on background agents,
+/// whose completion arrives as a task-notification carrying no counters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SubagentToolStats {
+    pub read_count: u64,
+    pub search_count: u64,
+    pub bash_count: u64,
+    pub edit_file_count: u64,
+    pub lines_added: u64,
+    pub lines_removed: u64,
+    pub other_tool_count: u64,
+}
+
 /// A single event emitted by, or on behalf of, a Claude Code session.
 ///
 /// Variants are internally tagged via `event_type` so the serialized JSON
@@ -99,15 +115,52 @@ pub enum ClaudeEvent {
         agent_type: String,
         agent_id: String,
         description: String,
+        /// The full brief the orchestrator sent down (the tool's `prompt`).
+        prompt: String,
+        /// The spawn asked for a background agent, so its tool_result returns
+        /// immediately and real completion arrives later as a notification.
+        run_in_background: bool,
+        timestamp: String,
+    },
+
+    /// A background sub-agent was accepted and is now running.
+    ///
+    /// Its tool_result comes back at once with `status: "async_launched"`, so it
+    /// is emphatically *not* a completion — it only tells us the run id and the
+    /// model Claude resolved for the agent.
+    SubagentLaunched {
+        session_id: u32,
+        agent_id: String,
+        agent_run_id: String,
+        model: String,
         timestamp: String,
     },
 
     /// A sub-agent finished its work.
+    ///
+    /// Everything past `success` comes from the transcript's `toolUseResult`
+    /// (foreground agents) or the `<task-notification>` message (background
+    /// agents), neither of which is guaranteed to be present — hence the
+    /// `Option`s and the empty-string fallback for `report`.
     SubagentCompleted {
         session_id: u32,
         agent_id: String,
         /// Whether the Task tool_result reported success (`is_error` absent/false).
         success: bool,
+        /// The sub-agent's final report back to the orchestrator.
+        report: String,
+        /// Raw status verbatim ("completed", …) when the transcript states one.
+        status: Option<String>,
+        /// Resolved agent type, which corrects a spawn that named none.
+        agent_type: Option<String>,
+        /// Model Claude actually ran the sub-agent on.
+        model: Option<String>,
+        duration_ms: Option<u64>,
+        total_tokens: Option<u64>,
+        tool_use_count: Option<u64>,
+        tool_stats: Option<SubagentToolStats>,
+        /// Claude's own id for the agent run — not the same as the tool_use id.
+        agent_run_id: Option<String>,
         timestamp: String,
     },
 
@@ -146,6 +199,7 @@ impl ClaudeEvent {
             | ClaudeEvent::FileEdited { session_id, .. }
             | ClaudeEvent::FileCreated { session_id, .. }
             | ClaudeEvent::SubagentSpawned { session_id, .. }
+            | ClaudeEvent::SubagentLaunched { session_id, .. }
             | ClaudeEvent::SubagentCompleted { session_id, .. }
             | ClaudeEvent::StatusUpdate { session_id, .. }
             | ClaudeEvent::TokenUsageUpdate { session_id, .. } => *session_id,
@@ -185,8 +239,18 @@ impl ClaudeEvent {
             ClaudeEvent::SubagentSpawned { agent_id, .. } => {
                 format!("SubagentSpawned:{agent_id}")
             }
-            ClaudeEvent::SubagentCompleted { agent_id, .. } => {
-                format!("SubagentCompleted:{agent_id}")
+            ClaudeEvent::SubagentLaunched { agent_id, .. } => {
+                format!("SubagentLaunched:{agent_id}")
+            }
+            // Timestamped: a background agent can be resumed and notify again
+            // under the same id, and each notification carries a fresh report.
+            // Keying on the id alone would drop every completion after the first.
+            ClaudeEvent::SubagentCompleted {
+                agent_id,
+                timestamp,
+                ..
+            } => {
+                format!("SubagentCompleted:{agent_id}:{timestamp}")
             }
             ClaudeEvent::StatusUpdate { session_id, state, message, .. } => {
                 format!("StatusUpdate:{session_id}:{state}:{message}")
@@ -249,10 +313,11 @@ mod tests {
             ClaudeEvent::ToolUseCompleted { session_id: 6, tool_name: "Read".into(), tool_use_id: "x".into(), success: true, timestamp: "t".into() },
             ClaudeEvent::FileEdited { session_id: 7, file_path: "/a".into(), tool: "Edit".into(), timestamp: "t".into() },
             ClaudeEvent::FileCreated { session_id: 8, file_path: "/b".into(), timestamp: "t".into() },
-            ClaudeEvent::SubagentSpawned { session_id: 9, agent_type: "Explore".into(), agent_id: "s".into(), description: "d".into(), timestamp: "t".into() },
-            ClaudeEvent::SubagentCompleted { session_id: 10, agent_id: "s".into(), success: true, timestamp: "t".into() },
+            ClaudeEvent::SubagentSpawned { session_id: 9, agent_type: "Explore".into(), agent_id: "s".into(), description: "d".into(), prompt: "p".into(), run_in_background: false, timestamp: "t".into() },
+            ClaudeEvent::SubagentCompleted { session_id: 10, agent_id: "s".into(), success: true, report: "r".into(), status: None, agent_type: None, model: None, duration_ms: None, total_tokens: None, tool_use_count: None, tool_stats: None, agent_run_id: None, timestamp: "t".into() },
             ClaudeEvent::StatusUpdate { session_id: 11, state: "working".into(), message: "m".into(), needs_input_prompt: None, timestamp: "t".into() },
             ClaudeEvent::TokenUsageUpdate { session_id: 12, input_tokens: 100, output_tokens: 50, cache_read_tokens: 10, cache_creation_tokens: 5, timestamp: "t".into() },
+            ClaudeEvent::SubagentLaunched { session_id: 13, agent_id: "s".into(), agent_run_id: "run".into(), model: "claude-fable-5".into(), timestamp: "t".into() },
         ];
         for (i, event) in events.iter().enumerate() {
             assert_eq!(event.session_id(), (i as u32) + 1);

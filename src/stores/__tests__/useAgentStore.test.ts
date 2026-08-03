@@ -8,48 +8,58 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { AGENT_DONE_LINGER_MS, useAgentStore, type SubagentInfo } from "../useAgentStore";
-import { useSessionStore, type SessionConfig } from "../useSessionStore";
+import { useAgentStore } from "../useAgentStore";
+import type { ClaudeEvent } from "@/types/claude-events";
 
-function spawned(sessionId: number, agentId: string) {
+function spawned(
+  sessionId: number,
+  agentId: string,
+  overrides?: Partial<Extract<ClaudeEvent, { event_type: "SubagentSpawned" }>>
+): ClaudeEvent {
   return {
-    event_type: "SubagentSpawned" as const,
+    event_type: "SubagentSpawned",
     session_id: sessionId,
     agent_type: "Explore",
     agent_id: agentId,
     description: "search for auth code",
+    prompt: "Find every call site of authenticate()",
+    run_in_background: false,
     timestamp: "2026-07-13T10:00:00.000Z",
+    ...overrides,
   };
 }
 
-function completed(sessionId: number, agentId: string, success = true, timestamp?: string) {
+function completed(
+  sessionId: number,
+  agentId: string,
+  success = true,
+  overrides?: Partial<Extract<ClaudeEvent, { event_type: "SubagentCompleted" }>>
+): ClaudeEvent {
   return {
-    event_type: "SubagentCompleted" as const,
+    event_type: "SubagentCompleted",
     session_id: sessionId,
     agent_id: agentId,
     success,
-    timestamp: timestamp ?? new Date().toISOString(),
-  };
-}
-
-function session(id: number): SessionConfig {
-  return {
-    id,
-    mode: "Claude",
-    branch: null,
-    status: "Working",
-    worktree_path: null,
-    project_path: "C:/proj",
+    report: "",
+    status: null,
+    agent_type: null,
+    model: null,
+    duration_ms: null,
+    total_tokens: null,
+    tool_use_count: null,
+    tool_stats: null,
+    agent_run_id: null,
+    timestamp: new Date().toISOString(),
+    ...overrides,
   };
 }
 
 describe("useAgentStore", () => {
   beforeEach(() => {
     useAgentStore.setState({ agents: [] });
-    useSessionStore.setState({ sessions: [] });
   });
 
-  it("SubagentSpawned adds a running agent", () => {
+  it("SubagentSpawned adds a running agent carrying its brief", () => {
     useAgentStore.getState().handleEvent(spawned(1, "toolu_a"));
     const agents = useAgentStore.getState().agents;
     expect(agents).toHaveLength(1);
@@ -57,8 +67,11 @@ describe("useAgentStore", () => {
       agentId: "toolu_a",
       sessionId: 1,
       agentType: "Explore",
+      prompt: "Find every call site of authenticate()",
+      runInBackground: false,
       completedAt: null,
       success: null,
+      report: "",
     });
   });
 
@@ -76,10 +89,66 @@ describe("useAgentStore", () => {
     expect(agent.success).toBe(false);
   });
 
+  it("SubagentCompleted stores the report and every counter it carries", () => {
+    useAgentStore.getState().handleEvent(spawned(1, "toolu_a", { agent_type: "unknown" }));
+    useAgentStore.getState().handleEvent(
+      completed(1, "toolu_a", true, {
+        report: "agent-status: done",
+        status: "completed",
+        agent_type: "general-purpose",
+        model: "claude-fable-5",
+        duration_ms: 1_659_000,
+        total_tokens: 231_047,
+        tool_use_count: 57,
+        tool_stats: {
+          read_count: 10,
+          search_count: 3,
+          bash_count: 0,
+          edit_file_count: 1,
+          lines_added: 137,
+          lines_removed: 0,
+          other_tool_count: 4,
+        },
+        agent_run_id: "a4967701",
+      })
+    );
+    expect(useAgentStore.getState().agents[0]).toMatchObject({
+      report: "agent-status: done",
+      status: "completed",
+      // The spawn named no real type; the result resolves it.
+      agentType: "general-purpose",
+      model: "claude-fable-5",
+      durationMs: 1_659_000,
+      totalTokens: 231_047,
+      toolUseCount: 57,
+      agentRunId: "a4967701",
+    });
+    expect(useAgentStore.getState().agents[0].toolStats?.lines_added).toBe(137);
+  });
+
+  // Real transcripts often launch an agent asynchronously without the spawn
+  // saying run_in_background, so the launch ack is what identifies it.
+  it("SubagentLaunched enriches a still-running agent and marks it background", () => {
+    useAgentStore.getState().handleEvent(spawned(1, "toolu_bg", { run_in_background: false }));
+    useAgentStore.getState().handleEvent({
+      event_type: "SubagentLaunched",
+      session_id: 1,
+      agent_id: "toolu_bg",
+      agent_run_id: "a11070c",
+      model: "claude-opus-4-8[1m]",
+      timestamp: "2026-07-13T10:00:05.000Z",
+    });
+    const agent = useAgentStore.getState().agents[0];
+    expect(agent.completedAt).toBeNull();
+    expect(agent.runInBackground).toBe(true);
+    expect(agent.model).toBe("claude-opus-4-8[1m]");
+    expect(agent.agentRunId).toBe("a11070c");
+  });
+
   it("completedAt comes from the event timestamp, not the wall clock", () => {
     useAgentStore.getState().handleEvent(spawned(1, "toolu_a"));
     const oldTs = "2026-07-01T00:00:00.000Z";
-    useAgentStore.getState().handleEvent(completed(1, "toolu_a", true, oldTs));
+    useAgentStore.getState().handleEvent(completed(1, "toolu_a", true, { timestamp: oldTs }));
     expect(useAgentStore.getState().agents[0].completedAt).toBe(Date.parse(oldTs));
   });
 
@@ -90,43 +159,69 @@ describe("useAgentStore", () => {
     expect(useAgentStore.getState().agents).toBe(before);
   });
 
-  it("completion does not overwrite an already-completed agent", () => {
+  it("a bare re-completion does not clobber a completed agent", () => {
     useAgentStore.getState().handleEvent(spawned(1, "toolu_a"));
-    useAgentStore.getState().handleEvent(completed(1, "toolu_a", false));
+    useAgentStore
+      .getState()
+      .handleEvent(completed(1, "toolu_a", false, { report: "failed early" }));
     const completedAt = useAgentStore.getState().agents[0].completedAt;
     useAgentStore.getState().handleEvent(completed(1, "toolu_a", true));
     expect(useAgentStore.getState().agents[0].success).toBe(false);
+    expect(useAgentStore.getState().agents[0].report).toBe("failed early");
     expect(useAgentStore.getState().agents[0].completedAt).toBe(completedAt);
   });
 
-  it("prune drops agents past the linger window but keeps recent ones", () => {
-    useSessionStore.setState({ sessions: [session(1)] });
-    const now = Date.now();
-    const base: Omit<SubagentInfo, "agentId" | "completedAt"> = {
-      sessionId: 1,
-      agentType: "Explore",
-      description: "",
-      spawnedAt: "",
-      success: true,
-    };
-    useAgentStore.setState({
-      agents: [
-        { ...base, agentId: "old", completedAt: now - AGENT_DONE_LINGER_MS - 1000 },
-        { ...base, agentId: "recent", completedAt: now - 1000 },
-        { ...base, agentId: "running", completedAt: null, success: null },
-      ],
-    });
-    useAgentStore.getState().prune();
-    const ids = useAgentStore.getState().agents.map((a) => a.agentId);
-    expect(ids).toEqual(["recent", "running"]);
+  // A background agent can be resumed and notify again under the same id, and
+  // the newest notification is the one worth reading.
+  it("a later completion carrying a report does update a finished agent", () => {
+    useAgentStore.getState().handleEvent(spawned(1, "toolu_bg", { run_in_background: true }));
+    useAgentStore.getState().handleEvent(completed(1, "toolu_bg", true, { report: "first pass" }));
+    useAgentStore.getState().handleEvent(completed(1, "toolu_bg", true, { report: "second pass" }));
+    expect(useAgentStore.getState().agents[0].report).toBe("second pass");
   });
 
-  it("prune drops agents whose session no longer exists", () => {
-    useSessionStore.setState({ sessions: [session(1)] });
-    useAgentStore.getState().handleEvent(spawned(1, "toolu_live"));
+  it("finished agents are kept indefinitely — nothing expires them", () => {
+    useAgentStore.getState().handleEvent(spawned(1, "toolu_a"));
+    useAgentStore.getState().handleEvent(
+      // A completion from months ago, as a resumed session replays.
+      completed(1, "toolu_a", true, { timestamp: "2026-01-01T00:00:00.000Z" })
+    );
+    expect(useAgentStore.getState().agents).toHaveLength(1);
+    expect(useAgentStore.getState().agents[0].completedAt).not.toBeNull();
+  });
+
+  it("agents of a dead session are kept, so a killed run can still be read", () => {
     useAgentStore.getState().handleEvent(spawned(99, "toolu_orphan"));
-    useAgentStore.getState().prune();
-    const ids = useAgentStore.getState().agents.map((a) => a.agentId);
-    expect(ids).toEqual(["toolu_live"]);
+    useAgentStore.getState().handleEvent(completed(99, "toolu_orphan", true));
+    expect(useAgentStore.getState().agents.map((a) => a.agentId)).toEqual(["toolu_orphan"]);
+  });
+
+  it("dismiss removes exactly one agent", () => {
+    useAgentStore.getState().handleEvent(spawned(1, "toolu_a"));
+    useAgentStore.getState().handleEvent(spawned(1, "toolu_b"));
+    useAgentStore.getState().dismiss("toolu_a");
+    expect(useAgentStore.getState().agents.map((a) => a.agentId)).toEqual(["toolu_b"]);
+  });
+
+  it("dismiss of an unknown id leaves the state untouched", () => {
+    useAgentStore.getState().handleEvent(spawned(1, "toolu_a"));
+    const before = useAgentStore.getState().agents;
+    useAgentStore.getState().dismiss("nope");
+    expect(useAgentStore.getState().agents).toBe(before);
+  });
+
+  it("clearFinished drops the finished agents of one session only", () => {
+    useAgentStore.getState().handleEvent(spawned(1, "toolu_done"));
+    useAgentStore.getState().handleEvent(spawned(1, "toolu_running"));
+    useAgentStore.getState().handleEvent(spawned(2, "toolu_other_done"));
+    useAgentStore.getState().handleEvent(completed(1, "toolu_done", true));
+    useAgentStore.getState().handleEvent(completed(2, "toolu_other_done", true));
+
+    useAgentStore.getState().clearFinished(1);
+
+    expect(useAgentStore.getState().agents.map((a) => a.agentId)).toEqual([
+      "toolu_running",
+      "toolu_other_done",
+    ]);
   });
 });

@@ -9,6 +9,14 @@ vi.mock("@tauri-apps/api/core", () => ({
 // Mock @tauri-apps/plugin-dialog
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn(),
+  save: vi.fn(),
+  ask: vi.fn(),
+}));
+
+// Mock @tauri-apps/plugin-clipboard-manager
+vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({
+  writeText: vi.fn().mockResolvedValue(undefined),
+  readText: vi.fn().mockResolvedValue(""),
 }));
 
 // Mock tauri-plugin-macos-permissions-api

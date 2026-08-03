@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod claude_sessions;
 pub mod claudemd;
 pub mod cli;
