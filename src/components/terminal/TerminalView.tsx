@@ -225,6 +225,12 @@ export const TerminalView = memo(function TerminalView({
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+  // Mirror isFocused into a ref: the async init reads it AFTER awaiting the
+  // font load, and the mount-time closure value goes stale if the user
+  // clicks this pane during that window (typing would then keep going to
+  // the previously focused terminal).
+  const isFocusedRef = useRef(isFocused);
+  isFocusedRef.current = isFocused;
 
   // Quick actions manager modal state
   const [showQuickActionsManager, setShowQuickActionsManager] = useState(false);
@@ -443,10 +449,12 @@ export const TerminalView = memo(function TerminalView({
       term.unicode.activeVersion = "11";
       term.open(container);
       // Mounted as the focused pane (e.g. the zoom branch remounts this view
-      // with isFocused already true): grab keyboard focus now. The parent's
-      // focusSlotTextarea helper can fire before the async init creates the
-      // xterm textarea, and the isFocused effect ran while termRef was null.
-      if (isFocused) term.focus();
+      // with isFocused already true) OR focused while the font was still
+      // loading: grab keyboard focus now. The parent's focusSlotTextarea
+      // helper can fire before the async init creates the xterm textarea,
+      // and the isFocused effect ran while termRef was null — the ref is the
+      // current value, not the mount-time closure's.
+      if (isFocusedRef.current) term.focus();
 
       // GPU-accelerated rendering (must be loaded after open())
       // Try WebGL first, fall back to Canvas2D (much faster than DOM on Linux)

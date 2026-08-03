@@ -769,7 +769,9 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
         // preparation. Close-time deletion of a hand-made worktree is
         // prevented by the backend's managed-base guard.
         worktreePath = slot.workingDirOverride;
-      } else if (effectiveRepoPath && slot.worktreeMode !== "project") {
+      } else if (effectiveRepoPath && slot.worktreeMode !== "project" && !slot.resumeSessionId) {
+        // resumeSessionId pins the project dir: `claude --resume` cannot
+        // find the conversation from a worktree (see updateSlotResumeSession).
         try {
           const result = await prepareSessionWorktree(
             effectiveRepoPath,
@@ -1292,7 +1294,17 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   const updateSlotResumeSession = useCallback((slotId: string, sessionId: string | null) => {
     setSlots((prev) =>
       prev.map((s) =>
-        s.id === slotId ? { ...s, resumeSessionId: sessionId } : s
+        s.id === slotId
+          ? {
+              ...s,
+              resumeSessionId: sessionId,
+              // `claude --resume` only finds the conversation from the
+              // transcript's own cwd — any worktree mode would move the
+              // shell elsewhere and the resume would silently fail. Same
+              // rule the History-tab launch already applies.
+              worktreeMode: sessionId ? "project" : s.worktreeMode,
+            }
+          : s
       )
     );
   }, []);
