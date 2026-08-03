@@ -512,21 +512,32 @@ impl Git {
         // guard a ref positional; reject option-like refs instead.
         reject_option_like_ref(name)?;
 
-        // Check if this is a remote branch reference
+        // A slash in the name does NOT mean remote ref: `feature/foo` is an
+        // ordinary local branch. Only treat it as remote when no local branch
+        // has that exact name and it matches a known remote-tracking ref —
+        // last-segment splitting used to check out the wrong branch (a local
+        // `login` for `origin/feature/login`) or invent a junk branch named
+        // after the last segment.
         if name.contains('/') {
-            // Try to extract the local branch name from remote ref (e.g., "origin/main" -> "main")
-            if let Some(local_name) = name.split('/').last() {
-                reject_option_like_ref(local_name)?;
-                // First try checking out the local branch if it exists
-                match self.run(&["checkout", local_name]).await {
-                    Ok(_) => return Ok(()),
-                    Err(GitError::CommandFailed { .. }) => {
-                        // Local branch doesn't exist, create tracking branch
-                        self.run(&["checkout", "-b", local_name, "--track", name])
-                            .await?;
-                        return Ok(());
+            let branches = self.list_branches().await?;
+            let is_local = branches.iter().any(|b| !b.is_remote && b.name == name);
+            let is_remote_ref = branches.iter().any(|b| b.is_remote && b.name == name);
+            if !is_local && is_remote_ref {
+                // Strip only the remote-name segment: origin/feature/login → feature/login
+                if let Some(pos) = name.find('/') {
+                    let local_name = &name[pos + 1..];
+                    reject_option_like_ref(local_name)?;
+                    // Reuse an existing local branch of that name if present
+                    match self.run(&["checkout", local_name]).await {
+                        Ok(_) => return Ok(()),
+                        Err(GitError::CommandFailed { .. }) => {
+                            // Local branch doesn't exist, create tracking branch
+                            self.run(&["checkout", "-b", local_name, "--track", name])
+                                .await?;
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e),
                     }
-                    Err(e) => return Err(e),
                 }
             }
         }
@@ -1541,6 +1552,25 @@ mod tests {
         git.checkout_branch("checkout-test").await.unwrap();
         let current = git.current_branch().await.unwrap();
         assert_eq!(current, "checkout-test");
+    }
+
+    /// A local branch with slashes in its name must be checked out as-is —
+    /// it used to be mistaken for a remote ref, failing over to a junk
+    /// branch named after the last path segment.
+    #[tokio::test]
+    async fn test_checkout_slash_named_local_branch() {
+        let (_dir, git) = create_test_repo().await;
+        git.run(&["branch", "fix/history-resume"]).await.unwrap();
+
+        git.checkout_branch("fix/history-resume").await.unwrap();
+        let current = git.current_branch().await.unwrap();
+        assert_eq!(current, "fix/history-resume");
+
+        let branches = git.list_branches().await.unwrap();
+        assert!(
+            !branches.iter().any(|b| b.name == "history-resume"),
+            "no junk last-segment branch may be created: {branches:?}"
+        );
     }
 
     #[tokio::test]
