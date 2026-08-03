@@ -247,11 +247,14 @@ export async function prepareSessionWorktree(
  *
  * @param projectPath - The path to the main repository
  * @param worktreePath - The worktree path to clean up
+ * @param worktreeBasePath - The project's custom worktree base dir (null = default);
+ *   the backend refuses to delete worktrees outside this managed base
  * @returns True if a worktree was cleaned up, false otherwise
  */
 export async function cleanupSessionWorktree(
   projectPath: string,
-  worktreePath: string | null
+  worktreePath: string | null,
+  worktreeBasePath?: string | null,
 ): Promise<boolean> {
   if (!worktreePath) {
     return false;
@@ -261,6 +264,7 @@ export async function cleanupSessionWorktree(
     const cleaned = await invoke<boolean>("cleanup_session_worktree", {
       projectPath,
       worktreePath,
+      worktreeBasePath: worktreeBasePath ?? null,
     });
 
     if (cleaned) {

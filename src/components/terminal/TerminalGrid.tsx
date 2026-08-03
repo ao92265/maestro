@@ -755,7 +755,9 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       let detectedBranch: string | null = null;
 
       if (slot.workingDirOverride && slot.workingDirOverride !== (effectiveRepoPath ?? projectPath)) {
-        // Recovered worktree from the History tab: run there as-is, no preparation.
+        // Recovered worktree from the History tab: run there as-is, no
+        // preparation. Close-time deletion of a hand-made worktree is
+        // prevented by the backend's managed-base guard.
         worktreePath = slot.workingDirOverride;
       } else if (effectiveRepoPath && slot.worktreeMode !== "project") {
         try {
@@ -1094,7 +1096,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     if (effectiveRepoPath && worktreePath) {
       const closeAction = useWorktreeSettingsStore.getState().worktreeCloseAction;
       if (closeAction === "delete") {
-        cleanupSessionWorktree(effectiveRepoPath, worktreePath)
+        cleanupSessionWorktree(effectiveRepoPath, worktreePath, worktreeBasePath)
           .then(() => refreshBranches())
           .catch(console.error);
       } else if (closeAction === "ask") {
@@ -1103,7 +1105,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
           kind: "info",
         }).then((confirmed) => {
           if (confirmed) {
-            cleanupSessionWorktree(effectiveRepoPath, worktreePath!)
+            cleanupSessionWorktree(effectiveRepoPath, worktreePath!, worktreeBasePath)
               .then(() => refreshBranches())
               .catch(console.error);
           }
@@ -1111,7 +1113,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       }
       // "keep" (default): do nothing — worktree persists
     }
-  }, [tabId, effectiveRepoPath, projectPath, removeSessionFromProject, refreshBranches, focusedSlotId, layoutTree, onSessionCountChange]);
+  }, [tabId, effectiveRepoPath, projectPath, removeSessionFromProject, refreshBranches, focusedSlotId, layoutTree, onSessionCountChange, worktreeBasePath]);
 
   /**
    * Removes a pre-launch slot (before it's launched).

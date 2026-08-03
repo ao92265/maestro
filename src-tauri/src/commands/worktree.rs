@@ -131,10 +131,23 @@ pub(crate) async fn prepare_worktree_inner(
 
     // Check if a *managed* worktree already exists for this branch (skip when force_new).
     if !force_new {
+        let base = worktree_base_path
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(worktree_base_dir);
+        let base = std::fs::canonicalize(&base).unwrap_or(base);
         match git.worktree_list().await {
             Ok(worktrees) => {
                 for wt in &worktrees {
                     if wt.is_main_worktree {
+                        continue;
+                    }
+                    // Only adopt worktrees under the Maestro-managed base: a
+                    // hand-made worktree adopted here would be force-deleted
+                    // (uncommitted work included) on session close.
+                    let wt_canonical = std::fs::canonicalize(&wt.path)
+                        .unwrap_or_else(|_| PathBuf::from(&wt.path));
+                    if !wt_canonical.starts_with(&base) {
                         continue;
                     }
                     if let Some(ref wt_branch) = wt.branch {
@@ -228,8 +241,9 @@ pub async fn cleanup_session_worktree(
     worktree_manager: State<'_, WorktreeManager>,
     project_path: String,
     worktree_path: String,
+    worktree_base_path: Option<String>,
 ) -> Result<bool, String> {
-    cleanup_worktree_inner(&worktree_manager, project_path, worktree_path).await
+    cleanup_worktree_inner(&worktree_manager, project_path, worktree_path, worktree_base_path).await
 }
 
 /// Inner implementation for cleanup, extracted for testability.
@@ -237,6 +251,7 @@ pub(crate) async fn cleanup_worktree_inner(
     worktree_manager: &WorktreeManager,
     project_path: String,
     worktree_path: String,
+    worktree_base_path: Option<String>,
 ) -> Result<bool, String> {
     if worktree_path.is_empty() {
         return Ok(false);
@@ -244,6 +259,23 @@ pub(crate) async fn cleanup_worktree_inner(
 
     let repo_path = PathBuf::from(&project_path);
     let wt_path = PathBuf::from(&worktree_path);
+
+    // Session close is an implicit cleanup — never force-delete a worktree
+    // outside the Maestro-managed base (it may hold uncommitted work Maestro
+    // did not create). Deliberate deletion stays in the git panel.
+    let base = worktree_base_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(worktree_base_dir);
+    let base = std::fs::canonicalize(&base).unwrap_or(base);
+    let wt_canonical = std::fs::canonicalize(&wt_path).unwrap_or_else(|_| wt_path.clone());
+    if !wt_canonical.starts_with(&base) {
+        log::warn!(
+            "Refusing to delete worktree outside the managed base dir: {}",
+            worktree_path
+        );
+        return Ok(false);
+    }
 
     match worktree_manager.remove(&repo_path, &wt_path).await {
         Ok(()) => {
@@ -818,9 +850,36 @@ mod tests {
     #[tokio::test]
     async fn test_cleanup_empty_path_is_noop() {
         let wm = WorktreeManager::new();
-        let result = cleanup_worktree_inner(&wm, "/tmp".to_string(), "".to_string())
+        let result = cleanup_worktree_inner(&wm, "/tmp".to_string(), "".to_string(), None)
             .await
             .unwrap();
         assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_refuses_unmanaged_worktree() {
+        let (_dir, path) = create_test_repo().await;
+        let git = Git::new(&path);
+        git.run(&["branch", "hand-made"]).await.unwrap();
+
+        // A worktree the user created by hand, outside the managed base.
+        let outside = tempfile::tempdir().unwrap();
+        let wt_path = outside.path().join("hand-made-wt");
+        git.run(&["worktree", "add", wt_path.to_str().unwrap(), "hand-made"])
+            .await
+            .unwrap();
+
+        let wm = WorktreeManager::new();
+        let result = cleanup_worktree_inner(
+            &wm,
+            path.to_string_lossy().to_string(),
+            wt_path.to_string_lossy().to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result, "unmanaged worktree must not be deleted");
+        assert!(wt_path.exists(), "unmanaged worktree directory must survive");
     }
 }
