@@ -134,6 +134,24 @@ async fn latest_report_date_before(dir: &Path, today: &str) -> Option<String> {
     best
 }
 
+/// Canonicalizes the project path for report naming and as the `claude -p`
+/// working directory. On Windows, canonicalize() prepends \\?\ (the
+/// extended-length prefix); cmd.exe rejects that as a working directory and
+/// silently falls back to C:\Windows, so the report would be generated from
+/// the wrong directory. Strip it, same as commands/terminal.rs.
+fn canonical_project_path(project_path: &str) -> String {
+    let canonical = std::fs::canonicalize(project_path)
+        .unwrap_or_else(|_| PathBuf::from(project_path))
+        .to_string_lossy()
+        .into_owned();
+    #[cfg(windows)]
+    let canonical = canonical
+        .strip_prefix(r"\\?\")
+        .map(str::to_string)
+        .unwrap_or(canonical);
+    canonical
+}
+
 /// Run `claude -p` headlessly in the project directory, prompt via stdin.
 async fn run_claude_print(project_path: &str, prompt: String) -> Result<String, String> {
     #[cfg(windows)]
@@ -273,10 +291,7 @@ pub async fn generate_standup_report(
     project_path: String,
     prompt_template: Option<String>,
 ) -> Result<StandupReport, String> {
-    let canonical = std::fs::canonicalize(&project_path)
-        .unwrap_or_else(|_| PathBuf::from(&project_path))
-        .to_string_lossy()
-        .into_owned();
+    let canonical = canonical_project_path(&project_path);
 
     let today = Local::now().format("%Y-%m-%d").to_string();
     let report_dir = project_report_dir(&canonical);
@@ -364,10 +379,7 @@ pub async fn load_standup_report(
     project_path: String,
     date: Option<String>,
 ) -> Result<Option<StandupReport>, String> {
-    let canonical = std::fs::canonicalize(&project_path)
-        .unwrap_or_else(|_| PathBuf::from(&project_path))
-        .to_string_lossy()
-        .into_owned();
+    let canonical = canonical_project_path(&project_path);
 
     let date = match date {
         Some(d) => {
