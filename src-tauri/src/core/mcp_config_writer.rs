@@ -225,8 +225,14 @@ fn merge_with_existing(
     // server is always re-added below — instead of erroring on every session.
     let existing = read_json_or_recover(mcp_path)?;
 
+    // Start from the existing root so sibling top-level keys the user has
+    // (`$schema`, ...) survive the rewrite — `.mcp.json` may be committed to
+    // the repo, and only `mcpServers` is ours to rebuild. (Same rule as
+    // merge_with_opencode_existing.)
+    let mut root = if existing.is_object() { existing } else { json!({}) };
+
     // Keep all servers EXCEPT this session's Maestro entry
-    let mut final_servers: HashMap<String, Value> = existing
+    let mut final_servers: serde_json::Map<String, Value> = root
         .get("mcpServers")
         .and_then(|s| s.as_object())
         .map(|obj| {
@@ -243,7 +249,7 @@ fn merge_with_existing(
                     !should_remove
                 })
                 .map(|(k, v)| (k.clone(), v.clone()))
-                .collect::<HashMap<_, _>>()
+                .collect::<serde_json::Map<_, _>>()
         })
         .unwrap_or_default();
 
@@ -259,7 +265,8 @@ fn merge_with_existing(
         final_servers.keys().collect::<Vec<_>>()
     );
 
-    Ok(json!({ "mcpServers": final_servers }))
+    root["mcpServers"] = Value::Object(final_servers);
+    Ok(root)
 }
 
 /// Writes a session-specific `.mcp.json` to the working directory.

@@ -106,6 +106,14 @@ pub async fn write_session_hooks_config(
     let settings_path = claude_dir.join("settings.local.json");
     let mut config: Value = read_json_or_recover(&settings_path)?;
 
+    // Valid JSON that isn't an object (a bare string or array) would make the
+    // index-assignment below panic — self-heal it to an object, same spirit
+    // as the corrupt-file recovery above.
+    if !config.is_object() {
+        log::warn!("settings.local.json is not a JSON object, rebuilding it");
+        config = serde_json::json!({});
+    }
+
     // Build and set hooks config
     let hooks = build_hooks_config(session_id, status_port, instance_id);
     config["hooks"] = hooks;

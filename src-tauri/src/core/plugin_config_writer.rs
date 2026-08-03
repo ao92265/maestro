@@ -33,6 +33,13 @@ fn merge_with_existing(
     // erroring on every future session.
     let mut config: Value = read_json_or_recover(settings_path)?;
 
+    // Valid JSON that isn't an object (a bare string or array) would make the
+    // index-assignment below panic — self-heal it to an object too.
+    if !config.is_object() {
+        log::warn!("settings.local.json is not a JSON object, rebuilding it");
+        config = json!({});
+    }
+
     // Remove legacy plugins array if present
     if let Some(obj) = config.as_object_mut() {
         obj.remove("plugins");

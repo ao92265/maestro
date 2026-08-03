@@ -534,10 +534,22 @@ async fn handle_hook_pre_tool(
         .unwrap_or("")
         .to_string();
 
+    // tool_input carries the tool's ENTIRE input — a Write call embeds the
+    // whole file body. Cap it like the transcript parser does (char-based,
+    // never mid-codepoint): the event crosses IPC on every tool call and is
+    // retained in the frontend's activity store.
     let tool_input = payload
         .extra
         .get("tool_input")
-        .map(|v| v.to_string())
+        .map(|v| {
+            let s = v.to_string();
+            if s.chars().count() <= 200 {
+                s
+            } else {
+                let truncated: String = s.chars().take(200).collect();
+                format!("{truncated}...")
+            }
+        })
         .unwrap_or_default();
 
     info!(
