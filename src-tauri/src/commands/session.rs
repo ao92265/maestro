@@ -9,6 +9,7 @@ use crate::core::plugin_manager::PluginManager;
 use crate::core::process_manager::ProcessManager;
 use crate::core::session_manager::{AiMode, SessionConfig, SessionManager, SessionStatus};
 use crate::core::status_server::StatusServer;
+use crate::core::transcript_watcher::TranscriptWatcher;
 
 /// Exposes `SessionManager::all_sessions` to the frontend.
 /// Returns a snapshot of all active sessions in arbitrary order.
@@ -127,6 +128,7 @@ pub async fn remove_sessions_for_project(
     mcp_manager: State<'_, McpManager>,
     status_server: State<'_, Arc<StatusServer>>,
     plugin_manager: State<'_, PluginManager>,
+    transcript_watcher: State<'_, Arc<TranscriptWatcher>>,
     project_path: String,
 ) -> Result<Vec<SessionConfig>, String> {
     let canonical = std::fs::canonicalize(&project_path)
@@ -144,6 +146,10 @@ pub async fn remove_sessions_for_project(
 
         // Unregister session from status server
         status_server.unregister_session(session.id).await;
+
+        // Release the transcript watcher (watchers are capped; leaked ones
+        // eventually block new sessions from getting an activity feed)
+        transcript_watcher.stop_watching(session.id);
 
         // Clean up .mcp.json entry (use worktree_path if set, otherwise project_path)
         let working_dir = session

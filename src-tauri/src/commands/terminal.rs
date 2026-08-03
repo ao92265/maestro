@@ -232,10 +232,17 @@ pub async fn save_pasted_image(data: Vec<u8>, media_type: String) -> Result<Stri
 pub async fn kill_all_sessions(
     state: State<'_, ProcessManager>,
     session_state: State<'_, SessionManager>,
+    transcript_watcher: State<'_, Arc<TranscriptWatcher>>,
 ) -> Result<u32, PtyError> {
     let pm = state.inner().clone();
     let killed = pm.kill_all_sessions().await?;
     let cleared = session_state.clear_all();
+    // Release every transcript watcher too: watchers are capped, and a
+    // frontend reload that leaks them eventually starves new sessions of
+    // their activity feed.
+    for session_id in transcript_watcher.watched_sessions() {
+        transcript_watcher.stop_watching(session_id);
+    }
     log::info!(
         "Cleanup: killed {} PTY session(s), cleared {} session entries",
         killed,
