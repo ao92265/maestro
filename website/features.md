@@ -17,7 +17,7 @@ nav_order: 4
 
 ## Multi-Terminal Session Grid
 
-Maestro's session grid lets you run 1–6 AI coding assistants simultaneously in a dynamic layout.
+Maestro's session grid lets you run 1–12 AI coding assistants simultaneously in a dynamic layout.
 
 - **Dynamic grid layout** — Automatically adjusts from 1x1 to 2x3 based on session count
 - **Real-time status indicators** — See each session's state at a glance (idle, working, waiting for input, done, error)

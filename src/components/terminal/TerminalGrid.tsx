@@ -65,7 +65,7 @@ import { useProjectColors } from "@/lib/useProjectColors";
 import { ParkedShelf } from "./ParkedShelf";
 import { PreLaunchCard, type SessionSlot } from "./PreLaunchCard";
 import { SplitPaneView } from "./SplitPaneView";
-import { createLeaf, splitLeaf, removeLeaf, updateRatio, collectSlotIds, findSiblingSlotId, buildGridTree, swapSlots, type TreeNode, type SplitDirection } from "./splitTree";
+import { MAX_SESSIONS, createLeaf, splitLeaf, removeLeaf, updateRatio, collectSlotIds, findSiblingSlotId, buildGridTree, swapSlots, type TreeNode, type SplitDirection } from "./splitTree";
 import { TerminalView } from "./TerminalView";
 import { SessionStatusDot, ThinkingIndicator } from "./ThinkingIndicator";
 
@@ -73,9 +73,6 @@ import { SessionStatusDot, ThinkingIndicator } from "./ThinkingIndicator";
 const EMPTY_MCP_SERVERS: McpServerConfig[] = [];
 const EMPTY_SKILLS: SkillConfig[] = [];
 const EMPTY_PLUGINS: PluginConfig[] = [];
-
-/** Hard ceiling on concurrent PTY sessions per grid to bound resource usage. */
-const MAX_SESSIONS = 6;
 
 /**
  * Launch mutex to serialize session launches within the same project.

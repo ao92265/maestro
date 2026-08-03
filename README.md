@@ -6,7 +6,7 @@
 
 ![Claude Maestro Platform](assets/platform_screenshot.png)
 
-A cross-platform desktop application that lets you run 1-6 Claude Code (or other AI CLI) sessions simultaneously, each in its own isolated git worktree.
+A cross-platform desktop application that lets you run 1-12 Claude Code (or other AI CLI) sessions simultaneously, each in its own isolated git worktree.
 
 ![macOS](https://img.shields.io/badge/macOS-13%2B-blue)
 ![Windows](https://img.shields.io/badge/Windows-10%2B-blue)
@@ -54,7 +54,7 @@ A cross-platform desktop application that lets you run 1-6 Claude Code (or other
 
 | Principle | Description |
 |-----------|-------------|
-| **Parallel Development** | Launch 1-6 AI sessions simultaneously. Work on feature branches, bug fixes, and refactoring all at once. |
+| **Parallel Development** | Launch 1-12 AI sessions simultaneously. Work on feature branches, bug fixes, and refactoring all at once. |
 | **True Isolation** | Each session operates in its own git worktree. No merge conflicts, no stepping on each other's changes. |
 | **AI-Native Workflow** | Built specifically for Claude Code, Gemini CLI, OpenAI Codex, and other AI coding assistants. |
 | **Cross-Platform** | Runs on macOS, Windows, and Linux with native performance. |
@@ -285,7 +285,7 @@ npm install -g @openai/codex
 1. **Launch Claude Maestro**
 2. **Select a project directory** (ideally a git repository)
 3. **Configure sessions** in the sidebar:
-   - Set the number of terminals (1-6)
+   - Set the number of terminals (1-12)
    - Choose AI mode for each session
    - Assign branches to sessions
 4. **Click "Launch"** to start all sessions

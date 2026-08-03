@@ -39,8 +39,7 @@ import { useGitStore } from "./stores/useGitStore";
 import { useTerminalSettingsStore } from "./stores/useTerminalSettingsStore";
 import { useStandupStore } from "@/stores/useStandupStore";
 import { useUpdateStore } from "./stores/useUpdateStore";
-
-const DEFAULT_SESSION_COUNT = 6;
+import { MAX_SESSIONS } from "./components/terminal/splitTree";
 
 /** Header title for each git-panel tab. */
 const GIT_PANEL_TITLES: Record<GitPanelTab, string> = {
@@ -435,7 +434,7 @@ function App() {
       tabId: t.id,
       name: t.name,
       color: projectColors.get(t.name) ?? projectColorFor(t.name),
-      atMax: (sessionCounts.get(t.id)?.slotCount ?? 0) >= DEFAULT_SESSION_COUNT,
+      atMax: (sessionCounts.get(t.id)?.slotCount ?? 0) >= MAX_SESSIONS,
     }));
 
   const handleAddSessionToProject = useCallback(
@@ -595,7 +594,7 @@ function App() {
               hideWindowControls
               inGridView={activeTabSessionsLaunched}
               slotCount={activeTabSlotCount}
-              maxSessions={DEFAULT_SESSION_COUNT}
+              maxSessions={MAX_SESSIONS}
               onAddSession={() => multiProjectRef.current?.addSessionToActiveProject()}
               eagleView={eagleView}
               onToggleEagleView={() => setEagleView((v) => !v)}

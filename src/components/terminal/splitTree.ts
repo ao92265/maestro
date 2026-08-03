@@ -25,6 +25,9 @@ export interface SplitNode {
 
 export type TreeNode = LeafNode | SplitNode;
 
+/** Hard ceiling on concurrent PTY sessions per grid to bound resource usage. */
+export const MAX_SESSIONS = 12;
+
 let _nextId = 0;
 function uid(): string {
   return `node-${Date.now()}-${++_nextId}`;
@@ -125,8 +128,9 @@ export function collectSlotIds(tree: TreeNode): string[] {
 }
 
 /**
- * Returns grid dimensions matching the old CSS grid layout:
- * 1→1x1, 2→2x1, 3→3x1, 4→2x2, 5-6→3x2, 7-9→3x3
+ * Returns grid dimensions matching the old CSS grid layout for up to 6
+ * panes (1→1x1, 2→2x1, 3→3x1, 4→2x2, 5-6→3x2); beyond that a square-ish
+ * grid with enough cells for every pane (7-9→3x3, 10-12→4x3, ...).
  */
 export function gridDimensions(count: number): { cols: number; rows: number } {
   if (count <= 1) return { cols: 1, rows: 1 };
@@ -134,7 +138,9 @@ export function gridDimensions(count: number): { cols: number; rows: number } {
   if (count === 3) return { cols: 3, rows: 1 };
   if (count === 4) return { cols: 2, rows: 2 };
   if (count <= 6) return { cols: 3, rows: 2 };
-  return { cols: 3, rows: 3 };
+  const cols = Math.ceil(Math.sqrt(count));
+  const rows = Math.ceil(count / cols);
+  return { cols, rows };
 }
 
 /**

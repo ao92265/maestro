@@ -86,7 +86,7 @@ Maestro will reuse an existing worktree if one already exists for the requested 
 
 ### How many sessions can I run simultaneously?
 
-Maestro supports 1–6 concurrent sessions. The practical limit depends on your system resources (RAM, CPU) and the AI CLIs' own requirements.
+Maestro supports 1–12 concurrent sessions. The practical limit depends on your system resources (RAM, CPU) and the AI CLIs' own requirements.
 
 ### Does Maestro use a lot of memory?
 

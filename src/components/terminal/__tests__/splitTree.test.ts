@@ -1,13 +1,47 @@
 import { describe, it, expect } from "vitest";
 import {
+  MAX_SESSIONS,
   buildGridTree,
   collectSlotIds,
   createLeaf,
+  gridDimensions,
   removeLeaf,
   splitLeaf,
   swapSlots,
   updateRatio,
 } from "../splitTree";
+
+describe("gridDimensions", () => {
+  it("keeps the classic layouts for 1-6 panes", () => {
+    expect(gridDimensions(1)).toEqual({ cols: 1, rows: 1 });
+    expect(gridDimensions(2)).toEqual({ cols: 2, rows: 1 });
+    expect(gridDimensions(3)).toEqual({ cols: 3, rows: 1 });
+    expect(gridDimensions(4)).toEqual({ cols: 2, rows: 2 });
+    expect(gridDimensions(5)).toEqual({ cols: 3, rows: 2 });
+    expect(gridDimensions(6)).toEqual({ cols: 3, rows: 2 });
+  });
+
+  it("always provides enough cells for every pane (no silently dropped panes)", () => {
+    for (let count = 1; count <= 16; count++) {
+      const { cols, rows } = gridDimensions(count);
+      expect(cols * rows).toBeGreaterThanOrEqual(count);
+    }
+  });
+
+  it("uses square-ish grids beyond 6 panes", () => {
+    expect(gridDimensions(9)).toEqual({ cols: 3, rows: 3 });
+    expect(gridDimensions(12)).toEqual({ cols: 4, rows: 3 });
+  });
+});
+
+describe("buildGridTree", () => {
+  it("places every slot in the tree up to MAX_SESSIONS", () => {
+    for (let count = 1; count <= MAX_SESSIONS; count++) {
+      const ids = Array.from({ length: count }, (_, i) => `s${i}`);
+      expect(collectSlotIds(buildGridTree(ids))).toEqual(ids);
+    }
+  });
+});
 
 describe("swapSlots", () => {
   it("swaps two leaves in a 2-pane horizontal split", () => {

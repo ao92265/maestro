@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { isMac } from "@/lib/platform";
+import { MAX_SESSIONS } from "@/components/terminal/splitTree";
 
 /** One entry of the eagle-view "add terminal" project dropdown. */
 export interface EagleProjectOption {
@@ -67,7 +68,7 @@ export function TopBar({
   hideWindowControls = false,
   inGridView = false,
   slotCount = 0,
-  maxSessions = 6,
+  maxSessions = MAX_SESSIONS,
   onAddSession,
   eagleView = false,
   onToggleEagleView,
