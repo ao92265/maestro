@@ -70,7 +70,16 @@ impl McpServer {
         let mut stdout = io::stdout();
 
         for line in stdin.lock().lines() {
-            let line = line?;
+            let line = match line {
+                Ok(l) => l,
+                // One non-UTF-8 byte must not kill the whole server (and
+                // with it the session's status reporting) — skip the line.
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                    eprintln!("Skipping non-UTF-8 input line: {}", e);
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
             if line.is_empty() {
                 continue;
             }
@@ -80,6 +89,21 @@ impl McpServer {
                 Ok(req) => req,
                 Err(e) => {
                     eprintln!("Failed to parse request: {}", e);
+                    // JSON-RPC 2.0 requires answering a parse error (id null,
+                    // code -32700) — silently dropping the line leaves the
+                    // client waiting forever for its response.
+                    let resp = JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id: Value::Null,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32700,
+                            message: format!("Parse error: {}", e),
+                        }),
+                    };
+                    let output = serde_json::to_string(&resp)?;
+                    writeln!(stdout, "{}", output)?;
+                    stdout.flush()?;
                     continue;
                 }
             };
