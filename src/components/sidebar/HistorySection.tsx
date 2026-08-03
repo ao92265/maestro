@@ -90,11 +90,17 @@ export function HistorySection({ onLaunch }: HistorySectionProps) {
     // Claude files transcripts per working directory, so a session that ran in
     // a worktree lives under that worktree's directory — not the repo's. Scan
     // the repo and every worktree, otherwise all branch work is invisible here.
+    // Skip only the worktree that IS repoPath under another spelling. Keying
+    // on is_main_worktree here hid the main checkout's conversations whenever
+    // the project tab points at a LINKED worktree — is_main marks the repo's
+    // first worktree, not the one this tab opened.
+    const normalizePath = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+    const repoKey = normalizePath(repoPath);
     const searchPaths = [
       repoPath,
-      // The main worktree is repoPath under another spelling; scanning it again
-      // would just cost an extra IPC round-trip for rows the dedupe discards.
-      ...worktrees.filter((w) => !w.is_bare && !w.is_main_worktree).map((w) => w.path),
+      ...worktrees
+        .filter((w) => !w.is_bare && normalizePath(w.path) !== repoKey)
+        .map((w) => w.path),
     ];
     const perPath = await Promise.all(
       searchPaths.map((path) => listClaudeSessions(path).catch(() => [] as ClaudeSessionInfo[]))
