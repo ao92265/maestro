@@ -210,20 +210,50 @@ async fn reader_task(
     // tool_result already came back with "async_launched", so the generic
     // completion must not be mistaken for the agent finishing.
     let mut async_task_ids: HashSet<String> = HashSet::new();
+    // Agents whose completion already went out: a resumed background agent
+    // can notify again under the same id with a fresh report, and that
+    // repeat must reach the bus too (the store updates it in place).
+    let mut completed_task_ids: HashSet<String> = HashSet::new();
 
     while rx.recv().await.is_some() {
         // Coalesce rapid notifications: drain any buffered signals so we
         // only read once per burst.
         while rx.try_recv().is_ok() {}
 
-        byte_offset = read_new_lines(
-            session_id,
-            &path,
-            byte_offset,
-            &event_bus,
-            &mut pending_task_ids,
-            &mut async_task_ids,
-        );
+        // The read pass is synchronous file I/O + JSON parsing; the initial
+        // catch-up can chew through a transcript of tens of MB. Run it on the
+        // blocking pool so N sessions catching up at once can't starve the
+        // async runtime (frozen terminals, hung commands) — and so abort()
+        // can take effect between passes.
+        let path_for_read = path.clone();
+        let bus = event_bus.clone();
+        let mut pending = std::mem::take(&mut pending_task_ids);
+        let mut asyncs = std::mem::take(&mut async_task_ids);
+        let mut completed = std::mem::take(&mut completed_task_ids);
+        let read_result = tokio::task::spawn_blocking(move || {
+            let offset = read_new_lines(
+                session_id,
+                &path_for_read,
+                byte_offset,
+                &bus,
+                &mut pending,
+                &mut asyncs,
+                &mut completed,
+            );
+            (offset, pending, asyncs, completed)
+        })
+        .await;
+        match read_result {
+            Ok((offset, pending, asyncs, completed)) => {
+                byte_offset = offset;
+                pending_task_ids = pending;
+                async_task_ids = asyncs;
+                completed_task_ids = completed;
+            }
+            Err(e) => {
+                log::error!("TranscriptWatcher: read pass for session {session_id} failed: {e}");
+            }
+        }
     }
 
     log::debug!("TranscriptWatcher: reader task for session {session_id} exiting");
@@ -254,6 +284,7 @@ fn read_new_lines(
     event_bus: &EventBus,
     pending_task_ids: &mut HashSet<String>,
     async_task_ids: &mut HashSet<String>,
+    completed_task_ids: &mut HashSet<String>,
 ) -> u64 {
     let file = match File::open(path) {
         Ok(f) => f,
@@ -285,6 +316,15 @@ fn read_new_lines(
         match reader.read_line(&mut line_buf) {
             Ok(0) => break, // EOF
             Ok(n) => {
+                // A line without a trailing newline is an entry the writer is
+                // still appending (notify fires on every modification, so we
+                // routinely wake mid-write). Consuming it would advance the
+                // offset past a fragment that parses as nothing, silently
+                // losing the whole entry's events — leave the offset at the
+                // line start and re-read once the writer finishes it.
+                if !line_buf.ends_with('\n') {
+                    break;
+                }
                 current_offset += n as u64;
                 let trimmed = line_buf.trim();
                 if !trimmed.is_empty() {
@@ -310,6 +350,12 @@ fn read_new_lines(
                             ClaudeEvent::SubagentCompleted { ref agent_id, .. } => {
                                 if pending_task_ids.remove(agent_id) {
                                     async_task_ids.remove(agent_id);
+                                    completed_task_ids.insert(agent_id.clone());
+                                    event_bus.emit(event);
+                                } else if completed_task_ids.contains(agent_id) {
+                                    // Repeat notification from a resumed
+                                    // background agent — carries a fresh
+                                    // report the store updates in place.
                                     event_bus.emit(event);
                                 }
                             }
@@ -387,7 +433,7 @@ mod tests {
         let path = file.path().to_path_buf();
         let (bus, collected) = test_event_bus();
 
-        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new());
+        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new(), &mut HashSet::new());
 
         assert_eq!(new_offset, 0, "empty file should keep offset at 0");
         assert!(
@@ -405,7 +451,7 @@ mod tests {
         let path = file.path().to_path_buf();
         let (bus, collected) = test_event_bus();
 
-        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new());
+        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new(), &mut HashSet::new());
 
         assert!(new_offset > 0, "offset should advance past the written line");
 
@@ -440,7 +486,7 @@ mod tests {
         let mut task_ids = HashSet::new();
 
         // First read picks up the first line.
-        let offset1 = read_new_lines(1, &path, 0, &bus, &mut task_ids, &mut HashSet::new());
+        let offset1 = read_new_lines(1, &path, 0, &bus, &mut task_ids, &mut HashSet::new(), &mut HashSet::new());
         assert_eq!(
             collected.lock().unwrap().len(),
             1,
@@ -453,7 +499,7 @@ mod tests {
         file.flush().expect("flush");
 
         // Second read starts from offset1 and should only pick up the new line.
-        let offset2 = read_new_lines(1, &path, offset1, &bus, &mut task_ids, &mut HashSet::new());
+        let offset2 = read_new_lines(1, &path, offset1, &bus, &mut task_ids, &mut HashSet::new(), &mut HashSet::new());
         assert!(
             offset2 > offset1,
             "offset should advance after reading second line"
@@ -489,7 +535,7 @@ mod tests {
         file.flush().unwrap();
 
         let (bus, collected) = test_event_bus();
-        read_new_lines(7, &file.path().to_path_buf(), 0, &bus, &mut HashSet::new(), &mut HashSet::new());
+        read_new_lines(7, &file.path().to_path_buf(), 0, &bus, &mut HashSet::new(), &mut HashSet::new(), &mut HashSet::new());
 
         let events = collected.lock().unwrap();
         // The Task's result surfaces as SubagentCompleted…
@@ -524,6 +570,7 @@ mod tests {
         let (bus, collected) = test_event_bus();
         let mut pending = HashSet::new();
         let mut async_ids = HashSet::new();
+        let mut completed = HashSet::new();
 
         // The spawn and the launch ack: still running, no completion yet.
         writeln!(file, "{spawn}").unwrap();
@@ -536,6 +583,7 @@ mod tests {
             &bus,
             &mut pending,
             &mut async_ids,
+            &mut completed,
         );
 
         {
@@ -572,6 +620,7 @@ mod tests {
             &bus,
             &mut pending,
             &mut async_ids,
+            &mut completed,
         );
 
         let events = collected.lock().unwrap();
@@ -614,6 +663,7 @@ mod tests {
             &bus,
             &mut HashSet::new(),
             &mut HashSet::new(),
+            &mut HashSet::new(),
         );
 
         let events = collected.lock().unwrap();
@@ -640,12 +690,42 @@ mod tests {
         }
     }
 
+    /// A trailing line without '\n' is an entry still being written: the
+    /// reader must leave the offset at the line start and pick the whole
+    /// entry up once the writer finishes it — consuming the fragment loses
+    /// the entry's events permanently.
+    #[test]
+    fn test_partial_trailing_line_is_not_consumed() {
+        let mut file = NamedTempFile::new().expect("create temp file");
+        let (bus, collected) = test_event_bus();
+        let path = file.path().to_path_buf();
+
+        // First half of the JSONL entry, no newline: mid-write snapshot.
+        let (first_half, second_half) = USER_MSG_LINE.split_at(40);
+        write!(file, "{first_half}").unwrap();
+        file.flush().unwrap();
+
+        let offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new(), &mut HashSet::new());
+        assert_eq!(offset, 0, "offset must stay at the unfinished line's start");
+        assert!(collected.lock().unwrap().is_empty(), "no events from a fragment");
+
+        // The writer finishes the line.
+        writeln!(file, "{second_half}").unwrap();
+        file.flush().unwrap();
+
+        let offset = read_new_lines(1, &path, offset, &bus, &mut HashSet::new(), &mut HashSet::new(), &mut HashSet::new());
+        assert!(offset > 0, "offset advances once the line is complete");
+        let events = collected.lock().unwrap();
+        assert_eq!(events.len(), 1, "the completed line parses exactly once");
+        assert!(matches!(&events[0], ClaudeEvent::UserMessage { text, .. } if text == "hello"));
+    }
+
     #[test]
     fn test_read_nonexistent_file() {
         let path = PathBuf::from("/tmp/nonexistent_transcript_test_file_12345.jsonl");
         let (bus, collected) = test_event_bus();
 
-        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new());
+        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new(), &mut HashSet::new());
 
         assert_eq!(
             new_offset, 0,

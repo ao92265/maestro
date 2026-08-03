@@ -177,8 +177,9 @@ fn subagent_completed(
     let status = str_field("status");
     // Only an explicit failure word counts as failure; anything else is passed
     // through verbatim in `status` so an unrecognised one is displayed rather
-    // than silently recoded as success or failure.
-    let failed = matches!(status.as_deref(), Some("failed") | Some("error"));
+    // than silently recoded as success or failure. "killed" is a failure: the
+    // agent was stopped before finishing its work.
+    let failed = matches!(status.as_deref(), Some("failed") | Some("error") | Some("killed"));
     let tool_stats = detail.get("toolStats").map(|s| {
         let count = |key: &str| s.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
         SubagentToolStats {
@@ -251,7 +252,7 @@ fn parse_user_message(session_id: u32, obj: &Value) -> Vec<ClaudeEvent> {
     if text.contains("<task-notification>") {
         if let Some(agent_id) = tag_value(&text, "tool-use-id") {
             let status = tag_value(&text, "status");
-            let failed = matches!(status.as_deref(), Some("failed") | Some("error"));
+            let failed = matches!(status.as_deref(), Some("failed") | Some("error") | Some("killed"));
             events.push(ClaudeEvent::SubagentCompleted {
                 session_id,
                 agent_id,
