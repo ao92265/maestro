@@ -32,13 +32,33 @@ case "$(uname -s)" in
     Darwin)
         if [ -n "$1" ]; then
             PATH_ARG="$(resolve_path "$1")"
-            launch_macos --args "$PATH_ARG"
+            # -n: force a second process. Without it, `open` merely focuses a
+            # running app and --args is silently dropped — the second process
+            # is what hands the path to the running instance via the
+            # single-instance plugin.
+            launch_macos -n --args "$PATH_ARG"
         else
             launch_macos
         fi
         ;;
     Linux)
-        MAESTRO_BIN="${MAESTRO_BIN:-maestro-app}"
+        # Resolve the app binary: the cargo build produces `maestro`, the
+        # bundled app `Maestro`. This CLI script is itself commonly installed
+        # as `maestro`, so never launch our own path (infinite recursion).
+        SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+        if [ -z "$MAESTRO_BIN" ]; then
+            for candidate in Maestro maestro; do
+                RESOLVED="$(command -v "$candidate" 2>/dev/null || true)"
+                if [ -n "$RESOLVED" ] && [ "$(readlink -f "$RESOLVED" 2>/dev/null || echo "$RESOLVED")" != "$SELF_PATH" ]; then
+                    MAESTRO_BIN="$RESOLVED"
+                    break
+                fi
+            done
+        fi
+        if [ -z "$MAESTRO_BIN" ]; then
+            echo "Error: Maestro binary not found on PATH. Set MAESTRO_BIN to its location." >&2
+            exit 1
+        fi
         if [ -n "$1" ]; then
             PATH_ARG="$(resolve_path "$1")"
             "$MAESTRO_BIN" "$PATH_ARG" &
