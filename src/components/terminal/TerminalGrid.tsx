@@ -1187,14 +1187,28 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
 
   /**
    * Parks a launched pane: hides it from the grid (CSS-only — the PTY and
-   * xterm instance keep running) and moves zoom/focus off it. Never calls
-   * killSession — restoring via the shelf brings the terminal back intact.
+   * xterm instance keep running) and moves zoom/focus off it. Parking the
+   * zoomed pane keeps the user in zoom-in: the next pane in zoom-strip order
+   * takes over the zoom (grid view only when nothing is left to zoom). Never
+   * calls killSession — restoring via the shelf brings the terminal back intact.
    */
   const handlePark = useCallback((slotId: string) => {
     const slot = slotsRef.current.find((s) => s.id === slotId);
     if (!slot || slot.sessionId === null) return;
     useSessionStore.getState().parkSession(slot.sessionId);
-    setZoomedSlotId((prev) => (prev === slotId ? null : prev));
+    if (zoomedSlotId === slotId) {
+      // Eagle mode suspends the per-project zoom — clear the stale zoom so
+      // leaving eagle view doesn't land on a pane the user never chose.
+      const idx = visibleDisplaySlotIds.indexOf(slotId);
+      const next = visibleDisplaySlotIds[(idx + 1) % visibleDisplaySlotIds.length];
+      if (!eagleMode && next !== undefined && next !== slotId) {
+        setZoomedSlotId(next);
+        setFocusedSlotId(next);
+        focusSlotTextarea(next);
+        return;
+      }
+      setZoomedSlotId(null);
+    }
     if (focusedSlotId === slotId) {
       const parked = useSessionStore.getState().parkedSessionIds;
       const fallback = slotsRef.current.find(
@@ -1202,7 +1216,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       );
       setFocusedSlotId(fallback ? fallback.id : findSiblingSlotId(layoutTree, slotId));
     }
-  }, [focusedSlotId, layoutTree]);
+  }, [focusedSlotId, layoutTree, zoomedSlotId, visibleDisplaySlotIds, eagleMode]);
 
   /**
    * Restores a parked session's pane into the view the user is in: while a

@@ -108,8 +108,8 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
     for (const tab of tabs) {
       if (!tab.sessionsLaunched) continue;
       for (const sessionId of tab.sessionIds) {
-        // Parked tiles are hidden — skipping them here also makes the
-        // stale-zoom guard below drop the zoom when a zoomed session parks.
+        // Parked tiles are hidden — skipping them here also triggers the
+        // stale-zoom guard below when the zoomed session itself parks.
         if (parkedSessionIds.includes(sessionId)) continue;
         list.push({
           sessionId,
@@ -135,13 +135,6 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
     })
   );
 
-  // Stale-zoom guard: if the zoomed session disappears (killed), drop the
-  // zoom — otherwise every tile stays visibility:hidden and the view blanks.
-  useEffect(() => {
-    if (eagleZoom === null) return;
-    if (!eagleSessions.some((s) => s.sessionId === eagleZoom)) setEagleZoom(null);
-  }, [eagleZoom, eagleSessions]);
-
   // User-dragged order for the eagle zoom tab strip (runtime-only — session
   // ids don't survive restarts). Same self-heal pattern as the per-project
   // zoom strip: killed sessions drop out, new ones append in natural order.
@@ -153,6 +146,33 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
       (a, b) => (rank.get(a.sessionId) ?? Infinity) - (rank.get(b.sessionId) ?? Infinity),
     );
   }, [eagleSessions, eagleTabOrder]);
+
+  // Stale-zoom guard: if the zoomed session disappears from the strip, keep
+  // the user in zoom-in when it was parked — the next terminal (same order as
+  // Alt+Arrow, via the previous strip order) takes over the zoom. Drop the
+  // zoom only when the session was killed or nothing is left to zoom —
+  // otherwise every tile stays visibility:hidden and the view blanks.
+  const prevEagleOrderRef = useRef<number[]>([]);
+  useEffect(() => {
+    if (eagleZoom !== null && !eagleSessions.some((s) => s.sessionId === eagleZoom)) {
+      const wasParked = useSessionStore.getState().parkedSessionIds.includes(eagleZoom);
+      let next: number | null = null;
+      if (wasParked && orderedEagleSessions.length > 0) {
+        const prevIds = prevEagleOrderRef.current;
+        const oldIdx = prevIds.indexOf(eagleZoom);
+        for (let step = 1; oldIdx >= 0 && step <= prevIds.length; step++) {
+          const cand = prevIds[(oldIdx + step) % prevIds.length];
+          if (orderedEagleSessions.some((s) => s.sessionId === cand)) {
+            next = cand;
+            break;
+          }
+        }
+        if (next === null) next = orderedEagleSessions[0].sessionId;
+      }
+      setEagleZoom(next);
+    }
+    prevEagleOrderRef.current = orderedEagleSessions.map((s) => s.sessionId);
+  }, [eagleZoom, eagleSessions, orderedEagleSessions]);
 
   const eagleTabSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } })
