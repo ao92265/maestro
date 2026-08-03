@@ -7,6 +7,13 @@ interface SessionActivity {
   totalInputTokens: number;
   totalOutputTokens: number;
   filesModified: string[];
+  /**
+   * Every Claude conversation UUID that has run in this terminal. Unlike
+   * `events` (capped at MAX_EVENTS_PER_SESSION) these are never evicted —
+   * the History tab's double-resume guard reads them, and a guard derived
+   * from the capped event list broke on long sessions.
+   */
+  conversationUuids: string[];
 }
 
 interface ActivityState {
@@ -24,6 +31,7 @@ function createEmptySession(): SessionActivity {
     totalInputTokens: 0,
     totalOutputTokens: 0,
     filesModified: [],
+    conversationUuids: [],
   };
 }
 
@@ -44,6 +52,23 @@ export const useActivityStore = create<ActivityState>((set, get) => ({
     set((state) => {
       const sessionId = event.session_id;
       const session = state.sessions[sessionId] ?? createEmptySession();
+
+      // A SessionStarted hook marks a fresh claude process in this terminal,
+      // and the transcript watcher then replays its conversation from byte 0.
+      // Reset the activity so the replay rebuilds it exactly once —
+      // accumulating across runs double-counted every resumed token. The
+      // conversation UUIDs survive the reset: they are identity, not activity.
+      if (event.event_type === "SessionStarted") {
+        const conversationUuids = session.conversationUuids.includes(event.claude_session_uuid)
+          ? session.conversationUuids
+          : [...session.conversationUuids, event.claude_session_uuid];
+        return {
+          sessions: {
+            ...state.sessions,
+            [sessionId]: { ...createEmptySession(), events: [event], conversationUuids },
+          },
+        };
+      }
 
       // Add event with cap
       const events = [...session.events, event];
@@ -71,6 +96,7 @@ export const useActivityStore = create<ActivityState>((set, get) => ({
             totalInputTokens,
             totalOutputTokens,
             filesModified,
+            conversationUuids: session.conversationUuids,
           },
         },
       };

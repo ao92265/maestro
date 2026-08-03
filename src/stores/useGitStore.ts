@@ -87,6 +87,14 @@ interface GitState {
   isLoadingMore: boolean;
   error: string | null;
 
+  /**
+   * Repo the display data (branches/commits/currentBranch) belongs to.
+   * Fetches stamp it synchronously and drop their response if a fetch for
+   * another repo superseded them — a slow response for the previous repo
+   * must not overwrite the current repo's panel.
+   */
+  activeRepoPath: string | null;
+
   // Actions
   fetchBranches: (repoPath: string) => Promise<void>;
   fetchCurrentBranch: (repoPath: string) => Promise<void>;
@@ -137,42 +145,50 @@ export const useGitStore = create<GitState>()((set, get) => ({
   isLoading: false,
   isLoadingMore: false,
   error: null,
+  activeRepoPath: null,
 
   fetchBranches: async (repoPath: string) => {
-    set({ isLoading: true, error: null });
+    set({ activeRepoPath: repoPath, isLoading: true, error: null });
     try {
       const branches = await invoke<BranchInfo[]>("git_branches", { repoPath });
+      if (get().activeRepoPath !== repoPath) return; // superseded by another repo
       set({ branches, isLoading: false });
     } catch (err) {
+      if (get().activeRepoPath !== repoPath) return;
       console.error("Failed to fetch branches:", err);
       set({ error: String(err), isLoading: false, branches: [] });
     }
   },
 
   fetchCurrentBranch: async (repoPath: string) => {
+    set({ activeRepoPath: repoPath });
     try {
       const currentBranch = await invoke<string>("git_current_branch", { repoPath });
+      if (get().activeRepoPath !== repoPath) return; // superseded by another repo
       set({ currentBranch });
     } catch (err) {
+      if (get().activeRepoPath !== repoPath) return;
       console.error("Failed to fetch current branch:", err);
       set({ currentBranch: null });
     }
   },
 
   fetchCommits: async (repoPath: string, maxCount = INITIAL_COMMIT_COUNT, allBranches = true) => {
-    set({ isLoading: true, error: null });
+    set({ activeRepoPath: repoPath, isLoading: true, error: null });
     try {
       const commits = await invoke<CommitInfo[]>("git_commit_log", {
         repoPath,
         maxCount,
         allBranches,
       });
+      if (get().activeRepoPath !== repoPath) return; // superseded by another repo
       set({
         commits,
         isLoading: false,
         hasMoreCommits: commits.length >= maxCount,
       });
     } catch (err) {
+      if (get().activeRepoPath !== repoPath) return;
       console.error("Failed to fetch commits:", err);
       set({ error: String(err), isLoading: false, commits: [] });
     }
@@ -182,7 +198,7 @@ export const useGitStore = create<GitState>()((set, get) => ({
     const { commits, hasMoreCommits, isLoadingMore } = get();
     if (!hasMoreCommits || isLoadingMore) return;
 
-    set({ isLoadingMore: true });
+    set({ activeRepoPath: repoPath, isLoadingMore: true });
     try {
       const newCount = commits.length + LOAD_MORE_COUNT;
       const allCommits = await invoke<CommitInfo[]>("git_commit_log", {
@@ -190,12 +206,14 @@ export const useGitStore = create<GitState>()((set, get) => ({
         maxCount: newCount,
         allBranches,
       });
+      if (get().activeRepoPath !== repoPath) return; // superseded by another repo
       set({
         commits: allCommits,
         isLoadingMore: false,
         hasMoreCommits: allCommits.length >= newCount,
       });
     } catch (err) {
+      if (get().activeRepoPath !== repoPath) return;
       console.error("Failed to load more commits:", err);
       set({ isLoadingMore: false });
     }
@@ -466,6 +484,7 @@ export const useGitStore = create<GitState>()((set, get) => ({
       isLoading: false,
       isLoadingMore: false,
       error: null,
+      activeRepoPath: null,
     });
   },
 }));

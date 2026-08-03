@@ -69,7 +69,15 @@ export const useAgentStore = create<AgentState>((set) => ({
     switch (event.event_type) {
       case "SubagentSpawned":
         set((state) => {
-          if (state.agents.some((a) => a.agentId === event.agent_id)) return state;
+          // Identity is (session, agent): resuming a conversation in a new
+          // terminal replays the same Task tool_use ids, and the new session
+          // must get its own nodes rather than be hidden by the dead one's.
+          if (
+            state.agents.some(
+              (a) => a.agentId === event.agent_id && a.sessionId === event.session_id
+            )
+          )
+            return state;
           return {
             agents: [
               ...state.agents,
@@ -102,10 +110,15 @@ export const useAgentStore = create<AgentState>((set) => ({
       // which real transcripts often omit — is what marks it as one.
       case "SubagentLaunched":
         set((state) => {
-          if (!state.agents.some((a) => a.agentId === event.agent_id)) return state;
+          if (
+            !state.agents.some(
+              (a) => a.agentId === event.agent_id && a.sessionId === event.session_id
+            )
+          )
+            return state;
           return {
             agents: state.agents.map((a) =>
-              a.agentId === event.agent_id
+              a.agentId === event.agent_id && a.sessionId === event.session_id
                 ? {
                     ...a,
                     runInBackground: true,
@@ -119,7 +132,9 @@ export const useAgentStore = create<AgentState>((set) => ({
         break;
       case "SubagentCompleted":
         set((state) => {
-          const target = state.agents.find((a) => a.agentId === event.agent_id);
+          const target = state.agents.find(
+            (a) => a.agentId === event.agent_id && a.sessionId === event.session_id
+          );
           if (!target) return state;
           // A detailed completion must not be clobbered by a bare one replayed
           // on catch-up. A later notification carrying a fresh report does
@@ -133,7 +148,7 @@ export const useAgentStore = create<AgentState>((set) => ({
           const completedAt = Number.isNaN(parsed) ? Date.now() : parsed;
           return {
             agents: state.agents.map((a) =>
-              a.agentId === event.agent_id
+              a.agentId === event.agent_id && a.sessionId === event.session_id
                 ? {
                     ...a,
                     completedAt,

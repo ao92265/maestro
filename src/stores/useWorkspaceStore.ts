@@ -200,14 +200,12 @@ export const useWorkspaceStore = create<WorkspaceState & WorkspaceActions>()(
       zoomTabOrders: {},
 
       openProject: async (path: string) => {
-        const { tabs } = get();
-
         // Deduplicate: if path already open, just activate that tab
-        const existing = tabs.find((t) => t.projectPath === path);
+        const existing = get().tabs.find((t) => t.projectPath === path);
         if (existing) {
-          set({
-            tabs: tabs.map((t) => ({ ...t, active: t.id === existing.id })),
-          });
+          set((state) => ({
+            tabs: state.tabs.map((t) => ({ ...t, active: t.id === existing.id })),
+          }));
           return;
         }
 
@@ -241,22 +239,34 @@ export const useWorkspaceStore = create<WorkspaceState & WorkspaceActions>()(
           selectedRepoPath = path;
         }
 
-        set({
-          tabs: [
-            ...tabs.map((t) => ({ ...t, active: false })),
-            {
-              id,
-              name,
-              projectPath: path,
-              active: true,
-              sessionIds: [],
-              sessionsLaunched: false,
-              workspaceType,
-              repositories,
-              selectedRepoPath,
-              worktreeBasePath: null,
-            },
-          ],
+        // Functional update: the awaits above can take seconds (repo scan),
+        // and a snapshot captured before them would clobber any tab change
+        // that landed meanwhile (concurrent CLI opens, session assignment).
+        // Re-check the dedup against current state for the same reason.
+        set((state) => {
+          const opened = state.tabs.find((t) => t.projectPath === path);
+          if (opened) {
+            return {
+              tabs: state.tabs.map((t) => ({ ...t, active: t.id === opened.id })),
+            };
+          }
+          return {
+            tabs: [
+              ...state.tabs.map((t) => ({ ...t, active: false })),
+              {
+                id,
+                name,
+                projectPath: path,
+                active: true,
+                sessionIds: [],
+                sessionsLaunched: false,
+                workspaceType,
+                repositories,
+                selectedRepoPath,
+                worktreeBasePath: null,
+              },
+            ],
+          };
         });
       },
 

@@ -71,9 +71,10 @@ export function HistorySection({ onLaunch }: HistorySectionProps) {
     const uuids = new Set<string>();
     for (const [maestroId, activity] of Object.entries(activitySessions)) {
       if (!liveIds.has(Number(maestroId))) continue;
-      for (const event of activity.events) {
-        if (event.event_type === "SessionStarted") uuids.add(event.claude_session_uuid);
-      }
+      // conversationUuids is kept outside the capped event list: deriving
+      // this from SessionStarted events broke once a long session evicted
+      // its own start event, making a live conversation double-resumable.
+      for (const uuid of activity.conversationUuids) uuids.add(uuid);
     }
     return uuids;
   }, [activitySessions, liveSessions]);
