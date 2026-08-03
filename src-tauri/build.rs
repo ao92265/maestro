@@ -69,9 +69,18 @@ fn copy_mcp_server_binary() {
         project_root.join("target").join(&target).join("release").join(binary_name),
     ];
 
+    // Pick the NEWEST existing candidate, not the first: in a debug build,
+    // candidate [0] (target/debug/…) is also the copy destination below, so a
+    // stale copy there would shadow a freshly rebuilt target/release binary
+    // forever.
     let mcp_source = candidates
         .into_iter()
-        .find(|p| p.exists())
+        .filter(|p| p.exists())
+        .max_by_key(|p| {
+            fs::metadata(p)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        })
         .unwrap_or_else(|| project_root.join("target").join("release").join(binary_name));
 
     if !mcp_source.exists() {
