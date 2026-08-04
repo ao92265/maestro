@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { GitFork, RefreshCw, X } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MAC_TITLE_BAR_INSET_PX, useMacTitleBarPadding } from "@/hooks/useMacTitleBarPadding";
 import { getDeduplicatedCurrentBranch } from "@/lib/git";
 import { isMac } from "@/lib/platform";
@@ -33,8 +33,15 @@ import { Sidebar } from "./components/sidebar/Sidebar";
 import { UpdateNotification } from "./components/update/UpdateNotification";
 import { useAppKeyboard } from "./hooks/useAppKeyboard";
 import { useSwipeNavigation } from "./hooks/useSwipeNavigation";
+import { GitHubWatchdogToasts } from "./components/shared/GitHubWatchdogToasts";
 import { initActivityListener, stopActivityListener } from "./stores/useActivityStore";
 import { initAgentListener, stopAgentListener } from "./stores/useAgentStore";
+import { useGitHubStore } from "./stores/useGitHubStore";
+import {
+  useGitHubWatchdogStore,
+  WATCHDOG_ISSUE_SEARCH,
+  WATCHDOG_PR_SEARCH,
+} from "./stores/useGitHubWatchdogStore";
 import { useGitStore } from "./stores/useGitStore";
 import { useTerminalSettingsStore } from "./stores/useTerminalSettingsStore";
 import { useStandupStore } from "@/stores/useStandupStore";
@@ -240,6 +247,35 @@ function App() {
     const interval = setInterval(checkForUpdates, checkIntervalMinutes * 60 * 1000);
     return () => clearInterval(interval);
   }, [autoCheckEnabled, checkIntervalMinutes, checkForUpdates]);
+
+  // GitHub watchdog: receive poll snapshots from the Rust background task.
+  const initWatchdogListeners = useGitHubWatchdogStore((s) => s.initListeners);
+  useEffect(() => {
+    const unlistenPromise = initWatchdogListeners().catch((err) => {
+      console.error("Failed to initialize GitHub watchdog listeners:", err);
+      return () => {};
+    });
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, [initWatchdogListeners]);
+
+  // GitHub watchdog: keep the Rust poller's project set in sync with the
+  // open workspace tabs. Serialized so active-tab flips (which also mutate
+  // `tabs`) don't re-invoke the command; the backend additionally ignores
+  // identical sets.
+  const watchedProjectsJson = useMemo(
+    () =>
+      JSON.stringify(
+        tabs.map((t) => ({ name: t.name, repoPath: t.selectedRepoPath ?? t.projectPath }))
+      ),
+    [tabs]
+  );
+  useEffect(() => {
+    void useGitHubWatchdogStore
+      .getState()
+      .syncProjects(JSON.parse(watchedProjectsJson));
+  }, [watchedProjectsJson]);
 
   // Standup scheduler: a minute tick that fires the daily report generation
   // once the configured local time has passed (at most once per day; the
@@ -515,6 +551,46 @@ function App() {
     });
   }, []);
 
+  // GitHub watchdog badge click: land on the git panel's PRs/Issues tab with
+  // the watchdog's search filter, in the project that has matching items
+  // (preferring the active project). Reuses the git-panel store fetches; the
+  // in-flight token guard absorbs the duplicate fetch GitGraphPanel fires.
+  const handleWatchdogNavigate = useCallback(
+    (kind: "prs" | "issues") => {
+      const watchdogProjects = useGitHubWatchdogStore.getState().projects;
+      const wsTabs = useWorkspaceStore.getState().tabs;
+      const pick = kind === "prs" ? "reviewRequests" : "assignedIssues";
+      const withItems = watchdogProjects.filter((p) => p[pick].length > 0);
+      const activeWsTab = wsTabs.find((t) => t.active);
+      const activeRepo = activeWsTab
+        ? (activeWsTab.selectedRepoPath ?? activeWsTab.projectPath)
+        : null;
+      const target = withItems.find((p) => p.repoPath === activeRepo) ?? withItems[0] ?? null;
+
+      if (target) {
+        const targetTab = wsTabs.find(
+          (t) => (t.selectedRepoPath ?? t.projectPath) === target.repoPath
+        );
+        if (targetTab && !targetTab.active) selectTab(targetTab.id);
+      }
+      // The git panel targets the active tab outside eagle view; leave eagle
+      // view so the selected project is actually the one shown.
+      setEagleView(false);
+
+      const repoPath = target?.repoPath ?? activeRepo;
+      if (repoPath) {
+        if (kind === "prs") {
+          void useGitHubStore.getState().fetchPullRequests(repoPath, "open", WATCHDOG_PR_SEARCH);
+        } else {
+          void useGitHubStore.getState().fetchIssues(repoPath, "open", WATCHDOG_ISSUE_SEARCH);
+        }
+      }
+      setGitPanelTab(kind);
+      setGitPanelOpen(true);
+    },
+    [selectTab]
+  );
+
   useAppKeyboard({
     onAddSession: handleAddSessionShortcut,
     canAddSession: activeTabSessionsLaunched,
@@ -608,6 +684,7 @@ function App() {
               onToggleNotesPanel={() => handleToggleUtilityPanel("notes")}
               standupPanelOpen={utilityPanel === "standup"}
               onToggleStandupPanel={() => handleToggleUtilityPanel("standup")}
+              onWatchdogNavigate={handleWatchdogNavigate}
             />
 
             {/* Git panel header - inline at same level as TopBar.
@@ -736,6 +813,7 @@ function App() {
       )}
 
       <UpdateNotification />
+      <GitHubWatchdogToasts />
     </div>
   );
 }

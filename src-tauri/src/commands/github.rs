@@ -1,7 +1,7 @@
 use crate::github::{
     AuthStatus, CreatePullRequestOptions, DiscussionDetail, DiscussionInfo, GitHub, GitHubError,
-    IssueDetail, IssueFilter, IssueInfo, MergeMethod, PullRequestDetail, PullRequestFilter,
-    PullRequestInfo,
+    GitHubWatchdog, IssueDetail, IssueFilter, IssueInfo, MergeMethod, PullRequestDetail,
+    PullRequestFilter, PullRequestInfo, WatchedProject,
 };
 
 /// Checks if the user is authenticated with GitHub CLI.
@@ -170,4 +170,15 @@ pub async fn github_comment_discussion(
 ) -> Result<(), GitHubError> {
     let gh = GitHub::new(&repo_path);
     gh.comment_discussion(number, &body).await
+}
+
+/// Replaces the set of projects the background GitHub watchdog polls.
+/// Called by the frontend whenever the open workspace tabs change; the
+/// watchdog polls immediately when the set actually changed.
+#[tauri::command]
+pub fn github_watchdog_set_projects(
+    state: tauri::State<'_, std::sync::Arc<GitHubWatchdog>>,
+    projects: Vec<WatchedProject>,
+) {
+    state.set_projects(projects);
 }

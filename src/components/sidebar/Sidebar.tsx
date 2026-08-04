@@ -56,6 +56,7 @@ import type {
   McpManagedServer,
 } from "@/lib/mcp";
 import { listContextDocs, readContextDoc, type ContextDoc } from "@/lib/claudemd";
+import { GitHubSettingsSection } from "./GitHubSettingsSection";
 import { HistorySection } from "./HistorySection";
 import { cardClass, divider, SectionHeader } from "./sectionChrome";
 
@@ -347,13 +348,17 @@ function ConfigTab({
       );
     case "settings":
       return (
-        <AppearanceSection
-          theme={theme}
-          onToggle={onToggleTheme}
-          launchedCount={launchedCount}
-          isStoppingAll={isStoppingAll}
-          onStopAll={onStopAll}
-        />
+        <>
+          <AppearanceSection
+            theme={theme}
+            onToggle={onToggleTheme}
+            launchedCount={launchedCount}
+            isStoppingAll={isStoppingAll}
+            onStopAll={onStopAll}
+          />
+          {divider}
+          <GitHubSettingsSection />
+        </>
       );
   }
 }

@@ -250,6 +250,13 @@ pub fn run() {
             app.manage(event_bus);
             app.manage(transcript_watcher);
 
+            // GitHub watchdog: background poller for review requests /
+            // assigned issues across all configured projects. The frontend
+            // syncs the project set via `github_watchdog_set_projects`.
+            let watchdog = Arc::new(github::GitHubWatchdog::new());
+            app.manage(watchdog.clone());
+            github::watchdog::spawn_watchdog(watchdog, app.handle().clone());
+
             // Capture any CLI-supplied path into PendingCliPath state. The
             // frontend drains this on mount via `take_pending_cli_path`, which
             // avoids the fragile "wait N ms then emit" race.
@@ -434,6 +441,7 @@ pub fn run() {
             commands::github::github_reopen_issue,
             commands::github::github_get_discussion,
             commands::github::github_comment_discussion,
+            commands::github::github_watchdog_set_projects,
             // Update commands
             commands::update::check_for_updates,
             commands::update::download_and_install_update,

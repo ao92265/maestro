@@ -15,6 +15,7 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import { isMac } from "@/lib/platform";
 import { MAX_SESSIONS } from "@/components/terminal/splitTree";
+import { GitHubWatchdogBadge } from "./GitHubWatchdogBadge";
 
 /** One entry of the eagle-view "add terminal" project dropdown. */
 export interface EagleProjectOption {
@@ -58,6 +59,9 @@ interface TopBarProps {
   /** Right-side Standup panel */
   standupPanelOpen?: boolean;
   onToggleStandupPanel?: () => void;
+  /** GitHub watchdog badge: navigate to the git panel with the matching
+   *  tab + search filter. Badge hides itself when totals are zero. */
+  onWatchdogNavigate?: (kind: "prs" | "issues") => void;
 }
 
 export function TopBar({
@@ -82,6 +86,7 @@ export function TopBar({
   onToggleNotesPanel,
   standupPanelOpen = false,
   onToggleStandupPanel,
+  onWatchdogNavigate,
 }: TopBarProps) {
   const appWindow = useMemo(() => getCurrentWindow(), []);
 
@@ -135,6 +140,8 @@ export function TopBar({
 
       {/* Right: action icons */}
       <div className="flex items-center gap-0.5 mr-1">
+        {/* GitHub watchdog totals (review requests / assigned issues) */}
+        {onWatchdogNavigate && <GitHubWatchdogBadge onNavigate={onWatchdogNavigate} />}
         {/* Active project: adds a pre-launch slot to its grid. */}
         {inGridView && !eagleView && (
           <button
