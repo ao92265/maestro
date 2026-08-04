@@ -1033,6 +1033,29 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   }, [launchSlot]);
 
   /**
+   * Closing/removing the zoomed pane keeps the user in zoom-in: the next
+   * pane in zoom-strip order takes over the zoom, same as parking/unparking
+   * (grid view only when nothing else is left to zoom). Without this the
+   * render-phase stale-zoom guard drops the user back to the grid. Returns
+   * true when a neighbor took over — zoom AND focus already moved.
+   */
+  const passZoomToNeighbor = useCallback((slotId: string): boolean => {
+    if (zoomedSlotId !== slotId) return false;
+    const idx = visibleDisplaySlotIds.indexOf(slotId);
+    const next = visibleDisplaySlotIds[(idx + 1) % visibleDisplaySlotIds.length];
+    // Eagle mode suspends the per-project zoom — clear the stale zoom so
+    // leaving eagle view doesn't land on a pane the user never chose.
+    if (!eagleMode && next !== undefined && next !== slotId) {
+      setZoomedSlotId(next);
+      setFocusedSlotId(next);
+      focusSlotTextarea(next);
+      return true;
+    }
+    setZoomedSlotId(null);
+    return false;
+  }, [zoomedSlotId, visibleDisplaySlotIds, eagleMode]);
+
+  /**
    * Handles killing/closing a session, updating the slot state.
    * Also cleans up any associated worktree and session-specific MCP config.
    */
@@ -1058,8 +1081,11 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       if (slot) {
         focusCallbacksRef.current.delete(slot.id);
 
+        // Closing the zoomed pane keeps the user in zoom view
+        const zoomMoved = passZoomToNeighbor(slot.id);
+
         // If the closed pane was focused, focus its sibling
-        if (focusedSlotId === slot.id) {
+        if (!zoomMoved && focusedSlotId === slot.id) {
           const sibling = findSiblingSlotId(layoutTree, slot.id);
           setFocusedSlotId(sibling);
         }
@@ -1127,7 +1153,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       }
       // "keep" (default): do nothing — worktree persists
     }
-  }, [tabId, effectiveRepoPath, projectPath, removeSessionFromProject, refreshBranches, focusedSlotId, layoutTree, onSessionCountChange, worktreeBasePath]);
+  }, [tabId, effectiveRepoPath, projectPath, removeSessionFromProject, refreshBranches, focusedSlotId, layoutTree, onSessionCountChange, worktreeBasePath, passZoomToNeighbor]);
 
   /**
    * Removes a pre-launch slot (before it's launched).
@@ -1143,8 +1169,11 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       return;
     }
 
+    // Removing the zoomed pre-launch card keeps the user in zoom view
+    const zoomMoved = passZoomToNeighbor(slotId);
+
     // If the removed pane was focused, focus its sibling
-    if (focusedSlotId === slotId) {
+    if (!zoomMoved && focusedSlotId === slotId) {
       const sibling = findSiblingSlotId(layoutTree, slotId);
       setFocusedSlotId(sibling);
     }
@@ -1156,7 +1185,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     });
 
     setSlots((prev) => prev.filter((s) => s.id !== slotId));
-  }, [focusedSlotId, layoutTree, onSessionCountChange]);
+  }, [focusedSlotId, layoutTree, onSessionCountChange, passZoomToNeighbor]);
 
   /** Kill a session's PTY and clean up its pane. False if this grid doesn't own it. */
   const killSessionById = useCallback((sessionId: number): boolean => {
