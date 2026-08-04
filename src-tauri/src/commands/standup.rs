@@ -18,7 +18,8 @@ use super::claude_sessions;
 use crate::core::status_server::StatusServer;
 use crate::git::Git;
 
-/// Generous ceiling — a standup covers at most a few days of work.
+/// Ceiling for the since-last-report commit log only — a standup covers at
+/// most a few days of work. The long-horizon overview has its own cap below.
 const MAX_COMMITS: usize = 100;
 /// Fallback window when no previous report exists (covers a long weekend).
 const DEFAULT_SINCE_DAYS: i64 = 3;
@@ -29,6 +30,9 @@ const MAX_COMMITS_CHARS: usize = 12_000;
 const MAX_SESSIONS_CHARS: usize = 4_000;
 /// Long-horizon window backing the "overall status" line of the report.
 const OVERVIEW_SINCE_DAYS: i64 = 30;
+/// Commit cap for the overview list (compact one-line-per-commit format);
+/// the char cap below trims whatever still overflows.
+const MAX_OVERVIEW_COMMITS: usize = 300;
 const MAX_OVERVIEW_CHARS: usize = 4_000;
 
 /// A generated (or loaded) standup report for one project.
@@ -234,11 +238,13 @@ Voice — it must read like I typed it myself:
 - No headings, no bold section titles, no greeting, no sign-off, no preamble like "Here's your standup", no code fences.
 - No AI-isms: never "Certainly", "Additionally", "Furthermore", "I successfully", "leveraged", "delved".
 - Summarize the work the way a dev would say it out loud. Do NOT enumerate commits, files, or every branch — group related work into one plain-words point. Skip technical detail a teammate wouldn't need.
+- The material can include teammates' commits (author names are shown). Only claim work I authored; leave other people's commits out.
 
 Shape (plain text, under 120 words total):
 - 2-4 short "-" bullets: what I got done since {since}, grouped by topic.
 - 1 bullet: what I'm picking up next (the natural follow-up from the material).
 - 1 bullet for blockers ONLY if the material shows a real one; otherwise leave blockers out or end a bullet with "no blockers".
+- If RECENT WORK shows nothing of mine since {since}, replace those bullets with one short line saying I've nothing new to report — do not pad, and do not mine the PROJECT OVERVIEW for filler.
 - Close with one or two sentences (no bullet): where the project stands overall — big-picture progress judged from the PROJECT OVERVIEW below, not just the last day's changes.
 
 RECENT WORK (since {since}):
@@ -252,6 +258,37 @@ RECENT WORK (since {since}):
 PROJECT OVERVIEW (only for the closing overall-status sentences):
 {overview}
 "#;
+
+/// Single-pass placeholder interpolation over `template`: each `{token}` in
+/// the TEMPLATE is replaced once, and substituted material is never
+/// re-scanned — so a commit subject or session prompt containing a literal
+/// "{sessions}"/"{overview}" cannot get expanded (unlike chained
+/// `str::replace`, which rescans the accumulated string).
+fn interpolate(template: &str, vars: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    loop {
+        let mut earliest: Option<(usize, &str, &str)> = None;
+        for &(token, value) in vars {
+            if let Some(pos) = rest.find(token) {
+                if earliest.map_or(true, |(p, _, _)| pos < p) {
+                    earliest = Some((pos, token, value));
+                }
+            }
+        }
+        match earliest {
+            Some((pos, token, value)) => {
+                out.push_str(&rest[..pos]);
+                out.push_str(value);
+                rest = &rest[pos + token.len()..];
+            }
+            None => {
+                out.push_str(rest);
+                return out;
+            }
+        }
+    }
+}
 
 /// Build the standup prompt from the gathered material. A non-empty custom
 /// template replaces the built-in one; both use the same placeholders.
@@ -268,34 +305,24 @@ fn build_prompt(
         Some(t) if !t.trim().is_empty() => t,
         _ => DEFAULT_PROMPT_TEMPLATE,
     };
-    template
-        .replace("{project}", project_name)
-        .replace("{date}", date)
-        .replace("{since}", since)
-        .replace(
-            "{commits}",
-            if commits.trim().is_empty() {
-                "(none)"
-            } else {
-                commits
-            },
-        )
-        .replace(
-            "{sessions}",
-            if sessions.trim().is_empty() {
-                "(none)"
-            } else {
-                sessions
-            },
-        )
-        .replace(
-            "{overview}",
-            if overview.trim().is_empty() {
-                "(none)"
-            } else {
-                overview
-            },
-        )
+    fn or_none(s: &str) -> &str {
+        if s.trim().is_empty() {
+            "(none)"
+        } else {
+            s
+        }
+    }
+    interpolate(
+        template,
+        &[
+            ("{project}", project_name),
+            ("{date}", date),
+            ("{since}", since),
+            ("{commits}", or_none(commits)),
+            ("{sessions}", or_none(sessions)),
+            ("{overview}", or_none(overview)),
+        ],
+    )
 }
 
 /// The built-in prompt template, for the panel's editor prefill / reset.
@@ -374,23 +401,37 @@ pub async fn generate_standup_report(
         })
         .collect::<Vec<_>>()
         .join(", ");
+    let branches_line = if branches.is_empty() {
+        "(none)".to_string()
+    } else {
+        branches
+    };
     let overview_since = (Local::now() - Duration::days(OVERVIEW_SINCE_DAYS))
         .format("%Y-%m-%d")
         .to_string();
     let overview_log = git
-        .commit_log_text_since(&overview_since, MAX_COMMITS)
+        .commit_subjects_text_since(&overview_since, MAX_OVERVIEW_COMMITS)
         .await
         .unwrap_or_default();
-    let overview = format!(
-        "Local branches: {}\n\nCommits from the last {} days (newest first):\n{}",
-        if branches.is_empty() {
-            "(none)".to_string()
-        } else {
-            branches
-        },
-        OVERVIEW_SINCE_DAYS,
-        overview_log
-    );
+    let commit_count = overview_log
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count();
+    let overview = if commit_count == 0 {
+        format!(
+            "Local branches: {}\n\nNo commits in the last {} days.",
+            branches_line, OVERVIEW_SINCE_DAYS
+        )
+    } else {
+        format!(
+            "Local branches: {}\n\n{}{} commits across all branches in the last {} days — most recent listed first, list may be truncated:\n{}",
+            branches_line,
+            commit_count,
+            if commit_count == MAX_OVERVIEW_COMMITS { "+" } else { "" },
+            OVERVIEW_SINCE_DAYS,
+            overview_log
+        )
+    };
 
     let project_name = Path::new(&canonical)
         .file_name()
@@ -540,6 +581,41 @@ mod tests {
         assert_eq!(
             p,
             "Report for maestro on 2026-07-31: abc fix bug / (none) / branch list"
+        );
+    }
+
+    #[test]
+    fn build_prompt_custom_template_without_overview_is_unchanged() {
+        // Backward-compat pin: a pre-{overview} custom template must produce
+        // byte-identical output even though an overview is now supplied.
+        let p = build_prompt(
+            Some("Report for {project} on {date}: {commits} / {sessions}"),
+            "maestro",
+            "2026-07-31",
+            "2026-07-30",
+            "abc fix bug",
+            "",
+            "branch list",
+        );
+        assert_eq!(p, "Report for maestro on 2026-07-31: abc fix bug / (none)");
+    }
+
+    #[test]
+    fn build_prompt_does_not_expand_tokens_inside_material() {
+        // Placeholder-looking text inside the material must pass through
+        // verbatim — only tokens in the template itself are interpolated.
+        let p = build_prompt(
+            Some("C: {commits} S: {sessions} O: {overview}"),
+            "maestro",
+            "2026-07-31",
+            "2026-07-30",
+            "subject mentions {sessions} and {overview}",
+            "session says {overview} and {commits}",
+            "OVERVIEW",
+        );
+        assert_eq!(
+            p,
+            "C: subject mentions {sessions} and {overview} S: session says {overview} and {commits} O: OVERVIEW"
         );
     }
 
