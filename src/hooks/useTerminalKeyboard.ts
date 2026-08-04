@@ -3,26 +3,18 @@ import { useEffect } from "react";
 interface UseTerminalKeyboardOptions {
   /** Total number of launched terminals */
   terminalCount: number;
-  /** Currently focused terminal index (0-based), or null if none focused */
-  focusedIndex: number | null;
-  /** Callback to focus a specific terminal by index */
-  onFocusTerminal: (index: number) => void;
-  /** Callback to cycle to the next terminal */
+  /** Callback to cycle focus to the next terminal (Cmd/Ctrl+Alt+Right) */
   onCycleNext: () => void;
-  /** Callback to cycle to the previous terminal */
+  /** Callback to cycle focus to the previous terminal (Cmd/Ctrl+Alt+Left) */
   onCyclePrevious: () => void;
-  /** Callback to split the focused terminal vertically (Cmd+D) */
-  onSplitVertical?: () => void;
-  /** Callback to split the focused terminal horizontally (Cmd+Shift+D) */
-  onSplitHorizontal?: () => void;
-  /** Callback to close the focused pane (Cmd+W) */
-  onClosePane?: () => void;
   /** Callback to toggle maximize on the focused terminal (Cmd/Ctrl+1) */
   onToggleZoomFocused?: () => void;
   /** Callback when Alt+ArrowRight is pressed (used to cycle zoomed terminal forward) */
   onZoomedNext?: () => void;
   /** Callback when Alt+ArrowLeft is pressed (used to cycle zoomed terminal backward) */
   onZoomedPrev?: () => void;
+  /** Callback to park the focused terminal (Alt+P) */
+  onParkFocused?: () => void;
   /**
    * Whether a single terminal is currently zoomed/maximized. When true, the
    * tab strip is visible and Alt+Left/Alt+Right cycle between tabs. When
@@ -45,40 +37,70 @@ function isMac(): boolean {
  * Global keyboard shortcut handler for terminal navigation.
  *
  * Shortcuts:
- * - Cmd/Ctrl+1-9,0: Jump to terminal N (1-9 for terminals 1-9, 0 for terminal 10)
- * - Cmd/Ctrl+[: Cycle to previous terminal
- * - Cmd/Ctrl+]: Cycle to next terminal
+ * - Cmd/Ctrl+1: Toggle maximize/zoom on the focused terminal
+ * - Cmd/Ctrl+Alt+Left/Right: Cycle focus to the previous/next terminal
+ * - Alt+Left/Right: Previous/next terminal tab while zoomed
+ * - Alt+P: Park the focused terminal
  */
 export function useTerminalKeyboard({
   terminalCount,
-  focusedIndex,
-  onFocusTerminal,
   onCycleNext,
   onCyclePrevious,
-  onSplitVertical,
-  onSplitHorizontal,
-  onClosePane,
   onToggleZoomFocused,
   onZoomedNext,
   onZoomedPrev,
+  onParkFocused,
   isZoomed = false,
   enabled = true,
 }: UseTerminalKeyboardOptions): void {
-  // Alt+Arrow needs CAPTURE-phase handling. xterm.js's key handler calls
-  // event.stopPropagation() for keys it processes, which kills any later
-  // bubble-phase listener — so a bubble-phase Alt+Arrow shortcut never fires
-  // while a terminal has focus. By registering in capture we win the race
-  // before xterm sees the event.
+  // Alt+Arrow, Cmd/Ctrl+Alt+Arrow and Alt+P need CAPTURE-phase handling.
+  // xterm.js's key handler calls event.stopPropagation() for keys it
+  // processes, which kills any later bubble-phase listener — so a
+  // bubble-phase shortcut never fires while a terminal has focus. By
+  // registering in capture we win the race before xterm sees the event.
   //
-  // We only consume Alt+Arrow when a terminal is currently zoomed, so users
-  // still get default Alt+Arrow word-movement inside the terminal in normal
-  // split-pane mode.
+  // We only consume bare Alt+Arrow when a terminal is currently zoomed, so
+  // users still get default Alt+Arrow word-movement inside the terminal in
+  // normal split-pane mode.
   useEffect(() => {
-    if (!enabled || !isZoomed) return;
+    if (!enabled) return;
 
-    function handleAltArrowCapture(event: KeyboardEvent) {
+    function handleCapture(event: KeyboardEvent) {
       if (event.type !== "keydown") return;
+
+      const modifierKey = isMac() ? event.metaKey : event.ctrlKey;
+
+      // Cmd/Ctrl+Alt+Left/Right: cycle terminal focus.
+      if (modifierKey && event.altKey && !event.shiftKey) {
+        if (terminalCount === 0) return;
+        if (event.key === "ArrowRight") {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          onCycleNext();
+          return;
+        }
+        if (event.key === "ArrowLeft") {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          onCyclePrevious();
+          return;
+        }
+        return;
+      }
+
+      // Alt-only shortcuts (no Cmd/Ctrl, no Shift)
       if (!event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+
+      // Alt+P: park the focused terminal. event.code for layout independence.
+      if (event.code === "KeyP" && onParkFocused) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        onParkFocused();
+        return;
+      }
+
+      // Alt+Left/Right: cycle zoom tabs — only while zoomed.
+      if (!isZoomed) return;
       if (event.key === "ArrowRight" && onZoomedNext) {
         event.preventDefault();
         event.stopImmediatePropagation();
@@ -93,10 +115,18 @@ export function useTerminalKeyboard({
       }
     }
 
-    window.addEventListener("keydown", handleAltArrowCapture, { capture: true });
-    return () =>
-      window.removeEventListener("keydown", handleAltArrowCapture, { capture: true });
-  }, [enabled, isZoomed, onZoomedNext, onZoomedPrev]);
+    window.addEventListener("keydown", handleCapture, { capture: true });
+    return () => window.removeEventListener("keydown", handleCapture, { capture: true });
+  }, [
+    enabled,
+    isZoomed,
+    terminalCount,
+    onCycleNext,
+    onCyclePrevious,
+    onZoomedNext,
+    onZoomedPrev,
+    onParkFocused,
+  ]);
 
   useEffect(() => {
     if (!enabled) return;
@@ -105,87 +135,19 @@ export function useTerminalKeyboard({
       const modifierKey = isMac() ? event.metaKey : event.ctrlKey;
       if (!modifierKey) return;
 
-      // Cmd/Ctrl+D: split pane (Shift = horizontal, no Shift = vertical)
-      // Works even with 0 launched terminals (splits pre-launch cards too).
-      // Match on event.code: with Shift held, event.key is "D", so a
-      // lowercase key comparison would make the horizontal split unreachable.
-      if (event.code === "KeyD" && !event.altKey) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        if (event.shiftKey) {
-          onSplitHorizontal?.();
-        } else {
-          onSplitVertical?.();
-        }
-        return;
-      }
-
-      // Cmd/Ctrl+W: close the focused pane
-      if (event.key === "w" && !event.altKey && !event.shiftKey) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        onClosePane?.();
-        return;
-      }
-
-      // Cmd/Ctrl+1: toggle maximize/zoom on the focused terminal.
-      // Overrides the legacy "focus terminal 1" mapping at the user's request.
-      // Use event.code so this is layout-independent.
-      if (
-        (event.code === "Digit1" || event.code === "Numpad1") &&
-        !event.altKey &&
-        !event.shiftKey &&
-        onToggleZoomFocused
-      ) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        onToggleZoomFocused();
-        return;
-      }
-
-      // Navigation shortcuts only apply when terminals exist
-      if (terminalCount === 0) return;
-
       // Don't interfere with other modifier combinations
       if (event.altKey || event.shiftKey) return;
 
-      // Handle number keys 2-9 and 0 for terminal jumping.
-      // "1" is reserved for toggle-zoom (handled above);
-      // "2" is reserved for the git panel (handled at the App level).
-      if (event.key >= "3" && event.key <= "9") {
-        const targetIndex = parseInt(event.key, 10) - 1;
-        if (targetIndex < terminalCount) {
-          event.preventDefault();
-          onFocusTerminal(targetIndex);
-        }
-        return;
-      }
-
-      if (event.key === "0") {
-        // 0 maps to terminal 10 (index 9)
-        const targetIndex = 9;
-        if (targetIndex < terminalCount) {
-          event.preventDefault();
-          onFocusTerminal(targetIndex);
-        }
-        return;
-      }
-
-      // Handle bracket keys for cycling
-      if (event.key === "]") {
+      // Cmd/Ctrl+1: toggle maximize/zoom on the focused terminal.
+      // Use event.code so this is layout-independent.
+      if ((event.code === "Digit1" || event.code === "Numpad1") && onToggleZoomFocused) {
         event.preventDefault();
-        onCycleNext();
-        return;
-      }
-
-      if (event.key === "[") {
-        event.preventDefault();
-        onCyclePrevious();
-        return;
+        event.stopImmediatePropagation();
+        onToggleZoomFocused();
       }
     }
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [enabled, terminalCount, focusedIndex, onFocusTerminal, onCycleNext, onCyclePrevious, onSplitVertical, onSplitHorizontal, onClosePane, onToggleZoomFocused]);
+  }, [enabled, onToggleZoomFocused]);
 }

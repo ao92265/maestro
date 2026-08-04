@@ -1,6 +1,6 @@
 import { X } from "lucide-react";
 import { useEffect, useRef } from "react";
-import { isMac } from "@/lib/platform";
+import { altLabel, modLabel } from "@/lib/shortcuts";
 
 interface ShortcutsModalProps {
   onClose: () => void;
@@ -16,35 +16,44 @@ interface ShortcutGroup {
   shortcuts: Shortcut[];
 }
 
-function buildGroups(mod: string): ShortcutGroup[] {
+function buildGroups(mod: string, alt: string): ShortcutGroup[] {
   return [
     {
-      title: "Window & Panels",
+      title: "Left Sidebar",
       shortcuts: [
-        { keys: ["Alt", "1"], description: "Toggle the left sidebar" },
-        { keys: [mod, "2"], description: "Toggle the git panel on the right" },
-        { keys: ["Alt", "N"], description: "Add a new pre-launch session pane" },
+        { keys: [alt, "1"], description: "General tab (press again to close)" },
+        { keys: [alt, "2"], description: "History tab (press again to close)" },
+        { keys: [alt, "3"], description: "Infra tab (press again to close)" },
+        { keys: [alt, "4"], description: "Settings tab (press again to close)" },
       ],
     },
     {
-      title: "Terminal Focus & Maximize",
+      title: "Right Panels",
       shortcuts: [
-        { keys: [mod, "1"], description: "Maximize the focused terminal (toggle)" },
-        { keys: ["Alt", "←"], description: "Previous terminal while maximized" },
-        { keys: ["Alt", "→"], description: "Next terminal while maximized" },
-        { keys: [mod, "3-9"], description: "Focus terminal 3-9" },
-        { keys: [mod, "0"], description: "Focus terminal 10" },
-        { keys: [mod, "["], description: "Cycle to previous terminal" },
-        { keys: [mod, "]"], description: "Cycle to next terminal" },
+        { keys: [mod, "2"], description: "Toggle the Git panel" },
+        { keys: [mod, "3"], description: "Toggle the Memory panel" },
+        { keys: [mod, "4"], description: "Toggle the Processes panel" },
+        { keys: [mod, "5"], description: "Toggle the Notes panel" },
+        { keys: [mod, "6"], description: "Toggle the Standup panel" },
       ],
     },
     {
-      title: "Sessions & Panes",
+      title: "Terminals & Views",
       shortcuts: [
-        { keys: [mod, "T"], description: "Add a session slot (in grid view)" },
-        { keys: [mod, "D"], description: "Split focused pane vertically" },
-        { keys: [mod, "Shift", "D"], description: "Split focused pane horizontally" },
-        { keys: [mod, "W"], description: "Close the focused pane" },
+        { keys: [mod, "T"], description: "New terminal (project picker in eagle view)" },
+        { keys: [mod, "1"], description: "Zoom the focused terminal (toggle)" },
+        { keys: [alt, "← →"], description: "Previous / next tab while zoomed" },
+        { keys: [mod, alt, "← →"], description: "Focus the previous / next terminal" },
+        { keys: [mod, "G"], description: "Toggle eagle view (all projects)" },
+        { keys: [alt, "P"], description: "Park the focused terminal" },
+      ],
+    },
+    {
+      title: "Projects",
+      shortcuts: [
+        // Ctrl on every platform: macOS reserves Cmd+Tab for the app switcher.
+        { keys: ["Ctrl", "Tab"], description: "Next project" },
+        { keys: ["Ctrl", "Shift", "Tab"], description: "Previous project" },
       ],
     },
   ];
@@ -60,8 +69,7 @@ function Key({ label }: { label: string }) {
 
 export function ShortcutsModal({ onClose }: ShortcutsModalProps) {
   const modalRef = useRef<HTMLDivElement>(null);
-  const mod = isMac() ? "⌘" : "Ctrl";
-  const groups = buildGroups(mod);
+  const groups = buildGroups(modLabel(), altLabel());
 
   useEffect(() => {
     const handleClick = (e: MouseEvent) => {

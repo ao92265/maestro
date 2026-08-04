@@ -53,6 +53,8 @@ interface TerminalViewProps {
   projectColor?: string;
   /** Reserve header space for the pane's drag handle overlay. */
   hasMoveHandle?: boolean;
+  /** Whether header tooltips advertise keyboard shortcuts (off in eagle view). */
+  showShortcutHints?: boolean;
 }
 
 /**
@@ -164,6 +166,7 @@ export const TerminalView = memo(function TerminalView({
   projectLabel,
   projectColor,
   hasMoveHandle = false,
+  showShortcutHints = true,
 }: TerminalViewProps) {
   const sessionData = useSessionStore(
     useShallow((s) => {
@@ -298,7 +301,7 @@ export const TerminalView = memo(function TerminalView({
   }, [fontSize, fontFamily, lineHeight, zoomLevel, getEffectiveFontFamily, getEffectiveFontSize]);
 
   /**
-   * Confirms with the user first (same dialog as the Cmd/Ctrl+W close path),
+   * Confirms with the user first,
    * then immediately removes the terminal from UI (optimistic update) and
    * kills the backend session in the background.
    */
@@ -648,19 +651,6 @@ export const TerminalView = memo(function TerminalView({
           return false;
         }
 
-        // Cmd/Ctrl+D (with or without Shift): split pane — block xterm so 'd' isn't sent to PTY.
-        // The DOM event bubbles to window where useTerminalKeyboard handles it.
-        // event.code, not event.key: with Shift held the key is "D", which a
-        // lowercase comparison would miss and hand the keystroke to xterm.
-        if (event.code === "KeyD" && (event.metaKey || event.ctrlKey) && !event.altKey && event.type === "keydown") {
-          return false;
-        }
-
-        // Cmd/Ctrl+W: close pane — block xterm so 'w' isn't sent to PTY.
-        if (event.key === "w" && (event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.type === "keydown") {
-          return false;
-        }
-
         // Cmd+K (Mac) or Ctrl+K (Linux/Windows): clear terminal scrollback + viewport
         if (event.key === "k" && (event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.type === "keydown") {
           term?.clear();
@@ -890,6 +880,7 @@ export const TerminalView = memo(function TerminalView({
         hasMoveHandle={hasMoveHandle}
         isFlagged={isFlagged}
         onToggleFlag={handleToggleFlag}
+        showShortcutHints={showShortcutHints}
       />
 
       {/* Tab bar — clicking its background or the already-active tab toggles
