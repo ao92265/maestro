@@ -402,6 +402,17 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     [displaySlotIds, parkedSlotIds],
   );
 
+  // Fresh zoom state for close paths that resolve after an async gap (the
+  // kill-confirm dialog, the kill IPC): a click-time closure could stomp a
+  // zoom requested while the dialog was open. Render-phase sync, same
+  // pattern as onAllSessionsClosedRef above — and keeping these out of
+  // callback deps stops zoom toggles from invalidating onKill/onRemove
+  // (which would defeat React.memo on TerminalView/PreLaunchCard).
+  const zoomedSlotIdRef = useRef<string | null>(null);
+  zoomedSlotIdRef.current = zoomedSlotId;
+  const visibleDisplaySlotIdsRef = useRef<string[]>([]);
+  visibleDisplaySlotIdsRef.current = visibleDisplaySlotIds;
+
   // Map focusedSlotId to an index in launchedSlots
   const focusedIndex = useMemo(() => {
     if (!focusedSlotId) return null;
@@ -1040,9 +1051,13 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
    * true when a neighbor took over — zoom AND focus already moved.
    */
   const passZoomToNeighbor = useCallback((slotId: string): boolean => {
-    if (zoomedSlotId !== slotId) return false;
-    const idx = visibleDisplaySlotIds.indexOf(slotId);
-    const next = visibleDisplaySlotIds[(idx + 1) % visibleDisplaySlotIds.length];
+    // Read through refs, not the render closure: kill paths call this after
+    // an async gap (confirm dialog / kill IPC), and a zoom requested during
+    // that gap must not be stomped by click-time state.
+    if (zoomedSlotIdRef.current !== slotId) return false;
+    const visible = visibleDisplaySlotIdsRef.current;
+    const idx = visible.indexOf(slotId);
+    const next = visible[(idx + 1) % visible.length];
     // Eagle mode suspends the per-project zoom — clear the stale zoom so
     // leaving eagle view doesn't land on a pane the user never chose.
     if (!eagleMode && next !== undefined && next !== slotId) {
@@ -1053,7 +1068,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     }
     setZoomedSlotId(null);
     return false;
-  }, [zoomedSlotId, visibleDisplaySlotIds, eagleMode]);
+  }, [eagleMode]);
 
   /**
    * Handles killing/closing a session, updating the slot state.
@@ -1241,19 +1256,10 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     const slot = slotsRef.current.find((s) => s.id === slotId);
     if (!slot || slot.sessionId === null) return;
     useSessionStore.getState().parkSession(slot.sessionId);
-    if (zoomedSlotId === slotId) {
-      // Eagle mode suspends the per-project zoom — clear the stale zoom so
-      // leaving eagle view doesn't land on a pane the user never chose.
-      const idx = visibleDisplaySlotIds.indexOf(slotId);
-      const next = visibleDisplaySlotIds[(idx + 1) % visibleDisplaySlotIds.length];
-      if (!eagleMode && next !== undefined && next !== slotId) {
-        setZoomedSlotId(next);
-        setFocusedSlotId(next);
-        focusSlotTextarea(next);
-        return;
-      }
-      setZoomedSlotId(null);
-    }
+    // Parking the zoomed pane: the next pane in zoom-strip order takes over
+    // the zoom (helper clears the zoom and falls through when nothing is
+    // left to zoom, so the focus fallback below still runs).
+    if (passZoomToNeighbor(slotId)) return;
     if (focusedSlotId === slotId) {
       const parked = useSessionStore.getState().parkedSessionIds;
       const fallback = slotsRef.current.find(
@@ -1261,7 +1267,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       );
       setFocusedSlotId(fallback ? fallback.id : findSiblingSlotId(layoutTree, slotId));
     }
-  }, [focusedSlotId, layoutTree, zoomedSlotId, visibleDisplaySlotIds, eagleMode]);
+  }, [focusedSlotId, layoutTree, passZoomToNeighbor]);
 
   /**
    * Restores a parked session's pane into the view the user is in: while a
