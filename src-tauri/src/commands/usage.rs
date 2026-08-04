@@ -68,7 +68,10 @@ struct ApiUsageResponse {
 
 #[derive(Debug, Deserialize)]
 struct UsageWindow {
-    utilization: f64,
+    /// Nullable: the API emits window-shaped objects with
+    /// `"utilization": null` (seen in the `extra_usage` blob); a required
+    /// f64 here would fail the whole response deserialize.
+    utilization: Option<f64>,
     resets_at: Option<String>,
 }
 
@@ -114,8 +117,10 @@ async fn read_keychain_credentials() -> Result<CredentialsData, String> {
     let output = tokio::process::Command::new("security")
         .args([
             "find-generic-password",
-            "-s", "Claude Code-credentials",
-            "-a", &username,
+            "-s",
+            "Claude Code-credentials",
+            "-a",
+            &username,
             "-w",
         ])
         .output()
@@ -126,11 +131,9 @@ async fn read_keychain_credentials() -> Result<CredentialsData, String> {
         return Err("No keychain entry found".to_string());
     }
 
-    let data = String::from_utf8(output.stdout)
-        .map_err(|_| "Invalid keychain data")?;
+    let data = String::from_utf8(output.stdout).map_err(|_| "Invalid keychain data")?;
 
-    serde_json::from_str(data.trim())
-        .map_err(|e| format!("Failed to parse keychain data: {}", e))
+    serde_json::from_str(data.trim()).map_err(|e| format!("Failed to parse keychain data: {}", e))
 }
 
 /// Read credentials from platform credential store (Windows/Linux).
@@ -152,8 +155,7 @@ async fn read_keychain_credentials() -> Result<CredentialsData, String> {
     .await
     .map_err(|e| format!("Task join error: {}", e))??;
 
-    serde_json::from_str(&result)
-        .map_err(|e| format!("Failed to parse credential data: {}", e))
+    serde_json::from_str(&result).map_err(|e| format!("Failed to parse credential data: {}", e))
 }
 
 /// Read credentials from file (fallback for non-macOS or if keychain fails).
@@ -172,8 +174,7 @@ async fn read_file_credentials() -> Result<CredentialsData, String> {
         .await
         .map_err(|e| format!("Failed to read file: {}", e))?;
 
-    serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse file: {}", e))
+    serde_json::from_str(&content).map_err(|e| format!("Failed to parse file: {}", e))
 }
 
 /// Get a valid access token, trying platform credential store first then file.
@@ -209,6 +210,52 @@ async fn get_access_token() -> Result<String, String> {
     Ok(oauth.access_token)
 }
 
+/// Map the API response into the frontend-facing `UsageData`.
+///
+/// Absent windows — and windows whose `utilization` is null — stay `None`
+/// so the UI can tell "not reported" apart from 0%.
+///
+/// Anthropic's API reports `utilization` already on a 0-100 scale for every
+/// window (do NOT reintroduce a `> 1.0 ? val : val * 100` heuristic — it
+/// pinned low session usage to 100%). Non-finite values are guarded
+/// (→ 0, never 100) and the result is clamped to [0, 100].
+fn to_usage_data(api: ApiUsageResponse) -> UsageData {
+    let parse_window = |w: Option<UsageWindow>| -> (Option<f64>, Option<String>) {
+        match w {
+            Some(UsageWindow {
+                utilization: Some(utilization),
+                resets_at,
+            }) => {
+                let percent = if utilization.is_finite() {
+                    utilization.clamp(0.0, 100.0)
+                } else {
+                    0.0
+                };
+                (Some(percent), resets_at)
+            }
+            _ => (None, None),
+        }
+    };
+
+    let (session_percent, session_resets_at) = parse_window(api.five_hour);
+    let (weekly_percent, weekly_resets_at) = parse_window(api.seven_day);
+    let (weekly_opus_percent, weekly_opus_resets_at) = parse_window(api.seven_day_opus);
+    let (spend_percent, spend_resets_at) = parse_window(api.cinder_cove);
+
+    UsageData {
+        session_percent,
+        session_resets_at,
+        weekly_percent,
+        weekly_resets_at,
+        weekly_opus_percent,
+        weekly_opus_resets_at,
+        spend_percent,
+        spend_resets_at,
+        error_message: None,
+        needs_auth: false,
+    }
+}
+
 /// Fetch usage data from Anthropic's OAuth API.
 /// Responses are cached for 30 seconds to prevent 429 errors when multiple
 /// components or re-renders trigger concurrent requests.
@@ -221,7 +268,11 @@ pub async fn get_claude_usage(force_refresh: Option<bool>) -> Result<UsageData, 
         if let Ok(guard) = USAGE_CACHE.lock() {
             if let Some((fetched_at, ttl, ref data)) = *guard {
                 if fetched_at.elapsed().as_secs() < ttl {
-                    log::debug!("Returning cached usage data (age: {}s, ttl: {}s)", fetched_at.elapsed().as_secs(), ttl);
+                    log::debug!(
+                        "Returning cached usage data (age: {}s, ttl: {}s)",
+                        fetched_at.elapsed().as_secs(),
+                        ttl
+                    );
                     return Ok(data.clone());
                 }
             }
@@ -308,44 +359,7 @@ async fn fetch_usage_from_api() -> Result<UsageData, String> {
         .await
         .map_err(|e| format!("Parse error: {}", e))?;
 
-    // Convert a reported window into (percent, resets_at); absent windows
-    // stay `None` so the UI can tell "not reported" apart from 0%.
-    //
-    // Anthropic's API reports `utilization` already on a 0-100 scale for
-    // every window (do NOT reintroduce a `> 1.0 ? val : val * 100` heuristic
-    // — it pinned low session usage to 100%). Non-finite values are guarded
-    // (→ 0, never 100) and the result is clamped to [0, 100].
-    let parse_window = |w: Option<UsageWindow>| -> (Option<f64>, Option<String>) {
-        match w {
-            Some(w) => {
-                let percent = if w.utilization.is_finite() {
-                    w.utilization.clamp(0.0, 100.0)
-                } else {
-                    0.0
-                };
-                (Some(percent), w.resets_at)
-            }
-            None => (None, None),
-        }
-    };
-
-    let (session_percent, session_resets_at) = parse_window(api_response.five_hour);
-    let (weekly_percent, weekly_resets_at) = parse_window(api_response.seven_day);
-    let (weekly_opus_percent, weekly_opus_resets_at) = parse_window(api_response.seven_day_opus);
-    let (spend_percent, spend_resets_at) = parse_window(api_response.cinder_cove);
-
-    let usage = UsageData {
-        session_percent,
-        session_resets_at,
-        weekly_percent,
-        weekly_resets_at,
-        weekly_opus_percent,
-        weekly_opus_resets_at,
-        spend_percent,
-        spend_resets_at,
-        error_message: None,
-        needs_auth: false,
-    };
+    let usage = to_usage_data(api_response);
 
     log::info!(
         "Usage: session={:?}, weekly={:?}, spend={:?}",
@@ -477,21 +491,25 @@ mod tests {
     }"#;
 
     #[test]
-    fn parses_enterprise_spend_window() {
+    fn maps_enterprise_response_to_spend_window_only() {
         let parsed: ApiUsageResponse = serde_json::from_str(ENTERPRISE_RESPONSE).unwrap();
-        assert!(parsed.five_hour.is_none());
-        assert!(parsed.seven_day.is_none());
-        assert!(parsed.seven_day_opus.is_none());
-        let spend = parsed.cinder_cove.expect("cinder_cove window should parse");
-        assert!((spend.utilization - 85.70003930000001).abs() < 1e-9);
+        let usage = to_usage_data(parsed);
+        assert_eq!(usage.session_percent, None);
+        assert_eq!(usage.session_resets_at, None);
+        assert_eq!(usage.weekly_percent, None);
+        assert_eq!(usage.weekly_opus_percent, None);
+        let spend = usage.spend_percent.expect("spend percent from cinder_cove");
+        assert!((spend - 85.70003930000001).abs() < 1e-9);
         assert_eq!(
-            spend.resets_at.as_deref(),
+            usage.spend_resets_at.as_deref(),
             Some("2026-09-06T10:33:51.866730+00:00")
         );
+        assert!(!usage.needs_auth);
+        assert_eq!(usage.error_message, None);
     }
 
     #[test]
-    fn parses_pro_max_windows_without_cinder_cove() {
+    fn maps_pro_max_response_to_session_and_weekly() {
         let parsed: ApiUsageResponse = serde_json::from_str(
             r#"{
                 "five_hour": {"utilization": 42.0, "resets_at": "2026-08-04T20:00:00Z"},
@@ -500,9 +518,35 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(parsed.five_hour.map(|w| w.utilization), Some(42.0));
-        assert_eq!(parsed.seven_day.map(|w| w.utilization), Some(63.5));
-        assert!(parsed.seven_day_opus.is_none());
-        assert!(parsed.cinder_cove.is_none());
+        let usage = to_usage_data(parsed);
+        assert_eq!(usage.session_percent, Some(42.0));
+        assert_eq!(
+            usage.session_resets_at.as_deref(),
+            Some("2026-08-04T20:00:00Z")
+        );
+        assert_eq!(usage.weekly_percent, Some(63.5));
+        assert_eq!(usage.weekly_resets_at, None);
+        assert_eq!(usage.weekly_opus_percent, None);
+        assert_eq!(usage.spend_percent, None);
+        assert_eq!(usage.spend_resets_at, None);
+    }
+
+    #[test]
+    fn treats_null_utilization_window_as_not_reported() {
+        // A window object can arrive with `"utilization": null` (that exact
+        // shape appears in the payload's extra_usage blob) — it must neither
+        // fail the deserialize nor render as a 0% bar.
+        let parsed: ApiUsageResponse = serde_json::from_str(
+            r#"{
+                "five_hour": {"utilization": null, "resets_at": "2026-08-04T20:00:00Z"},
+                "seven_day": null,
+                "seven_day_opus": null,
+                "cinder_cove": null
+            }"#,
+        )
+        .unwrap();
+        let usage = to_usage_data(parsed);
+        assert_eq!(usage.session_percent, None);
+        assert_eq!(usage.session_resets_at, None);
     }
 }
