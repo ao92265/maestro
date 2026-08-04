@@ -604,6 +604,9 @@ function EagleZoomTab({
   }, [isActive]);
 
   const isFlagged = useSessionStore((s) => s.flaggedSessionIds.includes(sessionId));
+  // Attention highlight (auto-unparked because the agent needs input) —
+  // same yellow chrome as the warning flag, cleared by selecting the session.
+  const hasAttention = useSessionStore((s) => s.attentionSessionIds.includes(sessionId));
   const handleClick = isActive
     ? () => useSessionStore.getState().toggleSessionFlag(sessionId)
     : onSelect;
@@ -612,7 +615,7 @@ function EagleZoomTab({
     transform: CSS.Transform.toString(transform),
     transition,
     opacity: isDragging ? 0.5 : 1,
-    ...(isActive && !isFlagged
+    ...(isActive && !isFlagged && !hasAttention
       ? {
           backgroundColor: `color-mix(in srgb, ${color} 15%, transparent)`,
           color,
@@ -628,7 +631,7 @@ function EagleZoomTab({
       {...listeners}
       onClick={handleClick}
       className={`flex shrink-0 items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors ${
-        isFlagged ? "warning-flag" : ""
+        isFlagged || hasAttention ? "warning-flag" : ""
       } ${
         isActive ? "" : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
       }`}

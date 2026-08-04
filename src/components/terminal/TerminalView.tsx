@@ -188,6 +188,9 @@ export const TerminalView = memo(function TerminalView({
   // Warning flag: user-toggled yellow chrome (header + tab strip), synced via
   // the session store so it shows in every view.
   const isFlagged = useSessionStore((s) => s.flaggedSessionIds.includes(sessionId));
+  // Attention highlight: auto-unparked because the agent asked for input —
+  // same yellow chrome, cleared when the user selects the session.
+  const hasAttention = useSessionStore((s) => s.attentionSessionIds.includes(sessionId));
   const toggleSessionFlag = useSessionStore((s) => s.toggleSessionFlag);
   const handleToggleFlag = useCallback(
     () => toggleSessionFlag(sessionId),
@@ -596,6 +599,10 @@ export const TerminalView = memo(function TerminalView({
               statusMessage: undefined,
               needsInputPrompt: undefined,
             });
+            // Answering the prompt also clears the auto-unpark attention
+            // highlight — the auto-unpark flow focuses this pane without a
+            // click, so replying may be the first user interaction with it.
+            useSessionStore.getState().clearSessionAttention(sessionId);
           }
         }
         writeStdin(sessionId, data).catch(console.error);
@@ -889,13 +896,14 @@ export const TerminalView = memo(function TerminalView({
         projectColor={projectColor}
         hasMoveHandle={hasMoveHandle}
         isFlagged={isFlagged}
+        hasAttention={hasAttention}
         onToggleFlag={handleToggleFlag}
       />
 
       {/* Tab bar — clicking its background or the already-active tab toggles
           the warning flag (yellow), in sync with the header above. */}
       <div
-        className={`flex shrink-0 cursor-pointer items-center gap-0.5 border-b border-neutral-800 ${isFlagged ? "warning-flag" : "bg-neutral-900/50"} px-2`}
+        className={`flex shrink-0 cursor-pointer items-center gap-0.5 border-b border-neutral-800 ${isFlagged || hasAttention ? "warning-flag" : "bg-neutral-900/50"} px-2`}
         onClick={(e) => {
           if ((e.target as HTMLElement).closest("button")) return;
           handleToggleFlag();

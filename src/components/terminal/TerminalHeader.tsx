@@ -45,6 +45,12 @@ interface TerminalHeaderProps {
   hasMoveHandle?: boolean;
   /** Warning flag: renders the header yellow (toggled by clicking it). */
   isFlagged?: boolean;
+  /**
+   * Attention highlight: the session was auto-unparked because its agent
+   * asked for input. Same yellow chrome as the warning flag; cleared when
+   * the user selects the session (not toggled by header clicks).
+   */
+  hasAttention?: boolean;
   /** Toggle the warning flag — fired on clicks outside interactive controls. */
   onToggleFlag?: () => void;
 }
@@ -78,6 +84,7 @@ export const TerminalHeader = memo(function TerminalHeader({
   projectColor,
   hasMoveHandle = false,
   isFlagged = false,
+  hasAttention = false,
   onToggleFlag,
 }: TerminalHeaderProps) {
   const { icon: ProviderIcon, label: providerLabel } = providerConfig[provider];
@@ -233,7 +240,7 @@ export const TerminalHeader = memo(function TerminalHeader({
 
   return (
     <div
-      className={`no-select flex ${adaptive.headerHeight} shrink-0 items-center ${adaptive.gapSize} border-b ${statusBorder} ${isFlagged ? "warning-flag" : "bg-maestro-surface"} ${hasMoveHandle ? "pl-6 pr-2" : "px-2"} ${onToggleFlag ? "cursor-pointer" : ""}`}
+      className={`no-select flex ${adaptive.headerHeight} shrink-0 items-center ${adaptive.gapSize} border-b ${statusBorder} ${isFlagged || hasAttention ? "warning-flag" : "bg-maestro-surface"} ${hasMoveHandle ? "pl-6 pr-2" : "px-2"} ${onToggleFlag ? "cursor-pointer" : ""}`}
       onClick={handleHeaderClick}
       title={onToggleFlag ? (isFlagged ? "Click to clear warning flag" : "Click to flag as warning") : undefined}
     >
