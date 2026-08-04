@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { RefreshCw } from "lucide-react";
 import { useUsageStore } from "@/stores/useUsageStore";
-import { formatResetTime } from "@/lib/usageParser";
+import { formatResetTime, getUsageBars } from "@/lib/usageParser";
 
 function barColor(percent: number): string {
   if (percent < 50) return "bg-maestro-green";
@@ -24,7 +24,9 @@ export function UsageBar() {
     );
   }
 
-  if (error || !usage) {
+  const bars = usage ? getUsageBars(usage) : [];
+
+  if (error || !usage || bars.length === 0) {
     return (
       <div className="flex items-center gap-2">
         <span className="text-[10px] text-maestro-muted/50" title={error ?? undefined}>
@@ -35,19 +37,22 @@ export function UsageBar() {
     );
   }
 
-  const weeklyReset = formatResetTime(usage.weeklyResetsAt);
-  const sessionReset = formatResetTime(usage.sessionResetsAt);
+  const tooltip = [
+    ...bars.map(
+      (b) => `${b.label}: ${Math.round(b.percent)}% (resets ${formatResetTime(b.resetsAt) || "—"})`,
+    ),
+    ...(usage.weeklyOpusPercent !== null
+      ? [`Weekly Opus: ${Math.round(usage.weeklyOpusPercent)}%`]
+      : []),
+  ].join("\n");
 
   return (
-    <div className="flex items-center gap-2" title={
-      `Session: ${Math.round(usage.sessionPercent)}% (resets ${sessionReset || "—"})\n` +
-      `Weekly: ${Math.round(usage.weeklyPercent)}% (resets ${weeklyReset || "—"})\n` +
-      `Weekly Opus: ${Math.round(usage.weeklyOpusPercent)}%`
-    }>
+    <div className="flex items-center gap-2" title={tooltip}>
       <RefreshButton onClick={() => fetchUsage(true)} spinning={isLoading} />
       <div className="flex items-center gap-3">
-        <Bar label="Session" percent={usage.sessionPercent} reset={sessionReset} />
-        <Bar label="Week" percent={usage.weeklyPercent} reset={weeklyReset} />
+        {bars.map((b) => (
+          <Bar key={b.label} label={b.label} percent={b.percent} reset={formatResetTime(b.resetsAt)} />
+        ))}
       </div>
     </div>
   );

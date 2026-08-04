@@ -19,48 +19,51 @@ const CACHE_TTL_SECS: u64 = 30;
 static USAGE_CACHE: Mutex<Option<(Instant, u64, UsageData)>> = Mutex::new(None);
 
 /// Usage data from Anthropic's OAuth API.
-#[derive(Debug, Clone, Serialize)]
+///
+/// Every window is optional: the API reports different windows per account
+/// type. Pro/Max accounts get the session/weekly windows; enterprise seats
+/// get a monthly spend budget instead, with the session/weekly windows
+/// returned as null. `None` means "window not reported" — distinct from 0%.
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageData {
     /// Session (5-hour window) usage percentage (0-100).
-    pub session_percent: f64,
+    pub session_percent: Option<f64>,
     /// When the session window resets (ISO 8601).
     pub session_resets_at: Option<String>,
     /// Weekly (7-day window) usage percentage for all models (0-100).
-    pub weekly_percent: f64,
+    pub weekly_percent: Option<f64>,
     /// When the weekly window resets (ISO 8601).
     pub weekly_resets_at: Option<String>,
     /// Weekly Opus-specific usage percentage (0-100).
-    pub weekly_opus_percent: f64,
+    pub weekly_opus_percent: Option<f64>,
     /// When the weekly Opus window resets (ISO 8601).
     pub weekly_opus_resets_at: Option<String>,
+    /// Monthly spend-budget usage percentage (0-100). Enterprise seats
+    /// report this window (named `cinder_cove` by the API) instead of the
+    /// session/weekly windows.
+    pub spend_percent: Option<f64>,
+    /// When the spend budget resets (ISO 8601).
+    pub spend_resets_at: Option<String>,
     /// Error message if token is expired or unavailable.
     pub error_message: Option<String>,
     /// Whether authentication is needed (token expired or missing).
     pub needs_auth: bool,
 }
 
-impl Default for UsageData {
-    fn default() -> Self {
-        Self {
-            session_percent: 0.0,
-            session_resets_at: None,
-            weekly_percent: 0.0,
-            weekly_resets_at: None,
-            weekly_opus_percent: 0.0,
-            weekly_opus_resets_at: None,
-            error_message: None,
-            needs_auth: false,
-        }
-    }
-}
-
 /// Response from Anthropic's /api/oauth/usage endpoint.
+///
+/// Which windows are populated depends on the account type: Pro/Max accounts
+/// report `five_hour`/`seven_day`/`seven_day_opus`, while enterprise seats
+/// report all of those as null and carry their monthly dollar budget under
+/// `cinder_cove` (observed with Claude Code 2.1.x, 2026-08). Unknown keys
+/// are ignored by serde.
 #[derive(Debug, Deserialize)]
 struct ApiUsageResponse {
     five_hour: Option<UsageWindow>,
     seven_day: Option<UsageWindow>,
     seven_day_opus: Option<UsageWindow>,
+    cinder_cove: Option<UsageWindow>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -305,52 +308,50 @@ async fn fetch_usage_from_api() -> Result<UsageData, String> {
         .await
         .map_err(|e| format!("Parse error: {}", e))?;
 
-    // Helper to convert utilization to percentage.
+    // Convert a reported window into (percent, resets_at); absent windows
+    // stay `None` so the UI can tell "not reported" apart from 0%.
     //
-    // Fix: the old heuristic `if val > 1.0 { val } else { val * 100.0 }` misfired
-    // for the session (`five_hour`) window. Anthropic's API reports `utilization`
-    // already on a 0-100 scale (matching the weekly window, which renders
-    // correctly). When session usage was low — e.g. exactly `1.0` (1%) or any
-    // value in (0, 1] — the `> 1.0` check failed and the value got multiplied by
-    // 100, pinning the bar to 100%. It also passed NaN/Infinity straight through
-    // (NaN > 1.0 is false → NaN * 100 = NaN → garbage / 100% in the UI).
-    //
-    // All windows share the same 0-100 scale, so we treat the value uniformly,
-    // guard non-finite inputs (→ 0, never 100), and clamp to [0, 100].
-    let to_percent = |val: f64| -> f64 {
-        if !val.is_finite() {
-            return 0.0;
+    // Anthropic's API reports `utilization` already on a 0-100 scale for
+    // every window (do NOT reintroduce a `> 1.0 ? val : val * 100` heuristic
+    // — it pinned low session usage to 100%). Non-finite values are guarded
+    // (→ 0, never 100) and the result is clamped to [0, 100].
+    let parse_window = |w: Option<UsageWindow>| -> (Option<f64>, Option<String>) {
+        match w {
+            Some(w) => {
+                let percent = if w.utilization.is_finite() {
+                    w.utilization.clamp(0.0, 100.0)
+                } else {
+                    0.0
+                };
+                (Some(percent), w.resets_at)
+            }
+            None => (None, None),
         }
-        val.clamp(0.0, 100.0)
     };
 
+    let (session_percent, session_resets_at) = parse_window(api_response.five_hour);
+    let (weekly_percent, weekly_resets_at) = parse_window(api_response.seven_day);
+    let (weekly_opus_percent, weekly_opus_resets_at) = parse_window(api_response.seven_day_opus);
+    let (spend_percent, spend_resets_at) = parse_window(api_response.cinder_cove);
+
     let usage = UsageData {
-        session_percent: api_response
-            .five_hour
-            .as_ref()
-            .map(|w| to_percent(w.utilization))
-            .unwrap_or(0.0),
-        session_resets_at: api_response.five_hour.and_then(|w| w.resets_at),
-        weekly_percent: api_response
-            .seven_day
-            .as_ref()
-            .map(|w| to_percent(w.utilization))
-            .unwrap_or(0.0),
-        weekly_resets_at: api_response.seven_day.and_then(|w| w.resets_at),
-        weekly_opus_percent: api_response
-            .seven_day_opus
-            .as_ref()
-            .map(|w| to_percent(w.utilization))
-            .unwrap_or(0.0),
-        weekly_opus_resets_at: api_response.seven_day_opus.and_then(|w| w.resets_at),
+        session_percent,
+        session_resets_at,
+        weekly_percent,
+        weekly_resets_at,
+        weekly_opus_percent,
+        weekly_opus_resets_at,
+        spend_percent,
+        spend_resets_at,
         error_message: None,
         needs_auth: false,
     };
 
     log::info!(
-        "Usage: session={:.1}%, weekly={:.1}%",
+        "Usage: session={:?}, weekly={:?}, spend={:?}",
         usage.session_percent,
-        usage.weekly_percent
+        usage.weekly_percent,
+        usage.spend_percent
     );
 
     Ok(usage)
@@ -445,4 +446,63 @@ pub async fn get_claude_account() -> Result<ClaudeAccount, String> {
         }
     }
     Ok(account)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Trimmed real /api/oauth/usage response captured from an enterprise
+    /// seat (Claude Code 2.1.x, 2026-08-04): the classic session/weekly
+    /// windows are null and the monthly dollar budget arrives as the
+    /// `cinder_cove` window. Unknown keys (experiment codenames, nested
+    /// spend/extra_usage blobs) must be ignored.
+    const ENTERPRISE_RESPONSE: &str = r#"{
+        "five_hour": null,
+        "seven_day": null,
+        "seven_day_oauth_apps": null,
+        "seven_day_opus": null,
+        "seven_day_sonnet": null,
+        "tangelo": null,
+        "cinder_cove": {
+            "utilization": 85.70003930000001,
+            "resets_at": "2026-09-06T10:33:51.866730+00:00",
+            "limit_dollars": 1000,
+            "used_dollars": 857.000393,
+            "remaining_dollars": 142.99960699999997
+        },
+        "extra_usage": {"is_enabled": true, "monthly_limit": 100, "utilization": null},
+        "limits": [],
+        "spend": {"percent": 0, "severity": "normal"}
+    }"#;
+
+    #[test]
+    fn parses_enterprise_spend_window() {
+        let parsed: ApiUsageResponse = serde_json::from_str(ENTERPRISE_RESPONSE).unwrap();
+        assert!(parsed.five_hour.is_none());
+        assert!(parsed.seven_day.is_none());
+        assert!(parsed.seven_day_opus.is_none());
+        let spend = parsed.cinder_cove.expect("cinder_cove window should parse");
+        assert!((spend.utilization - 85.70003930000001).abs() < 1e-9);
+        assert_eq!(
+            spend.resets_at.as_deref(),
+            Some("2026-09-06T10:33:51.866730+00:00")
+        );
+    }
+
+    #[test]
+    fn parses_pro_max_windows_without_cinder_cove() {
+        let parsed: ApiUsageResponse = serde_json::from_str(
+            r#"{
+                "five_hour": {"utilization": 42.0, "resets_at": "2026-08-04T20:00:00Z"},
+                "seven_day": {"utilization": 63.5, "resets_at": null},
+                "seven_day_opus": null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.five_hour.map(|w| w.utilization), Some(42.0));
+        assert_eq!(parsed.seven_day.map(|w| w.utilization), Some(63.5));
+        assert!(parsed.seven_day_opus.is_none());
+        assert!(parsed.cinder_cove.is_none());
+    }
 }

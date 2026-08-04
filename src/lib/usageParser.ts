@@ -1,19 +1,55 @@
 import { invoke } from "@tauri-apps/api/core";
 
-/** Usage data from Anthropic's OAuth API. */
+/**
+ * Usage data from Anthropic's OAuth API.
+ *
+ * Every window is nullable: the API reports different windows per account
+ * type. Pro/Max accounts get the session/weekly windows; enterprise seats
+ * get a monthly spend budget instead, with the session/weekly windows
+ * returned as null. `null` means "window not reported" — distinct from 0%.
+ */
 export interface UsageData {
-  sessionPercent: number;
+  sessionPercent: number | null;
   sessionResetsAt: string | null;
-  weeklyPercent: number;
+  weeklyPercent: number | null;
   weeklyResetsAt: string | null;
-  weeklyOpusPercent: number;
+  weeklyOpusPercent: number | null;
   weeklyOpusResetsAt: string | null;
+  spendPercent: number | null;
+  spendResetsAt: string | null;
   errorMessage: string | null;
   needsAuth: boolean;
 }
 
 export async function getClaudeUsage(forceRefresh = false): Promise<UsageData> {
   return invoke<UsageData>("get_claude_usage", { forceRefresh });
+}
+
+/** One bar of the usage display. */
+export interface UsageWindowBar {
+  label: string;
+  percent: number;
+  resetsAt: string | null;
+}
+
+/**
+ * Pick which bars to render: one per window the API actually reported.
+ * Pro/Max accounts report session + weekly windows; enterprise seats report
+ * a monthly spend budget instead (session/weekly come back null for those).
+ * Weekly Opus stays tooltip-only, matching the previous display.
+ */
+export function getUsageBars(usage: UsageData): UsageWindowBar[] {
+  const bars: UsageWindowBar[] = [];
+  if (usage.sessionPercent !== null) {
+    bars.push({ label: "Session", percent: usage.sessionPercent, resetsAt: usage.sessionResetsAt });
+  }
+  if (usage.weeklyPercent !== null) {
+    bars.push({ label: "Week", percent: usage.weeklyPercent, resetsAt: usage.weeklyResetsAt });
+  }
+  if (usage.spendPercent !== null) {
+    bars.push({ label: "Budget", percent: usage.spendPercent, resetsAt: usage.spendResetsAt });
+  }
+  return bars;
 }
 
 export interface ClaudeAccount {
