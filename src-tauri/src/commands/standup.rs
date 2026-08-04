@@ -130,8 +130,9 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     format!("{}\n[... truncated ...]", truncated)
 }
 
-/// Newest saved report date strictly before `today` (ISO dates sort lexically).
-async fn latest_report_date_before(dir: &Path, today: &str) -> Option<String> {
+/// Newest saved report date in `dir`, optionally strictly before `before`
+/// (ISO dates sort lexically).
+async fn latest_report_date(dir: &Path, before: Option<&str>) -> Option<String> {
     let mut entries = tokio::fs::read_dir(dir).await.ok()?;
     let mut best: Option<String> = None;
     while let Ok(Some(entry)) = entries.next_entry().await {
@@ -139,7 +140,7 @@ async fn latest_report_date_before(dir: &Path, today: &str) -> Option<String> {
         if let Some(date) = name.strip_suffix(".md") {
             if date.len() == 10
                 && NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()
-                && date < today
+                && before.map_or(true, |b| date < b)
                 && best.as_deref().map_or(true, |b| date > b)
             {
                 best = Some(date.to_string());
@@ -343,7 +344,7 @@ pub async fn generate_standup_report(
 
     let today = Local::now().format("%Y-%m-%d").to_string();
     let report_dir = project_report_dir(&canonical);
-    let since = latest_report_date_before(&report_dir, &today)
+    let since = latest_report_date(&report_dir, Some(&today))
         .await
         .unwrap_or_else(|| {
             (Local::now() - Duration::days(DEFAULT_SINCE_DAYS))
@@ -470,8 +471,10 @@ pub async fn generate_standup_report(
     })
 }
 
-/// Load a previously generated report (today's when `date` is omitted).
-/// Returns `None` when no report exists for that date.
+/// Load a previously generated report. When `date` is omitted, serves the
+/// newest saved report (today's when it exists, otherwise the last one
+/// generated) so the panel keeps showing a report until the next day's
+/// replaces it. Returns `None` when no matching report exists.
 #[tauri::command]
 pub async fn load_standup_report(
     project_path: String,
@@ -486,7 +489,9 @@ pub async fn load_standup_report(
                 .map_err(|_| format!("Invalid report date: {}", d))?;
             d
         }
-        None => Local::now().format("%Y-%m-%d").to_string(),
+        None => latest_report_date(&project_report_dir(&canonical), None)
+            .await
+            .unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string()),
     };
 
     let file_path = project_report_dir(&canonical).join(format!("{}.md", date));
@@ -544,18 +549,28 @@ mod tests {
         ] {
             std::fs::write(dir.path().join(name), "x").unwrap();
         }
-        let best = latest_report_date_before(dir.path(), "2026-07-30").await;
+        let best = latest_report_date(dir.path(), Some("2026-07-30")).await;
         assert_eq!(best.as_deref(), Some("2026-07-28"));
+    }
+
+    #[tokio::test]
+    async fn latest_report_date_unbounded_picks_newest_overall() {
+        // Retention: with no upper bound the newest saved report wins — this
+        // is what keeps yesterday's report readable until today's exists.
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["2026-07-28.md", "2026-07-30.md", "junk.txt"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        let best = latest_report_date(dir.path(), None).await;
+        assert_eq!(best.as_deref(), Some("2026-07-30"));
     }
 
     #[tokio::test]
     async fn latest_report_date_none_for_missing_dir() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope");
-        assert_eq!(
-            latest_report_date_before(&missing, "2026-07-30").await,
-            None
-        );
+        assert_eq!(latest_report_date(&missing, Some("2026-07-30")).await, None);
+        assert_eq!(latest_report_date(&missing, None).await, None);
     }
 
     #[test]

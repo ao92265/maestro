@@ -37,12 +37,23 @@ interface StandupState {
   setScheduleEnabled: (enabled: boolean) => void;
   setScheduleTime: (time: string) => void;
   setPromptTemplate: (template: string | null) => void;
-  /** Load today's saved report from disk if the project has none in memory. */
-  loadToday: (repoPath: string) => Promise<void>;
+  /**
+   * Load the newest saved report from disk if the project has none in memory
+   * — today's when it exists, otherwise the last generated one, so a report
+   * stays readable until the next day's replaces it.
+   */
+  loadLatest: (repoPath: string) => Promise<void>;
   /** Generate (or regenerate) the report for one project. */
   generate: (repoPath: string) => Promise<void>;
+  /**
+   * Generate only when no report for `date` is saved yet; an existing one is
+   * adopted as-is. The scheduled/catch-up path goes through this so it never
+   * overwrites a report that was already generated (manually or by an
+   * earlier app run) that day.
+   */
+  generateIfMissing: (repoPath: string, date: string) => Promise<void>;
   /** Fired by the App-level minute tick; runs at most once per day. */
-  maybeRunScheduled: (repoPaths: string[]) => void;
+  maybeRunScheduled: (repoPaths: string[]) => Promise<void>;
 }
 
 const lazyStore = new LazyStore("standup-settings.json");
@@ -85,10 +96,11 @@ export const useStandupStore = create<StandupState>()(
       setScheduleTime: (time) => set({ scheduleTime: time }),
       setPromptTemplate: (template) => set({ promptTemplate: template }),
 
-      loadToday: async (repoPath) => {
+      loadLatest: async (repoPath) => {
         const existing = get().reports[repoPath];
         if (existing && existing.status !== "idle") return;
         try {
+          // `date: null` makes the backend serve the newest saved report.
           const report = await invoke<StandupReport | null>("load_standup_report", {
             projectPath: repoPath,
             date: null,
@@ -143,8 +155,32 @@ export const useStandupStore = create<StandupState>()(
         }
       },
 
-      maybeRunScheduled: (repoPaths) => {
-        const { scheduleEnabled, scheduleTime, lastRunDate, generate } = get();
+      generateIfMissing: async (repoPath, date) => {
+        try {
+          const existing = await invoke<StandupReport | null>("load_standup_report", {
+            projectPath: repoPath,
+            date,
+          });
+          if (existing) {
+            set((state) => ({
+              reports: {
+                ...state.reports,
+                [repoPath]: { status: "ready", report: existing, error: null },
+              },
+            }));
+            return;
+          }
+        } catch (err) {
+          // If we can't tell whether the report exists, don't risk overwriting
+          // it — the user can still hit Generate manually.
+          console.error("Failed to check for an existing standup report:", err);
+          return;
+        }
+        await get().generate(repoPath);
+      },
+
+      maybeRunScheduled: async (repoPaths) => {
+        const { scheduleEnabled, scheduleTime, lastRunDate } = get();
         if (!scheduleEnabled || repoPaths.length === 0) return;
         const now = new Date();
         const today = localDateString(now);
@@ -153,9 +189,13 @@ export const useStandupStore = create<StandupState>()(
         if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return;
         const due = now.getHours() > hours || (now.getHours() === hours && now.getMinutes() >= minutes);
         if (!due) return;
-        // Mark before generating so a slow run can't double-fire on the next tick.
+        // Mark before generating (synchronously, before the first await) so a
+        // slow run can't double-fire on the next tick, and so the catch-up
+        // ticks fired at startup can't race the regular minute tick.
         set({ lastRunDate: today });
-        for (const repoPath of repoPaths) void generate(repoPath);
+        // Per project: skip days whose report already exists on disk (e.g.
+        // generated manually, or by a previous app run before a restart).
+        await Promise.all(repoPaths.map((repoPath) => get().generateIfMissing(repoPath, today)));
       },
     }),
     {

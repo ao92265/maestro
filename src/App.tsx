@@ -243,17 +243,25 @@ function App() {
 
   // Standup scheduler: a minute tick that fires the daily report generation
   // once the configured local time has passed (at most once per day; the
-  // store gates on lastRunDate). Only runs while the app is open.
+  // store gates on lastRunDate and skips reports already on disk). Besides
+  // the minute tick, a tick fires when the persisted schedule settings finish
+  // hydrating and whenever the restored tabs change — the settings and tabs
+  // both load async from disk after mount, so these extra ticks are what let
+  // a report missed while the app was closed catch up right at startup
+  // instead of a minute later.
   const maybeRunScheduledStandup = useStandupStore((s) => s.maybeRunScheduled);
   useEffect(() => {
     const tick = () => {
-      const openTabs = useWorkspaceStore.getState().tabs;
-      maybeRunScheduledStandup(openTabs.map((t) => t.selectedRepoPath ?? t.projectPath));
+      void maybeRunScheduledStandup(tabs.map((t) => t.selectedRepoPath ?? t.projectPath));
     };
     tick();
+    const unsubHydration = useStandupStore.persist.onFinishHydration(tick);
     const interval = setInterval(tick, 60_000);
-    return () => clearInterval(interval);
-  }, [maybeRunScheduledStandup]);
+    return () => {
+      unsubHydration();
+      clearInterval(interval);
+    };
+  }, [maybeRunScheduledStandup, tabs]);
 
   const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
   const macTitleBarPadding = useMacTitleBarPadding();
