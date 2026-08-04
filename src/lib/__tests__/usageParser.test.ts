@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { formatResetTime, getUsageBars, type UsageData } from "../usageParser";
+import {
+  formatResetTime,
+  getUsageBars,
+  mostCriticalBar,
+  type UsageData,
+} from "../usageParser";
 
 describe("formatResetTime", () => {
   // Anchor "now" so relative formatting is deterministic.
@@ -60,8 +65,14 @@ describe("getUsageBars", () => {
     weeklyResetsAt: null,
     weeklyOpusPercent: null,
     weeklyOpusResetsAt: null,
+    weeklySonnetPercent: null,
+    weeklySonnetResetsAt: null,
+    weeklyOauthAppsPercent: null,
+    weeklyOauthAppsResetsAt: null,
     spendPercent: null,
     spendResetsAt: null,
+    spendUsedDollars: null,
+    spendLimitDollars: null,
     errorMessage: null,
     needsAuth: false,
   };
@@ -94,6 +105,24 @@ describe("getUsageBars", () => {
     ]);
   });
 
+  it("adds a dollars detail to the Budget bar when the API reports them", () => {
+    const bars = getUsageBars({
+      ...noWindows,
+      spendPercent: 85.7,
+      spendResetsAt: "2026-09-06T10:33:51.866730+00:00",
+      spendUsedDollars: 857.000393,
+      spendLimitDollars: 1000,
+    });
+    expect(bars).toEqual([
+      {
+        label: "Budget",
+        percent: 85.7,
+        resetsAt: "2026-09-06T10:33:51.866730+00:00",
+        detail: "$857 / $1000",
+      },
+    ]);
+  });
+
   it("treats 0% as a reported window, not an absent one", () => {
     const bars = getUsageBars({ ...noWindows, sessionPercent: 0, weeklyPercent: 0 });
     expect(bars.map((b) => b.label)).toEqual(["Session", "Week"]);
@@ -103,8 +132,59 @@ describe("getUsageBars", () => {
     expect(getUsageBars(noWindows)).toEqual([]);
   });
 
-  it("keeps weekly Opus out of the bar list (tooltip-only)", () => {
-    const bars = getUsageBars({ ...noWindows, weeklyPercent: 50, weeklyOpusPercent: 12 });
-    expect(bars.map((b) => b.label)).toEqual(["Week"]);
+  it("promotes weekly Opus to its own row (was tooltip-only)", () => {
+    const bars = getUsageBars({
+      ...noWindows,
+      weeklyPercent: 50,
+      weeklyOpusPercent: 12,
+      weeklyOpusResetsAt: "2026-08-08T00:00:00.000Z",
+    });
+    expect(bars).toEqual([
+      { label: "Week", percent: 50, resetsAt: null },
+      { label: "Week (Opus)", percent: 12, resetsAt: "2026-08-08T00:00:00.000Z" },
+    ]);
+  });
+
+  it("shows every reported window, including per-model and OAuth-apps weeklies", () => {
+    const bars = getUsageBars({
+      ...noWindows,
+      sessionPercent: 10,
+      weeklyPercent: 20,
+      weeklyOpusPercent: 30,
+      weeklySonnetPercent: 40,
+      weeklyOauthAppsPercent: 50,
+      spendPercent: 60,
+    });
+    expect(bars.map((b) => b.label)).toEqual([
+      "Session",
+      "Week",
+      "Week (Opus)",
+      "Week (Sonnet)",
+      "Week (OAuth apps)",
+      "Budget",
+    ]);
+  });
+});
+
+describe("mostCriticalBar", () => {
+  it("returns null for an empty bar list", () => {
+    expect(mostCriticalBar([])).toBeNull();
+  });
+
+  it("picks the window with the highest utilization", () => {
+    const top = mostCriticalBar([
+      { label: "Session", percent: 42, resetsAt: null },
+      { label: "Week (Opus)", percent: 91, resetsAt: null },
+      { label: "Week", percent: 63, resetsAt: null },
+    ]);
+    expect(top?.label).toBe("Week (Opus)");
+  });
+
+  it("keeps the first (most general) window on a tie", () => {
+    const top = mostCriticalBar([
+      { label: "Session", percent: 50, resetsAt: null },
+      { label: "Week", percent: 50, resetsAt: null },
+    ]);
+    expect(top?.label).toBe("Session");
   });
 });

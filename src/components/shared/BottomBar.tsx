@@ -67,7 +67,10 @@ export function BottomBar({
         </button>
       )}
 
-      <div className="absolute right-4 top-1/2 -translate-y-1/2 flex items-center gap-4">
+      {/* inset-y-0 + items-center for the same stacking-context reason as the
+          left cluster: a translate transform would trap UsageBar's drop-up
+          below the terminal layers. */}
+      <div className="absolute inset-y-0 right-4 flex items-center gap-4">
         <SystemMetrics />
         <UsageBar />
       </div>

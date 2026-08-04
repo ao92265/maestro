@@ -39,12 +39,25 @@ pub struct UsageData {
     pub weekly_opus_percent: Option<f64>,
     /// When the weekly Opus window resets (ISO 8601).
     pub weekly_opus_resets_at: Option<String>,
+    /// Weekly Sonnet-specific usage percentage (0-100).
+    pub weekly_sonnet_percent: Option<f64>,
+    /// When the weekly Sonnet window resets (ISO 8601).
+    pub weekly_sonnet_resets_at: Option<String>,
+    /// Weekly OAuth-apps usage percentage (0-100).
+    pub weekly_oauth_apps_percent: Option<f64>,
+    /// When the weekly OAuth-apps window resets (ISO 8601).
+    pub weekly_oauth_apps_resets_at: Option<String>,
     /// Monthly spend-budget usage percentage (0-100). Enterprise seats
     /// report this window (named `cinder_cove` by the API) instead of the
     /// session/weekly windows.
     pub spend_percent: Option<f64>,
     /// When the spend budget resets (ISO 8601).
     pub spend_resets_at: Option<String>,
+    /// Dollars spent so far in the monthly budget window (only present when
+    /// the spend window is reported).
+    pub spend_used_dollars: Option<f64>,
+    /// Total dollar limit of the monthly budget window.
+    pub spend_limit_dollars: Option<f64>,
     /// Error message if token is expired or unavailable.
     pub error_message: Option<String>,
     /// Whether authentication is needed (token expired or missing).
@@ -54,15 +67,19 @@ pub struct UsageData {
 /// Response from Anthropic's /api/oauth/usage endpoint.
 ///
 /// Which windows are populated depends on the account type: Pro/Max accounts
-/// report `five_hour`/`seven_day`/`seven_day_opus`, while enterprise seats
-/// report all of those as null and carry their monthly dollar budget under
-/// `cinder_cove` (observed with Claude Code 2.1.x, 2026-08). Unknown keys
-/// are ignored by serde.
+/// report `five_hour`/`seven_day` plus per-model weekly windows
+/// (`seven_day_opus`/`seven_day_sonnet`) and `seven_day_oauth_apps`, while
+/// enterprise seats report all of those as null and carry their monthly
+/// dollar budget under `cinder_cove` (observed with Claude Code 2.1.x,
+/// 2026-08). Unknown keys (e.g. the `tangelo` experiment window and the
+/// `extra_usage`/`spend`/`limits` blobs) are ignored by serde.
 #[derive(Debug, Deserialize)]
 struct ApiUsageResponse {
     five_hour: Option<UsageWindow>,
     seven_day: Option<UsageWindow>,
     seven_day_opus: Option<UsageWindow>,
+    seven_day_sonnet: Option<UsageWindow>,
+    seven_day_oauth_apps: Option<UsageWindow>,
     cinder_cove: Option<UsageWindow>,
 }
 
@@ -73,6 +90,9 @@ struct UsageWindow {
     /// f64 here would fail the whole response deserialize.
     utilization: Option<f64>,
     resets_at: Option<String>,
+    /// Dollar fields only appear on the `cinder_cove` (spend budget) window.
+    limit_dollars: Option<f64>,
+    used_dollars: Option<f64>,
 }
 
 /// Credentials structure (same format in file and keychain).
@@ -225,6 +245,7 @@ fn to_usage_data(api: ApiUsageResponse) -> UsageData {
             Some(UsageWindow {
                 utilization: Some(utilization),
                 resets_at,
+                ..
             }) => {
                 let percent = if utilization.is_finite() {
                     utilization.clamp(0.0, 100.0)
@@ -237,9 +258,19 @@ fn to_usage_data(api: ApiUsageResponse) -> UsageData {
         }
     };
 
+    // Dollar amounts only make sense while the spend window is reported
+    // (utilization non-null) — keep them None otherwise, like the percents.
+    let (spend_used_dollars, spend_limit_dollars) = match &api.cinder_cove {
+        Some(w) if w.utilization.is_some() => (w.used_dollars, w.limit_dollars),
+        _ => (None, None),
+    };
+
     let (session_percent, session_resets_at) = parse_window(api.five_hour);
     let (weekly_percent, weekly_resets_at) = parse_window(api.seven_day);
     let (weekly_opus_percent, weekly_opus_resets_at) = parse_window(api.seven_day_opus);
+    let (weekly_sonnet_percent, weekly_sonnet_resets_at) = parse_window(api.seven_day_sonnet);
+    let (weekly_oauth_apps_percent, weekly_oauth_apps_resets_at) =
+        parse_window(api.seven_day_oauth_apps);
     let (spend_percent, spend_resets_at) = parse_window(api.cinder_cove);
 
     UsageData {
@@ -249,8 +280,14 @@ fn to_usage_data(api: ApiUsageResponse) -> UsageData {
         weekly_resets_at,
         weekly_opus_percent,
         weekly_opus_resets_at,
+        weekly_sonnet_percent,
+        weekly_sonnet_resets_at,
+        weekly_oauth_apps_percent,
+        weekly_oauth_apps_resets_at,
         spend_percent,
         spend_resets_at,
+        spend_used_dollars,
+        spend_limit_dollars,
         error_message: None,
         needs_auth: false,
     }
@@ -498,14 +535,43 @@ mod tests {
         assert_eq!(usage.session_resets_at, None);
         assert_eq!(usage.weekly_percent, None);
         assert_eq!(usage.weekly_opus_percent, None);
+        assert_eq!(usage.weekly_sonnet_percent, None);
+        assert_eq!(usage.weekly_oauth_apps_percent, None);
         let spend = usage.spend_percent.expect("spend percent from cinder_cove");
         assert!((spend - 85.70003930000001).abs() < 1e-9);
         assert_eq!(
             usage.spend_resets_at.as_deref(),
             Some("2026-09-06T10:33:51.866730+00:00")
         );
+        assert_eq!(usage.spend_used_dollars, Some(857.000393));
+        assert_eq!(usage.spend_limit_dollars, Some(1000.0));
         assert!(!usage.needs_auth);
         assert_eq!(usage.error_message, None);
+    }
+
+    #[test]
+    fn maps_per_model_weekly_windows_when_reported() {
+        let parsed: ApiUsageResponse = serde_json::from_str(
+            r#"{
+                "five_hour": {"utilization": 10.0, "resets_at": null},
+                "seven_day": {"utilization": 20.0, "resets_at": null},
+                "seven_day_opus": {"utilization": 30.0, "resets_at": "2026-08-08T00:00:00Z"},
+                "seven_day_sonnet": {"utilization": 40.0, "resets_at": "2026-08-08T00:00:00Z"},
+                "seven_day_oauth_apps": {"utilization": 50.0, "resets_at": null}
+            }"#,
+        )
+        .unwrap();
+        let usage = to_usage_data(parsed);
+        assert_eq!(usage.weekly_opus_percent, Some(30.0));
+        assert_eq!(usage.weekly_sonnet_percent, Some(40.0));
+        assert_eq!(
+            usage.weekly_sonnet_resets_at.as_deref(),
+            Some("2026-08-08T00:00:00Z")
+        );
+        assert_eq!(usage.weekly_oauth_apps_percent, Some(50.0));
+        // No spend window reported → no dollar figures either.
+        assert_eq!(usage.spend_used_dollars, None);
+        assert_eq!(usage.spend_limit_dollars, None);
     }
 
     #[test]

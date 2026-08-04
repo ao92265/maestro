@@ -15,8 +15,15 @@ export interface UsageData {
   weeklyResetsAt: string | null;
   weeklyOpusPercent: number | null;
   weeklyOpusResetsAt: string | null;
+  weeklySonnetPercent: number | null;
+  weeklySonnetResetsAt: string | null;
+  weeklyOauthAppsPercent: number | null;
+  weeklyOauthAppsResetsAt: string | null;
   spendPercent: number | null;
   spendResetsAt: string | null;
+  /** Dollars spent / total in the monthly budget window (enterprise only). */
+  spendUsedDollars: number | null;
+  spendLimitDollars: number | null;
   errorMessage: string | null;
   needsAuth: boolean;
 }
@@ -30,13 +37,15 @@ export interface UsageWindowBar {
   label: string;
   percent: number;
   resetsAt: string | null;
+  /** Extra context shown next to the bar, e.g. "$857 / $1000" for Budget. */
+  detail?: string;
 }
 
 /**
- * Pick which bars to render: one per window the API actually reported.
- * Pro/Max accounts report session + weekly windows; enterprise seats report
- * a monthly spend budget instead (session/weekly come back null for those).
- * Weekly Opus stays tooltip-only, matching the previous display.
+ * Pick which bars to render: one per window the API actually reported
+ * (null = not reported, distinct from 0%). Pro/Max accounts report the
+ * session + weekly windows (incl. per-model weeklies); enterprise seats
+ * report a monthly spend budget instead (session/weekly come back null).
  */
 export function getUsageBars(usage: UsageData): UsageWindowBar[] {
   const bars: UsageWindowBar[] = [];
@@ -46,10 +55,53 @@ export function getUsageBars(usage: UsageData): UsageWindowBar[] {
   if (usage.weeklyPercent !== null) {
     bars.push({ label: "Week", percent: usage.weeklyPercent, resetsAt: usage.weeklyResetsAt });
   }
+  if (usage.weeklyOpusPercent !== null) {
+    bars.push({
+      label: "Week (Opus)",
+      percent: usage.weeklyOpusPercent,
+      resetsAt: usage.weeklyOpusResetsAt,
+    });
+  }
+  if (usage.weeklySonnetPercent !== null) {
+    bars.push({
+      label: "Week (Sonnet)",
+      percent: usage.weeklySonnetPercent,
+      resetsAt: usage.weeklySonnetResetsAt,
+    });
+  }
+  if (usage.weeklyOauthAppsPercent !== null) {
+    bars.push({
+      label: "Week (OAuth apps)",
+      percent: usage.weeklyOauthAppsPercent,
+      resetsAt: usage.weeklyOauthAppsResetsAt,
+    });
+  }
   if (usage.spendPercent !== null) {
-    bars.push({ label: "Budget", percent: usage.spendPercent, resetsAt: usage.spendResetsAt });
+    const detail =
+      usage.spendUsedDollars !== null && usage.spendLimitDollars !== null
+        ? `$${Math.round(usage.spendUsedDollars)} / $${Math.round(usage.spendLimitDollars)}`
+        : undefined;
+    bars.push({
+      label: "Budget",
+      percent: usage.spendPercent,
+      resetsAt: usage.spendResetsAt,
+      ...(detail !== undefined ? { detail } : {}),
+    });
   }
   return bars;
+}
+
+/**
+ * The single most critical window (highest utilization) — shown in the
+ * dropdown trigger so glanceability survives the compression. Ties keep the
+ * first (most general) window. Returns null when nothing was reported.
+ */
+export function mostCriticalBar(bars: UsageWindowBar[]): UsageWindowBar | null {
+  let top: UsageWindowBar | null = null;
+  for (const bar of bars) {
+    if (top === null || bar.percent > top.percent) top = bar;
+  }
+  return top;
 }
 
 export interface ClaudeAccount {
