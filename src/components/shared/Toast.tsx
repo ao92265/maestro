@@ -1,5 +1,5 @@
 import { X } from "lucide-react";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 /** Default time a toast stays on screen before auto-dismissing. */
 export const TOAST_DURATION_MS = 8000;
@@ -29,11 +29,19 @@ export function Toast({
   onClick,
   onDismiss,
 }: ToastProps) {
-  // Auto-dismiss after the configured duration.
+  // Auto-dismiss after the configured duration. `onDismiss` is read through
+  // a ref so callers may pass a fresh closure every render (typical for
+  // toasts mapped from a store) without resetting the countdown — otherwise
+  // each stack re-render (e.g. a sibling dismissing) would restart every
+  // remaining toast's timer.
+  const onDismissRef = useRef(onDismiss);
   useEffect(() => {
-    const timer = setTimeout(onDismiss, durationMs);
+    onDismissRef.current = onDismiss;
+  });
+  useEffect(() => {
+    const timer = setTimeout(() => onDismissRef.current(), durationMs);
     return () => clearTimeout(timer);
-  }, [durationMs, onDismiss]);
+  }, [durationMs]);
 
   return (
     <div

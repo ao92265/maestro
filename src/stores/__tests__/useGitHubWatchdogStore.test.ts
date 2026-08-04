@@ -16,8 +16,10 @@ vi.mock("@tauri-apps/plugin-store", () => ({
 
 import type { IssueInfo, PullRequestInfo } from "../useGitHubStore";
 import {
+  carryForwardErroredLists,
   diffNewItems,
   useGitHubWatchdogStore,
+  watchedProjectsFromTabs,
   type WatchdogProjectResult,
   type WatchdogSnapshot,
 } from "../useGitHubWatchdogStore";
@@ -61,9 +63,17 @@ function issue(number: number, title = `Issue ${number}`): IssueInfo {
 function project(
   repoPath: string,
   reviewRequests: PullRequestInfo[] = [],
-  assignedIssues: IssueInfo[] = []
+  assignedIssues: IssueInfo[] = [],
+  errored: { prs?: boolean; issues?: boolean } = {}
 ): WatchdogProjectResult {
-  return { name: repoPath.split("/").pop() ?? repoPath, repoPath, reviewRequests, assignedIssues };
+  return {
+    name: repoPath.split("/").pop() ?? repoPath,
+    repoPath,
+    reviewRequests,
+    assignedIssues,
+    reviewRequestsErrored: errored.prs ?? false,
+    assignedIssuesErrored: errored.issues ?? false,
+  };
 }
 
 function snapshot(
@@ -91,6 +101,66 @@ describe("diffNewItems", () => {
     const prev = project("C:/git/maestro", [pr(1), pr(2)], [issue(10)]);
     const next = project("C:/git/maestro", [pr(1)], []);
     expect(diffNewItems(prev, next)).toEqual({ newPrs: [], newIssues: [] });
+  });
+
+  it("treats a baseline-less (errored) prev list like a first poll", () => {
+    // First data after an errored fetch must not toast everything.
+    const prev = project("C:/git/maestro", [], [issue(10)], { prs: true });
+    const next = project("C:/git/maestro", [pr(1), pr(2)], [issue(10), issue(11)]);
+    const diff = diffNewItems(prev, next);
+    expect(diff.newPrs).toEqual([]);
+    expect(diff.newIssues.map((i) => i.number)).toEqual([11]);
+  });
+});
+
+describe("carryForwardErroredLists", () => {
+  it("passes clean results through untouched", () => {
+    const prev = project("C:/git/maestro", [pr(1)]);
+    const next = project("C:/git/maestro", [pr(2)]);
+    expect(carryForwardErroredLists(prev, next)).toBe(next);
+  });
+
+  it("keeps previous data for an errored list and clears the flag", () => {
+    const prev = project("C:/git/maestro", [pr(1)], [issue(10)]);
+    const next = project("C:/git/maestro", [], [issue(10), issue(11)], { prs: true });
+    const merged = carryForwardErroredLists(prev, next);
+    expect(merged.reviewRequests.map((p) => p.number)).toEqual([1]);
+    expect(merged.reviewRequestsErrored).toBe(false);
+    // The healthy issues list is taken from the new poll.
+    expect(merged.assignedIssues.map((i) => i.number)).toEqual([10, 11]);
+  });
+
+  it("stays flagged when there is no baseline to carry", () => {
+    const next = project("C:/git/maestro", [], [], { prs: true, issues: true });
+    const merged = carryForwardErroredLists(undefined, next);
+    expect(merged.reviewRequestsErrored).toBe(true);
+    expect(merged.assignedIssuesErrored).toBe(true);
+
+    // A prev entry that is itself baseline-less doesn't count either.
+    const prev = project("C:/git/maestro", [], [], { prs: true });
+    const again = carryForwardErroredLists(prev, next);
+    expect(again.reviewRequestsErrored).toBe(true);
+  });
+});
+
+describe("watchedProjectsFromTabs", () => {
+  it("dedupes tabs that resolve to the same repo path (first wins)", () => {
+    const projects = watchedProjectsFromTabs([
+      { name: "maestro", projectPath: "C:/git/maestro", selectedRepoPath: null },
+      { name: "maestro-again", projectPath: "C:/git/elsewhere", selectedRepoPath: "C:/git/maestro" },
+      { name: "other", projectPath: "C:/git/other", selectedRepoPath: null },
+    ]);
+    expect(projects).toEqual([
+      { name: "maestro", repoPath: "C:/git/maestro" },
+      { name: "other", repoPath: "C:/git/other" },
+    ]);
+  });
+
+  it("prefers the selected repo path over the project path", () => {
+    const projects = watchedProjectsFromTabs([
+      { name: "ws", projectPath: "C:/git/workspace", selectedRepoPath: "C:/git/workspace/repo" },
+    ]);
+    expect(projects).toEqual([{ name: "ws", repoPath: "C:/git/workspace/repo" }]);
   });
 });
 
@@ -199,6 +269,70 @@ describe("useGitHubWatchdogStore", () => {
       .getState()
       .applySnapshot({ status: "gh-missing", projects: [], polledAt: 500 });
     expect(useGitHubWatchdogStore.getState().status).toBe("gh-missing");
+  });
+
+  it("keeps previous data through a transient errored poll (no toasts, stable badge)", () => {
+    const store = useGitHubWatchdogStore.getState();
+    store.applySnapshot(snapshot([project("C:/git/maestro", [pr(1)], [issue(10)])]));
+    // Sleep/resume: the poll fails, lists arrive empty but flagged.
+    useGitHubWatchdogStore
+      .getState()
+      .applySnapshot(
+        snapshot([project("C:/git/maestro", [], [], { prs: true, issues: true })], 2000)
+      );
+
+    const state = useGitHubWatchdogStore.getState();
+    expect(state.toasts).toEqual([]);
+    // Badge counts stay stable: last-known-good data carried forward.
+    expect(state.projects[0].reviewRequests.map((p) => p.number)).toEqual([1]);
+    expect(state.projects[0].assignedIssues.map((i) => i.number)).toEqual([10]);
+  });
+
+  it("toasts only genuinely new items after recovering from an errored poll", () => {
+    const store = useGitHubWatchdogStore.getState();
+    store.applySnapshot(snapshot([project("C:/git/maestro", [pr(1)])]));
+    useGitHubWatchdogStore
+      .getState()
+      .applySnapshot(snapshot([project("C:/git/maestro", [], [], { prs: true })], 2000));
+    // Recovery poll: pr(1) still open (carried baseline), pr(2) is new.
+    useGitHubWatchdogStore
+      .getState()
+      .applySnapshot(snapshot([project("C:/git/maestro", [pr(1), pr(2)])], 3000));
+
+    const { toasts } = useGitHubWatchdogStore.getState();
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toMatchObject({ kind: "pr", number: 2 });
+  });
+
+  it("does not toast the first successful data after an errored first poll", () => {
+    const store = useGitHubWatchdogStore.getState();
+    // First-ever poll for the project fails (e.g. gh unauthenticated).
+    store.applySnapshot(
+      snapshot([project("C:/git/maestro", [], [], { prs: true, issues: true })])
+    );
+    // Auth fixed: everything the fetch returns is pre-existing, not "new".
+    useGitHubWatchdogStore
+      .getState()
+      .applySnapshot(snapshot([project("C:/git/maestro", [pr(1)], [issue(10)])], 2000));
+
+    expect(useGitHubWatchdogStore.getState().toasts).toEqual([]);
+    // The baseline now exists, so later additions do toast.
+    useGitHubWatchdogStore
+      .getState()
+      .applySnapshot(snapshot([project("C:/git/maestro", [pr(1), pr(2)], [issue(10)])], 3000));
+    expect(useGitHubWatchdogStore.getState().toasts).toHaveLength(1);
+  });
+
+  it("an empty snapshot clears all project data (badge hides)", () => {
+    const store = useGitHubWatchdogStore.getState();
+    store.applySnapshot(snapshot([project("C:/git/maestro", [pr(1)], [issue(10)])]));
+    // Last project tab closed: the poller emits an empty snapshot.
+    useGitHubWatchdogStore.getState().applySnapshot(snapshot([], 2000));
+
+    const state = useGitHubWatchdogStore.getState();
+    expect(state.projects).toEqual([]);
+    expect(state.lastPolledAt).toBe(2000);
+    expect(state.toasts).toEqual([]);
   });
 
   it("syncProjects forwards the project set to the backend command", async () => {

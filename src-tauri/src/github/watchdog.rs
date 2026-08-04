@@ -62,6 +62,12 @@ pub enum GhStatus {
 }
 
 /// Poll results for one watched project.
+///
+/// A failed list is NOT the same as an empty list: `review_requests_errored`
+/// / `assigned_issues_errored` mark lists whose fetch failed (or was never
+/// attempted) this cycle. The frontend keeps its previous data for flagged
+/// lists, so a transient failure (laptop sleep/resume, network blip) neither
+/// zeroes the badge nor re-toasts every still-open item on recovery.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectResult {
@@ -71,6 +77,10 @@ pub struct ProjectResult {
     pub review_requests: Vec<PullRequestInfo>,
     /// Open issues assigned to the user.
     pub assigned_issues: Vec<IssueInfo>,
+    /// `review_requests` could not be fetched this cycle; ignore its contents.
+    pub review_requests_errored: bool,
+    /// `assigned_issues` could not be fetched this cycle; ignore its contents.
+    pub assigned_issues_errored: bool,
 }
 
 /// Full result of one poll cycle, emitted as the [`WATCHDOG_EVENT`] payload.
@@ -129,11 +139,13 @@ pub fn spawn_watchdog(watchdog: std::sync::Arc<GitHubWatchdog>, app: AppHandle) 
     tauri::async_runtime::spawn(async move {
         loop {
             let projects = watchdog.projects_snapshot();
-            if !projects.is_empty() {
-                let snapshot = poll_projects(&projects).await;
-                if let Err(e) = app.emit(WATCHDOG_EVENT, &snapshot) {
-                    log::warn!("github watchdog: failed to emit snapshot: {e}");
-                }
+            // Always emit, even for an empty set: closing the last project
+            // must clear the badge, and a cycle that was already in flight
+            // when the set emptied gets corrected by the notify-triggered
+            // re-poll that lands right after it.
+            let snapshot = poll_projects(&projects).await;
+            if let Err(e) = app.emit(WATCHDOG_EVENT, &snapshot) {
+                log::warn!("github watchdog: failed to emit snapshot: {e}");
             }
             // Sleep until the next interval OR an immediate wake from
             // set_projects (project list changed).
@@ -149,21 +161,27 @@ pub fn spawn_watchdog(watchdog: std::sync::Arc<GitHubWatchdog>, app: AppHandle) 
 /// All `gh` calls are serialized with [`STAGGER_DELAY`] between them.
 ///
 /// Error policy (deliberately quiet — this runs unattended every 5 minutes):
-/// - `GhNotFound` / `NotAuthenticated`: record the status, stop the cycle.
+/// - `GhNotFound` / `NotAuthenticated`: record the status and stop the
+///   cycle. The current AND all un-polled projects are still reported —
+///   flagged as errored — so the frontend never mistakes "not polled" for
+///   "gone" (which would later re-toast everything as first-poll data).
 /// - any other per-repo error (not a GitHub repo, network, rate limit):
-///   skip that project's list with a debug log and keep going.
+///   flag that project's list(s) with a debug log and keep going.
 async fn poll_projects(projects: &[WatchedProject]) -> WatchdogSnapshot {
     let mut status = GhStatus::Ok;
     let mut results: Vec<ProjectResult> = Vec::with_capacity(projects.len());
     let mut first_call = true;
 
-    'projects: for project in projects {
+    let mut remaining = projects.iter();
+    while let Some(project) = remaining.next() {
         let gh = GitHub::new(&project.repo_path);
         let mut result = ProjectResult {
             name: project.name.clone(),
             repo_path: project.repo_path.clone(),
             review_requests: Vec::new(),
             assigned_issues: Vec::new(),
+            review_requests_errored: false,
+            assigned_issues_errored: false,
         };
 
         if !std::mem::take(&mut first_call) {
@@ -179,17 +197,20 @@ async fn poll_projects(projects: &[WatchedProject]) -> WatchdogSnapshot {
         {
             Ok(prs) => result.review_requests = prs,
             Err(e) => {
+                // Issues weren't attempted either — both lists are unknown.
+                result.review_requests_errored = true;
+                result.assigned_issues_errored = true;
+                results.push(result);
                 if let Some(fatal) = fatal_status(&e) {
                     status = fatal;
-                    break 'projects;
+                    results.extend(remaining.map(errored_result));
+                    break;
                 }
                 log::debug!(
                     "github watchdog: PR poll skipped for {}: {e}",
                     project.repo_path
                 );
-                // Issues would almost certainly fail the same way; move on.
-                results.push(result);
-                continue 'projects;
+                continue;
             }
         }
 
@@ -204,9 +225,12 @@ async fn poll_projects(projects: &[WatchedProject]) -> WatchdogSnapshot {
         {
             Ok(issues) => result.assigned_issues = issues,
             Err(e) => {
+                result.assigned_issues_errored = true;
                 if let Some(fatal) = fatal_status(&e) {
                     status = fatal;
-                    break 'projects;
+                    results.push(result);
+                    results.extend(remaining.map(errored_result));
+                    break;
                 }
                 log::debug!(
                     "github watchdog: issue poll skipped for {}: {e}",
@@ -222,6 +246,18 @@ async fn poll_projects(projects: &[WatchedProject]) -> WatchdogSnapshot {
         status,
         projects: results,
         polled_at: now_ms(),
+    }
+}
+
+/// A result for a project whose lists could not be fetched this cycle.
+fn errored_result(project: &WatchedProject) -> ProjectResult {
+    ProjectResult {
+        name: project.name.clone(),
+        repo_path: project.repo_path.clone(),
+        review_requests: Vec::new(),
+        assigned_issues: Vec::new(),
+        review_requests_errored: true,
+        assigned_issues_errored: true,
     }
 }
 
@@ -289,6 +325,8 @@ mod tests {
                 repo_path: "C:/git/maestro".to_string(),
                 review_requests: vec![],
                 assigned_issues: vec![],
+                review_requests_errored: false,
+                assigned_issues_errored: true,
             }],
             polled_at: 1234,
         };
@@ -298,10 +336,45 @@ mod tests {
         assert_eq!(json["projects"][0]["repoPath"], "C:/git/maestro");
         assert!(json["projects"][0]["reviewRequests"].is_array());
         assert!(json["projects"][0]["assignedIssues"].is_array());
+        assert_eq!(json["projects"][0]["reviewRequestsErrored"], false);
+        assert_eq!(json["projects"][0]["assignedIssuesErrored"], true);
 
         let ok = serde_json::to_value(GhStatus::Ok).unwrap();
         assert_eq!(ok, "ok");
         let missing = serde_json::to_value(GhStatus::GhMissing).unwrap();
         assert_eq!(missing, "gh-missing");
+    }
+
+    /// A failing project must still appear in the snapshot, flagged as
+    /// errored — never silently dropped and never reported as empty lists.
+    /// Runs against a non-repo temp dir so every environment fails the same
+    /// project: gh missing → GhMissing, unauthenticated → NotAuthenticated,
+    /// authenticated → per-repo "not a git repository" error. In all three
+    /// cases the contract is identical: the project is present with both
+    /// lists flagged.
+    #[tokio::test]
+    async fn test_poll_projects_reports_failed_project_as_errored() {
+        let dir = std::env::temp_dir().join("maestro-watchdog-test-not-a-repo");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let projects = vec![project("broken", dir.to_string_lossy().as_ref())];
+        let snapshot = poll_projects(&projects).await;
+
+        assert_eq!(snapshot.projects.len(), 1);
+        let result = &snapshot.projects[0];
+        assert_eq!(result.name, "broken");
+        assert!(result.review_requests_errored);
+        assert!(result.assigned_issues_errored);
+        assert!(result.review_requests.is_empty());
+        assert!(result.assigned_issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_poll_projects_empty_set_yields_empty_snapshot() {
+        // The loop always emits; an empty watch set must produce an empty
+        // (badge-clearing) snapshot rather than being skipped.
+        let snapshot = poll_projects(&[]).await;
+        assert_eq!(snapshot.status, GhStatus::Ok);
+        assert!(snapshot.projects.is_empty());
     }
 }

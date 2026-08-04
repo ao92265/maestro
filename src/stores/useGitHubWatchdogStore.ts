@@ -10,7 +10,16 @@ import type { IssueInfo, PullRequestInfo } from "@/stores/useGitHubStore";
 /** Global `gh` health reported with every watchdog snapshot. */
 export type GhWatchdogStatus = "ok" | "gh-missing" | "not-authenticated";
 
-/** Poll results for one watched project. */
+/**
+ * Poll results for one watched project.
+ *
+ * The `*Errored` flags carry two closely-related meanings:
+ * - on the wire (from Rust): this cycle's fetch for the list failed, its
+ *   contents are meaningless (empty is NOT "zero items");
+ * - in the store (after {@link carryForwardErroredLists}): no trustworthy
+ *   baseline exists yet for the list — its first successful data must not
+ *   be treated as "new" transitions.
+ */
 export interface WatchdogProjectResult {
   name: string;
   repoPath: string;
@@ -18,6 +27,8 @@ export interface WatchdogProjectResult {
   reviewRequests: PullRequestInfo[];
   /** Open issues assigned to the user. */
   assignedIssues: IssueInfo[];
+  reviewRequestsErrored: boolean;
+  assignedIssuesErrored: boolean;
 }
 
 /** Payload of the `github-watchdog-update` Tauri event (one poll cycle). */
@@ -46,14 +57,44 @@ export const WATCHDOG_ISSUE_SEARCH = "assignee:@me";
 /** Keep at most this many queued toasts; oldest are dropped first. */
 const MAX_TOASTS = 6;
 
-// --- Transition diff (pure; exported for tests) ---
+// --- Transition helpers (pure; exported for tests) ---
+
+/**
+ * Replaces errored lists in `next` with the last-known-good data from
+ * `prev`, so a transient `gh` failure (laptop sleep/resume, network blip)
+ * neither zeroes the badge nor makes every still-open item look "new" on
+ * the next successful poll.
+ *
+ * A carried-forward list gets its errored flag CLEARED — the data is a real
+ * baseline. A list that errored with no baseline (first poll failed, or the
+ * previous entry was itself baseline-less) stays flagged so its first
+ * successful data is treated like a first poll (no toasts).
+ */
+export function carryForwardErroredLists(
+  prev: WatchdogProjectResult | undefined,
+  next: WatchdogProjectResult
+): WatchdogProjectResult {
+  if (!next.reviewRequestsErrored && !next.assignedIssuesErrored) return next;
+  const merged = { ...next };
+  if (next.reviewRequestsErrored && prev && !prev.reviewRequestsErrored) {
+    merged.reviewRequests = prev.reviewRequests;
+    merged.reviewRequestsErrored = false;
+  }
+  if (next.assignedIssuesErrored && prev && !prev.assignedIssuesErrored) {
+    merged.assignedIssues = prev.assignedIssues;
+    merged.assignedIssuesErrored = false;
+  }
+  return merged;
+}
 
 /**
  * Items in `next` that were absent from `prev`, keyed by number.
  *
  * `prev === undefined` means this is the first poll result ever seen for the
  * project (app start, or a newly-opened project tab): everything would be
- * "new", so nothing is reported. Disappearing items never toast.
+ * "new", so nothing is reported. A prev list still flagged as errored has no
+ * trustworthy baseline and is treated the same way. Disappearing items never
+ * toast.
  */
 export function diffNewItems(
   prev: WatchdogProjectResult | undefined,
@@ -63,9 +104,33 @@ export function diffNewItems(
   const prevPrs = new Set(prev.reviewRequests.map((pr) => pr.number));
   const prevIssues = new Set(prev.assignedIssues.map((issue) => issue.number));
   return {
-    newPrs: next.reviewRequests.filter((pr) => !prevPrs.has(pr.number)),
-    newIssues: next.assignedIssues.filter((issue) => !prevIssues.has(issue.number)),
+    newPrs: prev.reviewRequestsErrored
+      ? []
+      : next.reviewRequests.filter((pr) => !prevPrs.has(pr.number)),
+    newIssues: prev.assignedIssuesErrored
+      ? []
+      : next.assignedIssues.filter((issue) => !prevIssues.has(issue.number)),
   };
+}
+
+/**
+ * Maps open workspace tabs to the watchdog's project set, deduplicating by
+ * repo path (first tab wins): several tabs can point at the same repo (e.g.
+ * a multi-repo workspace root also opened directly), and polling it twice
+ * would double the badge counts and duplicate toasts.
+ */
+export function watchedProjectsFromTabs(
+  tabs: ReadonlyArray<{ name: string; projectPath: string; selectedRepoPath: string | null }>
+): Array<{ name: string; repoPath: string }> {
+  const seen = new Set<string>();
+  const projects: Array<{ name: string; repoPath: string }> = [];
+  for (const tab of tabs) {
+    const repoPath = tab.selectedRepoPath ?? tab.projectPath;
+    if (seen.has(repoPath)) continue;
+    seen.add(repoPath);
+    projects.push({ name: tab.name, repoPath });
+  }
+  return projects;
 }
 
 // --- Tauri LazyStore-backed StateStorage adapter ---
@@ -145,9 +210,15 @@ export const useGitHubWatchdogStore = create<WatchdogState & WatchdogActions>()(
         const { projects: prevProjects, notificationsEnabled, toasts } = get();
         const prevByPath = new Map(prevProjects.map((p) => [p.repoPath, p]));
 
+        // Errored lists keep the last-known-good data (see the helper docs);
+        // the merged results are what gets diffed AND stored.
+        const mergedProjects = snapshot.projects.map((project) =>
+          carryForwardErroredLists(prevByPath.get(project.repoPath), project)
+        );
+
         const newToasts: WatchdogToast[] = [];
         if (notificationsEnabled) {
-          for (const project of snapshot.projects) {
+          for (const project of mergedProjects) {
             const { newPrs, newIssues } = diffNewItems(
               prevByPath.get(project.repoPath),
               project
@@ -179,7 +250,7 @@ export const useGitHubWatchdogStore = create<WatchdogState & WatchdogActions>()(
 
         set({
           status: snapshot.status,
-          projects: snapshot.projects,
+          projects: mergedProjects,
           lastPolledAt: snapshot.polledAt,
           toasts: [...toasts, ...newToasts].slice(-MAX_TOASTS),
         });

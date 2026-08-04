@@ -41,6 +41,7 @@ import {
   useGitHubWatchdogStore,
   WATCHDOG_ISSUE_SEARCH,
   WATCHDOG_PR_SEARCH,
+  watchedProjectsFromTabs,
 } from "./stores/useGitHubWatchdogStore";
 import { useGitStore } from "./stores/useGitStore";
 import { useTerminalSettingsStore } from "./stores/useTerminalSettingsStore";
@@ -261,14 +262,11 @@ function App() {
   }, [initWatchdogListeners]);
 
   // GitHub watchdog: keep the Rust poller's project set in sync with the
-  // open workspace tabs. Serialized so active-tab flips (which also mutate
-  // `tabs`) don't re-invoke the command; the backend additionally ignores
-  // identical sets.
+  // open workspace tabs (deduplicated by repo path — see helper docs).
+  // Serialized so active-tab flips (which also mutate `tabs`) don't
+  // re-invoke the command; the backend additionally ignores identical sets.
   const watchedProjectsJson = useMemo(
-    () =>
-      JSON.stringify(
-        tabs.map((t) => ({ name: t.name, repoPath: t.selectedRepoPath ?? t.projectPath }))
-      ),
+    () => JSON.stringify(watchedProjectsFromTabs(tabs)),
     [tabs]
   );
   useEffect(() => {
