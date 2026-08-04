@@ -1,9 +1,11 @@
 //! Daily standup report generation.
 //!
 //! Gathers git commits and Claude agent-session metadata since the previous
-//! report, feeds them to a headless `claude -p` run (the user's existing
-//! Claude Code login — no API key), and persists the resulting markdown per
-//! project per date under the app data directory.
+//! report, plus a long-horizon project overview (branches + a month of
+//! commits) for the "overall status" line, feeds them to a headless
+//! `claude -p` run (the user's existing Claude Code login — no API key), and
+//! persists the resulting markdown per project per date under the app data
+//! directory.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -25,6 +27,9 @@ const CLAUDE_TIMEOUT_SECS: u64 = 300;
 /// Cap the raw material fed to the model.
 const MAX_COMMITS_CHARS: usize = 12_000;
 const MAX_SESSIONS_CHARS: usize = 4_000;
+/// Long-horizon window backing the "overall status" line of the report.
+const OVERVIEW_SINCE_DAYS: i64 = 30;
+const MAX_OVERVIEW_CHARS: usize = 4_000;
 
 /// A generated (or loaded) standup report for one project.
 #[derive(Debug, Clone, Serialize)]
@@ -56,7 +61,13 @@ fn project_report_dir(canonical_project: &str) -> PathBuf {
         .unwrap_or_else(|| "project".to_string());
     let sanitized: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let hash = StatusServer::generate_project_hash(canonical_project);
     standup_base_dir().join(format!("{}-{}", sanitized, hash))
@@ -214,39 +225,32 @@ async fn run_claude_print(project_path: &str, prompt: String) -> Result<String, 
 }
 
 /// Built-in prompt template. Users may override it from the Standup panel;
-/// `{project}`, `{date}`, `{since}`, `{commits}` and `{sessions}` are
-/// substituted before the prompt is sent to `claude -p`.
-pub const DEFAULT_PROMPT_TEMPLATE: &str = r#"You are writing a daily standup report for the developer working in this repository. Use ONLY the material below; never invent work that is not evidenced by it.
+/// `{project}`, `{date}`, `{since}`, `{commits}`, `{sessions}` and
+/// `{overview}` are substituted before the prompt is sent to `claude -p`.
+pub const DEFAULT_PROMPT_TEMPLATE: &str = r#"Write my standup update for the {project} project ({date}) so I can paste it straight into my team's group chat. Base it ONLY on the material below — never invent work that is not evidenced by it.
 
-Output exactly this GitHub-flavored markdown structure, with no preamble and no surrounding code fence:
+Voice — it must read like I typed it myself:
+- First person ("I"), casual but professional, plain language.
+- No headings, no bold section titles, no greeting, no sign-off, no preamble like "Here's your standup", no code fences.
+- No AI-isms: never "Certainly", "Additionally", "Furthermore", "I successfully", "leveraged", "delved".
+- Summarize the work the way a dev would say it out loud. Do NOT enumerate commits, files, or every branch — group related work into one plain-words point. Skip technical detail a teammate wouldn't need.
 
-# Standup — {project} — {date}
+Shape (plain text, under 120 words total):
+- 2-4 short "-" bullets: what I got done since {since}, grouped by topic.
+- 1 bullet: what I'm picking up next (the natural follow-up from the material).
+- 1 bullet for blockers ONLY if the material shows a real one; otherwise leave blockers out or end a bullet with "no blockers".
+- Close with one or two sentences (no bullet): where the project stands overall — big-picture progress judged from the PROJECT OVERVIEW below, not just the last day's changes.
 
-## TL;DR
-(1-3 bullets max)
-
-## Since last report
-(what was worked on; group related commits/sessions into one bullet each)
-
-## Blockers
-(evidence-based only; write "None evident." if nothing suggests one)
-
-## Next
-(the natural follow-ups implied by the material; 1-3 bullets)
-
-Formatting rules — the reader has ADHD, optimize for scanning:
-- Every bullet starts with a **bold 2-4 word lead**, then one short clause.
-- Max ~14 words per bullet. No nested bullets. No paragraphs.
-- Mention branch names inline as `code`.
-- Total under 200 words.
-
-MATERIAL (covers work since {since}):
+RECENT WORK (since {since}):
 
 == Git commits ==
 {commits}
 
-== Agent sessions (Claude conversations in this project) ==
+== Claude agent sessions in this project ==
 {sessions}
+
+PROJECT OVERVIEW (only for the closing overall-status sentences):
+{overview}
 "#;
 
 /// Build the standup prompt from the gathered material. A non-empty custom
@@ -258,6 +262,7 @@ fn build_prompt(
     since: &str,
     commits: &str,
     sessions: &str,
+    overview: &str,
 ) -> String {
     let template = match template {
         Some(t) if !t.trim().is_empty() => t,
@@ -269,11 +274,27 @@ fn build_prompt(
         .replace("{since}", since)
         .replace(
             "{commits}",
-            if commits.trim().is_empty() { "(none)" } else { commits },
+            if commits.trim().is_empty() {
+                "(none)"
+            } else {
+                commits
+            },
         )
         .replace(
             "{sessions}",
-            if sessions.trim().is_empty() { "(none)" } else { sessions },
+            if sessions.trim().is_empty() {
+                "(none)"
+            } else {
+                sessions
+            },
+        )
+        .replace(
+            "{overview}",
+            if overview.trim().is_empty() {
+                "(none)"
+            } else {
+                overview
+            },
         )
 }
 
@@ -336,6 +357,41 @@ pub async fn generate_standup_report(
         .collect::<Vec<_>>()
         .join("\n");
 
+    // 3. Long-horizon overview (branches + a month of commits) so the model
+    //    can judge where the project stands overall, not just the last delta.
+    let branches = git
+        .list_branches()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|b| !b.is_remote)
+        .map(|b| {
+            if b.is_current {
+                format!("{} (current)", b.name)
+            } else {
+                b.name
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let overview_since = (Local::now() - Duration::days(OVERVIEW_SINCE_DAYS))
+        .format("%Y-%m-%d")
+        .to_string();
+    let overview_log = git
+        .commit_log_text_since(&overview_since, MAX_COMMITS)
+        .await
+        .unwrap_or_default();
+    let overview = format!(
+        "Local branches: {}\n\nCommits from the last {} days (newest first):\n{}",
+        if branches.is_empty() {
+            "(none)".to_string()
+        } else {
+            branches
+        },
+        OVERVIEW_SINCE_DAYS,
+        overview_log
+    );
+
     let project_name = Path::new(&canonical)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -348,6 +404,7 @@ pub async fn generate_standup_report(
         &since,
         &truncate_chars(&commits, MAX_COMMITS_CHARS),
         &truncate_chars(&sessions, MAX_SESSIONS_CHARS),
+        &truncate_chars(&overview, MAX_OVERVIEW_CHARS),
     );
 
     let raw = run_claude_print(&canonical, prompt).await?;
@@ -438,7 +495,12 @@ mod tests {
     #[tokio::test]
     async fn latest_report_date_picks_newest_before_today() {
         let dir = tempfile::tempdir().unwrap();
-        for name in ["2026-07-25.md", "2026-07-28.md", "2026-07-30.md", "junk.txt"] {
+        for name in [
+            "2026-07-25.md",
+            "2026-07-28.md",
+            "2026-07-30.md",
+            "junk.txt",
+        ] {
             std::fs::write(dir.path().join(name), "x").unwrap();
         }
         let best = latest_report_date_before(dir.path(), "2026-07-30").await;
@@ -449,33 +511,49 @@ mod tests {
     async fn latest_report_date_none_for_missing_dir() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope");
-        assert_eq!(latest_report_date_before(&missing, "2026-07-30").await, None);
+        assert_eq!(
+            latest_report_date_before(&missing, "2026-07-30").await,
+            None
+        );
     }
 
     #[test]
     fn build_prompt_substitutes_placeholders_for_empty_material() {
-        let p = build_prompt(None, "maestro", "2026-07-30", "2026-07-28", "", "");
+        let p = build_prompt(None, "maestro", "2026-07-30", "2026-07-28", "", "", "");
         assert!(p.contains("maestro"));
         assert!(p.contains("(none)"));
         assert!(!p.contains("{project}"));
+        assert!(!p.contains("{overview}"));
     }
 
     #[test]
     fn build_prompt_uses_custom_template_with_placeholders() {
         let p = build_prompt(
-            Some("Report for {project} on {date}: {commits} / {sessions}"),
+            Some("Report for {project} on {date}: {commits} / {sessions} / {overview}"),
             "maestro",
             "2026-07-31",
             "2026-07-30",
             "abc fix bug",
             "",
+            "branch list",
         );
-        assert_eq!(p, "Report for maestro on 2026-07-31: abc fix bug / (none)");
+        assert_eq!(
+            p,
+            "Report for maestro on 2026-07-31: abc fix bug / (none) / branch list"
+        );
     }
 
     #[test]
     fn build_prompt_falls_back_to_default_on_blank_template() {
-        let p = build_prompt(Some("   "), "maestro", "2026-07-31", "2026-07-30", "", "");
-        assert!(p.contains("## TL;DR"));
+        let p = build_prompt(
+            Some("   "),
+            "maestro",
+            "2026-07-31",
+            "2026-07-30",
+            "",
+            "",
+            "",
+        );
+        assert!(p.contains("PROJECT OVERVIEW"));
     }
 }

@@ -280,7 +280,7 @@ function PromptEditorModal({ open, onClose }: { open: boolean; onClose: () => vo
           This prompt is sent to the headless Claude run together with your
           material. Available placeholders:{" "}
           <code>{"{project}"}</code> <code>{"{date}"}</code> <code>{"{since}"}</code>{" "}
-          <code>{"{commits}"}</code> <code>{"{sessions}"}</code>.
+          <code>{"{commits}"}</code> <code>{"{sessions}"}</code> <code>{"{overview}"}</code>.
         </p>
         <textarea
           value={draft}

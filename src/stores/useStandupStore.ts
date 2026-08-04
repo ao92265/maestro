@@ -31,7 +31,7 @@ interface StandupState {
   /**
    * Custom prompt template for the headless run (persisted). `null` means
    * "use the built-in default". Placeholders: {project} {date} {since}
-   * {commits} {sessions}.
+   * {commits} {sessions} {overview}.
    */
   promptTemplate: string | null;
   setScheduleEnabled: (enabled: boolean) => void;
