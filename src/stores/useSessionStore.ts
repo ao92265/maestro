@@ -163,16 +163,23 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
   error: null,
 
   parkSession: (sessionId: number) => {
-    set((state) => ({
-      parkedSessionIds: state.parkedSessionIds.includes(sessionId)
-        ? state.parkedSessionIds
-        : [...state.parkedSessionIds, sessionId],
-      // Parking is a deliberate act on the session — an auto-unpark
-      // attention highlight would be stale once it's hidden again.
-      attentionSessionIds: state.attentionSessionIds.filter(
-        (id) => id !== sessionId
-      ),
-    }));
+    set((state) => {
+      const alreadyParked = state.parkedSessionIds.includes(sessionId);
+      const hasAttention = state.attentionSessionIds.includes(sessionId);
+      // No-op guard: don't replace arrays (and re-render subscribers)
+      // when nothing changes.
+      if (alreadyParked && !hasAttention) return state;
+      return {
+        parkedSessionIds: alreadyParked
+          ? state.parkedSessionIds
+          : [...state.parkedSessionIds, sessionId],
+        // Parking is a deliberate act on the session — an auto-unpark
+        // attention highlight would be stale once it's hidden again.
+        attentionSessionIds: hasAttention
+          ? state.attentionSessionIds.filter((id) => id !== sessionId)
+          : state.attentionSessionIds,
+      };
+    });
   },
 
   unparkSession: (sessionId: number) => {

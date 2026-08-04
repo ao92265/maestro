@@ -1274,27 +1274,13 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     focusSlotTextarea(slot.id);
   }, []);
 
-  // Auto-unpark restore: when the store auto-unparks a parked session (its
-  // agent stopped and asked for input), route the newly-attention-marked
-  // session through the regular unpark flow so the restored pane behaves
-  // exactly like a shelf-chip click — including taking over the zoom view
-  // while zoomed. The store already cleared parkedSessionIds; this adds only
-  // the view-level restore, and only in the grid the user is looking at
-  // (background project tabs get their pane back silently; eagle view's tiles
-  // reappear via the store alone and its zoom is owned by MultiProjectView).
-  const attentionSessionIds = useSessionStore((s) => s.attentionSessionIds);
-  const prevAttentionRef = useRef<number[]>(attentionSessionIds);
-  useEffect(() => {
-    const prev = prevAttentionRef.current;
-    prevAttentionRef.current = attentionSessionIds;
-    if (!isActive || eagleMode) return;
-    for (const sessionId of attentionSessionIds) {
-      if (prev.includes(sessionId)) continue;
-      if (slotsRef.current.some((s) => s.sessionId === sessionId)) {
-        handleUnpark(sessionId);
-      }
-    }
-  }, [attentionSessionIds, isActive, eagleMode, handleUnpark]);
+  // NOTE: auto-unpark (agent asked for input while parked) deliberately does
+  // NOT route through handleUnpark. The store's unpark alone restores the
+  // pane's visibility (hiding derives from parkedSessionIds); stealing focus
+  // or the zoom view at an arbitrary async moment would inject the user's
+  // in-flight keystrokes into the restored session's PTY. The yellow
+  // attention chrome on the header/tabs/navigator is the notice — the user's
+  // own click brings the pane forward and clears it.
 
   // Keep closePaneRef in sync with latest handleKill/removeSlot
   closePaneRef.current = () => {
@@ -2234,6 +2220,18 @@ function ZoomTab({
     (s) => sessionId !== null && s.attentionSessionIds.includes(sessionId),
   );
 
+  // Attention-first click semantics on the active tab: the first click only
+  // acknowledges the attention highlight — it must not also set the warning
+  // flag (the chrome would stay yellow and the user would have flagged the
+  // session without knowing). Subsequent clicks toggle the flag as before.
+  const handleActiveClick = () => {
+    if (hasAttention && sessionId !== null) {
+      useSessionStore.getState().clearSessionAttention(sessionId);
+      return;
+    }
+    onToggleFlag?.();
+  };
+
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
@@ -2246,7 +2244,7 @@ function ZoomTab({
       style={style}
       {...attributes}
       {...listeners}
-      onClick={isActive && onToggleFlag ? onToggleFlag : onSelect}
+      onClick={isActive && onToggleFlag ? handleActiveClick : onSelect}
       className={`
         flex shrink-0 items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors
         ${isFlagged || hasAttention ? 'warning-flag' : ''}
@@ -2258,7 +2256,9 @@ function ZoomTab({
       title={
         isActive
           ? onToggleFlag
-            ? `${label} (click to ${isFlagged ? "clear" : "set"} warning flag)`
+            ? hasAttention
+              ? `${label} (needs input — click to clear the attention highlight)`
+              : `${label} (click to ${isFlagged ? "clear" : "set"} warning flag)`
             : `${label} (click to exit zoom)`
           : `Switch to ${label}`
       }

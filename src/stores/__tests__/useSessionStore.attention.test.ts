@@ -8,6 +8,7 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn().mockResolvedValue(undefined),
 }));
 
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 import {
@@ -17,6 +18,7 @@ import {
 } from "../useSessionStore";
 
 const listenMock = vi.mocked(listen);
+const invokeMock = vi.mocked(invoke);
 
 function session(
   id: number,
@@ -157,5 +159,61 @@ describe("useSessionStore auto-unpark attention", () => {
     useSessionStore.getState().removeSession(1);
 
     expect(useSessionStore.getState().attentionSessionIds).toEqual([2]);
+  });
+
+  it("does not auto-unpark a parked Done/Error session on the Stop-hook AwaitingInput signal", () => {
+    // The listener never downgrades an explicit terminal state — the guarded
+    // early-return must also mean: no unpark, no attention.
+    useSessionStore.setState({
+      sessions: [session(1, "Done"), session(2, "Error")],
+    });
+    useSessionStore.getState().parkSession(1);
+    useSessionStore.getState().parkSession(2);
+
+    emitStatus(1, "AwaitingInput");
+    emitStatus(2, "AwaitingInput");
+
+    const state = useSessionStore.getState();
+    expect(state.parkedSessionIds).toEqual([1, 2]);
+    expect(state.attentionSessionIds).toEqual([]);
+    expect(state.sessions.map((s) => s.status)).toEqual(["Done", "Error"]);
+  });
+
+  it("fetchSessions prunes attention ids absent from the fetched list", async () => {
+    useSessionStore.setState({
+      sessions: [session(1, "NeedsInput"), session(2, "NeedsInput")],
+      attentionSessionIds: [1, 2],
+    });
+
+    // Backend now only knows about session 2.
+    invokeMock.mockResolvedValueOnce([session(2, "NeedsInput")]);
+    await useSessionStore.getState().fetchSessions();
+
+    expect(useSessionStore.getState().attentionSessionIds).toEqual([2]);
+  });
+
+  it("fetchSessionsForProject prunes attention ids absent from the fetched list", async () => {
+    useSessionStore.setState({
+      sessions: [session(1, "NeedsInput"), session(2, "NeedsInput")],
+      attentionSessionIds: [1],
+    });
+
+    invokeMock.mockResolvedValueOnce([session(2, "NeedsInput")]);
+    await useSessionStore.getState().fetchSessionsForProject("C:/proj");
+
+    expect(useSessionStore.getState().attentionSessionIds).toEqual([]);
+  });
+
+  it("removeSessionsForProject prunes attention ids of removed sessions", async () => {
+    useSessionStore.setState({
+      sessions: [session(1, "NeedsInput"), session(2, "NeedsInput")],
+      attentionSessionIds: [1, 2],
+    });
+
+    invokeMock.mockResolvedValueOnce([session(1, "NeedsInput")]);
+    await useSessionStore.getState().removeSessionsForProject("C:/proj");
+
+    expect(useSessionStore.getState().attentionSessionIds).toEqual([2]);
+    expect(useSessionStore.getState().sessions.map((s) => s.id)).toEqual([2]);
   });
 });

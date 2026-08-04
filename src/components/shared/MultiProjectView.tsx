@@ -607,8 +607,17 @@ function EagleZoomTab({
   // Attention highlight (auto-unparked because the agent needs input) —
   // same yellow chrome as the warning flag, cleared by selecting the session.
   const hasAttention = useSessionStore((s) => s.attentionSessionIds.includes(sessionId));
+  // Attention-first click semantics on the active tab: the first click only
+  // acknowledges the attention highlight — it must not also set the warning
+  // flag. Subsequent clicks toggle the flag as before.
   const handleClick = isActive
-    ? () => useSessionStore.getState().toggleSessionFlag(sessionId)
+    ? () => {
+        if (hasAttention) {
+          useSessionStore.getState().clearSessionAttention(sessionId);
+          return;
+        }
+        useSessionStore.getState().toggleSessionFlag(sessionId);
+      }
     : onSelect;
 
   const style: React.CSSProperties = {
@@ -637,7 +646,9 @@ function EagleZoomTab({
       }`}
       title={
         isActive
-          ? `${projectName} · ${label} (click to ${isFlagged ? "clear" : "set"} warning flag)`
+          ? hasAttention
+            ? `${projectName} · ${label} (needs input — click to clear the attention highlight)`
+            : `${projectName} · ${label} (click to ${isFlagged ? "clear" : "set"} warning flag)`
           : `Switch to ${projectName} · ${label}`
       }
     >

@@ -192,10 +192,19 @@ export const TerminalView = memo(function TerminalView({
   // same yellow chrome, cleared when the user selects the session.
   const hasAttention = useSessionStore((s) => s.attentionSessionIds.includes(sessionId));
   const toggleSessionFlag = useSessionStore((s) => s.toggleSessionFlag);
-  const handleToggleFlag = useCallback(
-    () => toggleSessionFlag(sessionId),
-    [toggleSessionFlag, sessionId],
-  );
+  // Attention-first click semantics: while the session carries the attention
+  // highlight, the first click on the header/tab strip only acknowledges it —
+  // it must not also toggle the warning flag (the chrome would stay yellow
+  // and the user would have flagged the session without knowing). Subsequent
+  // clicks toggle the flag as before.
+  const handleToggleFlag = useCallback(() => {
+    const store = useSessionStore.getState();
+    if (store.attentionSessionIds.includes(sessionId)) {
+      store.clearSessionAttention(sessionId);
+      return;
+    }
+    toggleSessionFlag(sessionId);
+  }, [toggleSessionFlag, sessionId]);
   const hasSessionWorktree = Boolean(sessionData?.worktreePath);
   const projectPath = sessionData?.workingDirectory ?? sessionData?.projectPath ?? "";
 
@@ -600,8 +609,8 @@ export const TerminalView = memo(function TerminalView({
               needsInputPrompt: undefined,
             });
             // Answering the prompt also clears the auto-unpark attention
-            // highlight — the auto-unpark flow focuses this pane without a
-            // click, so replying may be the first user interaction with it.
+            // highlight — the pane can gain focus without a click (keyboard
+            // nav, file drop), so replying may be the acknowledging gesture.
             useSessionStore.getState().clearSessionAttention(sessionId);
           }
         }
@@ -908,7 +917,13 @@ export const TerminalView = memo(function TerminalView({
           if ((e.target as HTMLElement).closest("button")) return;
           handleToggleFlag();
         }}
-        title={isFlagged ? "Click to clear warning flag" : "Click to flag as warning"}
+        title={
+          hasAttention
+            ? "Needs input — click to clear the attention highlight"
+            : isFlagged
+              ? "Click to clear warning flag"
+              : "Click to flag as warning"
+        }
       >
         <button
           type="button"
