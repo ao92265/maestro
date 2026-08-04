@@ -65,7 +65,7 @@ import { useProjectColors } from "@/lib/useProjectColors";
 import { ParkedShelf } from "./ParkedShelf";
 import { PreLaunchCard, type SessionSlot } from "./PreLaunchCard";
 import { SplitPaneView } from "./SplitPaneView";
-import { MAX_SESSIONS, createLeaf, splitLeaf, removeLeaf, updateRatio, collectSlotIds, findSiblingSlotId, buildGridTree, swapSlots, type TreeNode, type SplitDirection } from "./splitTree";
+import { MAX_SESSIONS, createLeaf, removeLeaf, updateRatio, collectSlotIds, findSiblingSlotId, buildGridTree, swapSlots, type TreeNode } from "./splitTree";
 import { TerminalView } from "./TerminalView";
 import { SessionStatusDot, ThinkingIndicator } from "./ThinkingIndicator";
 
@@ -409,92 +409,78 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     return idx >= 0 ? idx : null;
   }, [focusedSlotId, launchedSlots]);
 
-  // Ref-based close callback to avoid forward-reference issues with handleKill/removeSlot
-  const closePaneRef = useRef<() => void>(() => {});
+  // Ref-based park callback: handlePark is defined further down the render
+  // body (it needs handleKill/removeSlot-adjacent state), so the hook gets a
+  // stable closure that dereferences the ref at call time.
+  const parkFocusedRef = useRef<() => void>(() => {});
 
-  /**
-   * Splits the focused terminal pane in the given direction.
-   * Creates a new pre-launch slot and inserts it as a sibling.
-   * Debounced to prevent double-fire from duplicate keyboard events.
-   */
-  const lastSplitRef = useRef(0);
-  const handleSplit = useCallback((direction: SplitDirection) => {
-    const now = Date.now();
-    if (now - lastSplitRef.current < 200) return; // debounce
-    lastSplitRef.current = now;
+  const zoomedNext = useCallback(() => {
+    if (!zoomedSlotId) return;
+    const idx = visibleDisplaySlotIds.indexOf(zoomedSlotId);
+    if (idx < 0) return;
+    const next = visibleDisplaySlotIds[(idx + 1) % visibleDisplaySlotIds.length];
+    setZoomedSlotId(next);
+    // Focus follows the zoomed terminal — the zoom view no longer remounts
+    // (which used to force focus via a fresh isFocused render).
+    setFocusedSlotId(next);
+    focusSlotTextarea(next);
+  }, [zoomedSlotId, visibleDisplaySlotIds]);
 
-    if (slotsRef.current.length >= MAX_SESSIONS) return;
-    // Default to first slot if nothing is focused
-    const targetSlotId = focusedSlotId ?? slotsRef.current[0]?.id;
-    if (!targetSlotId) return;
-    const newSlot = createEmptySlot(mcpServers, skills, plugins);
-    setSlots((prev) => [...prev, newSlot]);
-    setLayoutTree((prev) => splitLeaf(prev, targetSlotId, newSlot.id, direction));
-    setFocusedSlotId(newSlot.id);
-  }, [focusedSlotId, mcpServers, skills, plugins]);
+  const zoomedPrev = useCallback(() => {
+    if (!zoomedSlotId) return;
+    const idx = visibleDisplaySlotIds.indexOf(zoomedSlotId);
+    if (idx < 0) return;
+    const prev =
+      visibleDisplaySlotIds[(idx - 1 + visibleDisplaySlotIds.length) % visibleDisplaySlotIds.length];
+    setZoomedSlotId(prev);
+    setFocusedSlotId(prev);
+    focusSlotTextarea(prev);
+  }, [zoomedSlotId, visibleDisplaySlotIds]);
 
   // Terminal keyboard navigation hook
   useTerminalKeyboard({
     terminalCount: launchedSlots.length,
-    focusedIndex,
-    onFocusTerminal: useCallback((index: number) => {
-      const slot = launchedSlots[index];
-      if (slot) {
-        setFocusedSlotId(slot.id);
-      }
-    }, [launchedSlots]),
+    // While zoomed, focus-cycling follows the zoom-tab order so Cmd/Ctrl+Alt+
+    // Arrow never lands on a pane the zoom view is hiding.
     onCycleNext: useCallback(() => {
+      if (zoomedSlotId) {
+        zoomedNext();
+        return;
+      }
       if (launchedSlots.length === 0) return;
       const currentIdx = focusedIndex ?? -1;
       const nextIdx = (currentIdx + 1) % launchedSlots.length;
       setFocusedSlotId(launchedSlots[nextIdx].id);
-    }, [launchedSlots, focusedIndex]),
+    }, [zoomedSlotId, zoomedNext, launchedSlots, focusedIndex]),
     onCyclePrevious: useCallback(() => {
+      if (zoomedSlotId) {
+        zoomedPrev();
+        return;
+      }
       if (launchedSlots.length === 0) return;
       const currentIdx = focusedIndex ?? 0;
       const prevIdx = (currentIdx - 1 + launchedSlots.length) % launchedSlots.length;
       setFocusedSlotId(launchedSlots[prevIdx].id);
-    }, [launchedSlots, focusedIndex]),
-    onSplitVertical: useCallback(() => handleSplit("vertical"), [handleSplit]),
-    onSplitHorizontal: useCallback(() => handleSplit("horizontal"), [handleSplit]),
-    // Dereference the ref at call time, not render time: closePaneRef.current
+    }, [zoomedSlotId, zoomedPrev, launchedSlots, focusedIndex]),
+    // Dereference the ref at call time, not render time: parkFocusedRef.current
     // is reassigned further down the render body, so passing its value here
     // hands the hook the closure from the PREVIOUS render (stale focusedSlotId
-    // — Cmd/Ctrl+W would close the pane focused one render ago).
-    onClosePane: useCallback(() => closePaneRef.current(), []),
+    // — Alt+P would park the pane focused one render ago).
+    onParkFocused: useCallback(() => parkFocusedRef.current(), []),
     onToggleZoomFocused: useCallback(() => {
       const targetId = focusedSlotId ?? slotsRef.current[0]?.id;
       if (!targetId) return;
       if (parkedSlotIds.has(targetId)) return; // parked panes can't be zoomed
       setZoomedSlotId((prev) => (prev === targetId ? null : targetId));
     }, [focusedSlotId, parkedSlotIds]),
-    onZoomedNext: useCallback(() => {
-      if (!zoomedSlotId) return;
-      const idx = visibleDisplaySlotIds.indexOf(zoomedSlotId);
-      if (idx < 0) return;
-      const next = visibleDisplaySlotIds[(idx + 1) % visibleDisplaySlotIds.length];
-      setZoomedSlotId(next);
-      // Focus follows the zoomed terminal — the zoom view no longer remounts
-      // (which used to force focus via a fresh isFocused render).
-      setFocusedSlotId(next);
-      focusSlotTextarea(next);
-    }, [zoomedSlotId, visibleDisplaySlotIds]),
-    onZoomedPrev: useCallback(() => {
-      if (!zoomedSlotId) return;
-      const idx = visibleDisplaySlotIds.indexOf(zoomedSlotId);
-      if (idx < 0) return;
-      const prev =
-        visibleDisplaySlotIds[(idx - 1 + visibleDisplaySlotIds.length) % visibleDisplaySlotIds.length];
-      setZoomedSlotId(prev);
-      setFocusedSlotId(prev);
-      focusSlotTextarea(prev);
-    }, [zoomedSlotId, visibleDisplaySlotIds]),
+    onZoomedNext: zoomedNext,
+    onZoomedPrev: zoomedPrev,
     // When a terminal is zoomed the tab strip is the navigation UI, so
     // Alt+Left/Right should cycle tabs (handled in capture phase so xterm
     // doesn't swallow them). In normal split-pane mode Alt+Arrow stays as
     // xterm's word-movement.
     isZoomed: zoomedSlotId !== null,
-    // Split/zoom/focus shortcuts act on the per-project layout, which is
+    // Zoom/focus/park shortcuts act on the per-project layout, which is
     // suspended while the global eagle grid is showing.
     enabled: isActive && !eagleMode,
   });
@@ -1249,26 +1235,12 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     focusSlotTextarea(slot.id);
   }, []);
 
-  // Keep closePaneRef in sync with latest handleKill/removeSlot
-  closePaneRef.current = () => {
-    const targetId = focusedSlotId ?? slotsRef.current[0]?.id;
-    if (!targetId) return;
-    if (slotsRef.current.length <= 1) return; // don't close the last pane
-    const slot = slotsRef.current.find((s) => s.id === targetId);
-    if (!slot) return;
-
-    if (slot.sessionId !== null) {
-      // Confirm before closing a launched session (async native dialog)
-      ask("Are you sure you want to close this session?", {
-        title: "Close Session",
-        kind: "warning",
-      }).then((confirmed) => {
-        if (!confirmed) return;
-        killSessionById(slot.sessionId!);
-      }).catch(console.error);
-    } else {
-      removeSlot(slot.id);
-    }
+  // Keep parkFocusedRef in sync with the latest handlePark/focusedSlotId.
+  // Only an explicitly focused, launched pane parks — handlePark ignores
+  // pre-launch slots itself.
+  parkFocusedRef.current = () => {
+    if (!focusedSlotId) return;
+    handlePark(focusedSlotId);
   };
 
   /**
@@ -1529,6 +1501,9 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     // Rebuild layout as a clean 2D grid (matching old CSS grid dimensions)
     setLayoutTree(() => buildGridTree([...orderedSlotIds, newSlot.id]));
     setFocusedSlotId(newSlot.id);
+    // Stay in zoom-in view: the new pre-launch card takes over the zoom as
+    // the last tab in the strip (mirrors handleUnpark's behavior).
+    setZoomedSlotId((prev) => (prev === null ? null : newSlot.id));
     // Refresh branch list so new slots see the latest branches
     refreshBranches();
   }, [mcpServers, skills, plugins, refreshBranches, orderedSlotIds]);
@@ -1703,6 +1678,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
             projectLabel={eagleMode ? projectName : undefined}
             projectColor={eagleMode ? eagleColor : undefined}
             hasMoveHandle={showReorderHandle}
+            showShortcutHints={!eagleMode}
           />
           {dropOverlay}
         </DraggablePane>

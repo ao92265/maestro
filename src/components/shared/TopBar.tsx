@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { isMac } from "@/lib/platform";
+import { modLabel, titleWithShortcut } from "@/lib/shortcuts";
 import { MAX_SESSIONS } from "@/components/terminal/splitTree";
 
 /** One entry of the eagle-view "add terminal" project dropdown. */
@@ -143,7 +144,7 @@ export function TopBar({
             disabled={slotCount >= maxSessions}
             className="rounded p-1.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text disabled:cursor-not-allowed disabled:opacity-50"
             aria-label="Add session"
-            title="Add session"
+            title={titleWithShortcut("New terminal", modLabel(), "T")}
           >
             <Plus size={14} />
           </button>
@@ -161,7 +162,7 @@ export function TopBar({
                   : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
               }`}
               aria-label="Add terminal to project"
-              title="Add terminal — pick a project"
+              title={titleWithShortcut("New terminal — pick a project", modLabel(), "T")}
             >
               <Plus size={14} />
             </button>
@@ -207,7 +208,7 @@ export function TopBar({
                 : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
             }`}
             aria-label="Eagle view"
-            title="Eagle view — all projects' terminals at once"
+            title={titleWithShortcut("Eagle view", modLabel(), "G")}
           >
             <Bird size={14} />
           </button>
@@ -222,7 +223,7 @@ export function TopBar({
                 : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
             }`}
             aria-label="Memory"
-            title="Memory — Claude Code memory files"
+            title={titleWithShortcut("Memory", modLabel(), "3")}
           >
             <Brain size={14} />
           </button>
@@ -237,7 +238,7 @@ export function TopBar({
                 : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
             }`}
             aria-label="Processes"
-            title="Processes — dev processes and containers"
+            title={titleWithShortcut("Processes", modLabel(), "4")}
           >
             <Activity size={14} />
           </button>
@@ -252,7 +253,7 @@ export function TopBar({
                 : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
             }`}
             aria-label="Notes"
-            title="Notes"
+            title={titleWithShortcut("Notes", modLabel(), "5")}
           >
             <StickyNote size={14} />
           </button>
@@ -267,7 +268,7 @@ export function TopBar({
                 : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
             }`}
             aria-label="Standup"
-            title="Standup — daily report per project"
+            title={titleWithShortcut("Standup", modLabel(), "6")}
           >
             <Sunrise size={14} />
           </button>
@@ -283,7 +284,7 @@ export function TopBar({
               : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
           }`}
           aria-label="Git"
-          title="Git"
+          title={titleWithShortcut("Git", modLabel(), "2")}
         >
           <GitMerge size={14} />
         </button>

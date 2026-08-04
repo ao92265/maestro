@@ -26,10 +26,17 @@ import {
   loadRightPanelWidth,
   RIGHT_PANEL_WIDTH_STORAGE_KEY,
 } from "./components/shared/PanelResizeHandle";
+import { EagleProjectPickerModal } from "./components/shared/EagleProjectPickerModal";
 import { ProjectTabs } from "./components/shared/ProjectTabs";
 import { type EagleProjectOption, TopBar } from "./components/shared/TopBar";
 import { UtilityPanel, type UtilityPanelKind } from "./components/shared/UtilityPanel";
-import { Sidebar } from "./components/sidebar/Sidebar";
+import {
+  loadSavedSidebarTab,
+  saveSidebarTab,
+  Sidebar,
+  sidebarTabShortcutTransition,
+  type SidebarTabId,
+} from "./components/sidebar/Sidebar";
 import { UpdateNotification } from "./components/update/UpdateNotification";
 import { useAppKeyboard } from "./hooks/useAppKeyboard";
 import { useSwipeNavigation } from "./hooks/useSwipeNavigation";
@@ -77,6 +84,8 @@ function App() {
   const retryAfterFDAGrant = useFDAStore((s) => s.retryAfterGrant);
   const multiProjectRef = useRef<MultiProjectViewHandle>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  // Active left-sidebar tab — lifted out of Sidebar so Alt+1-4 can drive it.
+  const [sidebarTab, setSidebarTab] = useState<SidebarTabId>(loadSavedSidebarTab);
   const [gitPanelOpen, setGitPanelOpen] = useState(false);
   // Git-panel tab (commits/branches/…) is deliberately a single app-level
   // state shared across eagle carousel cards: swiping keeps you on the same
@@ -90,6 +99,8 @@ function App() {
   const [currentBranch, setCurrentBranch] = useState<string | undefined>(undefined);
   // Eagle view: one flat grid of every project's terminals at once
   const [eagleView, setEagleView] = useState(false);
+  // Eagle view Cmd/Ctrl+T: arrow-navigable project picker for the new terminal.
+  const [eagleAddPickerOpen, setEagleAddPickerOpen] = useState(false);
   // Eagle view git carousel: index of the project whose git panel card shows.
   const [eagleGitIndex, setEagleGitIndex] = useState(0);
   // Right-side utility panel (Memory / Processes), opened from the top bar.
@@ -416,10 +427,21 @@ function App() {
     }
   }, [activeTab, isStoppingAll, setSessionsLaunched]);
 
-  // Cmd/Ctrl+T: add a new session slot in grid view
+  // Cmd/Ctrl+T: add a new terminal. In eagle view this opens the project
+  // picker modal; otherwise the active project's grid gets a new slot (the
+  // grid keeps the zoom-in view and zooms the new slot when one is zoomed).
   const handleAddSessionShortcut = useCallback(() => {
+    if (eagleView) {
+      setEagleAddPickerOpen(true);
+      return;
+    }
     multiProjectRef.current?.addSessionToActiveProject();
-  }, []);
+  }, [eagleView]);
+
+  // Leaving eagle view always drops the picker.
+  useEffect(() => {
+    if (!eagleView) setEagleAddPickerOpen(false);
+  }, [eagleView]);
 
   const handleToggleUtilityPanel = useCallback((panel: UtilityPanelKind) => {
     setUtilityPanel((prev) => (prev === panel ? null : panel));
@@ -482,7 +504,24 @@ function App() {
     }
   }, []);
 
-  const handleToggleSidebar = useCallback(() => setSidebarOpen((prev) => !prev), []);
+  const handleSelectSidebarTab = useCallback((tab: SidebarTabId) => {
+    setSidebarTab(tab);
+    saveSidebarTab(tab);
+  }, []);
+
+  // Alt+1-4: open the sidebar on tab N; pressing the active tab's shortcut
+  // again closes the sidebar (per-tab toggle, no separate pane toggle).
+  const handleSidebarTabShortcut = useCallback(
+    (index: number) => {
+      const next = sidebarTabShortcutTransition(sidebarOpen, sidebarTab, index);
+      if (!next) return;
+      setSidebarOpen(next.open);
+      if (next.open && next.tab !== sidebarTab) {
+        handleSelectSidebarTab(next.tab);
+      }
+    },
+    [sidebarOpen, sidebarTab, handleSelectSidebarTab],
+  );
 
   // Closing a project tab terminates every terminal running in it, so when the
   // tab has live sessions we confirm first. `getState()` (not the reactive
@@ -517,10 +556,15 @@ function App() {
 
   useAppKeyboard({
     onAddSession: handleAddSessionShortcut,
-    canAddSession: activeTabSessionsLaunched,
-    onToggleSidebar: handleToggleSidebar,
+    // Eagle view: Cmd/Ctrl+T opens the project picker instead of adding
+    // directly, so it only needs at least one open project.
+    canAddSession: eagleView ? tabs.length > 0 : activeTabSessionsLaunched,
+    onSidebarTab: handleSidebarTabShortcut,
     onToggleGitPanel: handleToggleGitPanel,
+    onToggleUtilityPanel: handleToggleUtilityPanel,
     onToggleEagleView: useCallback(() => setEagleView((v) => !v), []),
+    onNextProject: switchToNextTab,
+    onPrevProject: switchToPrevTab,
   });
 
   // Handler to enter grid view for the active project
@@ -571,6 +615,8 @@ function App() {
         <Sidebar
           collapsed={!sidebarOpen}
           onCollapse={() => setSidebarOpen(false)}
+          activeTab={sidebarTab}
+          onSelectTab={handleSelectSidebarTab}
           theme={theme}
           onToggleTheme={toggleTheme}
           launchedCount={activeTabLaunchedCount}
@@ -724,6 +770,18 @@ function App() {
           </div>
         </div>
       </div>
+
+      {/* Eagle view Cmd/Ctrl+T: pick which project gets the new terminal */}
+      {eagleAddPickerOpen && (
+        <EagleProjectPickerModal
+          projects={eagleProjects}
+          onPick={(tabId) => {
+            setEagleAddPickerOpen(false);
+            handleAddSessionToProject(tabId);
+          }}
+          onClose={() => setEagleAddPickerOpen(false)}
+        />
+      )}
 
       {/* FDA Dialog for macOS TCC-protected paths */}
       {showFDADialog && (

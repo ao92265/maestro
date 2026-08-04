@@ -19,12 +19,39 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
-import { Sidebar } from "../Sidebar";
+import { type ComponentProps, useState } from "react";
+import {
+  loadSavedSidebarTab,
+  saveSidebarTab,
+  Sidebar,
+  sidebarTabShortcutTransition,
+  type SidebarTabId,
+} from "../Sidebar";
 import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 import { useSessionStore } from "@/stores/useSessionStore";
 
 const invokeMock = vi.mocked(invoke);
+
+/**
+ * The active tab is lifted to App (so Alt+1-4 shortcuts can drive it); this
+ * harness recreates App's side of the contract: state + persistence.
+ */
+function ControlledSidebar(
+  props: Omit<ComponentProps<typeof Sidebar>, "activeTab" | "onSelectTab">,
+) {
+  const [tab, setTab] = useState<SidebarTabId>(loadSavedSidebarTab);
+  return (
+    <Sidebar
+      {...props}
+      activeTab={tab}
+      onSelectTab={(t) => {
+        setTab(t);
+        saveSidebarTab(t);
+      }}
+    />
+  );
+}
 
 function buildTab(overrides: Partial<WorkspaceTab> = {}): WorkspaceTab {
   return {
@@ -126,7 +153,7 @@ describe("Sidebar tab bar", () => {
   });
 
   it("renders the four tabs with General active by default", () => {
-    render(<Sidebar />);
+    render(<ControlledSidebar />);
     for (const label of ["General", "History", "Infra", "Settings"]) {
       expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
     }
@@ -141,7 +168,7 @@ describe("Sidebar tab bar", () => {
   });
 
   it("switches to Infra (MCP + skills + project context)", () => {
-    render(<Sidebar />);
+    render(<ControlledSidebar />);
     fireEvent.click(screen.getByRole("button", { name: "Infra" }));
     expect(screen.getByText("MCP Servers")).toBeInTheDocument();
     expect(screen.getByText("Plugins & Skills")).toBeInTheDocument();
@@ -150,7 +177,7 @@ describe("Sidebar tab bar", () => {
   });
 
   it("switches to Settings and persists the chosen tab", async () => {
-    render(<Sidebar />);
+    render(<ControlledSidebar />);
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
     expect(screen.getByText("Terminal Settings")).toBeInTheDocument();
     await waitFor(() => {
@@ -160,14 +187,14 @@ describe("Sidebar tab bar", () => {
 
   it("falls back to General when a removed tab id was persisted", () => {
     localStorage.setItem("maestro-sidebar-tab", "memory");
-    render(<Sidebar />);
+    render(<ControlledSidebar />);
     expect(screen.getByText("Agents")).toBeInTheDocument();
   });
 
   it("History tab lists worktree conversations and resumes in their own directory", async () => {
     usePendingLaunchStore.setState({ pending: null });
     const onHistoryLaunch = vi.fn();
-    render(<Sidebar onHistoryLaunch={onHistoryLaunch} />);
+    render(<ControlledSidebar onHistoryLaunch={onHistoryLaunch} />);
 
     fireEvent.click(screen.getByRole("button", { name: "History" }));
     // Expand the project's collapsible
@@ -191,7 +218,7 @@ describe("Sidebar tab bar", () => {
   });
 
   it("History tab scans the repo and every worktree for conversations", async () => {
-    render(<Sidebar />);
+    render(<ControlledSidebar />);
     fireEvent.click(screen.getByRole("button", { name: "History" }));
     fireEvent.click(screen.getByRole("button", { name: /maestro/ }));
 
@@ -226,7 +253,7 @@ describe("Sidebar tab bar", () => {
       return base(cmd, args);
     });
 
-    render(<Sidebar />);
+    render(<ControlledSidebar />);
     fireEvent.click(screen.getByRole("button", { name: "History" }));
     fireEvent.click(screen.getByRole("button", { name: /maestro/ }));
 
@@ -240,7 +267,7 @@ describe("Sidebar tab bar", () => {
 
   it("History tab launches an agent into a surviving worktree", async () => {
     usePendingLaunchStore.setState({ pending: null });
-    render(<Sidebar />);
+    render(<ControlledSidebar />);
 
     fireEvent.click(screen.getByRole("button", { name: "History" }));
     fireEvent.click(screen.getByRole("button", { name: /maestro/ }));
@@ -276,8 +303,36 @@ describe("Sidebar tab bar", () => {
       ],
     });
     const onNavigate = vi.fn();
-    render(<Sidebar onAgentNavigate={onNavigate} />);
+    render(<ControlledSidebar onAgentNavigate={onNavigate} />);
     fireEvent.click(screen.getByText("My agent"));
     expect(onNavigate).toHaveBeenCalledWith("tab-1", 1);
+  });
+});
+
+describe("sidebarTabShortcutTransition (Alt+1-4 toggle semantics)", () => {
+  it("opens the sidebar on the requested tab when closed", () => {
+    expect(sidebarTabShortcutTransition(false, "general", 2)).toEqual({
+      open: true,
+      tab: "history",
+    });
+  });
+
+  it("closes the sidebar when the active tab's shortcut repeats", () => {
+    expect(sidebarTabShortcutTransition(true, "infra", 3)).toEqual({
+      open: false,
+      tab: "infra",
+    });
+  });
+
+  it("switches tabs when the sidebar is open on another tab", () => {
+    expect(sidebarTabShortcutTransition(true, "general", 4)).toEqual({
+      open: true,
+      tab: "settings",
+    });
+  });
+
+  it("returns null for an index that names no tab", () => {
+    expect(sidebarTabShortcutTransition(true, "general", 5)).toBeNull();
+    expect(sidebarTabShortcutTransition(false, "general", 0)).toBeNull();
   });
 });
