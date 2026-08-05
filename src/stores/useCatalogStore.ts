@@ -32,6 +32,12 @@ interface CatalogState {
   loadLatest: (repoPath: string) => Promise<void>;
   /** Scan (or rescan) one project. The only way a catalogue is ever built. */
   scan: (repoPath: string) => Promise<void>;
+  /**
+   * Stop the scan running for a project, killing the headless Claude process.
+   * A scan can hold that process for up to 45 minutes, so leaving the panel
+   * with no way out is not an option.
+   */
+  cancel: (repoPath: string) => Promise<void>;
 }
 
 export const useCatalogStore = create<CatalogState>((set, get) => ({
@@ -39,7 +45,10 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
 
   loadLatest: async (repoPath) => {
     const existing = get().catalogs[repoPath];
-    if (existing && existing.status !== "idle") return;
+    // Skip only what a read cannot improve: a scan in flight owns the slot,
+    // and an entry that already holds a catalogue has the newest from disk.
+    // A FAILED scan must not block the read — that entry has no catalogue.
+    if (existing?.status === "scanning" || existing?.catalog) return;
     try {
       // `date: null` makes the backend serve the newest saved catalogue.
       const catalog = await invoke<ProjectCatalog | null>("load_project_catalog", {
@@ -49,7 +58,7 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
       // Re-check after the await: a scan may have taken the slot while we read
       // from disk — its state must win over this stale read.
       const current = get().catalogs[repoPath];
-      if (current && current.status !== "idle") return;
+      if (current?.status === "scanning" || current?.catalog) return;
       set((state) => ({
         catalogs: {
           ...state.catalogs,
@@ -88,6 +97,9 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
         },
       }));
     } catch (err) {
+      // A cancel already released the slot, so this rejection is the stop we
+      // asked for — a deliberate stop must not paint the panel red.
+      if (get().catalogs[repoPath]?.status !== "scanning") return;
       set((state) => ({
         catalogs: {
           ...state.catalogs,
@@ -98,6 +110,28 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
           },
         },
       }));
+    }
+  },
+
+  cancel: async (repoPath) => {
+    const entry = get().catalogs[repoPath];
+    if (entry?.status !== "scanning") return;
+    // Release the slot first so the in-flight scan's rejection stays quiet
+    // (see the catch above), then kill the process behind it.
+    set((state) => ({
+      catalogs: {
+        ...state.catalogs,
+        [repoPath]: {
+          status: entry.catalog ? "ready" : "idle",
+          catalog: entry.catalog,
+          error: null,
+        },
+      },
+    }));
+    try {
+      await invoke("cancel_project_catalog", { projectPath: repoPath });
+    } catch (err) {
+      console.error("Failed to stop the catalog scan:", err);
     }
   },
 }));

@@ -115,6 +115,21 @@ describe("useCatalogStore", () => {
     expect(entry.catalog).toBeNull();
   });
 
+  it("loadLatest still reads after a failed scan", async () => {
+    // A failed scan must not lock the panel out of the disk for the rest of
+    // the session — the entry is in "error" but holds no catalog.
+    useCatalogStore.setState({
+      catalogs: { [PROJECT]: { status: "error", catalog: null, error: "boom" } },
+    });
+    invokeMock.mockResolvedValueOnce(catalog("2026-06-12"));
+    await useCatalogStore.getState().loadLatest(PROJECT);
+    expect(invokeMock).toHaveBeenCalledWith("load_project_catalog", {
+      projectPath: PROJECT,
+      date: null,
+    });
+    expect(useCatalogStore.getState().catalogs[PROJECT].catalog?.date).toBe("2026-06-12");
+  });
+
   it("loadLatest does not re-read a project that already has a catalog", async () => {
     useCatalogStore.setState({
       catalogs: { [PROJECT]: { status: "ready", catalog: catalog(), error: null } },
@@ -137,6 +152,52 @@ describe("useCatalogStore", () => {
     const entry = useCatalogStore.getState().catalogs[PROJECT];
     expect(entry.status).toBe("scanning");
     expect(entry.catalog).toBeNull();
+  });
+
+  it("cancel stops the run and hands the slot back", async () => {
+    invokeMock.mockImplementationOnce(() => new Promise<ProjectCatalog>(() => {}));
+    void useCatalogStore.getState().scan(PROJECT);
+    await useCatalogStore.getState().cancel(PROJECT);
+    expect(invokeMock).toHaveBeenCalledWith("cancel_project_catalog", {
+      projectPath: PROJECT,
+    });
+    const entry = useCatalogStore.getState().catalogs[PROJECT];
+    expect(entry.status).toBe("idle");
+    expect(entry.error).toBeNull();
+  });
+
+  it("cancel leaves the previous catalog on screen", async () => {
+    const old = catalog("2026-07-01");
+    useCatalogStore.setState({
+      catalogs: { [PROJECT]: { status: "ready", catalog: old, error: null } },
+    });
+    invokeMock.mockImplementationOnce(() => new Promise<ProjectCatalog>(() => {}));
+    void useCatalogStore.getState().scan(PROJECT);
+    await useCatalogStore.getState().cancel(PROJECT);
+    const entry = useCatalogStore.getState().catalogs[PROJECT];
+    expect(entry.status).toBe("ready");
+    expect(entry.catalog).toEqual(old);
+  });
+
+  it("a cancelled scan's rejection does not paint the panel red", async () => {
+    // The backend rejects with "Scan stopped." once the process is killed;
+    // that is the outcome the user asked for, not a failure to report.
+    let reject: (e: unknown) => void = () => {};
+    invokeMock.mockImplementationOnce(
+      () => new Promise<ProjectCatalog>((_, r) => (reject = r))
+    );
+    const pending = useCatalogStore.getState().scan(PROJECT);
+    await useCatalogStore.getState().cancel(PROJECT);
+    reject("Scan stopped.");
+    await pending;
+    const entry = useCatalogStore.getState().catalogs[PROJECT];
+    expect(entry.status).toBe("idle");
+    expect(entry.error).toBeNull();
+  });
+
+  it("cancel does nothing when no scan is running", async () => {
+    await useCatalogStore.getState().cancel(PROJECT);
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 
   it("loadLatest swallows a read failure rather than showing an error", async () => {

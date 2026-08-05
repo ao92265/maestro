@@ -216,10 +216,15 @@ pub fn or_none(s: &str) -> &str {
 /// repository needs far longer than one that summarises material we already
 /// gathered, so the ceiling is the caller's choice — [`CLAUDE_TIMEOUT_SECS`]
 /// is the default the summarising features pass.
+///
+/// `tools` restricts the run to the named built-in tools; an empty slice
+/// leaves the CLI's own defaults alone (what the summarising features want,
+/// since they hand the model everything in the prompt and expect no tool use).
 pub async fn run_claude_print_with_timeout(
     project_path: &str,
     prompt: String,
     timeout_secs: u64,
+    tools: &[&str],
 ) -> Result<String, String> {
     #[cfg(windows)]
     let mut cmd = {
@@ -239,6 +244,16 @@ pub async fn run_claude_print_with_timeout(
         c.env("PATH", crate::core::cli_path::augmented_path());
         c
     };
+
+    if !tools.is_empty() {
+        // `--tools` decides which built-in tools EXIST for the run, so a
+        // permissive project settings.json cannot hand the model Bash or
+        // Write; `--allowedTools` then spares the survivors a permission
+        // prompt that a headless run has no way to answer. Both flags take a
+        // comma- or space-separated list (`claude --help`).
+        let list = tools.join(",");
+        cmd.args(["--tools", list.as_str(), "--allowedTools", list.as_str()]);
+    }
 
     cmd.current_dir(project_path)
         .stdin(Stdio::piped())
@@ -289,18 +304,20 @@ pub async fn run_and_save(
     dir: &Path,
     date: &str,
 ) -> Result<String, String> {
-    run_and_save_with_timeout(cwd, prompt, dir, date, CLAUDE_TIMEOUT_SECS).await
+    run_and_save_with_timeout(cwd, prompt, dir, date, CLAUDE_TIMEOUT_SECS, &[]).await
 }
 
-/// Same, with an explicit run timeout (see [`run_claude_print_with_timeout`]).
+/// Same, with an explicit run timeout and tool restriction (see
+/// [`run_claude_print_with_timeout`]).
 pub async fn run_and_save_with_timeout(
     cwd: &str,
     prompt: String,
     dir: &Path,
     date: &str,
     timeout_secs: u64,
+    tools: &[&str],
 ) -> Result<String, String> {
-    let raw = run_claude_print_with_timeout(cwd, prompt, timeout_secs).await?;
+    let raw = run_claude_print_with_timeout(cwd, prompt, timeout_secs, tools).await?;
     let markdown = strip_ansi(&raw).trim().to_string();
     if markdown.is_empty() {
         return Err("Claude returned an empty report".to_string());

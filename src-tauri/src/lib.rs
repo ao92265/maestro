@@ -452,6 +452,7 @@ pub fn run() {
             commands::plan::load_daily_plan,
             // Project feature catalogue (on-demand scan, one per project)
             commands::catalog::scan_project_catalog,
+            commands::catalog::cancel_project_catalog,
             commands::catalog::load_project_catalog,
             // CLI commands
             commands::cli::install_cli,
