@@ -18,7 +18,11 @@ export function sessionsForTab(tab: WorkspaceTab, sessions: SessionConfig[]): Se
 
 /**
  * Aggregated status for a project, derived from its sessions.
- * Priority order: Working > NeedsInput > Error > Done > Starting > Idle
+ * Priority order: NeedsInput > Working > Error > Done > Starting > Idle
+ *
+ * NeedsInput comes first on purpose: the tab strip answers "does this project
+ * need me?", and with several terminals per project something is almost always
+ * working — ranking Working first hid every blocked terminal behind a busy one.
  */
 export type ProjectStatus =
   | "idle"
@@ -30,14 +34,19 @@ export type ProjectStatus =
 
 /**
  * Maps backend session status to CSS color class names.
+ *
+ * Blue means working, the neon accent means "needs your input" — the same
+ * convention the session badges, terminal chrome and thinking dots use. These
+ * two used to be swapped here (working painted accent-red, needs-input yellow),
+ * which taught the opposite of every other surface.
  */
 export const STATUS_COLORS: Record<ProjectStatus, string> = {
   idle: "bg-maestro-muted",
   starting: "bg-orange-500",
-  working: "bg-maestro-accent",
-  "needs-input": "bg-yellow-500",
+  working: "bg-maestro-blue",
+  "needs-input": "bg-maestro-accent",
   done: "bg-maestro-green",
-  error: "bg-red-500",
+  error: "bg-maestro-red",
 };
 
 /**
@@ -74,10 +83,10 @@ export function useProjectStatus(tabId: string): {
       projectSessions.some((s) => s.status === status);
 
     let status: ProjectStatus;
-    if (hasStatus("Working")) {
-      status = "working";
-    } else if (hasStatus("NeedsInput")) {
+    if (hasStatus("NeedsInput")) {
       status = "needs-input";
+    } else if (hasStatus("Working")) {
+      status = "working";
     } else if (hasStatus("Error")) {
       status = "error";
     } else if (projectSessions.every((s) => s.status === "Done")) {

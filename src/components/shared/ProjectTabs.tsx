@@ -117,10 +117,10 @@ function TabItem({
         {sessionCount > 0 && (
           <span
             className={`text-[10px] font-medium px-1.5 py-0.5 rounded-full ${
-              status === "working"
+              status === "needs-input"
                 ? "bg-maestro-accent/20 text-maestro-accent"
-                : status === "needs-input"
-                  ? "bg-yellow-500/20 text-yellow-500"
+                : status === "working"
+                  ? "bg-maestro-blue/20 text-maestro-blue"
                   : "bg-maestro-muted/20 text-maestro-muted"
             }`}
           >

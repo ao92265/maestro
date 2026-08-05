@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { create } from "zustand";
 import { samePath } from "@/lib/path";
+import { useAgentStore } from "@/stores/useAgentStore";
 
 /** AI provider variants supported by the backend orchestrator. */
 export type AiMode = "Claude" | "Gemini" | "Codex" | "OpenCode" | "Plain";
@@ -371,6 +372,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
             // NeedsInput, but never downgrade an explicit terminal state
             // (Done/Error) or a startup Timeout the agent/frontend already set.
             let status: BackendSessionStatus;
+            let statusMessage = message;
             if (event.payload.status === "AwaitingInput") {
               const existing = get().sessions.find(
                 (s) => s.id === session_id && s.project_path === project_path
@@ -378,7 +380,22 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
               if (existing && ["Done", "Error", "Timeout"].includes(existing.status)) {
                 return;
               }
-              status = "NeedsInput";
+              // The Stop hook fires whenever the agent ends its turn — including
+              // when it ends the turn precisely because it handed work off to
+              // background subagents. Those are still running, so the session is
+              // working, not waiting on the user. Self-correcting: the next turn
+              // end, once no subagent is running, reports NeedsInput as normal.
+              const runningSubagents = useAgentStore
+                .getState()
+                .agents.filter((a) => a.sessionId === session_id && a.completedAt === null).length;
+              if (runningSubagents > 0) {
+                status = "Working";
+                statusMessage = `${runningSubagents} subagent${
+                  runningSubagents === 1 ? "" : "s"
+                } running`;
+              } else {
+                status = "NeedsInput";
+              }
             } else {
               status = event.payload.status;
             }
@@ -392,7 +409,11 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
               // Buffer this status update - it will be applied when the session is added
               const bufferKey = statusBufferKey(session_id, project_path);
               console.log(`[SessionStore] Buffering status for non-existent session. Key: '${bufferKey}'`);
-              pendingStatusUpdates.set(bufferKey, { ...event.payload, status });
+              pendingStatusUpdates.set(bufferKey, {
+                ...event.payload,
+                status,
+                message: statusMessage,
+              });
               return;
             }
 
@@ -407,7 +428,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
                   ? {
                       ...s,
                       status,
-                      statusMessage: message,
+                      statusMessage,
                       needsInputPrompt: needs_input_prompt,
                       lastMcpUpdateTime: Date.now(),
                     }
