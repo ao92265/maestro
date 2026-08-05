@@ -447,6 +447,9 @@ pub fn run() {
             commands::standup::generate_standup_report,
             commands::standup::get_default_standup_prompt,
             commands::standup::load_standup_report,
+            // Daily plan commands (one plan across all open projects)
+            commands::plan::generate_daily_plan,
+            commands::plan::load_daily_plan,
             // CLI commands
             commands::cli::install_cli,
             commands::cli::uninstall_cli,

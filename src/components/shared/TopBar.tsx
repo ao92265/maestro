@@ -7,9 +7,9 @@ import {
   Minus,
   PanelLeft,
   Plus,
+  Sparkles,
   Square,
   StickyNote,
-  Sunrise,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -55,9 +55,9 @@ interface TopBarProps {
   /** Right-side Notes panel */
   notesPanelOpen?: boolean;
   onToggleNotesPanel?: () => void;
-  /** Right-side Standup panel */
-  standupPanelOpen?: boolean;
-  onToggleStandupPanel?: () => void;
+  /** Right-side AI panel (Report / Plan / Catalog tabs) */
+  aiPanelOpen?: boolean;
+  onToggleAiPanel?: () => void;
 }
 
 export function TopBar({
@@ -80,8 +80,8 @@ export function TopBar({
   onToggleProcessesPanel,
   notesPanelOpen = false,
   onToggleNotesPanel,
-  standupPanelOpen = false,
-  onToggleStandupPanel,
+  aiPanelOpen = false,
+  onToggleAiPanel,
 }: TopBarProps) {
   const appWindow = useMemo(() => getCurrentWindow(), []);
 
@@ -257,19 +257,19 @@ export function TopBar({
             <StickyNote size={14} />
           </button>
         )}
-        {onToggleStandupPanel && (
+        {onToggleAiPanel && (
           <button
             type="button"
-            onClick={onToggleStandupPanel}
+            onClick={onToggleAiPanel}
             className={`rounded p-1.5 transition-colors ${
-              standupPanelOpen
+              aiPanelOpen
                 ? "text-maestro-accent hover:bg-maestro-accent/10"
                 : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
             }`}
-            aria-label="Standup"
-            title="Standup — daily report per project"
+            aria-label="AI"
+            title="AI — daily report and plan"
           >
-            <Sunrise size={14} />
+            <Sparkles size={14} />
           </button>
         )}
         {/* Git panel — in eagle view it becomes a per-project carousel

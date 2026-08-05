@@ -6,25 +6,29 @@
 //! `claude -p` run (the user's existing Claude Code login — no API key), and
 //! persists the resulting markdown per project per date under the app data
 //! directory.
+//!
+//! The generic machinery — running `claude -p`, saving/loading a dated
+//! artifact, newest-artifact lookup, truncation, safe interpolation — lives in
+//! [`super::ai_runner`] and is shared with the daily plan. This module owns
+//! only the standup's material gathering and prompt.
 
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::path::PathBuf;
 
 use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
 use serde::Serialize;
-use tokio::io::AsyncWriteExt;
 
+use super::ai_runner;
 use super::claude_sessions;
-use crate::core::status_server::StatusServer;
 use crate::git::Git;
 
+/// Artifact kind — also the directory name under the app data dir. Changing
+/// it would orphan every previously saved report.
+const KIND: &str = "standups";
 /// Ceiling for the since-last-report commit log only — a standup covers at
 /// most a few days of work. The long-horizon overview has its own cap below.
 const MAX_COMMITS: usize = 100;
 /// Fallback window when no previous report exists (covers a long weekend).
 const DEFAULT_SINCE_DAYS: i64 = 3;
-/// `claude -p` can take a while on a big context; kill it after this.
-const CLAUDE_TIMEOUT_SECS: u64 = 300;
 /// Cap the raw material fed to the model.
 const MAX_COMMITS_CHARS: usize = 12_000;
 const MAX_SESSIONS_CHARS: usize = 4_000;
@@ -46,190 +50,12 @@ pub struct StandupReport {
     pub generated_at: String,
 }
 
-/// Base directory for saved reports: `<app data>/standups/`.
-fn standup_base_dir() -> PathBuf {
-    directories::ProjectDirs::from("com", "maestro", "maestro")
-        .map(|p| p.data_dir().to_path_buf())
-        .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(home).join(".local/share/maestro")
-        })
-        .join("standups")
-}
-
-/// Per-project report directory: `<base>/<sanitized-name>-<hash12>/`.
+/// Per-project report directory: `<app data>/standups/<name>-<hash12>/`.
 fn project_report_dir(canonical_project: &str) -> PathBuf {
-    let name = Path::new(canonical_project)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_lowercase())
-        .unwrap_or_else(|| "project".to_string());
-    let sanitized: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let hash = StatusServer::generate_project_hash(canonical_project);
-    standup_base_dir().join(format!("{}-{}", sanitized, hash))
+    ai_runner::project_artifact_dir(KIND, canonical_project)
 }
 
-/// Remove ANSI escape sequences (CSI and OSC) so saved reports are clean text.
-fn strip_ansi(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match chars.peek() {
-            Some('[') => {
-                // CSI: parameters end at the first "final byte" in '@'..='~'.
-                chars.next();
-                for n in chars.by_ref() {
-                    if ('@'..='~').contains(&n) {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                // OSC: runs until BEL or ESC-backslash (ST).
-                chars.next();
-                while let Some(n) = chars.next() {
-                    if n == '\u{07}' {
-                        break;
-                    }
-                    if n == '\u{1b}' {
-                        if chars.peek() == Some(&'\\') {
-                            chars.next();
-                        }
-                        break;
-                    }
-                }
-            }
-            Some(_) => {
-                // Two-character escape (e.g. ESC c).
-                chars.next();
-            }
-            None => {}
-        }
-    }
-    out
-}
-
-/// Truncate on a char boundary, appending a marker when content was dropped.
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let truncated: String = s.chars().take(max_chars).collect();
-    format!("{}\n[... truncated ...]", truncated)
-}
-
-/// Newest saved report date in `dir`, optionally strictly before `before`
-/// (ISO dates sort lexically).
-async fn latest_report_date(dir: &Path, before: Option<&str>) -> Option<String> {
-    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
-    let mut best: Option<String> = None;
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some(date) = name.strip_suffix(".md") {
-            if date.len() == 10
-                && NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()
-                && before.map_or(true, |b| date < b)
-                && best.as_deref().map_or(true, |b| date > b)
-            {
-                best = Some(date.to_string());
-            }
-        }
-    }
-    best
-}
-
-/// Canonicalizes the project path for report naming and as the `claude -p`
-/// working directory. On Windows, canonicalize() prepends \\?\ (the
-/// extended-length prefix); cmd.exe rejects that as a working directory and
-/// silently falls back to C:\Windows, so the report would be generated from
-/// the wrong directory. Strip it, same as commands/terminal.rs.
-fn canonical_project_path(project_path: &str) -> String {
-    let canonical = std::fs::canonicalize(project_path)
-        .unwrap_or_else(|_| PathBuf::from(project_path))
-        .to_string_lossy()
-        .into_owned();
-    #[cfg(windows)]
-    let canonical = canonical
-        .strip_prefix(r"\\?\")
-        .map(str::to_string)
-        .unwrap_or(canonical);
-    canonical
-}
-
-/// Run `claude -p` headlessly in the project directory, prompt via stdin.
-async fn run_claude_print(project_path: &str, prompt: String) -> Result<String, String> {
-    #[cfg(windows)]
-    let mut cmd = {
-        use crate::core::windows_process::TokioCommandExt;
-        // `claude` may be an npm `.cmd` shim, which CreateProcess cannot spawn
-        // directly; route through cmd.exe. The prompt travels via stdin, so no
-        // untrusted content ever reaches cmd's argument parser.
-        let mut c = tokio::process::Command::new("cmd");
-        c.args(["/C", "claude", "-p"]);
-        c.hide_console_window();
-        c
-    };
-    #[cfg(not(windows))]
-    let mut cmd = {
-        let mut c = tokio::process::Command::new("claude");
-        c.arg("-p");
-        c.env("PATH", crate::core::cli_path::augmented_path());
-        c
-    };
-
-    cmd.current_dir(project_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    let mut child = cmd.spawn().map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => {
-            "Claude CLI not found on PATH — install it with: npm install -g @anthropic-ai/claude-code".to_string()
-        }
-        _ => format!("Failed to start Claude CLI: {}", e),
-    })?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(prompt.as_bytes())
-            .await
-            .map_err(|e| format!("Failed to send prompt to Claude CLI: {}", e))?;
-        // Dropping stdin closes the pipe so `claude -p` knows input ended.
-    }
-
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(CLAUDE_TIMEOUT_SECS),
-        child.wait_with_output(),
-    )
-    .await
-    .map_err(|_| format!("Claude run timed out after {}s", CLAUDE_TIMEOUT_SECS))?
-    .map_err(|e| format!("Claude run failed: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "Claude CLI exited with {}: {}",
-            output.status,
-            stderr.trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// Built-in prompt template. Users may override it from the Standup panel;
+/// Built-in prompt template. Users may override it from the AI panel;
 /// `{project}`, `{date}`, `{since}`, `{commits}`, `{sessions}` and
 /// `{overview}` are substituted before the prompt is sent to `claude -p`.
 pub const DEFAULT_PROMPT_TEMPLATE: &str = r#"Write my standup update for the {project} project ({date}) so I can paste it straight into my team's group chat. Base it ONLY on the material below — never invent work that is not evidenced by it.
@@ -260,37 +86,6 @@ PROJECT OVERVIEW (only for the closing overall-status sentences):
 {overview}
 "#;
 
-/// Single-pass placeholder interpolation over `template`: each `{token}` in
-/// the TEMPLATE is replaced once, and substituted material is never
-/// re-scanned — so a commit subject or session prompt containing a literal
-/// "{sessions}"/"{overview}" cannot get expanded (unlike chained
-/// `str::replace`, which rescans the accumulated string).
-fn interpolate(template: &str, vars: &[(&str, &str)]) -> String {
-    let mut out = String::with_capacity(template.len());
-    let mut rest = template;
-    loop {
-        let mut earliest: Option<(usize, &str, &str)> = None;
-        for &(token, value) in vars {
-            if let Some(pos) = rest.find(token) {
-                if earliest.map_or(true, |(p, _, _)| pos < p) {
-                    earliest = Some((pos, token, value));
-                }
-            }
-        }
-        match earliest {
-            Some((pos, token, value)) => {
-                out.push_str(&rest[..pos]);
-                out.push_str(value);
-                rest = &rest[pos + token.len()..];
-            }
-            None => {
-                out.push_str(rest);
-                return out;
-            }
-        }
-    }
-}
-
 /// Build the standup prompt from the gathered material. A non-empty custom
 /// template replaces the built-in one; both use the same placeholders.
 fn build_prompt(
@@ -306,22 +101,15 @@ fn build_prompt(
         Some(t) if !t.trim().is_empty() => t,
         _ => DEFAULT_PROMPT_TEMPLATE,
     };
-    fn or_none(s: &str) -> &str {
-        if s.trim().is_empty() {
-            "(none)"
-        } else {
-            s
-        }
-    }
-    interpolate(
+    ai_runner::interpolate(
         template,
         &[
             ("{project}", project_name),
             ("{date}", date),
             ("{since}", since),
-            ("{commits}", or_none(commits)),
-            ("{sessions}", or_none(sessions)),
-            ("{overview}", or_none(overview)),
+            ("{commits}", ai_runner::or_none(commits)),
+            ("{sessions}", ai_runner::or_none(sessions)),
+            ("{overview}", ai_runner::or_none(overview)),
         ],
     )
 }
@@ -340,11 +128,11 @@ pub async fn generate_standup_report(
     project_path: String,
     prompt_template: Option<String>,
 ) -> Result<StandupReport, String> {
-    let canonical = canonical_project_path(&project_path);
+    let canonical = ai_runner::canonical_project_path(&project_path);
 
-    let today = Local::now().format("%Y-%m-%d").to_string();
+    let today = ai_runner::today_local();
     let report_dir = project_report_dir(&canonical);
-    let since = latest_report_date(&report_dir, Some(&today))
+    let since = ai_runner::latest_artifact_date(&report_dir, Some(&today))
         .await
         .unwrap_or_else(|| {
             (Local::now() - Duration::days(DEFAULT_SINCE_DAYS))
@@ -434,34 +222,19 @@ pub async fn generate_standup_report(
         )
     };
 
-    let project_name = Path::new(&canonical)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| canonical.clone());
+    let project_name = ai_runner::project_name_of(&canonical);
 
     let prompt = build_prompt(
         prompt_template.as_deref(),
         &project_name,
         &today,
         &since,
-        &truncate_chars(&commits, MAX_COMMITS_CHARS),
-        &truncate_chars(&sessions, MAX_SESSIONS_CHARS),
-        &truncate_chars(&overview, MAX_OVERVIEW_CHARS),
+        &ai_runner::truncate_chars(&commits, MAX_COMMITS_CHARS),
+        &ai_runner::truncate_chars(&sessions, MAX_SESSIONS_CHARS),
+        &ai_runner::truncate_chars(&overview, MAX_OVERVIEW_CHARS),
     );
 
-    let raw = run_claude_print(&canonical, prompt).await?;
-    let markdown = strip_ansi(&raw).trim().to_string();
-    if markdown.is_empty() {
-        return Err("Claude returned an empty report".to_string());
-    }
-
-    tokio::fs::create_dir_all(&report_dir)
-        .await
-        .map_err(|e| format!("Failed to create report directory: {}", e))?;
-    let file_path = report_dir.join(format!("{}.md", today));
-    tokio::fs::write(&file_path, &markdown)
-        .await
-        .map_err(|e| format!("Failed to save report: {}", e))?;
+    let markdown = ai_runner::run_and_save(&canonical, prompt, &report_dir, &today).await?;
 
     Ok(StandupReport {
         project_path,
@@ -480,98 +253,32 @@ pub async fn load_standup_report(
     project_path: String,
     date: Option<String>,
 ) -> Result<Option<StandupReport>, String> {
-    let canonical = canonical_project_path(&project_path);
+    let canonical = ai_runner::canonical_project_path(&project_path);
+    let report_dir = project_report_dir(&canonical);
 
     let date = match date {
         Some(d) => {
-            // Reject anything that isn't a plain ISO date — it becomes a filename.
-            NaiveDate::parse_from_str(&d, "%Y-%m-%d")
-                .map_err(|_| format!("Invalid report date: {}", d))?;
+            ai_runner::validate_date(&d)?;
             d
         }
-        None => latest_report_date(&project_report_dir(&canonical), None)
+        None => ai_runner::latest_artifact_date(&report_dir, None)
             .await
-            .unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string()),
+            .unwrap_or_else(ai_runner::today_local),
     };
 
-    let file_path = project_report_dir(&canonical).join(format!("{}.md", date));
-    match tokio::fs::read_to_string(&file_path).await {
-        Ok(markdown) => {
-            let generated_at = tokio::fs::metadata(&file_path)
-                .await
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .map(|t| DateTime::<Utc>::from(t).to_rfc3339())
-                .unwrap_or_default();
-            Ok(Some(StandupReport {
-                project_path,
-                date,
-                markdown,
-                generated_at,
-            }))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("Failed to read report: {}", e)),
-    }
+    Ok(ai_runner::load_artifact(&report_dir, &date)
+        .await?
+        .map(|(markdown, generated_at)| StandupReport {
+            project_path,
+            date,
+            markdown,
+            generated_at,
+        }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn strip_ansi_removes_csi_and_osc_sequences() {
-        assert_eq!(strip_ansi("plain text"), "plain text");
-        assert_eq!(strip_ansi("\u{1b}[31mred\u{1b}[0m"), "red");
-        assert_eq!(strip_ansi("a\u{1b}]0;title\u{07}b"), "ab");
-        assert_eq!(strip_ansi("a\u{1b}]0;title\u{1b}\\b"), "ab");
-        // Trailing lone escape must not panic or loop.
-        assert_eq!(strip_ansi("end\u{1b}"), "end");
-    }
-
-    #[test]
-    fn truncate_chars_marks_dropped_content() {
-        assert_eq!(truncate_chars("short", 10), "short");
-        let long = "x".repeat(20);
-        let cut = truncate_chars(&long, 10);
-        assert!(cut.starts_with("xxxxxxxxxx"));
-        assert!(cut.ends_with("[... truncated ...]"));
-    }
-
-    #[tokio::test]
-    async fn latest_report_date_picks_newest_before_today() {
-        let dir = tempfile::tempdir().unwrap();
-        for name in [
-            "2026-07-25.md",
-            "2026-07-28.md",
-            "2026-07-30.md",
-            "junk.txt",
-        ] {
-            std::fs::write(dir.path().join(name), "x").unwrap();
-        }
-        let best = latest_report_date(dir.path(), Some("2026-07-30")).await;
-        assert_eq!(best.as_deref(), Some("2026-07-28"));
-    }
-
-    #[tokio::test]
-    async fn latest_report_date_unbounded_picks_newest_overall() {
-        // Retention: with no upper bound the newest saved report wins — this
-        // is what keeps yesterday's report readable until today's exists.
-        let dir = tempfile::tempdir().unwrap();
-        for name in ["2026-07-28.md", "2026-07-30.md", "junk.txt"] {
-            std::fs::write(dir.path().join(name), "x").unwrap();
-        }
-        let best = latest_report_date(dir.path(), None).await;
-        assert_eq!(best.as_deref(), Some("2026-07-30"));
-    }
-
-    #[tokio::test]
-    async fn latest_report_date_none_for_missing_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("nope");
-        assert_eq!(latest_report_date(&missing, Some("2026-07-30")).await, None);
-        assert_eq!(latest_report_date(&missing, None).await, None);
-    }
 
     #[test]
     fn build_prompt_substitutes_placeholders_for_empty_material() {
@@ -646,5 +353,15 @@ mod tests {
             "",
         );
         assert!(p.contains("PROJECT OVERVIEW"));
+    }
+
+    #[test]
+    fn report_dir_is_unchanged_by_the_shared_runner() {
+        // Pin the on-disk layout: saved reports must keep loading after the
+        // extraction, so the directory stays `<data>/standups/<name>-<hash>`.
+        let dir = project_report_dir("/home/me/git/Maestro");
+        assert!(dir.parent().unwrap().ends_with("standups"));
+        let leaf = dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(leaf.starts_with("maestro-"), "unexpected leaf: {leaf}");
     }
 }

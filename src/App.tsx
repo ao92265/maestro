@@ -37,6 +37,7 @@ import { initActivityListener, stopActivityListener } from "./stores/useActivity
 import { initAgentListener, stopAgentListener } from "./stores/useAgentStore";
 import { useGitStore } from "./stores/useGitStore";
 import { useTerminalSettingsStore } from "./stores/useTerminalSettingsStore";
+import { usePlanStore } from "@/stores/usePlanStore";
 import { useStandupStore } from "@/stores/useStandupStore";
 import { useUpdateStore } from "./stores/useUpdateStore";
 import { MAX_SESSIONS } from "./components/terminal/splitTree";
@@ -241,15 +242,17 @@ function App() {
     return () => clearInterval(interval);
   }, [autoCheckEnabled, checkIntervalMinutes, checkForUpdates]);
 
-  // Standup scheduler: a minute tick that fires the daily report generation
-  // once the configured local time has passed (at most once per day; the
-  // store gates on lastRunDate and skips reports already on disk). Besides
-  // the minute tick, a tick fires when the persisted schedule settings finish
-  // hydrating and whenever the set of open repo paths changes — the settings
-  // and tabs both load async from disk after mount, so these extra ticks are
-  // what let a report missed while the app was closed catch up right at
-  // startup instead of a minute later.
+  // Daily-AI scheduler: a minute tick that fires the standup report AND the
+  // cross-project plan once the configured local time has passed (at most
+  // once per day each; the stores gate on lastRunDate and skip artifacts
+  // already on disk). Both ride the one schedule setting, which lives in the
+  // standup store. Besides the minute tick, a tick fires when either store's
+  // persisted settings finish hydrating and whenever the set of open repo
+  // paths changes — the settings and tabs both load async from disk after
+  // mount, so these extra ticks are what let a run missed while the app was
+  // closed catch up right at startup instead of a minute later.
   const maybeRunScheduledStandup = useStandupStore((s) => s.maybeRunScheduled);
+  const maybeRunScheduledPlan = usePlanStore((s) => s.maybeRunScheduled);
   // Stable projection of the open repo paths (newline-joined so string
   // equality skips re-renders): tab switches flip flags and rebuild the tabs
   // array every time, and depending on `tabs` directly would tear down and
@@ -262,15 +265,18 @@ function App() {
     const repoPaths = standupRepoPathsKey === "" ? [] : standupRepoPathsKey.split("\n");
     const tick = () => {
       void maybeRunScheduledStandup(repoPaths);
+      void maybeRunScheduledPlan(repoPaths);
     };
     tick();
-    const unsubHydration = useStandupStore.persist.onFinishHydration(tick);
+    const unsubStandupHydration = useStandupStore.persist.onFinishHydration(tick);
+    const unsubPlanHydration = usePlanStore.persist.onFinishHydration(tick);
     const interval = setInterval(tick, 60_000);
     return () => {
-      unsubHydration();
+      unsubStandupHydration();
+      unsubPlanHydration();
       clearInterval(interval);
     };
-  }, [maybeRunScheduledStandup, standupRepoPathsKey]);
+  }, [maybeRunScheduledStandup, maybeRunScheduledPlan, standupRepoPathsKey]);
 
   const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
   const macTitleBarPadding = useMacTitleBarPadding();
@@ -623,8 +629,8 @@ function App() {
               onToggleProcessesPanel={() => handleToggleUtilityPanel("processes")}
               notesPanelOpen={utilityPanel === "notes"}
               onToggleNotesPanel={() => handleToggleUtilityPanel("notes")}
-              standupPanelOpen={utilityPanel === "standup"}
-              onToggleStandupPanel={() => handleToggleUtilityPanel("standup")}
+              aiPanelOpen={utilityPanel === "ai"}
+              onToggleAiPanel={() => handleToggleUtilityPanel("ai")}
             />
 
             {/* Git panel header - inline at same level as TopBar.
