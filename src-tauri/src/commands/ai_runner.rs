@@ -307,7 +307,7 @@ pub async fn run_and_save(
     date: &str,
     noun: &str,
 ) -> Result<String, String> {
-    run_and_save_with_timeout(cwd, prompt, dir, date, CLAUDE_TIMEOUT_SECS, &[]).await
+    run_and_save_with_timeout(cwd, prompt, dir, date, CLAUDE_TIMEOUT_SECS, &[], noun).await
 }
 
 /// Same, with an explicit run timeout and tool restriction (see
@@ -319,6 +319,7 @@ pub async fn run_and_save_with_timeout(
     date: &str,
     timeout_secs: u64,
     tools: &[&str],
+    noun: &str,
 ) -> Result<String, String> {
     let raw = run_claude_print_with_timeout(cwd, prompt, timeout_secs, tools).await?;
     let markdown = strip_ansi(&raw).trim().to_string();

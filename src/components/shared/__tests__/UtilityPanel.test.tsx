@@ -166,7 +166,9 @@ describe("UtilityPanel", () => {
     expect(screen.getByText(/daily schedule is off/i)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("tab", { name: "Catalog" }));
-    expect(screen.getByText(/coming soon/i)).toBeInTheDocument();
+    // Catalog is on-demand only: no schedule, just the scan button and the
+    // empty state until the user runs one.
+    expect(screen.getByRole("button", { name: /scan project/i })).toBeInTheDocument();
   });
 
   it("Plan tab subscribes to the open projects without an infinite render loop", () => {

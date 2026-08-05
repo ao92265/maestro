@@ -32,6 +32,8 @@ use crate::github::{GitHub, IssueFilter};
 
 /// Artifact kind — also the directory name under the app data dir.
 const KIND: &str = "catalogs";
+/// Names this artifact in the errors the user sees ("Failed to save catalog").
+const ARTIFACT_NOUN: &str = "catalog";
 /// Hard ceiling on a scan. The model reads its way around the whole repo,
 /// which takes far longer than the one-pass summaries; 45 minutes is a limit
 /// on a hung run, not an expectation. The shared 5-minute default would kill a
@@ -286,7 +288,7 @@ fn fit_previous_catalog(markdown: &str, budget: usize) -> String {
 /// to the budget. `None` when the project has never been scanned.
 async fn previous_catalog_material(dir: &Path, budget: usize) -> Option<(String, String)> {
     let date = ai_runner::latest_artifact_date(dir, None).await?;
-    let (markdown, _) = ai_runner::load_artifact(dir, &date).await.ok()??;
+    let (markdown, _) = ai_runner::load_artifact(dir, &date, ARTIFACT_NOUN).await.ok()??;
     Some((date, fit_previous_catalog(&markdown, budget)))
 }
 
@@ -384,6 +386,7 @@ pub async fn scan_project_catalog(project_path: String) -> Result<ProjectCatalog
                 &today,
                 CATALOG_TIMEOUT_SECS,
                 CATALOG_TOOLS,
+                ARTIFACT_NOUN,
             )
             .await
         })
@@ -434,7 +437,7 @@ pub async fn load_project_catalog(
 
     let date = match date {
         Some(d) => {
-            ai_runner::validate_date(&d)?;
+            ai_runner::validate_date(&d, ARTIFACT_NOUN)?;
             d
         }
         None => match ai_runner::latest_artifact_date(&dir, None).await {
@@ -445,7 +448,7 @@ pub async fn load_project_catalog(
         },
     };
 
-    Ok(ai_runner::load_artifact(&dir, &date)
+    Ok(ai_runner::load_artifact(&dir, &date, ARTIFACT_NOUN)
         .await?
         .map(|(markdown, generated_at)| ProjectCatalog {
             project_path,
@@ -812,6 +815,6 @@ mod tests {
         let err = load_project_catalog("/tmp/x".to_string(), Some("../../secret".to_string()))
             .await
             .unwrap_err();
-        assert!(err.contains("Invalid report date"));
+        assert!(err.contains("Invalid catalog date"), "unexpected error: {err}");
     }
 }
