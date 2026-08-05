@@ -14,7 +14,7 @@ vi.mock("@tauri-apps/plugin-store", () => ({
   },
 }));
 
-import { usePlanStore, type DailyPlan } from "../usePlanStore";
+import { MAX_SCHEDULED_ATTEMPTS, usePlanStore, type DailyPlan } from "../usePlanStore";
 import { localDateString, useStandupStore } from "../useStandupStore";
 
 const invokeMock = vi.mocked(invoke);
@@ -39,6 +39,8 @@ describe("usePlanStore", () => {
       concerns: "",
       lastRunDate: null,
       runInProgress: false,
+      failedRuns: 0,
+      failedRunsDate: null,
     });
     // The plan rides the standup's schedule — there is only one setting.
     useStandupStore.setState({ scheduleEnabled: true, scheduleTime: "08:30" });
@@ -81,6 +83,7 @@ describe("usePlanStore", () => {
     // Transient run state must NOT be persisted.
     expect(persisted).not.toHaveProperty("runInProgress");
     expect(persisted).not.toHaveProperty("plan");
+    expect(persisted).not.toHaveProperty("failedRuns");
   });
 
   it("loadLatest adopts the newest saved plan from disk (retention)", async () => {
@@ -148,6 +151,80 @@ describe("usePlanStore", () => {
     await usePlanStore.getState().maybeRunScheduled(PROJECTS);
     expect(usePlanStore.getState().status).toBe("error");
     expect(usePlanStore.getState().lastRunDate).toBeNull();
+    expect(usePlanStore.getState().failedRuns).toBe(1);
+  });
+
+  it("gives up for the day after the retry budget is spent", async () => {
+    // Without a cap, a permanently broken `claude` would be respawned by
+    // every minute tick until midnight.
+    invokeMock.mockImplementation(async (cmd) => {
+      if (cmd === "load_daily_plan") return null;
+      throw new Error("claude blew up");
+    });
+    for (let i = 0; i < MAX_SCHEDULED_ATTEMPTS; i++) {
+      await usePlanStore.getState().maybeRunScheduled(PROJECTS);
+    }
+    expect(usePlanStore.getState().failedRuns).toBe(MAX_SCHEDULED_ATTEMPTS);
+    // The day is consumed, so further ticks do nothing at all.
+    const callsSoFar = invokeMock.mock.calls.length;
+    await usePlanStore.getState().maybeRunScheduled(PROJECTS);
+    await usePlanStore.getState().maybeRunScheduled(PROJECTS);
+    expect(invokeMock.mock.calls.length).toBe(callsSoFar);
+  });
+
+  it("a successful retry after a failure clears the failure budget", async () => {
+    let failNext = true;
+    invokeMock.mockImplementation(async (cmd) => {
+      if (cmd === "load_daily_plan") return null;
+      if (failNext) throw new Error("transient");
+      return plan();
+    });
+    await usePlanStore.getState().maybeRunScheduled(PROJECTS);
+    expect(usePlanStore.getState().failedRuns).toBe(1);
+
+    failNext = false;
+    await usePlanStore.getState().maybeRunScheduled(PROJECTS);
+    expect(usePlanStore.getState().status).toBe("ready");
+    expect(usePlanStore.getState().failedRuns).toBe(0);
+    expect(usePlanStore.getState().lastRunDate).toBe("2026-07-30");
+  });
+
+  it("yesterday's spent budget does not block today", async () => {
+    usePlanStore.setState({
+      failedRuns: MAX_SCHEDULED_ATTEMPTS,
+      failedRunsDate: "2026-07-29",
+    });
+    await usePlanStore.getState().maybeRunScheduled(PROJECTS);
+    expect(invokeMock).toHaveBeenCalledWith("generate_daily_plan", expect.anything());
+    expect(usePlanStore.getState().lastRunDate).toBe("2026-07-30");
+  });
+
+  it("loadLatest recovers from an earlier error but never overwrites a shown plan", async () => {
+    // An error must not wedge the tab for the session: reopening it re-reads.
+    usePlanStore.setState({ status: "error", error: "boom", plan: null });
+    invokeMock.mockResolvedValueOnce(plan("2026-07-29"));
+    await usePlanStore.getState().loadLatest();
+    expect(usePlanStore.getState().status).toBe("ready");
+    expect(usePlanStore.getState().plan?.date).toBe("2026-07-29");
+
+    // With a plan already on screen the disk is not consulted again.
+    invokeMock.mockClear();
+    await usePlanStore.getState().loadLatest();
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("loadLatest does not clobber a state taken while it was reading", async () => {
+    let resolveLoad!: (p: DailyPlan | null) => void;
+    invokeMock.mockImplementationOnce(
+      () => new Promise<DailyPlan | null>((res) => (resolveLoad = res))
+    );
+    const pending = usePlanStore.getState().loadLatest();
+    // A generation fails and takes the slot while the disk read is in flight.
+    usePlanStore.setState({ status: "error", error: "boom", plan: null });
+    resolveLoad(plan("2026-07-29"));
+    await pending;
+    expect(usePlanStore.getState().status).toBe("error");
+    expect(usePlanStore.getState().error).toBe("boom");
   });
 
   it("scheduled run fires again after midnight when lastRunDate is yesterday", async () => {

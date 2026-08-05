@@ -24,6 +24,9 @@ use crate::git::Git;
 /// Artifact kind — also the directory name under the app data dir. Changing
 /// it would orphan every previously saved report.
 const KIND: &str = "standups";
+/// Noun used in the errors this feature surfaces to the user. Pinned to
+/// "report" so the messages are byte-identical to the pre-extraction ones.
+const NOUN: &str = "report";
 /// Ceiling for the since-last-report commit log only — a standup covers at
 /// most a few days of work. The long-horizon overview has its own cap below.
 const MAX_COMMITS: usize = 100;
@@ -234,7 +237,7 @@ pub async fn generate_standup_report(
         &ai_runner::truncate_chars(&overview, MAX_OVERVIEW_CHARS),
     );
 
-    let markdown = ai_runner::run_and_save(&canonical, prompt, &report_dir, &today).await?;
+    let markdown = ai_runner::run_and_save(&canonical, prompt, &report_dir, &today, NOUN).await?;
 
     Ok(StandupReport {
         project_path,
@@ -258,7 +261,7 @@ pub async fn load_standup_report(
 
     let date = match date {
         Some(d) => {
-            ai_runner::validate_date(&d)?;
+            ai_runner::validate_date(&d, NOUN)?;
             d
         }
         None => ai_runner::latest_artifact_date(&report_dir, None)
@@ -266,7 +269,7 @@ pub async fn load_standup_report(
             .unwrap_or_else(ai_runner::today_local),
     };
 
-    Ok(ai_runner::load_artifact(&report_dir, &date)
+    Ok(ai_runner::load_artifact(&report_dir, &date, NOUN)
         .await?
         .map(|(markdown, generated_at)| StandupReport {
             project_path,
@@ -357,11 +360,30 @@ mod tests {
 
     #[test]
     fn report_dir_is_unchanged_by_the_shared_runner() {
-        // Pin the on-disk layout: saved reports must keep loading after the
-        // extraction, so the directory stays `<data>/standups/<name>-<hash>`.
-        let dir = project_report_dir("/home/me/git/Maestro");
+        // Pin the on-disk layout exactly — name AND hash: saved reports must
+        // keep loading after the extraction, so the directory stays
+        // `<data>/standups/<lowercased-name>-<project-hash>`.
+        let path = "/home/me/git/Maestro";
+        let dir = project_report_dir(path);
         assert!(dir.parent().unwrap().ends_with("standups"));
         let leaf = dir.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(leaf.starts_with("maestro-"), "unexpected leaf: {leaf}");
+        assert_eq!(
+            leaf,
+            format!(
+                "maestro-{}",
+                crate::core::status_server::StatusServer::generate_project_hash(path)
+            )
+        );
+    }
+
+    #[test]
+    fn standup_error_wording_is_unchanged() {
+        // The shared runner takes a noun so the plan can say "plan"; standup
+        // must keep the exact strings it had before the extraction.
+        assert_eq!(NOUN, "report");
+        assert_eq!(
+            ai_runner::validate_date("nope", NOUN).unwrap_err(),
+            "Invalid report date: nope"
+        );
     }
 }

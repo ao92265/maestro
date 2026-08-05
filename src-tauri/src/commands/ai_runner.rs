@@ -161,10 +161,11 @@ pub async fn latest_artifact_date(dir: &Path, before: Option<&str>) -> Option<St
 }
 
 /// Rejects anything that isn't a plain ISO date — it becomes a filename.
-pub fn validate_date(date: &str) -> Result<(), String> {
+/// `noun` names the artifact in the error the user sees ("report", "plan").
+pub fn validate_date(date: &str, noun: &str) -> Result<(), String> {
     NaiveDate::parse_from_str(date, "%Y-%m-%d")
         .map(|_| ())
-        .map_err(|_| format!("Invalid report date: {}", date))
+        .map_err(|_| format!("Invalid {} date: {}", noun, date))
 }
 
 /// Single-pass placeholder interpolation over `template`: each `{token}` in
@@ -271,33 +272,39 @@ pub async fn run_claude_print(project_path: &str, prompt: String) -> Result<Stri
 
 /// Run the prompt and persist the cleaned answer as `<dir>/<date>.md`.
 /// Returns the saved markdown. An empty answer is an error and saves nothing,
-/// so a failed run never consumes the day's slot on disk.
+/// so a failed run never consumes the day's slot on disk. `noun` names the
+/// artifact in the errors the user sees ("report", "plan").
 pub async fn run_and_save(
     cwd: &str,
     prompt: String,
     dir: &Path,
     date: &str,
+    noun: &str,
 ) -> Result<String, String> {
     let raw = run_claude_print(cwd, prompt).await?;
     let markdown = strip_ansi(&raw).trim().to_string();
     if markdown.is_empty() {
-        return Err("Claude returned an empty report".to_string());
+        return Err(format!("Claude returned an empty {}", noun));
     }
 
     tokio::fs::create_dir_all(dir)
         .await
-        .map_err(|e| format!("Failed to create report directory: {}", e))?;
+        .map_err(|e| format!("Failed to create {} directory: {}", noun, e))?;
     let file_path = dir.join(format!("{}.md", date));
     tokio::fs::write(&file_path, &markdown)
         .await
-        .map_err(|e| format!("Failed to save report: {}", e))?;
+        .map_err(|e| format!("Failed to save {}: {}", noun, e))?;
     Ok(markdown)
 }
 
 /// Read `<dir>/<date>.md`, returning its markdown and RFC 3339 mtime.
 /// `Ok(None)` means "not generated", which callers surface as an empty panel
 /// rather than an error.
-pub async fn load_artifact(dir: &Path, date: &str) -> Result<Option<(String, String)>, String> {
+pub async fn load_artifact(
+    dir: &Path,
+    date: &str,
+    noun: &str,
+) -> Result<Option<(String, String)>, String> {
     let file_path = dir.join(format!("{}.md", date));
     match tokio::fs::read_to_string(&file_path).await {
         Ok(markdown) => {
@@ -310,7 +317,7 @@ pub async fn load_artifact(dir: &Path, date: &str) -> Result<Option<(String, Str
             Ok(Some((markdown, generated_at)))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("Failed to read report: {}", e)),
+        Err(e) => Err(format!("Failed to read {}: {}", noun, e)),
     }
 }
 
@@ -379,27 +386,43 @@ mod tests {
     async fn load_artifact_reads_saved_markdown_and_reports_missing() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("2026-08-04.md"), "# plan").unwrap();
-        let found = load_artifact(dir.path(), "2026-08-04").await.unwrap();
+        let found = load_artifact(dir.path(), "2026-08-04", "plan")
+            .await
+            .unwrap();
         assert_eq!(found.map(|(md, _)| md), Some("# plan".to_string()));
-        assert!(load_artifact(dir.path(), "2026-08-03")
+        assert!(load_artifact(dir.path(), "2026-08-03", "plan")
             .await
             .unwrap()
             .is_none());
     }
 
     #[test]
+    fn errors_name_the_artifact_kind() {
+        // The same machinery serves the standup report and the daily plan, so
+        // the noun travels with the call instead of being hardcoded.
+        assert_eq!(
+            validate_date("nope", "report").unwrap_err(),
+            "Invalid report date: nope"
+        );
+        assert_eq!(
+            validate_date("nope", "plan").unwrap_err(),
+            "Invalid plan date: nope"
+        );
+    }
+
+    #[test]
     fn validate_date_rejects_non_iso_input() {
         // The date becomes a filename, so anything that could escape the
         // artifact directory or trail extra text has to be rejected.
-        assert!(validate_date("2026-08-04").is_ok());
-        assert!(validate_date("../../etc/passwd").is_err());
-        assert!(validate_date("2026-08-04/../../secret").is_err());
-        assert!(validate_date("2026-08-04.md").is_err());
-        assert!(validate_date("").is_err());
+        assert!(validate_date("2026-08-04", "report").is_ok());
+        assert!(validate_date("../../etc/passwd", "report").is_err());
+        assert!(validate_date("2026-08-04/../../secret", "report").is_err());
+        assert!(validate_date("2026-08-04.md", "report").is_err());
+        assert!(validate_date("", "report").is_err());
         // Unpadded components still parse to a real date (chrono accepts
         // them) — harmless as a filename, and pinned here so the looser rule
         // is a documented choice rather than an accident.
-        assert!(validate_date("2026-8-4").is_ok());
+        assert!(validate_date("2026-8-4", "report").is_ok());
     }
 
     #[test]

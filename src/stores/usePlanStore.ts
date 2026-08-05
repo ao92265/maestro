@@ -33,11 +33,18 @@ interface PlanState {
   lastRunDate: string | null;
   /** True while a scheduled/catch-up run is in flight. In-memory only. */
   runInProgress: boolean;
+  /**
+   * Failed scheduled attempts so far on `failedRunsDate`. In-memory only, so
+   * a restart (which may well be what fixes the problem) buys a fresh budget.
+   */
+  failedRuns: number;
+  failedRunsDate: string | null;
   setConcerns: (concerns: string) => void;
   /**
-   * Load the newest saved plan from disk if none is in memory — today's when
-   * it exists, otherwise the last generated one, so a plan stays readable
-   * until the next day's replaces it.
+   * Load the newest saved plan from disk — today's when it exists, otherwise
+   * the last generated one, so a plan stays readable until the next day's
+   * replaces it. Skipped when a plan is already shown or being generated; an
+   * earlier error is NOT a reason to skip, so a failed read can recover.
    */
   loadLatest: () => Promise<void>;
   /** Generate (or regenerate) the plan across the given projects. */
@@ -51,10 +58,22 @@ interface PlanState {
   /**
    * Fired by the App-level minute tick; runs at most once per day, at the
    * schedule time the Report tab configures (there is one schedule setting,
-   * shared — see useStandupStore).
+   * shared — see useStandupStore). A failed run is retried by the following
+   * ticks, but only up to {@link MAX_SCHEDULED_ATTEMPTS} times a day.
    */
   maybeRunScheduled: (repoPaths: string[]) => Promise<void>;
 }
+
+/**
+ * Scheduled attempts allowed per day before the plan gives up until tomorrow.
+ *
+ * The standup store marks the day done even when generation fails; this store
+ * retries instead, because one plan covering every project is worth a couple
+ * of retries (a transient `claude` failure would otherwise cost the whole
+ * day). The cap is what keeps that from turning into a `claude -p` spawn
+ * every 60 seconds until midnight when the failure is permanent.
+ */
+export const MAX_SCHEDULED_ATTEMPTS = 3;
 
 const lazyStore = new LazyStore("plan-settings.json");
 
@@ -86,17 +105,23 @@ export const usePlanStore = create<PlanState>()(
       concerns: "",
       lastRunDate: null,
       runInProgress: false,
+      failedRuns: 0,
+      failedRunsDate: null,
 
       setConcerns: (concerns) => set({ concerns }),
 
       loadLatest: async () => {
-        if (get().status !== "idle") return;
+        const before = get().status;
+        // A plan already on screen, or one being written, must not be
+        // replaced by a disk read; an "error" state may be, so reopening the
+        // tab can recover from a failed read instead of staying broken.
+        if (before === "ready" || before === "generating") return;
         try {
           // `date: null` makes the backend serve the newest saved plan.
           const plan = await invoke<DailyPlan | null>("load_daily_plan", { date: null });
-          // Re-check after the await: a scheduled/manual run may have started
-          // while we read from disk — its state must win over this stale read.
-          if (get().status !== "idle") return;
+          // Re-check after the await: a run may have taken over while we read
+          // from disk — its state must win over this now-stale read.
+          if (get().status !== before) return;
           if (plan) set({ status: "ready", plan, error: null });
         } catch (err) {
           console.error("Failed to load daily plan:", err);
@@ -147,12 +172,15 @@ export const usePlanStore = create<PlanState>()(
         // The schedule (on/off + time of day) is the Report tab's — the plan
         // deliberately has no second setting, it rides the same daily slot.
         const { scheduleEnabled, scheduleTime } = useStandupStore.getState();
-        const { lastRunDate, runInProgress } = get();
+        const { lastRunDate, runInProgress, failedRunsDate } = get();
         if (!scheduleEnabled || repoPaths.length === 0) return;
         if (runInProgress) return;
         const now = new Date();
         const today = localDateString(now);
         if (lastRunDate === today) return;
+        // A new day resets the retry budget.
+        const failedRuns = failedRunsDate === today ? get().failedRuns : 0;
+        if (failedRuns >= MAX_SCHEDULED_ATTEMPTS) return;
         const [hours, minutes] = scheduleTime.split(":").map(Number);
         if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return;
         const due =
@@ -167,7 +195,15 @@ export const usePlanStore = create<PlanState>()(
           // Skip days whose plan already exists on disk (generated manually,
           // or by a previous app run before a restart) — that on-disk check is
           // also what makes the startup catch-up safe to fire repeatedly.
-          if (await get().generateIfMissing(repoPaths, today)) set({ lastRunDate: today });
+          if (await get().generateIfMissing(repoPaths, today)) {
+            set({ lastRunDate: today, failedRuns: 0, failedRunsDate: today });
+          } else {
+            const attempts = failedRuns + 1;
+            set({ failedRuns: attempts, failedRunsDate: today });
+            // Budget spent: consume the day so the minute tick stops respawning
+            // `claude -p` until midnight. The Generate button still works.
+            if (attempts >= MAX_SCHEDULED_ATTEMPTS) set({ lastRunDate: today });
+          }
         } finally {
           set({ runInProgress: false });
         }

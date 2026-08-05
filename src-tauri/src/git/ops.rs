@@ -503,6 +503,39 @@ impl Git {
         Ok(output.stdout)
     }
 
+    /// Raw `git log` text since a date on the CHECKED-OUT branch only, one
+    /// line per commit with the author name shown, optionally restricted to a
+    /// single author (`--author` matches against both name and email).
+    ///
+    /// Deliberately different from [`Self::commit_log_text_since`]: the daily
+    /// plan asks "what do I have in flight here", so commits fetched onto
+    /// other branches — and, when the author is known, other people's commits
+    /// on this one — must not read as the user's own momentum.
+    pub async fn commit_log_text_since_on_head(
+        &self,
+        since: &str,
+        max_count: usize,
+        author: Option<&str>,
+    ) -> Result<String, GitError> {
+        let since_arg = format!("--since={}", since);
+        let count_arg = format!("--max-count={}", max_count);
+        // A single `--author=<value>` argument: the value can never be parsed
+        // as a separate option, whatever the configured identity contains.
+        let author_arg = author.map(|a| format!("--author={}", a));
+        let mut args = vec![
+            "log",
+            &since_arg,
+            &count_arg,
+            "--date=short",
+            "--pretty=format:%ad %h %an: %s",
+        ];
+        if let Some(ref arg) = author_arg {
+            args.push(arg);
+        }
+        let output = self.run(&args).await?;
+        Ok(output.stdout)
+    }
+
     /// Compact variant of [`Self::commit_log_text_since`]: one
     /// `YYYY-MM-DD subject` line per commit (no hash/author), across all
     /// branches. Long-horizon overview context for the standup report.
