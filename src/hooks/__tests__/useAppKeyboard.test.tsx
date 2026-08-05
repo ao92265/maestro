@@ -83,7 +83,7 @@ describe("useAppKeyboard right panels (Cmd/Ctrl+2-6)", () => {
       "memory",
       "processes",
       "notes",
-      "standup",
+      "ai",
     ]);
   });
 
