@@ -65,7 +65,6 @@ A cross-platform desktop application that lets you run 1-12 Claude Code (or othe
 
 ### Multi-Terminal Session Grid
 - Dynamic grid layout (1x1 to 2x3) that adapts to your session count
-- iTerm2-style split panes within each session (Cmd+D vertical, Cmd+Shift+D horizontal)
 - Real-time status indicators: idle, working, waiting for input, done, error
 - Per-session mode selection (Claude Code, Gemini CLI, OpenAI Codex, Plain Terminal)
 
@@ -120,20 +119,20 @@ A cross-platform desktop application that lets you run 1-12 Claude Code (or othe
 
 | Shortcut | Action |
 |----------|--------|
-| **Cmd+T** | Add new terminal session |
-| **Cmd+D** | Split pane vertically |
-| **Cmd+Shift+D** | Split pane horizontally |
-| **Cmd+W** | Close focused pane |
-| **Cmd+1-9** | Jump to terminal 1-9 |
-| **Cmd+[** / **Cmd+]** | Cycle previous / next terminal |
+| **Alt+1-4** | Toggle the left sidebar on the General / History / Infra / Settings tab |
+| **Cmd+2-6** | Toggle the right-side Git / Memory / Processes / Notes / Standup panel |
+| **Cmd+T** | New terminal (stays in zoom-in view; project picker in eagle view) |
+| **Cmd+1** | Zoom the focused terminal (toggle) |
+| **Alt+←** / **Alt+→** | Previous / next terminal tab while zoomed |
+| **Cmd+Alt+←** / **Cmd+Alt+→** | Focus the previous / next terminal |
+| **Cmd+G** | Toggle eagle view (all projects' terminals) |
+| **Alt+P** | Park the focused terminal |
+| **Ctrl+Tab** / **Ctrl+Shift+Tab** | Next / previous project (Ctrl on all platforms) |
 | **Cmd+K** | Clear terminal scrollback |
 | **Cmd+C** | Copy selection (SIGINT if no selection) |
-| **Cmd+=** / **Cmd+-** | Zoom in / out |
-| **Cmd+0** | Reset zoom |
 | **Shift+Enter** | Newline without executing |
-| **Cmd+Left** / **Cmd+Right** | Jump to line start / end |
-| **Cmd+Backspace** | Delete to line start |
-| **Escape** | Exit zoom mode |
+| **Cmd+Left** / **Cmd+Right** | Jump to line start / end (macOS only) |
+| **Cmd+Backspace** | Delete to line start (macOS only) |
 
 > **Note:** Cmd = Ctrl on Windows/Linux
 

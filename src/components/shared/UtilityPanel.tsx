@@ -1,21 +1,21 @@
-import { Activity, Brain, StickyNote, Sunrise, X } from "lucide-react";
+import { Activity, Brain, Sparkles, StickyNote, X } from "lucide-react";
 import {
   PanelResizeHandle,
   RIGHT_PANEL_MAX_WIDTH,
   RIGHT_PANEL_MIN_WIDTH,
 } from "@/components/shared/PanelResizeHandle";
+import { AiPanel } from "@/components/ai/AiPanel";
 import { NotepadPanel } from "@/components/notepad/NotepadPanel";
 import { MemorySection } from "@/components/sidebar/MemorySection";
 import { ProcessesSection } from "@/components/sidebar/ProcessesSection";
-import { StandupPanel } from "@/components/standup/StandupPanel";
 
-export type UtilityPanelKind = "memory" | "processes" | "notes" | "standup";
+export type UtilityPanelKind = "memory" | "processes" | "notes" | "ai";
 
 const PANEL_META: Record<UtilityPanelKind, { title: string; icon: React.ElementType }> = {
   memory: { title: "Memory", icon: Brain },
   processes: { title: "Processes", icon: Activity },
   notes: { title: "Notes", icon: StickyNote },
-  standup: { title: "Standup", icon: Sunrise },
+  ai: { title: "AI", icon: Sparkles },
 };
 
 /**
@@ -72,7 +72,7 @@ export function UtilityPanel({
           ) : panel === "processes" ? (
             <ProcessesSection />
           ) : (
-            <StandupPanel />
+            <AiPanel />
           )}
         </div>
       )}

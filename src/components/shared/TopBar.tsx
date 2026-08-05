@@ -8,14 +8,17 @@ import {
   Network,
   PanelLeft,
   Plus,
+  Sparkles,
   Square,
   StickyNote,
-  Sunrise,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { isMac } from "@/lib/platform";
+import { modLabel, titleWithShortcut } from "@/lib/shortcuts";
 import { MAX_SESSIONS } from "@/components/terminal/splitTree";
+import { GitHubWatchdogBadge } from "./GitHubWatchdogBadge";
+import { HealthAttentionBadge } from "./HealthAttentionBadge";
 
 /** One entry of the eagle-view "add terminal" project dropdown. */
 export interface EagleProjectOption {
@@ -61,9 +64,12 @@ interface TopBarProps {
   /** Right-side Notes panel */
   notesPanelOpen?: boolean;
   onToggleNotesPanel?: () => void;
-  /** Right-side Standup panel */
-  standupPanelOpen?: boolean;
-  onToggleStandupPanel?: () => void;
+  /** Right-side AI panel (Report / Plan / Catalog tabs) */
+  aiPanelOpen?: boolean;
+  onToggleAiPanel?: () => void;
+  /** GitHub watchdog badge: navigate to the git panel with the matching
+   *  tab + search filter. Badge hides itself when totals are zero. */
+  onWatchdogNavigate?: (kind: "prs" | "issues") => void;
 }
 
 export function TopBar({
@@ -89,8 +95,9 @@ export function TopBar({
   onToggleProcessesPanel,
   notesPanelOpen = false,
   onToggleNotesPanel,
-  standupPanelOpen = false,
-  onToggleStandupPanel,
+  aiPanelOpen = false,
+  onToggleAiPanel,
+  onWatchdogNavigate,
 }: TopBarProps) {
   const appWindow = useMemo(() => getCurrentWindow(), []);
 
@@ -144,6 +151,8 @@ export function TopBar({
 
       {/* Right: action icons */}
       <div className="flex items-center gap-0.5 mr-1">
+        {/* GitHub watchdog totals (review requests / assigned issues) */}
+        {onWatchdogNavigate && <GitHubWatchdogBadge onNavigate={onWatchdogNavigate} />}
         {/* Active project: adds a pre-launch slot to its grid. */}
         {inGridView && !eagleView && (
           <button
@@ -152,7 +161,7 @@ export function TopBar({
             disabled={slotCount >= maxSessions}
             className="rounded p-1.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text disabled:cursor-not-allowed disabled:opacity-50"
             aria-label="Add session"
-            title="Add session"
+            title={titleWithShortcut("New terminal", modLabel(), "T")}
           >
             <Plus size={14} />
           </button>
@@ -170,7 +179,7 @@ export function TopBar({
                   : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
               }`}
               aria-label="Add terminal to project"
-              title="Add terminal — pick a project"
+              title={titleWithShortcut("New terminal — pick a project", modLabel(), "T")}
             >
               <Plus size={14} />
             </button>
@@ -216,7 +225,7 @@ export function TopBar({
                 : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
             }`}
             aria-label="Eagle view"
-            title="Eagle view — all projects' terminals at once"
+            title={titleWithShortcut("Eagle view", modLabel(), "G")}
           >
             <Bird size={14} />
           </button>
@@ -246,30 +255,32 @@ export function TopBar({
           <button
             type="button"
             onClick={onToggleMemoryPanel}
-            className={`rounded p-1.5 transition-colors ${
+            className={`relative rounded p-1.5 transition-colors ${
               memoryPanelOpen
                 ? "text-maestro-accent hover:bg-maestro-accent/10"
                 : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
             }`}
             aria-label="Memory"
-            title="Memory — Claude Code memory files"
+            title={titleWithShortcut("Memory", modLabel(), "3")}
           >
             <Brain size={14} />
+            <HealthAttentionBadge area="memory" />
           </button>
         )}
         {onToggleProcessesPanel && (
           <button
             type="button"
             onClick={onToggleProcessesPanel}
-            className={`rounded p-1.5 transition-colors ${
+            className={`relative rounded p-1.5 transition-colors ${
               processesPanelOpen
                 ? "text-maestro-accent hover:bg-maestro-accent/10"
                 : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
             }`}
             aria-label="Processes"
-            title="Processes — dev processes and containers"
+            title={titleWithShortcut("Processes", modLabel(), "4")}
           >
             <Activity size={14} />
+            <HealthAttentionBadge area="processes" />
           </button>
         )}
         {onToggleNotesPanel && (
@@ -282,24 +293,24 @@ export function TopBar({
                 : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
             }`}
             aria-label="Notes"
-            title="Notes"
+            title={titleWithShortcut("Notes", modLabel(), "5")}
           >
             <StickyNote size={14} />
           </button>
         )}
-        {onToggleStandupPanel && (
+        {onToggleAiPanel && (
           <button
             type="button"
-            onClick={onToggleStandupPanel}
+            onClick={onToggleAiPanel}
             className={`rounded p-1.5 transition-colors ${
-              standupPanelOpen
+              aiPanelOpen
                 ? "text-maestro-accent hover:bg-maestro-accent/10"
                 : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
             }`}
-            aria-label="Standup"
-            title="Standup — daily report per project"
+            aria-label="AI"
+            title={titleWithShortcut("AI — daily report and plan", modLabel(), "6")}
           >
-            <Sunrise size={14} />
+            <Sparkles size={14} />
           </button>
         )}
         {/* Git panel — in eagle view it becomes a per-project carousel
@@ -313,7 +324,7 @@ export function TopBar({
               : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
           }`}
           aria-label="Git"
-          title="Git"
+          title={titleWithShortcut("Git", modLabel(), "2")}
         >
           <GitMerge size={14} />
         </button>

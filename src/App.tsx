@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { GitFork, RefreshCw, X } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MAC_TITLE_BAR_INSET_PX, useMacTitleBarPadding } from "@/hooks/useMacTitleBarPadding";
 import { getDeduplicatedCurrentBranch } from "@/lib/git";
 import { isMac } from "@/lib/platform";
@@ -27,17 +27,35 @@ import {
   loadRightPanelWidth,
   RIGHT_PANEL_WIDTH_STORAGE_KEY,
 } from "./components/shared/PanelResizeHandle";
+import { EagleProjectPickerModal } from "./components/shared/EagleProjectPickerModal";
 import { ProjectTabs } from "./components/shared/ProjectTabs";
 import { type EagleProjectOption, TopBar } from "./components/shared/TopBar";
 import { UtilityPanel, type UtilityPanelKind } from "./components/shared/UtilityPanel";
-import { Sidebar } from "./components/sidebar/Sidebar";
+import {
+  loadSavedSidebarTab,
+  saveSidebarTab,
+  Sidebar,
+  sidebarTabShortcutTransition,
+  type SidebarTabId,
+} from "./components/sidebar/Sidebar";
 import { UpdateNotification } from "./components/update/UpdateNotification";
+import { HEALTH_CHECK_INTERVAL_MS } from "./lib/healthRules";
 import { useAppKeyboard } from "./hooks/useAppKeyboard";
 import { useSwipeNavigation } from "./hooks/useSwipeNavigation";
+import { NotificationToasts } from "./components/shared/NotificationToasts";
 import { initActivityListener, stopActivityListener } from "./stores/useActivityStore";
 import { initAgentListener, stopAgentListener } from "./stores/useAgentStore";
+import { useGitHubStore } from "./stores/useGitHubStore";
+import {
+  useGitHubWatchdogStore,
+  WATCHDOG_ISSUE_SEARCH,
+  WATCHDOG_PR_SEARCH,
+  watchedProjectsFromTabs,
+} from "./stores/useGitHubWatchdogStore";
 import { useGitStore } from "./stores/useGitStore";
+import { useHealthStore } from "./stores/useHealthStore";
 import { useTerminalSettingsStore } from "./stores/useTerminalSettingsStore";
+import { usePlanStore } from "@/stores/usePlanStore";
 import { useStandupStore } from "@/stores/useStandupStore";
 import { useUpdateStore } from "./stores/useUpdateStore";
 import { MAX_SESSIONS } from "./components/terminal/splitTree";
@@ -78,6 +96,8 @@ function App() {
   const retryAfterFDAGrant = useFDAStore((s) => s.retryAfterGrant);
   const multiProjectRef = useRef<MultiProjectViewHandle>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  // Active left-sidebar tab — lifted out of Sidebar so Alt+1-4 can drive it.
+  const [sidebarTab, setSidebarTab] = useState<SidebarTabId>(loadSavedSidebarTab);
   const [gitPanelOpen, setGitPanelOpen] = useState(false);
   // Git-panel tab (commits/branches/…) is deliberately a single app-level
   // state shared across eagle carousel cards: swiping keeps you on the same
@@ -91,6 +111,8 @@ function App() {
   const [currentBranch, setCurrentBranch] = useState<string | undefined>(undefined);
   // Eagle view: one flat grid of every project's terminals at once
   const [eagleView, setEagleView] = useState(false);
+  // Eagle view Cmd/Ctrl+T: arrow-navigable project picker for the new terminal.
+  const [eagleAddPickerOpen, setEagleAddPickerOpen] = useState(false);
   // Eagle view git carousel: index of the project whose git panel card shows.
   const [eagleGitIndex, setEagleGitIndex] = useState(0);
   // Landscape view: every project, terminal and subagent on one graph. Rendered
@@ -249,19 +271,78 @@ function App() {
     return () => clearInterval(interval);
   }, [autoCheckEnabled, checkIntervalMinutes, checkForUpdates]);
 
-  // Standup scheduler: a minute tick that fires the daily report generation
-  // once the configured local time has passed (at most once per day; the
-  // store gates on lastRunDate). Only runs while the app is open.
-  const maybeRunScheduledStandup = useStandupStore((s) => s.maybeRunScheduled);
+  // GitHub watchdog: receive poll snapshots from the Rust background task.
+  const initWatchdogListeners = useGitHubWatchdogStore((s) => s.initListeners);
   useEffect(() => {
+    const unlistenPromise = initWatchdogListeners().catch((err) => {
+      console.error("Failed to initialize GitHub watchdog listeners:", err);
+      return () => {};
+    });
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, [initWatchdogListeners]);
+
+  // GitHub watchdog: keep the Rust poller's project set in sync with the
+  // open workspace tabs (deduplicated by repo path — see helper docs).
+  // Serialized so active-tab flips (which also mutate `tabs`) don't
+  // re-invoke the command; the backend additionally ignores identical sets.
+  const watchedProjectsJson = useMemo(
+    () => JSON.stringify(watchedProjectsFromTabs(tabs)),
+    [tabs]
+  );
+  useEffect(() => {
+    void useGitHubWatchdogStore
+      .getState()
+      .syncProjects(JSON.parse(watchedProjectsJson));
+  }, [watchedProjectsJson]);
+
+  // Health checker: rule-based memory/process checks on a quiet interval.
+  // Independent of the open tabs — it scans every project with saved memory
+  // and the whole watched process table — so nothing here restarts the
+  // interval or resets the CPU/RAM streaks.
+  useEffect(() => {
+    const runCheck = () => void useHealthStore.getState().runCheck();
+    runCheck();
+    const interval = setInterval(runCheck, HEALTH_CHECK_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Daily-AI scheduler: a minute tick that fires the standup report AND the
+  // cross-project plan once the configured local time has passed (at most
+  // once per day each; the stores gate on lastRunDate and skip artifacts
+  // already on disk). Both ride the one schedule setting, which lives in the
+  // standup store. Besides the minute tick, a tick fires when either store's
+  // persisted settings finish hydrating and whenever the set of open repo
+  // paths changes — the settings and tabs both load async from disk after
+  // mount, so these extra ticks are what let a run missed while the app was
+  // closed catch up right at startup instead of a minute later.
+  const maybeRunScheduledStandup = useStandupStore((s) => s.maybeRunScheduled);
+  const maybeRunScheduledPlan = usePlanStore((s) => s.maybeRunScheduled);
+  // Stable projection of the open repo paths (newline-joined so string
+  // equality skips re-renders): tab switches flip flags and rebuild the tabs
+  // array every time, and depending on `tabs` directly would tear down and
+  // recreate the interval on each switch. This only changes when a path is
+  // actually added/removed — which is exactly when a fresh tick is wanted.
+  const standupRepoPathsKey = useWorkspaceStore((s) =>
+    s.tabs.map((t) => t.selectedRepoPath ?? t.projectPath).join("\n")
+  );
+  useEffect(() => {
+    const repoPaths = standupRepoPathsKey === "" ? [] : standupRepoPathsKey.split("\n");
     const tick = () => {
-      const openTabs = useWorkspaceStore.getState().tabs;
-      maybeRunScheduledStandup(openTabs.map((t) => t.selectedRepoPath ?? t.projectPath));
+      void maybeRunScheduledStandup(repoPaths);
+      void maybeRunScheduledPlan(repoPaths);
     };
     tick();
+    const unsubStandupHydration = useStandupStore.persist.onFinishHydration(tick);
+    const unsubPlanHydration = usePlanStore.persist.onFinishHydration(tick);
     const interval = setInterval(tick, 60_000);
-    return () => clearInterval(interval);
-  }, [maybeRunScheduledStandup]);
+    return () => {
+      unsubStandupHydration();
+      unsubPlanHydration();
+      clearInterval(interval);
+    };
+  }, [maybeRunScheduledStandup, maybeRunScheduledPlan, standupRepoPathsKey]);
 
   const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
   const macTitleBarPadding = useMacTitleBarPadding();
@@ -424,10 +505,21 @@ function App() {
     }
   }, [activeTab, isStoppingAll, setSessionsLaunched]);
 
-  // Cmd/Ctrl+T: add a new session slot in grid view
+  // Cmd/Ctrl+T: add a new terminal. In eagle view this opens the project
+  // picker modal; otherwise the active project's grid gets a new slot (the
+  // grid keeps the zoom-in view and zooms the new slot when one is zoomed).
   const handleAddSessionShortcut = useCallback(() => {
+    if (eagleView) {
+      setEagleAddPickerOpen(true);
+      return;
+    }
     multiProjectRef.current?.addSessionToActiveProject();
-  }, []);
+  }, [eagleView]);
+
+  // Leaving eagle view always drops the picker.
+  useEffect(() => {
+    if (!eagleView) setEagleAddPickerOpen(false);
+  }, [eagleView]);
 
   const handleToggleUtilityPanel = useCallback((panel: UtilityPanelKind) => {
     setUtilityPanel((prev) => (prev === panel ? null : panel));
@@ -505,7 +597,24 @@ function App() {
     [selectTab],
   );
 
-  const handleToggleSidebar = useCallback(() => setSidebarOpen((prev) => !prev), []);
+  const handleSelectSidebarTab = useCallback((tab: SidebarTabId) => {
+    setSidebarTab(tab);
+    saveSidebarTab(tab);
+  }, []);
+
+  // Alt+1-4: open the sidebar on tab N; pressing the active tab's shortcut
+  // again closes the sidebar (per-tab toggle, no separate pane toggle).
+  const handleSidebarTabShortcut = useCallback(
+    (index: number) => {
+      const next = sidebarTabShortcutTransition(sidebarOpen, sidebarTab, index);
+      if (!next) return;
+      setSidebarOpen(next.open);
+      if (next.open && next.tab !== sidebarTab) {
+        handleSelectSidebarTab(next.tab);
+      }
+    },
+    [sidebarOpen, sidebarTab, handleSelectSidebarTab],
+  );
 
   // Closing a project tab terminates every terminal running in it, so when the
   // tab has live sessions we confirm first. `getState()` (not the reactive
@@ -538,13 +647,58 @@ function App() {
     });
   }, []);
 
+  // GitHub watchdog badge click: land on the git panel's PRs/Issues tab with
+  // the watchdog's search filter, in the project that has matching items
+  // (preferring the active project). Reuses the git-panel store fetches; the
+  // in-flight token guard absorbs the duplicate fetch GitGraphPanel fires.
+  const handleWatchdogNavigate = useCallback(
+    (kind: "prs" | "issues") => {
+      const watchdogProjects = useGitHubWatchdogStore.getState().projects;
+      const wsTabs = useWorkspaceStore.getState().tabs;
+      const pick = kind === "prs" ? "reviewRequests" : "assignedIssues";
+      const withItems = watchdogProjects.filter((p) => p[pick].length > 0);
+      const activeWsTab = wsTabs.find((t) => t.active);
+      const activeRepo = activeWsTab
+        ? (activeWsTab.selectedRepoPath ?? activeWsTab.projectPath)
+        : null;
+      const target = withItems.find((p) => p.repoPath === activeRepo) ?? withItems[0] ?? null;
+
+      if (target) {
+        const targetTab = wsTabs.find(
+          (t) => (t.selectedRepoPath ?? t.projectPath) === target.repoPath
+        );
+        if (targetTab && !targetTab.active) selectTab(targetTab.id);
+      }
+      // The git panel targets the active tab outside eagle view; leave eagle
+      // view so the selected project is actually the one shown.
+      setEagleView(false);
+
+      const repoPath = target?.repoPath ?? activeRepo;
+      if (repoPath) {
+        if (kind === "prs") {
+          void useGitHubStore.getState().fetchPullRequests(repoPath, "open", WATCHDOG_PR_SEARCH);
+        } else {
+          void useGitHubStore.getState().fetchIssues(repoPath, "open", WATCHDOG_ISSUE_SEARCH);
+        }
+      }
+      setGitPanelTab(kind);
+      setGitPanelOpen(true);
+    },
+    [selectTab]
+  );
+
   useAppKeyboard({
     onAddSession: handleAddSessionShortcut,
-    canAddSession: activeTabSessionsLaunched,
-    onToggleSidebar: handleToggleSidebar,
+    // Eagle view: Cmd/Ctrl+T opens the project picker instead of adding
+    // directly, so it only needs at least one open project.
+    canAddSession: eagleView ? tabs.length > 0 : activeTabSessionsLaunched,
+    onSidebarTab: handleSidebarTabShortcut,
     onToggleGitPanel: handleToggleGitPanel,
+    onToggleUtilityPanel: handleToggleUtilityPanel,
     onToggleEagleView: useCallback(() => setEagleView((v) => !v), []),
     onToggleLandscapeView: useCallback(() => setLandscapeView((v) => !v), []),
+    onNextProject: switchToNextTab,
+    onPrevProject: switchToPrevTab,
   });
 
   // Handler to enter grid view for the active project
@@ -595,6 +749,8 @@ function App() {
         <Sidebar
           collapsed={!sidebarOpen}
           onCollapse={() => setSidebarOpen(false)}
+          activeTab={sidebarTab}
+          onSelectTab={handleSelectSidebarTab}
           theme={theme}
           onToggleTheme={toggleTheme}
           launchedCount={activeTabLaunchedCount}
@@ -633,8 +789,9 @@ function App() {
               onToggleProcessesPanel={() => handleToggleUtilityPanel("processes")}
               notesPanelOpen={utilityPanel === "notes"}
               onToggleNotesPanel={() => handleToggleUtilityPanel("notes")}
-              standupPanelOpen={utilityPanel === "standup"}
-              onToggleStandupPanel={() => handleToggleUtilityPanel("standup")}
+              aiPanelOpen={utilityPanel === "ai"}
+              onToggleAiPanel={() => handleToggleUtilityPanel("ai")}
+              onWatchdogNavigate={handleWatchdogNavigate}
             />
 
             {/* Git panel header - inline at same level as TopBar.
@@ -761,6 +918,18 @@ function App() {
         </div>
       </div>
 
+      {/* Eagle view Cmd/Ctrl+T: pick which project gets the new terminal */}
+      {eagleAddPickerOpen && (
+        <EagleProjectPickerModal
+          projects={eagleProjects}
+          onPick={(tabId) => {
+            setEagleAddPickerOpen(false);
+            handleAddSessionToProject(tabId);
+          }}
+          onClose={() => setEagleAddPickerOpen(false)}
+        />
+      )}
+
       {/* FDA Dialog for macOS TCC-protected paths */}
       {showFDADialog && (
         <FDADialog
@@ -772,6 +941,7 @@ function App() {
       )}
 
       <UpdateNotification />
+      <NotificationToasts />
     </div>
   );
 }

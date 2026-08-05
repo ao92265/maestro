@@ -56,12 +56,18 @@ import type {
   McpManagedServer,
 } from "@/lib/mcp";
 import { listContextDocs, readContextDoc, type ContextDoc } from "@/lib/claudemd";
+import { altLabel, titleWithShortcut } from "@/lib/shortcuts";
 import { HistorySection } from "./HistorySection";
+import { NotificationsSettingsSection } from "./NotificationsSettingsSection";
 import { cardClass, divider, SectionHeader } from "./sectionChrome";
 
 interface SidebarProps {
   collapsed?: boolean;
   onCollapse?: () => void;
+  /** Active sidebar tab — lifted to App so Alt+1-4 shortcuts can drive it. */
+  activeTab: SidebarTabId;
+  /** Select a sidebar tab (App persists the choice). */
+  onSelectTab: (tab: SidebarTabId) => void;
   theme?: "dark" | "light";
   onToggleTheme?: () => void;
   /** Number of running sessions in the active project (drives Stop All visibility). */
@@ -99,6 +105,8 @@ function loadSavedWidth(): number {
 export function Sidebar({
   collapsed,
   onCollapse,
+  activeTab,
+  onSelectTab,
   theme,
   onToggleTheme,
   launchedCount = 0,
@@ -111,16 +119,10 @@ export function Sidebar({
   const [width, setWidth] = useState(loadSavedWidth);
   const [isDragging, setIsDragging] = useState(false);
   const dragStartRef = useRef<{ x: number; w: number } | null>(null);
-  const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTabId>(loadSavedTab);
 
   useEffect(() => {
     localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(width));
   }, [width]);
-
-  const handleSelectTab = useCallback((tab: SidebarTabId) => {
-    setActiveSidebarTab(tab);
-    localStorage.setItem(SIDEBAR_TAB_STORAGE_KEY, tab);
-  }, []);
 
   const handleDragStart = useCallback(
     (e: React.MouseEvent) => {
@@ -211,12 +213,12 @@ export function Sidebar({
       } ${collapsed ? "overflow-hidden border-r-0 opacity-0" : "opacity-100"}`}
     >
       {/* Tab bar */}
-      <SidebarTabBar active={activeSidebarTab} onSelect={handleSelectTab} />
+      <SidebarTabBar active={activeTab} onSelect={onSelectTab} />
 
       {/* Scrollable content */}
       <div className="flex-1 overflow-y-auto overflow-x-hidden px-2.5 py-3">
         <ConfigTab
-          activeSidebarTab={activeSidebarTab}
+          activeSidebarTab={activeTab}
           theme={theme}
           onToggleTheme={onToggleTheme}
           launchedCount={launchedCount}
@@ -253,9 +255,9 @@ export function Sidebar({
 /*  TAB BAR                                                          */
 /* ================================================================ */
 
-type SidebarTabId = "general" | "history" | "infra" | "settings";
+export type SidebarTabId = "general" | "history" | "infra" | "settings";
 
-const SIDEBAR_TABS: { id: SidebarTabId; label: string; icon: React.ElementType }[] = [
+export const SIDEBAR_TABS: { id: SidebarTabId; label: string; icon: React.ElementType }[] = [
   { id: "general", label: "General", icon: Home },
   { id: "history", label: "History", icon: History },
   { id: "infra", label: "Infra", icon: Package },
@@ -264,9 +266,30 @@ const SIDEBAR_TABS: { id: SidebarTabId; label: string; icon: React.ElementType }
 
 const SIDEBAR_TAB_STORAGE_KEY = "maestro-sidebar-tab";
 
-function loadSavedTab(): SidebarTabId {
+export function loadSavedSidebarTab(): SidebarTabId {
   const saved = localStorage.getItem(SIDEBAR_TAB_STORAGE_KEY);
   return SIDEBAR_TABS.some((t) => t.id === saved) ? (saved as SidebarTabId) : "general";
+}
+
+export function saveSidebarTab(tab: SidebarTabId): void {
+  localStorage.setItem(SIDEBAR_TAB_STORAGE_KEY, tab);
+}
+
+/**
+ * State transition for the Alt+1-4 sidebar shortcuts: closed → open on that
+ * tab; open on that tab already → close; open on another tab → switch.
+ * Returns null when the index doesn't name a tab.
+ */
+export function sidebarTabShortcutTransition(
+  open: boolean,
+  activeTab: SidebarTabId,
+  index: number,
+): { open: boolean; tab: SidebarTabId } | null {
+  const tab = SIDEBAR_TABS[index - 1]?.id;
+  if (!tab) return null;
+  if (!open) return { open: true, tab };
+  if (activeTab === tab) return { open: false, tab: activeTab };
+  return { open: true, tab };
 }
 
 function SidebarTabBar({
@@ -281,12 +304,12 @@ function SidebarTabBar({
     // regardless of its label, sized by the available space, with a small
     // gap between tab names.
     <div className="grid shrink-0 auto-cols-fr grid-flow-col gap-1 border-b border-maestro-border/60 px-1">
-      {SIDEBAR_TABS.map(({ id, label, icon: Icon }) => (
+      {SIDEBAR_TABS.map(({ id, label, icon: Icon }, index) => (
         <button
           key={id}
           type="button"
           onClick={() => onSelect(id)}
-          title={label}
+          title={titleWithShortcut(label, altLabel(), String(index + 1))}
           className={`flex min-w-0 flex-col items-center gap-0.5 border-b-2 px-0.5 py-1.5 text-[9px] font-semibold uppercase tracking-wide transition-colors ${
             active === id
               ? "border-maestro-accent text-maestro-accent"
@@ -347,13 +370,17 @@ function ConfigTab({
       );
     case "settings":
       return (
-        <AppearanceSection
-          theme={theme}
-          onToggle={onToggleTheme}
-          launchedCount={launchedCount}
-          isStoppingAll={isStoppingAll}
-          onStopAll={onStopAll}
-        />
+        <>
+          <AppearanceSection
+            theme={theme}
+            onToggle={onToggleTheme}
+            launchedCount={launchedCount}
+            isStoppingAll={isStoppingAll}
+            onStopAll={onStopAll}
+          />
+          {divider}
+          <NotificationsSettingsSection />
+        </>
       );
   }
 }

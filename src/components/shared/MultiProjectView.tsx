@@ -604,15 +604,27 @@ function EagleZoomTab({
   }, [isActive]);
 
   const isFlagged = useSessionStore((s) => s.flaggedSessionIds.includes(sessionId));
+  // Attention highlight (auto-unparked because the agent needs input) —
+  // same yellow chrome as the warning flag, cleared by selecting the session.
+  const hasAttention = useSessionStore((s) => s.attentionSessionIds.includes(sessionId));
+  // Attention-first click semantics on the active tab: the first click only
+  // acknowledges the attention highlight — it must not also set the warning
+  // flag. Subsequent clicks toggle the flag as before.
   const handleClick = isActive
-    ? () => useSessionStore.getState().toggleSessionFlag(sessionId)
+    ? () => {
+        if (hasAttention) {
+          useSessionStore.getState().clearSessionAttention(sessionId);
+          return;
+        }
+        useSessionStore.getState().toggleSessionFlag(sessionId);
+      }
     : onSelect;
 
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
     opacity: isDragging ? 0.5 : 1,
-    ...(isActive && !isFlagged
+    ...(isActive && !isFlagged && !hasAttention
       ? {
           backgroundColor: `color-mix(in srgb, ${color} 15%, transparent)`,
           color,
@@ -628,13 +640,15 @@ function EagleZoomTab({
       {...listeners}
       onClick={handleClick}
       className={`flex shrink-0 items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors ${
-        isFlagged ? "warning-flag" : ""
+        isFlagged || hasAttention ? "warning-flag" : ""
       } ${
         isActive ? "" : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
       }`}
       title={
         isActive
-          ? `${projectName} · ${label} (click to ${isFlagged ? "clear" : "set"} warning flag)`
+          ? hasAttention
+            ? `${projectName} · ${label} (needs input — click to clear the attention highlight)`
+            : `${projectName} · ${label} (click to ${isFlagged ? "clear" : "set"} warning flag)`
           : `Switch to ${projectName} · ${label}`
       }
     >

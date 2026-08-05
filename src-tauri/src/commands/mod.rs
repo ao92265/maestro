@@ -1,4 +1,6 @@
 pub mod agents;
+pub mod ai_runner;
+pub mod catalog;
 pub mod claude_sessions;
 pub mod claudemd;
 pub mod cli;
@@ -9,6 +11,7 @@ pub mod hooks;
 pub mod marketplace;
 pub mod mcp;
 pub mod memory;
+pub mod plan;
 pub mod plugin;
 pub mod processes;
 pub mod session;

@@ -20,6 +20,8 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 
 import { UtilityPanel } from "../UtilityPanel";
 import { useNotesStore } from "@/stores/useNotesStore";
+import { usePlanStore } from "@/stores/usePlanStore";
+import { useStandupStore } from "@/stores/useStandupStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 
 const invokeMock = vi.mocked(invoke);
@@ -101,6 +103,8 @@ describe("UtilityPanel", () => {
     useWorkspaceStore.setState({ tabs: [buildTab()] });
     // Notes live in a module-level zustand store — reset so tests don't leak.
     useNotesStore.setState({ notes: [], activeNoteId: null });
+    usePlanStore.setState({ status: "idle", plan: null, error: null, concerns: "" });
+    useStandupStore.setState({ reports: {}, scheduleEnabled: false, scheduleTime: "08:30" });
     // The processes poll skips when the window is unfocused; happy-dom is headless.
     vi.spyOn(document, "hasFocus").mockReturnValue(true);
   });
@@ -146,6 +150,42 @@ describe("UtilityPanel", () => {
     // The old two-pane implementation is gone: no Preview toggle, no textarea.
     expect(screen.queryByRole("button", { name: /preview/i })).toBeNull();
     expect(document.querySelector("textarea")).toBeNull();
+  });
+
+  it("renders the AI panel on the Report tab and switches to Plan", async () => {
+    render(<UtilityPanel panel="ai" width={320} onResize={() => {}} onClose={() => {}} />);
+    // Opening the panel always lands on Report (where Standup used to live).
+    expect(screen.getByRole("tab", { name: "Report" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByLabelText("Daily report time")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: "Plan" }));
+    expect(screen.getByRole("tab", { name: "Plan" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByLabelText("What's on your mind?")).toBeInTheDocument();
+    // The plan has no schedule of its own; with the report schedule off it
+    // says so rather than silently never running.
+    expect(screen.getByText(/daily schedule is off/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: "Catalog" }));
+    // Catalog is on-demand only: no schedule, just the scan button and the
+    // empty state until the user runs one.
+    expect(screen.getByRole("button", { name: /scan project/i })).toBeInTheDocument();
+  });
+
+  it("Plan tab subscribes to the open projects without an infinite render loop", () => {
+    // Regression guard: a selector returning a freshly mapped array re-renders
+    // forever under zustand v5 (React logs "getSnapshot should be cached" and
+    // then throws "Maximum update depth exceeded"). useShallow is what stops it.
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      render(<UtilityPanel panel="ai" width={320} onResize={() => {}} onClose={() => {}} />);
+      fireEvent.click(screen.getByRole("tab", { name: "Plan" }));
+      expect(screen.getByRole("button", { name: /generate plan/i })).toBeEnabled();
+      const logged = errorSpy.mock.calls.flat().map(String).join(" ");
+      expect(logged).not.toContain("getSnapshot should be cached");
+      expect(logged).not.toContain("Maximum update depth");
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   it("calls onClose from the header close button", () => {

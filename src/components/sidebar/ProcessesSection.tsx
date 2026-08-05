@@ -18,7 +18,10 @@ import {
   type DevProcess,
   type DockerContainer,
 } from "@/lib/processes";
+import { HealthReasonLines } from "@/components/shared/HealthReasonLines";
+import { processKey, type HealthFlag } from "@/lib/healthRules";
 import { assessStaleness } from "@/lib/staleProcess";
+import { flagsByRow, useHealthStore } from "@/stores/useHealthStore";
 import {
   DEFAULT_WATCHLIST,
   useProcessWatchlistStore,
@@ -157,6 +160,22 @@ export function ProcessesSection() {
   }, [groups, openProjectPaths]);
 
   const staleCount = assessedGroups.filter((g) => g.stale.level === "stale").length;
+
+  // Health checker flags, resolved per PID. A group inherits every flag raised
+  // against any of its processes (the rows are grouped, the rules are not).
+  const healthFlags = useHealthStore((s) => s.flags);
+  const healthRows = useMemo(() => flagsByRow(healthFlags, "processes"), [healthFlags]);
+  const flagsForProcess = useCallback(
+    (p: DevProcess) => healthRows.get(`${processKey(p)}|${p.matched}`),
+    [healthRows],
+  );
+  const flagsForGroup = useCallback(
+    (g: ProcessGroup): HealthFlag[] | undefined => {
+      const groupFlags = g.procs.flatMap((p) => flagsForProcess(p) ?? []);
+      return groupFlags.length > 0 ? groupFlags : undefined;
+    },
+    [flagsForProcess],
+  );
 
   // One confirm dialog per target: guards double-clicks on kill buttons.
   const pendingKills = useRef(new Set<string>());
@@ -316,11 +335,12 @@ export function ProcessesSection() {
                 const groupExpanded = expandedGroups.has(group.key);
                 const repo = dirBasename(group.cwd);
                 const isStale = stale.level === "stale";
+                const groupReasons = flagsForGroup(group);
                 return (
                   <div key={group.key}>
                     <div
                       className={`group flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-maestro-border/30 ${
-                        isStale ? "bg-maestro-red/5" : ""
+                        isStale ? "bg-maestro-red/5" : groupReasons ? "bg-maestro-orange/5" : ""
                       }`}
                       title={isStale ? stale.reason : group.cmd || group.matched}
                     >
@@ -368,6 +388,7 @@ export function ProcessesSection() {
                             {group.cmd || group.procs[0].name}
                           </span>
                         )}
+                        {groupReasons && <HealthReasonLines flags={groupReasons} />}
                       </span>
                       <span className="shrink-0 text-[10px] tabular-nums text-maestro-muted">
                         {formatMem(group.memoryBytes)}
@@ -394,11 +415,18 @@ export function ProcessesSection() {
                         {group.procs.map((p) => (
                           <div
                             key={p.pid}
-                            className="group flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-maestro-border/30"
+                            className={`group flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-maestro-border/30 ${
+                              flagsForProcess(p) ? "bg-maestro-orange/5" : ""
+                            }`}
                             title={p.cmd}
                           >
-                            <span className="flex-1 truncate text-[11px] text-maestro-text/80">
-                              PID {p.pid}
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate text-[11px] text-maestro-text/80">
+                                PID {p.pid}
+                              </span>
+                              {flagsForProcess(p) && (
+                                <HealthReasonLines flags={flagsForProcess(p) ?? []} />
+                              )}
                             </span>
                             {p.isMaestro && maestroBadge}
                             {portChips(p.ports)}

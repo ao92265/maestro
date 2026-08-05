@@ -65,7 +65,7 @@ import { useProjectColors } from "@/lib/useProjectColors";
 import { ParkedShelf } from "./ParkedShelf";
 import { PreLaunchCard, type SessionSlot } from "./PreLaunchCard";
 import { SplitPaneView } from "./SplitPaneView";
-import { MAX_SESSIONS, createLeaf, splitLeaf, removeLeaf, updateRatio, collectSlotIds, findSiblingSlotId, buildGridTree, swapSlots, type TreeNode, type SplitDirection } from "./splitTree";
+import { MAX_SESSIONS, createLeaf, removeLeaf, updateRatio, collectSlotIds, findSiblingSlotId, buildGridTree, swapSlots, type TreeNode } from "./splitTree";
 import { TerminalView } from "./TerminalView";
 import { SessionStatusDot, ThinkingIndicator } from "./ThinkingIndicator";
 
@@ -340,17 +340,32 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   const onAllSessionsClosedRef = useRef(onAllSessionsClosed);
   onAllSessionsClosedRef.current = onAllSessionsClosed;
 
+  // Clear a pane's yellow attention highlight (set when it was auto-unparked
+  // because its agent asked for input). Called only from USER-driven selection
+  // paths — programmatic focus (e.g. the auto-unpark restore itself) must
+  // keep the highlight until the user actually looks at the session.
+  const clearSlotAttention = useCallback((slotId: string) => {
+    const slot = slotsRef.current.find((s) => s.id === slotId);
+    if (slot && slot.sessionId !== null) {
+      useSessionStore.getState().clearSessionAttention(slot.sessionId);
+    }
+  }, []);
+
   // Stable per-slot focus callbacks — avoids creating new arrow functions on every render,
   // which would defeat React.memo on TerminalView.
   const focusCallbacksRef = useRef(new Map<string, () => void>());
   const getFocusCallback = useCallback((slotId: string) => {
     let cb = focusCallbacksRef.current.get(slotId);
     if (!cb) {
-      cb = () => setFocusedSlotId(slotId);
+      cb = () => {
+        // Clicking the pane is the user selecting it — attention is served.
+        clearSlotAttention(slotId);
+        setFocusedSlotId(slotId);
+      };
       focusCallbacksRef.current.set(slotId, cb);
     }
     return cb;
-  }, []);
+  }, [clearSlotAttention]);
 
   // Ordered slot IDs from the split tree (defines Cmd+1-9 ordering)
   const orderedSlotIds = useMemo(() => collectSlotIds(layoutTree), [layoutTree]);
@@ -402,6 +417,17 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     [displaySlotIds, parkedSlotIds],
   );
 
+  // Fresh zoom state for close paths that resolve after an async gap (the
+  // kill-confirm dialog, the kill IPC): a click-time closure could stomp a
+  // zoom requested while the dialog was open. Render-phase sync, same
+  // pattern as onAllSessionsClosedRef above — and keeping these out of
+  // callback deps stops zoom toggles from invalidating onKill/onRemove
+  // (which would defeat React.memo on TerminalView/PreLaunchCard).
+  const zoomedSlotIdRef = useRef<string | null>(null);
+  zoomedSlotIdRef.current = zoomedSlotId;
+  const visibleDisplaySlotIdsRef = useRef<string[]>([]);
+  visibleDisplaySlotIdsRef.current = visibleDisplaySlotIds;
+
   // Map focusedSlotId to an index in launchedSlots
   const focusedIndex = useMemo(() => {
     if (!focusedSlotId) return null;
@@ -409,92 +435,82 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     return idx >= 0 ? idx : null;
   }, [focusedSlotId, launchedSlots]);
 
-  // Ref-based close callback to avoid forward-reference issues with handleKill/removeSlot
-  const closePaneRef = useRef<() => void>(() => {});
+  // Ref-based park callback: handlePark is defined further down the render
+  // body (it needs handleKill/removeSlot-adjacent state), so the hook gets a
+  // stable closure that dereferences the ref at call time.
+  const parkFocusedRef = useRef<() => void>(() => {});
 
-  /**
-   * Splits the focused terminal pane in the given direction.
-   * Creates a new pre-launch slot and inserts it as a sibling.
-   * Debounced to prevent double-fire from duplicate keyboard events.
-   */
-  const lastSplitRef = useRef(0);
-  const handleSplit = useCallback((direction: SplitDirection) => {
-    const now = Date.now();
-    if (now - lastSplitRef.current < 200) return; // debounce
-    lastSplitRef.current = now;
+  const zoomedNext = useCallback(() => {
+    if (!zoomedSlotId) return;
+    const idx = visibleDisplaySlotIds.indexOf(zoomedSlotId);
+    if (idx < 0) return;
+    const next = visibleDisplaySlotIds[(idx + 1) % visibleDisplaySlotIds.length];
+    clearSlotAttention(next);
+    setZoomedSlotId(next);
+    // Focus follows the zoomed terminal — the zoom view no longer remounts
+    // (which used to force focus via a fresh isFocused render).
+    setFocusedSlotId(next);
+    focusSlotTextarea(next);
+  }, [zoomedSlotId, visibleDisplaySlotIds, clearSlotAttention]);
 
-    if (slotsRef.current.length >= MAX_SESSIONS) return;
-    // Default to first slot if nothing is focused
-    const targetSlotId = focusedSlotId ?? slotsRef.current[0]?.id;
-    if (!targetSlotId) return;
-    const newSlot = createEmptySlot(mcpServers, skills, plugins);
-    setSlots((prev) => [...prev, newSlot]);
-    setLayoutTree((prev) => splitLeaf(prev, targetSlotId, newSlot.id, direction));
-    setFocusedSlotId(newSlot.id);
-  }, [focusedSlotId, mcpServers, skills, plugins]);
+  const zoomedPrev = useCallback(() => {
+    if (!zoomedSlotId) return;
+    const idx = visibleDisplaySlotIds.indexOf(zoomedSlotId);
+    if (idx < 0) return;
+    const prev =
+      visibleDisplaySlotIds[(idx - 1 + visibleDisplaySlotIds.length) % visibleDisplaySlotIds.length];
+    clearSlotAttention(prev);
+    setZoomedSlotId(prev);
+    setFocusedSlotId(prev);
+    focusSlotTextarea(prev);
+  }, [zoomedSlotId, visibleDisplaySlotIds, clearSlotAttention]);
 
   // Terminal keyboard navigation hook
   useTerminalKeyboard({
     terminalCount: launchedSlots.length,
-    focusedIndex,
-    onFocusTerminal: useCallback((index: number) => {
-      const slot = launchedSlots[index];
-      if (slot) {
-        setFocusedSlotId(slot.id);
-      }
-    }, [launchedSlots]),
+    // While zoomed, focus-cycling follows the zoom-tab order so Cmd/Ctrl+Alt+
+    // Arrow never lands on a pane the zoom view is hiding.
     onCycleNext: useCallback(() => {
+      if (zoomedSlotId) {
+        zoomedNext();
+        return;
+      }
       if (launchedSlots.length === 0) return;
       const currentIdx = focusedIndex ?? -1;
       const nextIdx = (currentIdx + 1) % launchedSlots.length;
+      clearSlotAttention(launchedSlots[nextIdx].id);
       setFocusedSlotId(launchedSlots[nextIdx].id);
-    }, [launchedSlots, focusedIndex]),
+    }, [zoomedSlotId, zoomedNext, launchedSlots, focusedIndex, clearSlotAttention]),
     onCyclePrevious: useCallback(() => {
+      if (zoomedSlotId) {
+        zoomedPrev();
+        return;
+      }
       if (launchedSlots.length === 0) return;
       const currentIdx = focusedIndex ?? 0;
       const prevIdx = (currentIdx - 1 + launchedSlots.length) % launchedSlots.length;
+      clearSlotAttention(launchedSlots[prevIdx].id);
       setFocusedSlotId(launchedSlots[prevIdx].id);
-    }, [launchedSlots, focusedIndex]),
-    onSplitVertical: useCallback(() => handleSplit("vertical"), [handleSplit]),
-    onSplitHorizontal: useCallback(() => handleSplit("horizontal"), [handleSplit]),
-    // Dereference the ref at call time, not render time: closePaneRef.current
+    }, [zoomedSlotId, zoomedPrev, launchedSlots, focusedIndex, clearSlotAttention]),
+    // Dereference the ref at call time, not render time: parkFocusedRef.current
     // is reassigned further down the render body, so passing its value here
     // hands the hook the closure from the PREVIOUS render (stale focusedSlotId
-    // — Cmd/Ctrl+W would close the pane focused one render ago).
-    onClosePane: useCallback(() => closePaneRef.current(), []),
+    // — Alt+P would park the pane focused one render ago).
+    onParkFocused: useCallback(() => parkFocusedRef.current(), []),
     onToggleZoomFocused: useCallback(() => {
       const targetId = focusedSlotId ?? slotsRef.current[0]?.id;
       if (!targetId) return;
       if (parkedSlotIds.has(targetId)) return; // parked panes can't be zoomed
       setZoomedSlotId((prev) => (prev === targetId ? null : targetId));
     }, [focusedSlotId, parkedSlotIds]),
-    onZoomedNext: useCallback(() => {
-      if (!zoomedSlotId) return;
-      const idx = visibleDisplaySlotIds.indexOf(zoomedSlotId);
-      if (idx < 0) return;
-      const next = visibleDisplaySlotIds[(idx + 1) % visibleDisplaySlotIds.length];
-      setZoomedSlotId(next);
-      // Focus follows the zoomed terminal — the zoom view no longer remounts
-      // (which used to force focus via a fresh isFocused render).
-      setFocusedSlotId(next);
-      focusSlotTextarea(next);
-    }, [zoomedSlotId, visibleDisplaySlotIds]),
-    onZoomedPrev: useCallback(() => {
-      if (!zoomedSlotId) return;
-      const idx = visibleDisplaySlotIds.indexOf(zoomedSlotId);
-      if (idx < 0) return;
-      const prev =
-        visibleDisplaySlotIds[(idx - 1 + visibleDisplaySlotIds.length) % visibleDisplaySlotIds.length];
-      setZoomedSlotId(prev);
-      setFocusedSlotId(prev);
-      focusSlotTextarea(prev);
-    }, [zoomedSlotId, visibleDisplaySlotIds]),
+    onZoomedNext: zoomedNext,
+    onZoomedPrev: zoomedPrev,
     // When a terminal is zoomed the tab strip is the navigation UI, so
     // Alt+Left/Right should cycle tabs (handled in capture phase so xterm
     // doesn't swallow them). In normal split-pane mode Alt+Arrow stays as
     // xterm's word-movement.
     isZoomed: zoomedSlotId !== null,
-    // Split/zoom/focus shortcuts act on the per-project layout, which is
+    // Zoom/focus/park shortcuts act on the per-project layout, which is
     // suspended while the global eagle grid is showing.
     enabled: isActive && !eagleMode,
   });
@@ -1033,6 +1049,33 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   }, [launchSlot]);
 
   /**
+   * Closing/removing the zoomed pane keeps the user in zoom-in: the next
+   * pane in zoom-strip order takes over the zoom, same as parking/unparking
+   * (grid view only when nothing else is left to zoom). Without this the
+   * render-phase stale-zoom guard drops the user back to the grid. Returns
+   * true when a neighbor took over — zoom AND focus already moved.
+   */
+  const passZoomToNeighbor = useCallback((slotId: string): boolean => {
+    // Read through refs, not the render closure: kill paths call this after
+    // an async gap (confirm dialog / kill IPC), and a zoom requested during
+    // that gap must not be stomped by click-time state.
+    if (zoomedSlotIdRef.current !== slotId) return false;
+    const visible = visibleDisplaySlotIdsRef.current;
+    const idx = visible.indexOf(slotId);
+    const next = visible[(idx + 1) % visible.length];
+    // Eagle mode suspends the per-project zoom — clear the stale zoom so
+    // leaving eagle view doesn't land on a pane the user never chose.
+    if (!eagleMode && next !== undefined && next !== slotId) {
+      setZoomedSlotId(next);
+      setFocusedSlotId(next);
+      focusSlotTextarea(next);
+      return true;
+    }
+    setZoomedSlotId(null);
+    return false;
+  }, [eagleMode]);
+
+  /**
    * Handles killing/closing a session, updating the slot state.
    * Also cleans up any associated worktree and session-specific MCP config.
    */
@@ -1058,8 +1101,11 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       if (slot) {
         focusCallbacksRef.current.delete(slot.id);
 
+        // Closing the zoomed pane keeps the user in zoom view
+        const zoomMoved = passZoomToNeighbor(slot.id);
+
         // If the closed pane was focused, focus its sibling
-        if (focusedSlotId === slot.id) {
+        if (!zoomMoved && focusedSlotId === slot.id) {
           const sibling = findSiblingSlotId(layoutTree, slot.id);
           setFocusedSlotId(sibling);
         }
@@ -1127,7 +1173,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       }
       // "keep" (default): do nothing — worktree persists
     }
-  }, [tabId, effectiveRepoPath, projectPath, removeSessionFromProject, refreshBranches, focusedSlotId, layoutTree, onSessionCountChange, worktreeBasePath]);
+  }, [tabId, effectiveRepoPath, projectPath, removeSessionFromProject, refreshBranches, focusedSlotId, layoutTree, onSessionCountChange, worktreeBasePath, passZoomToNeighbor]);
 
   /**
    * Removes a pre-launch slot (before it's launched).
@@ -1143,8 +1189,11 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       return;
     }
 
+    // Removing the zoomed pre-launch card keeps the user in zoom view
+    const zoomMoved = passZoomToNeighbor(slotId);
+
     // If the removed pane was focused, focus its sibling
-    if (focusedSlotId === slotId) {
+    if (!zoomMoved && focusedSlotId === slotId) {
       const sibling = findSiblingSlotId(layoutTree, slotId);
       setFocusedSlotId(sibling);
     }
@@ -1156,7 +1205,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     });
 
     setSlots((prev) => prev.filter((s) => s.id !== slotId));
-  }, [focusedSlotId, layoutTree, onSessionCountChange]);
+  }, [focusedSlotId, layoutTree, onSessionCountChange, passZoomToNeighbor]);
 
   /** Kill a session's PTY and clean up its pane. False if this grid doesn't own it. */
   const killSessionById = useCallback((sessionId: number): boolean => {
@@ -1181,6 +1230,9 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     const slot = slotsRef.current.find((s) => s.sessionId === sessionId);
     if (!slot) return false;
     unparkIfParked(sessionId);
+    // Callers are user navigation (terminal navigator, eagle zoom, sidebar) —
+    // selecting the session clears its attention highlight.
+    useSessionStore.getState().clearSessionAttention(sessionId);
     // Leave zoom if a different pane is zoomed, so the target is visible.
     setZoomedSlotId((prev) => (prev === slot.id ? prev : null));
     setFocusedSlotId(slot.id);
@@ -1193,6 +1245,8 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     const slot = slotsRef.current.find((s) => s.sessionId === sessionId);
     if (!slot) return false;
     unparkIfParked(sessionId);
+    // User navigation — selecting the session clears its attention highlight.
+    useSessionStore.getState().clearSessionAttention(sessionId);
     // Set (not toggle): repeated calls stay zoomed on the same pane, and any
     // other pane's zoom is replaced.
     setZoomedSlotId(slot.id);
@@ -1212,19 +1266,10 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     const slot = slotsRef.current.find((s) => s.id === slotId);
     if (!slot || slot.sessionId === null) return;
     useSessionStore.getState().parkSession(slot.sessionId);
-    if (zoomedSlotId === slotId) {
-      // Eagle mode suspends the per-project zoom — clear the stale zoom so
-      // leaving eagle view doesn't land on a pane the user never chose.
-      const idx = visibleDisplaySlotIds.indexOf(slotId);
-      const next = visibleDisplaySlotIds[(idx + 1) % visibleDisplaySlotIds.length];
-      if (!eagleMode && next !== undefined && next !== slotId) {
-        setZoomedSlotId(next);
-        setFocusedSlotId(next);
-        focusSlotTextarea(next);
-        return;
-      }
-      setZoomedSlotId(null);
-    }
+    // Parking the zoomed pane: the next pane in zoom-strip order takes over
+    // the zoom (helper clears the zoom and falls through when nothing is
+    // left to zoom, so the focus fallback below still runs).
+    if (passZoomToNeighbor(slotId)) return;
     if (focusedSlotId === slotId) {
       const parked = useSessionStore.getState().parkedSessionIds;
       const fallback = slotsRef.current.find(
@@ -1232,7 +1277,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       );
       setFocusedSlotId(fallback ? fallback.id : findSiblingSlotId(layoutTree, slotId));
     }
-  }, [focusedSlotId, layoutTree, zoomedSlotId, visibleDisplaySlotIds, eagleMode]);
+  }, [focusedSlotId, layoutTree, passZoomToNeighbor]);
 
   /**
    * Restores a parked session's pane into the view the user is in: while a
@@ -1249,26 +1294,20 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     focusSlotTextarea(slot.id);
   }, []);
 
-  // Keep closePaneRef in sync with latest handleKill/removeSlot
-  closePaneRef.current = () => {
-    const targetId = focusedSlotId ?? slotsRef.current[0]?.id;
-    if (!targetId) return;
-    if (slotsRef.current.length <= 1) return; // don't close the last pane
-    const slot = slotsRef.current.find((s) => s.id === targetId);
-    if (!slot) return;
+  // NOTE: auto-unpark (agent asked for input while parked) deliberately does
+  // NOT route through handleUnpark. The store's unpark alone restores the
+  // pane's visibility (hiding derives from parkedSessionIds); stealing focus
+  // or the zoom view at an arbitrary async moment would inject the user's
+  // in-flight keystrokes into the restored session's PTY. The yellow
+  // attention chrome on the header/tabs/navigator is the notice — the user's
+  // own click brings the pane forward and clears it.
 
-    if (slot.sessionId !== null) {
-      // Confirm before closing a launched session (async native dialog)
-      ask("Are you sure you want to close this session?", {
-        title: "Close Session",
-        kind: "warning",
-      }).then((confirmed) => {
-        if (!confirmed) return;
-        killSessionById(slot.sessionId!);
-      }).catch(console.error);
-    } else {
-      removeSlot(slot.id);
-    }
+  // Keep parkFocusedRef in sync with the latest handlePark/focusedSlotId.
+  // Only an explicitly focused, launched pane parks — handlePark ignores
+  // pre-launch slots itself.
+  parkFocusedRef.current = () => {
+    if (!focusedSlotId) return;
+    handlePark(focusedSlotId);
   };
 
   /**
@@ -1529,6 +1568,9 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     // Rebuild layout as a clean 2D grid (matching old CSS grid dimensions)
     setLayoutTree(() => buildGridTree([...orderedSlotIds, newSlot.id]));
     setFocusedSlotId(newSlot.id);
+    // Stay in zoom-in view: the new pre-launch card takes over the zoom as
+    // the last tab in the strip (mirrors handleUnpark's behavior).
+    setZoomedSlotId((prev) => (prev === null ? null : newSlot.id));
     // Refresh branch list so new slots see the latest branches
     refreshBranches();
   }, [mcpServers, skills, plugins, refreshBranches, orderedSlotIds]);
@@ -1607,12 +1649,14 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     const zoomingIn = zoomedSlotId !== slotId;
     setZoomedSlotId(zoomingIn ? slotId : null);
     if (zoomingIn) {
-      // Zooming in focuses the zoomed terminal (parity with the old
-      // dedicated zoom render, which hardcoded isFocused).
+      // Zooming in is the user selecting the pane — clear its attention
+      // highlight and focus it (parity with the old dedicated zoom render,
+      // which hardcoded isFocused).
+      clearSlotAttention(slotId);
       setFocusedSlotId(slotId);
       focusSlotTextarea(slotId);
     }
-  }, [zoomedSlotId]);
+  }, [zoomedSlotId, clearSlotAttention]);
 
   // Esc deliberately does NOT exit zoom: the focused terminal needs it
   // (e.g. interrupting Claude). Exit via the header button or Cmd/Ctrl+1.
@@ -1707,6 +1751,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
             projectLabel={eagleMode ? projectName : undefined}
             projectColor={eagleColor}
             hasMoveHandle={showReorderHandle}
+            showShortcutHints={!eagleMode}
           />
           {dropOverlay}
         </DraggablePane>
@@ -2183,6 +2228,23 @@ function ZoomTab({
   const isFlagged = useSessionStore(
     (s) => sessionId !== null && s.flaggedSessionIds.includes(sessionId),
   );
+  // Attention highlight (auto-unparked because the agent needs input) —
+  // same yellow chrome as the warning flag, cleared by selecting the session.
+  const hasAttention = useSessionStore(
+    (s) => sessionId !== null && s.attentionSessionIds.includes(sessionId),
+  );
+
+  // Attention-first click semantics on the active tab: the first click only
+  // acknowledges the attention highlight — it must not also set the warning
+  // flag (the chrome would stay yellow and the user would have flagged the
+  // session without knowing). Subsequent clicks toggle the flag as before.
+  const handleActiveClick = () => {
+    if (hasAttention && sessionId !== null) {
+      useSessionStore.getState().clearSessionAttention(sessionId);
+      return;
+    }
+    onToggleFlag?.();
+  };
 
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
@@ -2196,10 +2258,10 @@ function ZoomTab({
       style={style}
       {...attributes}
       {...listeners}
-      onClick={isActive && onToggleFlag ? onToggleFlag : onSelect}
+      onClick={isActive && onToggleFlag ? handleActiveClick : onSelect}
       className={`
         flex shrink-0 items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors
-        ${isFlagged ? 'warning-flag' : ''}
+        ${isFlagged || hasAttention ? 'warning-flag' : ''}
         ${isActive
           ? 'bg-maestro-blue/15 text-maestro-blue'
           : 'text-maestro-muted hover:bg-maestro-card hover:text-maestro-text'
@@ -2208,7 +2270,9 @@ function ZoomTab({
       title={
         isActive
           ? onToggleFlag
-            ? `${label} (click to ${isFlagged ? "clear" : "set"} warning flag)`
+            ? hasAttention
+              ? `${label} (needs input — click to clear the attention highlight)`
+              : `${label} (click to ${isFlagged ? "clear" : "set"} warning flag)`
             : `${label} (click to exit zoom)`
           : `Switch to ${label}`
       }

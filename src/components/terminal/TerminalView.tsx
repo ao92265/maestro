@@ -53,6 +53,8 @@ interface TerminalViewProps {
   projectColor?: string;
   /** Reserve header space for the pane's drag handle overlay. */
   hasMoveHandle?: boolean;
+  /** Whether header tooltips advertise keyboard shortcuts (off in eagle view). */
+  showShortcutHints?: boolean;
 }
 
 /**
@@ -164,6 +166,7 @@ export const TerminalView = memo(function TerminalView({
   projectLabel,
   projectColor,
   hasMoveHandle = false,
+  showShortcutHints = true,
 }: TerminalViewProps) {
   const sessionData = useSessionStore(
     useShallow((s) => {
@@ -188,11 +191,23 @@ export const TerminalView = memo(function TerminalView({
   // Warning flag: user-toggled yellow chrome (header + tab strip), synced via
   // the session store so it shows in every view.
   const isFlagged = useSessionStore((s) => s.flaggedSessionIds.includes(sessionId));
+  // Attention highlight: auto-unparked because the agent asked for input —
+  // same yellow chrome, cleared when the user selects the session.
+  const hasAttention = useSessionStore((s) => s.attentionSessionIds.includes(sessionId));
   const toggleSessionFlag = useSessionStore((s) => s.toggleSessionFlag);
-  const handleToggleFlag = useCallback(
-    () => toggleSessionFlag(sessionId),
-    [toggleSessionFlag, sessionId],
-  );
+  // Attention-first click semantics: while the session carries the attention
+  // highlight, the first click on the header/tab strip only acknowledges it —
+  // it must not also toggle the warning flag (the chrome would stay yellow
+  // and the user would have flagged the session without knowing). Subsequent
+  // clicks toggle the flag as before.
+  const handleToggleFlag = useCallback(() => {
+    const store = useSessionStore.getState();
+    if (store.attentionSessionIds.includes(sessionId)) {
+      store.clearSessionAttention(sessionId);
+      return;
+    }
+    toggleSessionFlag(sessionId);
+  }, [toggleSessionFlag, sessionId]);
   const hasSessionWorktree = Boolean(sessionData?.worktreePath);
   const projectPath = sessionData?.workingDirectory ?? sessionData?.projectPath ?? "";
 
@@ -298,7 +313,7 @@ export const TerminalView = memo(function TerminalView({
   }, [fontSize, fontFamily, lineHeight, zoomLevel, getEffectiveFontFamily, getEffectiveFontSize]);
 
   /**
-   * Confirms with the user first (same dialog as the Cmd/Ctrl+W close path),
+   * Confirms with the user first,
    * then immediately removes the terminal from UI (optimistic update) and
    * kills the backend session in the background.
    */
@@ -596,6 +611,10 @@ export const TerminalView = memo(function TerminalView({
               statusMessage: undefined,
               needsInputPrompt: undefined,
             });
+            // Answering the prompt also clears the auto-unpark attention
+            // highlight — the pane can gain focus without a click (keyboard
+            // nav, file drop), so replying may be the acknowledging gesture.
+            useSessionStore.getState().clearSessionAttention(sessionId);
           }
         }
         writeStdin(sessionId, data).catch(console.error);
@@ -645,19 +664,6 @@ export const TerminalView = memo(function TerminalView({
           !event.shiftKey &&
           event.type === "keydown"
         ) {
-          return false;
-        }
-
-        // Cmd/Ctrl+D (with or without Shift): split pane — block xterm so 'd' isn't sent to PTY.
-        // The DOM event bubbles to window where useTerminalKeyboard handles it.
-        // event.code, not event.key: with Shift held the key is "D", which a
-        // lowercase comparison would miss and hand the keystroke to xterm.
-        if (event.code === "KeyD" && (event.metaKey || event.ctrlKey) && !event.altKey && event.type === "keydown") {
-          return false;
-        }
-
-        // Cmd/Ctrl+W: close pane — block xterm so 'w' isn't sent to PTY.
-        if (event.key === "w" && (event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.type === "keydown") {
           return false;
         }
 
@@ -887,18 +893,26 @@ export const TerminalView = memo(function TerminalView({
         projectColor={projectColor}
         hasMoveHandle={hasMoveHandle}
         isFlagged={isFlagged}
+        hasAttention={hasAttention}
         onToggleFlag={handleToggleFlag}
+        showShortcutHints={showShortcutHints}
       />
 
       {/* Tab bar — clicking its background or the already-active tab toggles
           the warning flag (yellow), in sync with the header above. */}
       <div
-        className={`flex shrink-0 cursor-pointer items-center gap-0.5 border-b border-neutral-800 ${isFlagged ? "warning-flag" : "bg-neutral-900/50"} px-2`}
+        className={`flex shrink-0 cursor-pointer items-center gap-0.5 border-b border-neutral-800 ${isFlagged || hasAttention ? "warning-flag" : "bg-neutral-900/50"} px-2`}
         onClick={(e) => {
           if ((e.target as HTMLElement).closest("button")) return;
           handleToggleFlag();
         }}
-        title={isFlagged ? "Click to clear warning flag" : "Click to flag as warning"}
+        title={
+          hasAttention
+            ? "Needs input — click to clear the attention highlight"
+            : isFlagged
+              ? "Click to clear warning flag"
+              : "Click to flag as warning"
+        }
       >
         <button
           type="button"

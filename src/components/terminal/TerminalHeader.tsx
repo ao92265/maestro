@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { OpenCodeIcon, type IconComponent } from "@/components/icons";
 import { ThinkingIndicator } from "@/components/terminal/ThinkingIndicator";
+import { altLabel, modLabel, titleWithShortcut } from "@/lib/shortcuts";
 
 export type SessionStatus = "idle" | "starting" | "working" | "needs-input" | "done" | "error" | "timeout";
 
@@ -46,8 +47,21 @@ interface TerminalHeaderProps {
   hasMoveHandle?: boolean;
   /** Warning flag: renders the header yellow (toggled by clicking it). */
   isFlagged?: boolean;
+  /**
+   * Attention highlight: the session was auto-unparked because its agent
+   * asked for input. Same yellow chrome as the warning flag; cleared when
+   * the user selects the session (the first header click clears it instead
+   * of toggling the warning flag).
+   */
+  hasAttention?: boolean;
   /** Toggle the warning flag — fired on clicks outside interactive controls. */
   onToggleFlag?: () => void;
+  /**
+   * Whether tooltips advertise the park/zoom keyboard shortcuts. Off in eagle
+   * view, where the per-project shortcut handler is suspended (the buttons
+   * themselves still work).
+   */
+  showShortcutHints?: boolean;
 }
 
 const providerConfig: Record<AIProvider, { icon: IconComponent; label: string }> = {
@@ -79,7 +93,9 @@ export const TerminalHeader = memo(function TerminalHeader({
   projectColor,
   hasMoveHandle = false,
   isFlagged = false,
+  hasAttention = false,
   onToggleFlag,
+  showShortcutHints = true,
 }: TerminalHeaderProps) {
   const { icon: ProviderIcon, label: providerLabel } = providerConfig[provider];
   const [showZoomMenu, setShowZoomMenu] = useState(false);
@@ -240,9 +256,17 @@ export const TerminalHeader = memo(function TerminalHeader({
 
   return (
     <div
-      className={`no-select flex ${adaptive.headerHeight} shrink-0 items-center ${adaptive.gapSize} border-b ${statusBorder} ${isFlagged ? "warning-flag" : "bg-maestro-surface"} ${hasMoveHandle ? "pl-6 pr-2" : "px-2"} ${onToggleFlag ? "cursor-pointer" : ""}`}
+      className={`no-select flex ${adaptive.headerHeight} shrink-0 items-center ${adaptive.gapSize} border-b ${statusBorder} ${isFlagged || hasAttention ? "warning-flag" : "bg-maestro-surface"} ${hasMoveHandle ? "pl-6 pr-2" : "px-2"} ${onToggleFlag ? "cursor-pointer" : ""}`}
       onClick={handleHeaderClick}
-      title={onToggleFlag ? (isFlagged ? "Click to clear warning flag" : "Click to flag as warning") : undefined}
+      title={
+        onToggleFlag
+          ? hasAttention
+            ? "Needs input — click to clear the attention highlight"
+            : isFlagged
+              ? "Click to clear warning flag"
+              : "Click to flag as warning"
+          : undefined
+      }
     >
       {/* Left cluster */}
       <div className={`flex min-w-0 flex-1 items-center ${adaptive.gapSize}`}>
@@ -345,7 +369,11 @@ export const TerminalHeader = memo(function TerminalHeader({
             type="button"
             onClick={() => onPark()}
             className="rounded p-0.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-accent"
-            title="Park terminal (hide without stopping)"
+            title={
+              showShortcutHints
+                ? titleWithShortcut("Park terminal — hide without stopping", altLabel(), "P")
+                : "Park terminal — hide without stopping"
+            }
             aria-label={`Park session ${sessionId}`}
           >
             <ParkingSquare size={terminalCount <= 4 ? 14 : 12} />
@@ -358,7 +386,17 @@ export const TerminalHeader = memo(function TerminalHeader({
             type="button"
             onClick={() => onToggleZoom()}
             className="rounded p-0.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-accent"
-            title={isZoomed ? "Restore grid view" : "Zoom terminal"}
+            title={
+              showShortcutHints
+                ? titleWithShortcut(
+                    isZoomed ? "Restore grid view" : "Zoom terminal",
+                    modLabel(),
+                    "1",
+                  )
+                : isZoomed
+                  ? "Restore grid view"
+                  : "Zoom terminal"
+            }
             aria-label={isZoomed ? "Restore grid view" : "Zoom terminal"}
           >
             {isZoomed ? <Minimize size={terminalCount <= 4 ? 14 : 12} /> : <Expand size={terminalCount <= 4 ? 14 : 12} />}
