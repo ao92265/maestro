@@ -16,7 +16,8 @@ const TABS: { id: AiTab; label: string }[] = [
  * Body of the right-side AI panel: everything Maestro generates with a
  * headless Claude run, behind one tab strip. Report is the daily per-project
  * standup, Plan is the single cross-project "what to do first today", and
- * Catalog is reserved. Opening the panel always lands on Report.
+ * Catalog is the on-demand feature catalogue of the active project. Opening
+ * the panel always lands on Report.
  */
 export function AiPanel() {
   const [tab, setTab] = useState<AiTab>("report");

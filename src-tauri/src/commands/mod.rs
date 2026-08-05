@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod ai_runner;
+pub mod catalog;
 pub mod claude_sessions;
 pub mod claudemd;
 pub mod cli;
