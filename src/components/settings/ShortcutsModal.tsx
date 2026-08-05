@@ -23,6 +23,8 @@ function buildGroups(mod: string): ShortcutGroup[] {
       shortcuts: [
         { keys: ["Alt", "1"], description: "Toggle the left sidebar" },
         { keys: [mod, "2"], description: "Toggle the git panel on the right" },
+        { keys: [mod, "G"], description: "Toggle eagle view (all terminals)" },
+        { keys: [mod, "Shift", "G"], description: "Toggle the landscape agent graph" },
         { keys: ["Alt", "N"], description: "Add a new pre-launch session pane" },
       ],
     },

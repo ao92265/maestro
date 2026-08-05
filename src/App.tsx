@@ -16,6 +16,7 @@ import { useSessionStore } from "@/stores/useSessionStore";
 import { type RepositoryInfo, useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { GitGraphPanel } from "./components/git/GitGraphPanel";
 import type { GitPanelTab } from "./components/git/GitPanelTabs";
+import { LandscapeView } from "./components/landscape/LandscapeView";
 import { BottomBar } from "./components/shared/BottomBar";
 import { FDADialog } from "./components/shared/FDADialog";
 import {
@@ -92,6 +93,13 @@ function App() {
   const [eagleView, setEagleView] = useState(false);
   // Eagle view git carousel: index of the project whose git panel card shows.
   const [eagleGitIndex, setEagleGitIndex] = useState(0);
+  // Landscape view: every project, terminal and subagent on one graph. Rendered
+  // over the terminals rather than instead of them, so nothing is torn down.
+  const [landscapeView, setLandscapeView] = useState(false);
+  // Marks the landscape button while a terminal anywhere is blocked on you.
+  const needsInputAnywhere = useSessionStore((s) =>
+    s.sessions.some((session) => session.status === "NeedsInput"),
+  );
   // Right-side utility panel (Memory / Processes), opened from the top bar.
   // One at a time: opening one replaces the other.
   const [utilityPanel, setUtilityPanel] = useState<UtilityPanelKind | null>(null);
@@ -482,6 +490,21 @@ function App() {
     }
   }, []);
 
+  // Landscape view: clicking a node leaves the graph for that project (and,
+  // when the node is a terminal, zooms it) — the same route the sidebar's
+  // Agents section takes.
+  const handleLandscapeNavigate = useCallback(
+    (tabId: string, sessionId?: number) => {
+      setEagleView(false);
+      selectTab(tabId);
+      if (sessionId === undefined) return;
+      requestAnimationFrame(() => {
+        multiProjectRef.current?.zoomSessionInProject(tabId, sessionId);
+      });
+    },
+    [selectTab],
+  );
+
   const handleToggleSidebar = useCallback(() => setSidebarOpen((prev) => !prev), []);
 
   // Closing a project tab terminates every terminal running in it, so when the
@@ -521,6 +544,7 @@ function App() {
     onToggleSidebar: handleToggleSidebar,
     onToggleGitPanel: handleToggleGitPanel,
     onToggleEagleView: useCallback(() => setEagleView((v) => !v), []),
+    onToggleLandscapeView: useCallback(() => setLandscapeView((v) => !v), []),
   });
 
   // Handler to enter grid view for the active project
@@ -600,6 +624,9 @@ function App() {
               onToggleEagleView={() => setEagleView((v) => !v)}
               eagleProjects={eagleProjects}
               onAddSessionToProject={handleAddSessionToProject}
+              landscapeView={landscapeView}
+              onToggleLandscapeView={() => setLandscapeView((v) => !v)}
+              landscapeAttention={needsInputAnywhere}
               memoryPanelOpen={utilityPanel === "memory"}
               onToggleMemoryPanel={() => handleToggleUtilityPanel("memory")}
               processesPanelOpen={utilityPanel === "processes"}
@@ -668,6 +695,15 @@ function App() {
                 onSessionCountChange={handleSessionCountChange}
                 eagleView={eagleView}
               />
+
+              {/* Landscape graph — an overlay, never a replacement: unmounting
+                  MultiProjectView would tear down every live terminal. */}
+              {landscapeView && (
+                <LandscapeView
+                  onNavigate={handleLandscapeNavigate}
+                  onClose={() => setLandscapeView(false)}
+                />
+              )}
             </main>
 
             {/* Memory / Processes utility panel (optional right side) */}

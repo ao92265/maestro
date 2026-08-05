@@ -1,0 +1,136 @@
+/**
+ * Deterministic layout for the landscape graph.
+ *
+ * Same input always produces the same picture — that is the whole point of the
+ * "Reorganize" button: after dragging nodes around, one click puts every node
+ * back where it belongs and it lands in the *same* place every time. (A
+ * force-directed/physics layout would look organic but settle differently on
+ * every run, so a second click would never reproduce the first.)
+ *
+ * Shape per project ("cluster"): the project node on the left, its terminals
+ * stacked in the middle column, and each terminal's subagents stacked in the
+ * right column beside it. Clusters are then tiled into a roughly square grid so
+ * "fit everything on screen" doesn't degenerate into one very tall column.
+ */
+
+export interface XY {
+  x: number;
+  y: number;
+}
+
+/** One terminal and the agents hanging off it, in render order. */
+export interface LayoutTerminal {
+  sessionId: number;
+  agentIds: string[];
+}
+
+/** One project and its terminals, in render order. */
+export interface LayoutProject {
+  tabId: string;
+  terminals: LayoutTerminal[];
+}
+
+/* ── Node sizes (px). Exported so the node components and the layout agree. ── */
+export const PROJECT_W = 236;
+export const PROJECT_H = 84;
+export const TERMINAL_W = 232;
+export const TERMINAL_H = 76;
+export const AGENT_W = 252;
+export const AGENT_H = 104;
+
+/* ── Gaps (px) ── */
+/** Between the project, terminal and agent columns. */
+const COL_GAP = 84;
+/** Between two agents of the same terminal. */
+const AGENT_GAP = 14;
+/** Between two terminal rows of the same project. */
+const TERMINAL_GAP = 28;
+/** Between neighbouring project clusters. */
+const CLUSTER_GAP_X = 110;
+const CLUSTER_GAP_Y = 80;
+
+/** Full width of one cluster: the three columns plus the gaps between them. */
+export const CLUSTER_W = PROJECT_W + COL_GAP + TERMINAL_W + COL_GAP + AGENT_W;
+
+/** Node id helpers — also the identity used to persist manual positions. */
+export const projectNodeId = (tabId: string) => `project:${tabId}`;
+export const terminalNodeId = (sessionId: number) => `terminal:${sessionId}`;
+export const agentNodeId = (sessionId: number, agentId: string) =>
+  `agent:${sessionId}:${agentId}`;
+
+/** Height of one terminal's row: the taller of the terminal and its agent stack. */
+function rowHeight(terminal: LayoutTerminal): number {
+  const n = terminal.agentIds.length;
+  const agentsH = n === 0 ? 0 : n * AGENT_H + (n - 1) * AGENT_GAP;
+  return Math.max(TERMINAL_H, agentsH);
+}
+
+/** Height of a whole project cluster (all its terminal rows stacked). */
+function clusterHeight(project: LayoutProject): number {
+  const rows = project.terminals.map(rowHeight);
+  if (rows.length === 0) return PROJECT_H;
+  const sum = rows.reduce((a, b) => a + b, 0);
+  return Math.max(PROJECT_H, sum + (rows.length - 1) * TERMINAL_GAP);
+}
+
+/**
+ * Position every node of every project.
+ *
+ * Returns a map keyed by the node ids above; a caller that has no position for
+ * a node (shouldn't happen) can fall back to the origin.
+ */
+export function layoutLandscape(projects: LayoutProject[]): Map<string, XY> {
+  const positions = new Map<string, XY>();
+  if (projects.length === 0) return positions;
+
+  // Roughly square tiling: with 5 clusters that's 3 columns, with 2 it's 2.
+  const columns = Math.max(1, Math.ceil(Math.sqrt(projects.length)));
+  const heights = projects.map(clusterHeight);
+
+  // Row heights must be known before placing a row, so pre-compute them.
+  const rowTops: number[] = [];
+  let y = 0;
+  for (let row = 0; row * columns < projects.length; row += 1) {
+    rowTops.push(y);
+    const rowHeights = heights.slice(row * columns, row * columns + columns);
+    y += Math.max(...rowHeights) + CLUSTER_GAP_Y;
+  }
+
+  projects.forEach((project, index) => {
+    const row = Math.floor(index / columns);
+    const column = index % columns;
+    const originX = column * (CLUSTER_W + CLUSTER_GAP_X);
+    const originY = rowTops[row];
+    const height = heights[index];
+
+    // Project node: vertically centred against its own terminal stack.
+    positions.set(projectNodeId(project.tabId), {
+      x: originX,
+      y: originY + (height - PROJECT_H) / 2,
+    });
+
+    const terminalX = originX + PROJECT_W + COL_GAP;
+    const agentX = terminalX + TERMINAL_W + COL_GAP;
+
+    let cursorY = originY;
+    for (const terminal of project.terminals) {
+      const rowH = rowHeight(terminal);
+      positions.set(terminalNodeId(terminal.sessionId), {
+        x: terminalX,
+        y: cursorY + (rowH - TERMINAL_H) / 2,
+      });
+
+      const n = terminal.agentIds.length;
+      const agentsH = n === 0 ? 0 : n * AGENT_H + (n - 1) * AGENT_GAP;
+      let agentY = cursorY + (rowH - agentsH) / 2;
+      for (const agentId of terminal.agentIds) {
+        positions.set(agentNodeId(terminal.sessionId, agentId), { x: agentX, y: agentY });
+        agentY += AGENT_H + AGENT_GAP;
+      }
+
+      cursorY += rowH + TERMINAL_GAP;
+    }
+  });
+
+  return positions;
+}

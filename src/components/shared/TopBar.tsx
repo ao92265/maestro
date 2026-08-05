@@ -5,6 +5,7 @@ import {
   Brain,
   GitMerge,
   Minus,
+  Network,
   PanelLeft,
   Plus,
   Square,
@@ -46,6 +47,11 @@ interface TopBarProps {
   eagleProjects?: EagleProjectOption[];
   /** Eagle view: add a terminal to the given project (opens its pre-launch card). */
   onAddSessionToProject?: (tabId: string) => void;
+  /** Landscape view: every project, terminal and subagent on one canvas */
+  landscapeView?: boolean;
+  onToggleLandscapeView?: () => void;
+  /** A terminal somewhere is waiting for input — marks the landscape button. */
+  landscapeAttention?: boolean;
   /** Right-side Memory panel */
   memoryPanelOpen?: boolean;
   onToggleMemoryPanel?: () => void;
@@ -74,6 +80,9 @@ export function TopBar({
   onToggleEagleView,
   eagleProjects = [],
   onAddSessionToProject,
+  landscapeView = false,
+  onToggleLandscapeView,
+  landscapeAttention = false,
   memoryPanelOpen = false,
   onToggleMemoryPanel,
   processesPanelOpen = false,
@@ -210,6 +219,27 @@ export function TopBar({
             title="Eagle view — all projects' terminals at once"
           >
             <Bird size={14} />
+          </button>
+        )}
+        {onToggleLandscapeView && (
+          <button
+            type="button"
+            onClick={onToggleLandscapeView}
+            className={`relative rounded p-1.5 transition-colors ${
+              landscapeView
+                ? "text-maestro-accent hover:bg-maestro-accent/10"
+                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
+            }`}
+            aria-label="Landscape view"
+            title="Landscape — every project, terminal and subagent on one canvas"
+          >
+            <Network size={14} />
+            {landscapeAttention && !landscapeView && (
+              <span
+                aria-hidden="true"
+                className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-maestro-accent"
+              />
+            )}
           </button>
         )}
         {onToggleMemoryPanel && (

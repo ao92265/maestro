@@ -11,6 +11,8 @@ interface UseAppKeyboardOptions {
   onToggleGitPanel?: () => void;
   /** Callback to toggle the eagle all-projects terminals view (Cmd/Ctrl+G) */
   onToggleEagleView?: () => void;
+  /** Callback to toggle the landscape agent graph (Cmd/Ctrl+Shift+G) */
+  onToggleLandscapeView?: () => void;
 }
 
 /**
@@ -27,6 +29,7 @@ function isMac(): boolean {
  * - Cmd/Ctrl+T: Add a new session slot (when in grid view)
  * - Cmd/Ctrl+2: Toggle the git panel
  * - Cmd/Ctrl+G: Toggle the eagle all-projects terminals view
+ * - Cmd/Ctrl+Shift+G: Toggle the landscape agent graph
  * - Alt+1: Toggle the left sidebar
  * - Alt+N: Add a new session slot (when in grid view)
  */
@@ -36,6 +39,7 @@ export function useAppKeyboard({
   onToggleSidebar,
   onToggleGitPanel,
   onToggleEagleView,
+  onToggleLandscapeView,
 }: UseAppKeyboardOptions): void {
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -59,6 +63,15 @@ export function useAppKeyboard({
 
       const modifierKey = isMac() ? event.metaKey : event.ctrlKey;
       if (!modifierKey) return;
+
+      // Cmd/Ctrl+Shift+G: toggle the landscape graph — the "everything at once"
+      // sibling of Cmd/Ctrl+G, so it is checked before Shift is filtered out.
+      if (event.shiftKey && !event.altKey && event.code === "KeyG" && onToggleLandscapeView) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        onToggleLandscapeView();
+        return;
+      }
 
       // Don't interfere with other modifier combinations
       if (event.altKey || event.shiftKey) return;
@@ -94,5 +107,12 @@ export function useAppKeyboard({
     // bubble-phase listener — including xterm's textarea and other modal handlers.
     window.addEventListener("keydown", handleKeyDown, { capture: true });
     return () => window.removeEventListener("keydown", handleKeyDown, { capture: true });
-  }, [onAddSession, canAddSession, onToggleSidebar, onToggleGitPanel, onToggleEagleView]);
+  }, [
+    onAddSession,
+    canAddSession,
+    onToggleSidebar,
+    onToggleGitPanel,
+    onToggleEagleView,
+    onToggleLandscapeView,
+  ]);
 }
