@@ -91,11 +91,20 @@ interface SessionState {
    * as parkedSessionIds: session IDs are reassigned each app launch.
    */
   flaggedSessionIds: number[];
+  /**
+   * Sessions that were auto-unparked because their agent stopped and asked
+   * for input while parked. Rendered as a yellow "attention" highlight on the
+   * session's header and tabs (same styling as the manual warning flag) until
+   * the user focuses/selects the session. In-memory only, same rationale as
+   * parkedSessionIds.
+   */
+  attentionSessionIds: number[];
   isLoading: boolean;
   error: string | null;
   parkSession: (sessionId: number) => void;
   unparkSession: (sessionId: number) => void;
   toggleSessionFlag: (sessionId: number) => void;
+  clearSessionAttention: (sessionId: number) => void;
   fetchSessions: () => Promise<void>;
   fetchSessionsForProject: (projectPath: string) => Promise<void>;
   addSession: (session: SessionConfig) => void;
@@ -149,15 +158,28 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
   sessions: [],
   parkedSessionIds: [],
   flaggedSessionIds: [],
+  attentionSessionIds: [],
   isLoading: false,
   error: null,
 
   parkSession: (sessionId: number) => {
-    set((state) =>
-      state.parkedSessionIds.includes(sessionId)
-        ? state
-        : { parkedSessionIds: [...state.parkedSessionIds, sessionId] }
-    );
+    set((state) => {
+      const alreadyParked = state.parkedSessionIds.includes(sessionId);
+      const hasAttention = state.attentionSessionIds.includes(sessionId);
+      // No-op guard: don't replace arrays (and re-render subscribers)
+      // when nothing changes.
+      if (alreadyParked && !hasAttention) return state;
+      return {
+        parkedSessionIds: alreadyParked
+          ? state.parkedSessionIds
+          : [...state.parkedSessionIds, sessionId],
+        // Parking is a deliberate act on the session — an auto-unpark
+        // attention highlight would be stale once it's hidden again.
+        attentionSessionIds: hasAttention
+          ? state.attentionSessionIds.filter((id) => id !== sessionId)
+          : state.attentionSessionIds,
+      };
+    });
   },
 
   unparkSession: (sessionId: number) => {
@@ -174,6 +196,18 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     }));
   },
 
+  clearSessionAttention: (sessionId: number) => {
+    set((state) =>
+      state.attentionSessionIds.includes(sessionId)
+        ? {
+            attentionSessionIds: state.attentionSessionIds.filter(
+              (id) => id !== sessionId
+            ),
+          }
+        : state
+    );
+  },
+
   fetchSessions: async () => {
     set({ isLoading: true, error: null });
     try {
@@ -181,11 +215,14 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       set((state) => ({
         sessions,
         isLoading: false,
-        // Prune parked/flagged IDs that no longer exist in the fetched list
+        // Prune parked/flagged/attention IDs that no longer exist in the fetched list
         parkedSessionIds: state.parkedSessionIds.filter((id) =>
           sessions.some((s) => s.id === id)
         ),
         flaggedSessionIds: state.flaggedSessionIds.filter((id) =>
+          sessions.some((s) => s.id === id)
+        ),
+        attentionSessionIds: state.attentionSessionIds.filter((id) =>
           sessions.some((s) => s.id === id)
         ),
       }));
@@ -204,11 +241,14 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       set((state) => ({
         sessions,
         isLoading: false,
-        // Prune parked/flagged IDs that no longer exist in the fetched list
+        // Prune parked/flagged/attention IDs that no longer exist in the fetched list
         parkedSessionIds: state.parkedSessionIds.filter((id) =>
           sessions.some((s) => s.id === id)
         ),
         flaggedSessionIds: state.flaggedSessionIds.filter((id) =>
+          sessions.some((s) => s.id === id)
+        ),
+        attentionSessionIds: state.attentionSessionIds.filter((id) =>
           sessions.some((s) => s.id === id)
         ),
       }));
@@ -328,6 +368,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       sessions: state.sessions.filter((s) => s.id !== sessionId),
       parkedSessionIds: state.parkedSessionIds.filter((id) => id !== sessionId),
       flaggedSessionIds: state.flaggedSessionIds.filter((id) => id !== sessionId),
+      attentionSessionIds: state.attentionSessionIds.filter((id) => id !== sessionId),
     }));
   },
 
@@ -345,6 +386,9 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
           (id) => !removed.some((r) => r.id === id)
         ),
         flaggedSessionIds: state.flaggedSessionIds.filter(
+          (id) => !removed.some((r) => r.id === id)
+        ),
+        attentionSessionIds: state.attentionSessionIds.filter(
           (id) => !removed.some((r) => r.id === id)
         ),
       }));
@@ -401,19 +445,48 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
               clearStartupTimeout(session_id);
             }
 
-            set((state) => ({
-              sessions: state.sessions.map((s) =>
-                s.id === session_id && s.project_path === project_path
+            set((state) => {
+              // Auto-unpark on the TRANSITION into NeedsInput: a parked agent
+              // that stops and asks for the user must come back into view,
+              // marked for attention (yellow chrome) until the user selects
+              // it. Edge-triggered on purpose — if the user re-parks the
+              // still-NeedsInput session, repeated NeedsInput events are not
+              // a new transition and must not undo that manual choice.
+              const existing = state.sessions.find(
+                (s) => s.id === session_id && s.project_path === project_path
+              );
+              const autoUnpark =
+                existing !== undefined &&
+                status === "NeedsInput" &&
+                existing.status !== "NeedsInput" &&
+                state.parkedSessionIds.includes(session_id);
+
+              return {
+                sessions: state.sessions.map((s) =>
+                  s.id === session_id && s.project_path === project_path
+                    ? {
+                        ...s,
+                        status,
+                        statusMessage: message,
+                        needsInputPrompt: needs_input_prompt,
+                        lastMcpUpdateTime: Date.now(),
+                      }
+                    : s
+                ),
+                ...(autoUnpark
                   ? {
-                      ...s,
-                      status,
-                      statusMessage: message,
-                      needsInputPrompt: needs_input_prompt,
-                      lastMcpUpdateTime: Date.now(),
+                      parkedSessionIds: state.parkedSessionIds.filter(
+                        (id) => id !== session_id
+                      ),
+                      attentionSessionIds: state.attentionSessionIds.includes(
+                        session_id
+                      )
+                        ? state.attentionSessionIds
+                        : [...state.attentionSessionIds, session_id],
                     }
-                  : s
-              ),
-            }));
+                  : {}),
+              };
+            });
           })
             .then((unlisten) => {
               activeUnlisten = unlisten;

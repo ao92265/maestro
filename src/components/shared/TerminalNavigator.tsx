@@ -25,6 +25,9 @@ export function TerminalNavigator({ onNavigate }: TerminalNavigatorProps) {
   const tabs = useWorkspaceStore((s) => s.tabs);
   const sessions = useSessionStore((s) => s.sessions);
   const parkedIds = useSessionStore((s) => s.parkedSessionIds);
+  // Attention highlight (auto-unparked because the agent needs input) —
+  // same yellow chrome as the warning flag, cleared by selecting the session.
+  const attentionIds = useSessionStore((s) => s.attentionSessionIds);
 
   // Close on click-away or Escape.
   useEffect(() => {
@@ -98,6 +101,7 @@ export function TerminalNavigator({ onNavigate }: TerminalNavigatorProps) {
                 </div>
                 {terminals.map((sess) => {
                   const isParked = parkedIds.includes(sess.id);
+                  const hasAttention = attentionIds.includes(sess.id);
                   return (
                     <button
                       key={sess.id}
@@ -111,7 +115,9 @@ export function TerminalNavigator({ onNavigate }: TerminalNavigatorProps) {
                           ? "Parked — click to restore and go to it"
                           : "Go to this terminal"
                       }
-                      className="flex w-full items-center gap-1.5 rounded px-2 py-1 text-left text-xs text-maestro-text transition-colors hover:bg-maestro-surface"
+                      className={`flex w-full items-center gap-1.5 rounded px-2 py-1 text-left text-xs text-maestro-text transition-colors hover:bg-maestro-surface ${
+                        hasAttention ? "warning-flag" : ""
+                      }`}
                     >
                       <SessionStatusDot sessionId={sess.id} />
                       <span className="min-w-0 flex-1 truncate">
