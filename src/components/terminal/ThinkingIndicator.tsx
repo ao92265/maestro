@@ -93,12 +93,25 @@ export const ThinkingIndicator = memo(function ThinkingIndicator({
         ? "bg-maestro-accent"
         : "bg-maestro-muted/40";
 
-  const animate = activity === "thinking";
+  // Both live states ripple: these dots are the app's primary "what is this
+  // terminal doing?" signal, and a static red dot reads the same as a stale one.
+  // Only idle stands still.
+  //
+  // The class is applied plainly, NOT as `motion-safe:animate-thinking-dot`:
+  // `animate-thinking-dot` is hand-written in globals.css rather than a Tailwind
+  // theme animation, so Tailwind never generates a `motion-safe:` variant of it
+  // and the dots silently never animated. Reduced motion is already honoured by
+  // the `prefers-reduced-motion` block in globals.css.
+  const animate = activity !== "idle";
 
   const dotStyle = {
     width: `${size}px`,
     height: `${size}px`,
   } as const;
+
+  const dotClass = `rounded-full ${dotColor} ${
+    animate ? "animate-thinking-dot motion-reduce:opacity-70" : "opacity-60"
+  }`;
 
   return (
     <span
@@ -107,18 +120,9 @@ export const ThinkingIndicator = memo(function ThinkingIndicator({
       title={label}
       className={`inline-flex shrink-0 items-center gap-0.5 ${className}`}
     >
-      <span
-        style={{ ...dotStyle, animationDelay: "0ms" }}
-        className={`rounded-full ${dotColor} ${animate ? "motion-safe:animate-thinking-dot motion-reduce:opacity-70" : "opacity-60"}`}
-      />
-      <span
-        style={{ ...dotStyle, animationDelay: "180ms" }}
-        className={`rounded-full ${dotColor} ${animate ? "motion-safe:animate-thinking-dot motion-reduce:opacity-70" : "opacity-60"}`}
-      />
-      <span
-        style={{ ...dotStyle, animationDelay: "360ms" }}
-        className={`rounded-full ${dotColor} ${animate ? "motion-safe:animate-thinking-dot motion-reduce:opacity-70" : "opacity-60"}`}
-      />
+      <span style={{ ...dotStyle, animationDelay: "0ms" }} className={dotClass} />
+      <span style={{ ...dotStyle, animationDelay: "180ms" }} className={dotClass} />
+      <span style={{ ...dotStyle, animationDelay: "360ms" }} className={dotClass} />
     </span>
   );
 });

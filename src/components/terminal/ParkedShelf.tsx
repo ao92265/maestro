@@ -2,6 +2,7 @@ import { useMemo } from "react";
 
 import { samePath } from "@/lib/path";
 import { projectColorFor } from "@/lib/projectColor";
+import { useProjectColors } from "@/lib/useProjectColors";
 import { type BackendSessionStatus, useSessionStore } from "@/stores/useSessionStore";
 import { ThinkingIndicator } from "./ThinkingIndicator";
 
@@ -23,11 +24,14 @@ function basenameOf(path: string): string {
 }
 
 /**
- * Chip border per status. Parked terminals stay parked (WhatsApp-archive
- * semantics), but a chip whose agent stopped and wants the user turns
- * red and pulses; errors turn dark red; explicit Done turns green.
+ * Extra chip treatment for states the thinking dots can't express.
+ *
+ * The border itself is the project's color (see below), so status lives in the
+ * dots — except for the pulse that makes a parked terminal wanting the user
+ * impossible to miss, and the terminal Error/Done states, which the dots read
+ * as plain "idle".
  */
-function chipBorderClass(status: BackendSessionStatus): string {
+function chipAttentionClass(status: BackendSessionStatus): string {
   switch (status) {
     case "NeedsInput":
       return "parked-chip-attention";
@@ -37,7 +41,7 @@ function chipBorderClass(status: BackendSessionStatus): string {
     case "Done":
       return "border-maestro-green";
     default:
-      return "border-maestro-border";
+      return "";
   }
 }
 
@@ -60,6 +64,9 @@ interface ParkedShelfProps {
 export function ParkedShelf({ projectPath, onUnpark, showProjectLabels = false }: ParkedShelfProps) {
   const sessions = useSessionStore((s) => s.sessions);
   const parkedIds = useSessionStore((s) => s.parkedSessionIds);
+  // Clash-resolved colors, so a parked chip matches the project's terminals
+  // rather than showing that project's raw (possibly re-seated) hash color.
+  const projectColors = useProjectColors();
 
   const parkedSessions = useMemo(
     () =>
@@ -89,20 +96,26 @@ export function ParkedShelf({ projectPath, onUnpark, showProjectLabels = false }
         Parked
       </span>
       {parkedSessions.map((sess) => {
-        const projectName = showProjectLabels ? basenameOf(sess.project_path) : null;
+        const project = basenameOf(sess.project_path);
+        const projectColor = projectColors.get(project) ?? projectColorFor(project);
+        const attention = chipAttentionClass(sess.status);
         return (
           <button
             key={sess.id}
             type="button"
             onClick={() => onUnpark(sess.id)}
-            className={`flex shrink-0 items-center gap-1.5 rounded-full border bg-maestro-card px-2.5 py-0.5 text-xs text-maestro-text transition-colors hover:border-maestro-accent ${chipBorderClass(sess.status)}`}
+            // The chip's border is its project's color, matching that project's
+            // terminals in the grid; the attention classes above override it
+            // for the few states the dots can't show.
+            style={attention ? undefined : { borderColor: projectColor }}
+            className={`flex shrink-0 items-center gap-1.5 rounded-full border bg-maestro-card px-2.5 py-0.5 text-xs text-maestro-text transition-colors hover:border-maestro-accent ${attention}`}
             title="Restore terminal"
           >
             <span className={`h-1.5 w-1.5 rounded-full ${STATUS_DOT[sess.status] ?? STATUS_DOT.Idle}`} />
             <ThinkingIndicator sessionId={sess.id} size={3} />
-            {projectName && (
-              <span className="font-bold" style={{ color: projectColorFor(projectName) }}>
-                {projectName}
+            {showProjectLabels && (
+              <span className="font-bold" style={{ color: projectColor }}>
+                {project}
               </span>
             )}
             <span className="max-w-[140px] truncate">

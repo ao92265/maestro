@@ -3,39 +3,37 @@
  *
  * The color is derived purely from the project name, so the same project
  * always gets the same color — across sessions, restarts and machines.
- * Used by the eagle view to color-code terminal tiles by project.
+ * Used to color-code every terminal that belongs to a project: its cell border,
+ * its label in the tab strips, the parked shelf and the landscape graph.
+ *
+ * The whole hue circle is available, red included. Status is no longer carried
+ * by color alone — the three-dot ThinkingIndicator (blue = working, red =
+ * needs your input) is what reports what a terminal is doing — so reserving red
+ * for status would cost a tenth of the palette for nothing.
  */
 
 /**
- * Two hues closer than this (circular distance in degrees) are considered a
- * clash — at the fixed saturation/lightness they are too similar to tell
- * apart at a glance. 30° still allows up to 10 clearly distinct projects
- * within the allowed (non-red) arc.
+ * Ideal minimum separation between two project hues (circular degrees). At the
+ * fixed saturation/lightness, hues closer than this are hard to tell apart at a
+ * glance. It is a target, not a guarantee: with more than 360/30 = 12 projects
+ * open, {@link resolveProjectColors} spreads them as far apart as the circle
+ * allows instead of giving two projects the same color.
  */
 const HUE_CLASH_DISTANCE = 30;
 
 /**
  * Probe step used to re-seat a clashing hue. 137° ≈ the golden angle, which
- * spreads successive probes evenly around the allowed arc, and is coprime
- * with its span so repeated probing eventually visits every hue.
+ * spreads successive probes evenly around the circle and shares no factor with
+ * 360 beyond 1, so repeated probing keeps landing on fresh hues.
  */
 const HUE_PROBE_STEP = 137;
 
 /** Bounded so pathological sets (many near-identical names) can't loop long. */
 const MAX_PROBES = 24;
 
-/**
- * Red is reserved for session status ("agent needs your input" borders), so
- * project colors may never look red. Hues are confined to the arc
- * [ALLOWED_HUE_MIN, ALLOWED_HUE_MIN + ALLOWED_HUE_SPAN) — i.e. 30°..330° —
- * which excludes the red band around 0°/360°.
- */
-const ALLOWED_HUE_MIN = 30;
-const ALLOWED_HUE_SPAN = 300;
-
-/** Wrap an arbitrary offset into the allowed (non-red) hue arc. */
-function allowedHue(offset: number): number {
-  return ALLOWED_HUE_MIN + (((offset % ALLOWED_HUE_SPAN) + ALLOWED_HUE_SPAN) % ALLOWED_HUE_SPAN);
+/** Wrap an arbitrary offset into [0, 360). */
+function wrapHue(offset: number): number {
+  return ((offset % 360) + 360) % 360;
 }
 
 function hueFor(name: string): number {
@@ -43,7 +41,7 @@ function hueFor(name: string): number {
   for (let i = 0; i < name.length; i++) {
     hash = (hash * 31 + name.charCodeAt(i)) | 0;
   }
-  return allowedHue(hash);
+  return wrapHue(hash);
 }
 
 function hslFor(hue: number): string {
@@ -56,6 +54,16 @@ function hueDistance(a: number, b: number): number {
   return d > 180 ? 360 - d : d;
 }
 
+/** Distance from `hue` to the nearest already-claimed hue (Infinity if none). */
+function nearestClaimed(hue: number, claimed: number[]): number {
+  let nearest = Number.POSITIVE_INFINITY;
+  for (const taken of claimed) {
+    const d = hueDistance(taken, hue);
+    if (d < nearest) nearest = d;
+  }
+  return nearest;
+}
+
 /**
  * Maps a project name to a stable HSL color.
  *
@@ -63,7 +71,9 @@ function hueDistance(a: number, b: number): number {
  * borders and bold text on the dark theme.
  *
  * Prefer {@link resolveProjectColors} when the full set of open projects is
- * known — it keeps this mapping but re-seats colors that would clash.
+ * known — it keeps this mapping but re-seats colors that would clash. Two
+ * unrelated names can hash to the same hue, so this function alone does not
+ * guarantee distinct colors.
  */
 export function projectColorFor(name: string): string {
   return hslFor(hueFor(name));
@@ -71,14 +81,18 @@ export function projectColorFor(name: string): string {
 
 /**
  * Assigns a color to every project name, keeping the deterministic
- * name → color rule but resolving clashes between *different* names.
+ * name → color rule but guaranteeing that no two *different* names share one.
  *
- * Names are processed in sorted order (independent of tab order), each
- * claiming its hash hue. When a name's hue lands within
- * {@link HUE_CLASH_DISTANCE} of an already-claimed hue, it is re-seated by
- * deterministic golden-angle probing until a free hue is found. The result is
- * therefore stable for a given set of open projects — no per-render
- * randomness — while identical names still intentionally share one color.
+ * Names are processed in sorted order (independent of tab order), each claiming
+ * its hash hue. A hue within {@link HUE_CLASH_DISTANCE} of one already claimed
+ * is re-seated by deterministic golden-angle probing. If probing runs out —
+ * which it must once the circle is crowded — the name takes the hue furthest
+ * from every claimed one, scanning whole degrees in order. That final step is
+ * what turns "usually distinct" into "always distinct": the old code gave up
+ * after 24 probes and accepted a duplicate hue.
+ *
+ * Stable for a given set of open projects (no per-render randomness); identical
+ * names still intentionally share one color.
  */
 export function resolveProjectColors(names: Iterable<string>): Map<string, string> {
   const unique = Array.from(new Set(names)).sort();
@@ -88,13 +102,25 @@ export function resolveProjectColors(names: Iterable<string>): Map<string, strin
   for (const name of unique) {
     let hue = hueFor(name);
     let probes = 0;
-    while (
-      probes < MAX_PROBES &&
-      claimed.some((taken) => hueDistance(taken, hue) < HUE_CLASH_DISTANCE)
-    ) {
-      hue = allowedHue(hue - ALLOWED_HUE_MIN + HUE_PROBE_STEP);
+    while (probes < MAX_PROBES && nearestClaimed(hue, claimed) < HUE_CLASH_DISTANCE) {
+      hue = wrapHue(hue + HUE_PROBE_STEP);
       probes++;
     }
+
+    // Still clashing: take the emptiest spot on the circle rather than double up.
+    if (nearestClaimed(hue, claimed) < HUE_CLASH_DISTANCE) {
+      let bestHue = hue;
+      let bestGap = -1;
+      for (let candidate = 0; candidate < 360; candidate++) {
+        const gap = nearestClaimed(candidate, claimed);
+        if (gap > bestGap) {
+          bestGap = gap;
+          bestHue = candidate;
+        }
+      }
+      hue = bestHue;
+    }
+
     claimed.push(hue);
     colors.set(name, hslFor(hue));
   }

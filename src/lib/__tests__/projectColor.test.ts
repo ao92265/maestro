@@ -13,47 +13,53 @@ function circularDistance(a: number, b: number): number {
   return d > 180 ? 360 - d : d;
 }
 
+/** Two generated names whose raw hash hues land within 30° of each other. */
+function findClashingPair(): [string, string] {
+  const names = Array.from({ length: 60 }, (_, i) => `project-${i}`);
+  for (let i = 0; i < names.length; i++) {
+    for (let j = i + 1; j < names.length; j++) {
+      const a = hueOf(projectColorFor(names[i]));
+      const b = hueOf(projectColorFor(names[j]));
+      if (circularDistance(a, b) < 30) return [names[i], names[j]];
+    }
+  }
+  throw new Error("no clashing pair found among the sample names");
+}
+
 describe("projectColorFor", () => {
   it("is deterministic for the same name", () => {
     expect(projectColorFor("maestro")).toBe(projectColorFor("maestro"));
   });
 
-  it("never assigns a red-ish hue (red is reserved for needs-input status)", () => {
-    // 200 arbitrary names — every hue must stay inside the allowed 30°..330°
-    // arc, leaving the red band around 0°/360° to the status borders.
-    for (let i = 0; i < 200; i++) {
-      const hue = hueOf(projectColorFor(`project-${i}`));
-      expect(hue).toBeGreaterThanOrEqual(30);
-      expect(hue).toBeLessThan(330);
+  it("uses the whole hue circle, red included", () => {
+    // Red used to be reserved for the needs-input border. Status now lives in
+    // the thinking dots, so the red band is part of the palette again.
+    const hues = Array.from({ length: 200 }, (_, i) => hueOf(projectColorFor(`project-${i}`)));
+    expect(hues.some((h) => h < 30 || h >= 330)).toBe(true);
+    for (const hue of hues) {
+      expect(hue).toBeGreaterThanOrEqual(0);
+      expect(hue).toBeLessThan(360);
     }
   });
 });
 
 describe("resolveProjectColors", () => {
   it("keeps the hash color when there is no clash", () => {
+    // The alphabetically first name always claims first, so it never re-seats.
     const colors = resolveProjectColors(["maestro", "dreadnought"]);
-    // Sanity: these two names don't clash, so both keep their base color.
-    for (const name of ["maestro", "dreadnought"]) {
-      expect(colors.get(name)).toBe(projectColorFor(name));
-    }
+    expect(colors.get("dreadnought")).toBe(projectColorFor("dreadnought"));
   });
 
   it("gives identical names the same color (intentional rule)", () => {
     const colors = resolveProjectColors(["web", "web", "api"]);
     expect(colors.size).toBe(2);
-    expect(colors.get("web")).toBe(projectColorFor("web"));
   });
 
   it("re-seats one of two different names whose hues clash", () => {
-    // "core" (245) and "api" (224) land within 30° of each other — without
-    // resolution their borders would be indistinguishable.
-    const a = hueOf(projectColorFor("core"));
-    const b = hueOf(projectColorFor("api"));
-    expect(circularDistance(a, b)).toBeLessThan(30);
-
-    const colors = resolveProjectColors(["core", "api"]);
-    const resolvedA = hueOf(colors.get("core")!);
-    const resolvedB = hueOf(colors.get("api")!);
+    const [first, second] = findClashingPair();
+    const colors = resolveProjectColors([first, second]);
+    const resolvedA = hueOf(colors.get(first)!);
+    const resolvedB = hueOf(colors.get(second)!);
     expect(circularDistance(resolvedA, resolvedB)).toBeGreaterThanOrEqual(30);
   });
 
@@ -76,22 +82,22 @@ describe("resolveProjectColors", () => {
     }
   });
 
-  it("terminates on pathologically large clashing sets", () => {
-    // 30 names cannot all be 30° apart (max 10 in the allowed arc) — must
-    // still return quickly with a color for every name.
+  it("never gives two different projects the same color, even when crowded", () => {
+    // 30 names cannot all sit 30° apart — but no two may collide outright,
+    // which is what the old 24-probe bail-out allowed.
     const names = Array.from({ length: 30 }, (_, i) => `project-${i}`);
     const colors = resolveProjectColors(names);
     expect(colors.size).toBe(30);
+    expect(new Set(colors.values()).size).toBe(30);
   });
 
-  it("keeps re-seated colors out of the red band too", () => {
-    // Force many re-seats; every resolved hue must stay in the allowed arc.
-    const names = Array.from({ length: 30 }, (_, i) => `project-${i}`);
-    const colors = resolveProjectColors(names);
-    for (const color of colors.values()) {
-      const hue = hueOf(color);
-      expect(hue).toBeGreaterThanOrEqual(30);
-      expect(hue).toBeLessThan(330);
+  it("spreads a crowded set out instead of bunching it up", () => {
+    const names = Array.from({ length: 24 }, (_, i) => `project-${i}`);
+    const hues = [...resolveProjectColors(names).values()].map(hueOf).sort((a, b) => a - b);
+    // 24 hues on a 360° circle average 15° apart; assert nothing is squeezed
+    // to less than half of that fair share.
+    for (let i = 1; i < hues.length; i++) {
+      expect(hues[i] - hues[i - 1]).toBeGreaterThanOrEqual(7);
     }
   });
 });

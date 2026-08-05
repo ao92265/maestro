@@ -858,15 +858,13 @@ export const TerminalView = memo(function TerminalView({
   return (
     <div
       className={`terminal-cell flex h-full flex-col bg-maestro-bg ${cellStatusClass(effectiveStatus)} ${isFocused ? "terminal-cell-focused" : ""}`}
-      // Eagle view: paint the cell's own border in the project color (one
-      // border per tile) — except when the agent needs the user or errored,
-      // where the red status border must stay visible (inline style would
-      // otherwise override the status class).
-      style={
-        projectColor && effectiveStatus !== "needs-input" && effectiveStatus !== "error"
-          ? { borderColor: projectColor }
-          : undefined
-      }
+      // The border is always the project's color, in every view — that is what
+      // it means. Status is not carried by the border any more: the status
+      // classes still supply the colored glow, and the three-dot indicator in
+      // the header says whether the terminal is working or waiting on you.
+      // (Previously this was eagle-only and stepped aside for needs-input and
+      // error, so the same terminal changed identity depending on its state.)
+      style={projectColor ? { borderColor: projectColor } : undefined}
       onClick={onFocus}
     >
       {/* Rich header bar */}

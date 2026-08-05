@@ -1700,8 +1700,12 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
             onAttachFiles={() => {
               handleAttachFiles(sessionId, slot.id).catch(console.error);
             }}
+            // The color is always on: a terminal's border tells you which
+            // project it belongs to in every view, not just eagle. The written
+            // label stays eagle-only — inside a single project's grid every
+            // tile would repeat the same name.
             projectLabel={eagleMode ? projectName : undefined}
-            projectColor={eagleMode ? eagleColor : undefined}
+            projectColor={eagleColor}
             hasMoveHandle={showReorderHandle}
           />
           {dropOverlay}
