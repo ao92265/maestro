@@ -5,9 +5,132 @@
 //! file-history snapshot.  [`parse_transcript_line`] converts a single line
 //! into zero or more [`ClaudeEvent`] variants without performing any file I/O.
 
+use serde::Deserialize;
+use serde_json::value::RawValue;
 use serde_json::Value;
 
 use super::claude_event::{ClaudeEvent, SubagentToolStats, TokenUsage};
+
+// ---------------------------------------------------------------------------
+// Line shapes
+// ---------------------------------------------------------------------------
+//
+// Transcript lines are big: on the transcripts on this machine, `toolUseResult`
+// alone is ~48% of every byte written, and ~99% of that sits under keys nothing
+// here reads (`file`, `stdout`, `structuredPatch`, …). Deserializing a line into
+// a `Value` allocated that whole tree — on every appended line of every live
+// session, and over the entire file again on resume.
+//
+// These narrow structs make serde walk past the unread keys without allocating
+// them, and keep the fields that *can* be huge as unparsed spans (`RawValue`)
+// so they cost something only on the branch that genuinely reads them.
+//
+// Every field is a span rather than a typed value on purpose: a struct of
+// `RawValue`s cannot fail to deserialize from a JSON object, so an unexpected
+// field type costs the entry one field (exactly like `Value::as_str` returning
+// `None` did) instead of dropping the whole line.
+
+/// The top-level fields a transcript entry is read for.
+#[derive(Deserialize)]
+struct Entry<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<&'a RawValue>,
+    #[serde(borrow)]
+    uuid: Option<&'a RawValue>,
+    #[serde(borrow)]
+    timestamp: Option<&'a RawValue>,
+    #[serde(borrow)]
+    message: Option<&'a RawValue>,
+    #[serde(rename = "toolUseResult", borrow)]
+    tool_use_result: Option<&'a RawValue>,
+}
+
+/// A message envelope; only its `content` is ever read.
+#[derive(Deserialize)]
+struct Message<'a> {
+    #[serde(borrow)]
+    content: Option<&'a RawValue>,
+}
+
+/// The fields of a user-message content block that are read. A `tool_result`
+/// block's own `content` — the tool's entire output — is not one of them.
+#[derive(Deserialize)]
+struct ContentBlock<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<&'a RawValue>,
+    #[serde(borrow)]
+    text: Option<&'a RawValue>,
+    #[serde(rename = "tool_use_id", borrow)]
+    tool_use_id: Option<&'a RawValue>,
+    #[serde(rename = "is_error", borrow)]
+    is_error: Option<&'a RawValue>,
+}
+
+/// The `toolUseResult` fields that describe a sub-agent run.
+#[derive(Deserialize)]
+struct ResultDetail<'a> {
+    #[serde(rename = "agentId", borrow)]
+    agent_id: Option<&'a RawValue>,
+    #[serde(borrow)]
+    status: Option<&'a RawValue>,
+    #[serde(rename = "agentType", borrow)]
+    agent_type: Option<&'a RawValue>,
+    #[serde(rename = "resolvedModel", borrow)]
+    resolved_model: Option<&'a RawValue>,
+    #[serde(borrow)]
+    content: Option<&'a RawValue>,
+    #[serde(rename = "totalDurationMs", borrow)]
+    total_duration_ms: Option<&'a RawValue>,
+    #[serde(rename = "totalTokens", borrow)]
+    total_tokens: Option<&'a RawValue>,
+    #[serde(rename = "totalToolUseCount", borrow)]
+    total_tool_use_count: Option<&'a RawValue>,
+    #[serde(rename = "toolStats", borrow)]
+    tool_stats: Option<&'a RawValue>,
+}
+
+// ---------------------------------------------------------------------------
+// Helpers: reading unparsed spans
+// ---------------------------------------------------------------------------
+
+/// Decode a span that should hold a JSON string, mirroring `Value::as_str`:
+/// anything else yields `None` rather than an error.
+fn raw_str(raw: Option<&RawValue>) -> Option<String> {
+    serde_json::from_str::<String>(raw?.get()).ok()
+}
+
+/// As [`raw_str`], but dropping empty strings the way the old `str_field` did.
+fn raw_str_non_empty(raw: Option<&RawValue>) -> Option<String> {
+    raw_str(raw).filter(|s| !s.is_empty())
+}
+
+/// Decode a span that should hold a JSON integer, mirroring `Value::as_u64`.
+fn raw_u64(raw: Option<&RawValue>) -> Option<u64> {
+    serde_json::from_str::<u64>(raw?.get()).ok()
+}
+
+/// Decode a span that should hold a JSON bool, mirroring `Value::as_bool`.
+fn raw_bool(raw: Option<&RawValue>) -> Option<bool> {
+    serde_json::from_str::<bool>(raw?.get()).ok()
+}
+
+/// Materialize a span as a whole [`Value`] — only on branches that need the
+/// entire subtree.
+fn raw_value(raw: Option<&RawValue>) -> Option<Value> {
+    serde_json::from_str(raw?.get()).ok()
+}
+
+/// Split a span holding an array of content blocks into the fields that are
+/// read. Blocks that are not objects are dropped, as they were before: they
+/// matched neither the `text` nor the `tool_result` branch.
+fn content_blocks<'a>(content: Option<&'a RawValue>) -> Option<Vec<ContentBlock<'a>>> {
+    let raws: Vec<&'a RawValue> = serde_json::from_str(content?.get()).ok()?;
+    Some(
+        raws.into_iter()
+            .filter_map(|r| serde_json::from_str::<ContentBlock>(r.get()).ok())
+            .collect(),
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -23,16 +146,14 @@ pub fn parse_transcript_line(session_id: u32, line: &str) -> Vec<ClaudeEvent> {
         return Vec::new();
     }
 
-    let obj: Value = match serde_json::from_str(trimmed) {
+    let entry: Entry = match serde_json::from_str(trimmed) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
 
-    let msg_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-    match msg_type {
-        "user" => parse_user_message(session_id, &obj),
-        "assistant" => parse_assistant_message(session_id, &obj),
+    match raw_str(entry.kind).as_deref().unwrap_or("") {
+        "user" => parse_user_message(session_id, &entry),
+        "assistant" => parse_assistant_message(session_id, &entry),
         _ => Vec::new(), // skip file-history-snapshot, unknown types
     }
 }
@@ -154,8 +275,8 @@ fn extract_result_text(content: Option<&Value>) -> String {
 /// sub-agent results carry an `agentId` plus a `status`; ordinary tools carry
 /// neither, and older sub-agent results carry no metadata at all — those fall
 /// through to the watcher's bare completion synthesis.
-fn is_subagent_result(detail: &Value) -> bool {
-    detail.get("agentId").is_some() && detail.get("status").is_some()
+fn is_subagent_result(detail: &ResultDetail) -> bool {
+    detail.agent_id.is_some() && detail.status.is_some()
 }
 
 /// Build a rich [`ClaudeEvent::SubagentCompleted`] from an entry's
@@ -164,23 +285,16 @@ fn subagent_completed(
     session_id: u32,
     agent_id: &str,
     is_error: bool,
-    detail: &Value,
+    detail: &ResultDetail,
     timestamp: &str,
 ) -> ClaudeEvent {
-    let str_field = |key: &str| {
-        detail
-            .get(key)
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
-    let status = str_field("status");
+    let status = raw_str_non_empty(detail.status);
     // Only an explicit failure word counts as failure; anything else is passed
     // through verbatim in `status` so an unrecognised one is displayed rather
     // than silently recoded as success or failure. "killed" is a failure: the
     // agent was stopped before finishing its work.
     let failed = matches!(status.as_deref(), Some("failed") | Some("error") | Some("killed"));
-    let tool_stats = detail.get("toolStats").map(|s| {
+    let tool_stats = raw_value(detail.tool_stats).map(|s| {
         let count = |key: &str| s.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
         SubagentToolStats {
             read_count: count("readCount"),
@@ -197,45 +311,39 @@ fn subagent_completed(
         session_id,
         agent_id: agent_id.to_string(),
         success: !is_error && !failed,
-        report: extract_result_text(detail.get("content")),
+        report: extract_result_text(raw_value(detail.content).as_ref()),
         status,
-        agent_type: str_field("agentType"),
-        model: str_field("resolvedModel"),
-        duration_ms: detail.get("totalDurationMs").and_then(|v| v.as_u64()),
-        total_tokens: detail.get("totalTokens").and_then(|v| v.as_u64()),
-        tool_use_count: detail.get("totalToolUseCount").and_then(|v| v.as_u64()),
+        agent_type: raw_str_non_empty(detail.agent_type),
+        model: raw_str_non_empty(detail.resolved_model),
+        duration_ms: raw_u64(detail.total_duration_ms),
+        total_tokens: raw_u64(detail.total_tokens),
+        tool_use_count: raw_u64(detail.total_tool_use_count),
         tool_stats,
-        agent_run_id: str_field("agentId"),
+        agent_run_id: raw_str_non_empty(detail.agent_id),
         timestamp: timestamp.to_string(),
     }
 }
 
-fn extract_timestamp(obj: &Value) -> String {
-    obj.get("timestamp")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
-}
+fn parse_user_message(session_id: u32, entry: &Entry) -> Vec<ClaudeEvent> {
+    let uuid = raw_str(entry.uuid).unwrap_or_default();
+    let timestamp = raw_str(entry.timestamp).unwrap_or_default();
 
-fn extract_uuid(obj: &Value) -> String {
-    obj.get("uuid")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
-}
-
-fn parse_user_message(session_id: u32, obj: &Value) -> Vec<ClaudeEvent> {
-    let uuid = extract_uuid(obj);
-    let timestamp = extract_timestamp(obj);
-
-    let content = obj.get("message").and_then(|m| m.get("content"));
-    let content_blocks = content.and_then(|c| c.as_array());
+    let content = entry
+        .message
+        .and_then(|m| serde_json::from_str::<Message>(m.get()).ok())
+        .and_then(|m| m.content);
+    let content_blocks = content_blocks(content);
 
     // Content is an array of blocks for ordinary messages, but a bare string for
     // system-injected ones — task notifications among them — so read both shapes.
-    let text = match content {
-        Some(Value::String(s)) => s.clone(),
-        _ => content_blocks.map(|b| join_text_blocks(b)).unwrap_or_default(),
+    let text = match &content_blocks {
+        Some(blocks) => blocks
+            .iter()
+            .filter(|b| raw_str(b.kind).as_deref() == Some("text"))
+            .filter_map(|b| raw_str(b.text))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => raw_str(content).unwrap_or_default(),
     };
 
     let mut events = vec![ClaudeEvent::UserMessage {
@@ -274,47 +382,41 @@ fn parse_user_message(session_id: u32, obj: &Value) -> Vec<ClaudeEvent> {
     // tool_result blocks close out an earlier tool_use with the same id.
     // The originating tool's name isn't present on the result block, so
     // tool_name is left empty; consumers match on tool_use_id.
-    if let Some(blocks) = content_blocks {
+    if let Some(blocks) = &content_blocks {
         // Sub-agent detail hangs off the entry, not the block. Claude Code
         // writes at most one tool_result per entry (0 of 4070 entries across
         // every transcript on this machine carried two), so it belongs to
         // whichever result block this entry has.
-        let detail = obj.get("toolUseResult").filter(|v| v.is_object());
+        //
+        // Reading it through `ResultDetail` skips the tool's payload — the
+        // `file` / `stdout` blob that is most of the line — without allocating
+        // it. A `toolUseResult` that is not an object fails to decode and is
+        // treated as absent, exactly as the old `is_object()` filter did.
+        let detail = entry
+            .tool_use_result
+            .and_then(|r| serde_json::from_str::<ResultDetail>(r.get()).ok())
+            .filter(is_subagent_result);
+        let detail = detail.as_ref();
         for block in blocks {
-            if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+            if raw_str(block.kind).as_deref() != Some("tool_result") {
                 continue;
             }
-            let tool_use_id = block
-                .get("tool_use_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let tool_use_id = raw_str(block.tool_use_id).unwrap_or_default();
             if tool_use_id.is_empty() {
                 continue;
             }
-            let is_error = block
-                .get("is_error")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let is_error = raw_bool(block.is_error).unwrap_or(false);
 
             // Pushed ahead of the ToolUseCompleted for the same id: the watcher
             // treats a sub-agent event as the authoritative outcome and drops
             // the generic completion that follows it.
-            if let Some(detail) = detail.filter(|d| is_subagent_result(d)) {
-                if detail.get("status").and_then(|v| v.as_str()) == Some("async_launched") {
+            if let Some(detail) = detail {
+                if raw_str(detail.status).as_deref() == Some("async_launched") {
                     events.push(ClaudeEvent::SubagentLaunched {
                         session_id,
                         agent_id: tool_use_id.clone(),
-                        agent_run_id: detail
-                            .get("agentId")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        model: detail
-                            .get("resolvedModel")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
+                        agent_run_id: raw_str(detail.agent_id).unwrap_or_default(),
+                        model: raw_str(detail.resolved_model).unwrap_or_default(),
                         timestamp: timestamp.clone(),
                     });
                 } else {
@@ -341,10 +443,14 @@ fn parse_user_message(session_id: u32, obj: &Value) -> Vec<ClaudeEvent> {
     events
 }
 
-fn parse_assistant_message(session_id: u32, obj: &Value) -> Vec<ClaudeEvent> {
-    let uuid = extract_uuid(obj);
-    let timestamp = extract_timestamp(obj);
-    let message = obj.get("message");
+fn parse_assistant_message(session_id: u32, entry: &Entry) -> Vec<ClaudeEvent> {
+    let uuid = raw_str(entry.uuid).unwrap_or_default();
+    let timestamp = raw_str(entry.timestamp).unwrap_or_default();
+    // Tool inputs are read whole (an unknown tool's summary is the serialized
+    // input), so the message subtree is materialized. `toolUseResult` never is:
+    // an assistant entry carries nothing there this parser reads.
+    let message = raw_value(entry.message);
+    let message = message.as_ref();
 
     let model = message
         .and_then(|m| m.get("model"))

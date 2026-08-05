@@ -406,17 +406,20 @@ export const useWorkspaceStore = create<WorkspaceState & WorkspaceActions>()(
       },
 
       rehydrateRepositories: async () => {
-        const { tabs } = get();
-        for (const tab of tabs) {
-          if (tab.workspaceType === "multi-repo") {
+        // Runs on every launch: each tab's scan walks a directory tree, so
+        // they go out together rather than queueing behind one another. Each
+        // still handles its own failure, so one bad path can't sink the rest.
+        const multiRepoTabs = get().tabs.filter((t) => t.workspaceType === "multi-repo");
+        await Promise.all(
+          multiRepoTabs.map(async (tab) => {
             try {
               const repos = await invoke<RepositoryInfo[]>("detect_repositories", { path: tab.projectPath });
               get().updateRepositories(tab.id, repos);
             } catch (err) {
               console.error(`Failed to rehydrate repos for ${tab.projectPath}:`, err);
             }
-          }
-        }
+          })
+        );
       },
     }),
     {

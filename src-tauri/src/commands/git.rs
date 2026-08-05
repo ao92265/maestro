@@ -405,47 +405,59 @@ pub async fn is_git_worktree(repo_path: String) -> Result<bool, GitError> {
     git.is_worktree().await
 }
 
+/// Directories to skip during the recursive workspace scan.
+const SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    ".git",
+    "target",
+    "build",
+    "dist",
+    ".next",
+    "vendor",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".cargo",
+];
+
+/// Ceiling on the real work one workspace scan does at once: the per-repo
+/// `git` probes and the directory reads each take a permit. A wide tree can
+/// therefore never fork hundreds of git processes or saturate the blocking
+/// pool, however many directories the fan-out visits.
+const MAX_CONCURRENT_SCANS: usize = 8;
+
 /// Recursively scans a directory for nested git repositories.
 /// Skips common non-project directories (node_modules, .git, etc.) and
 /// limits depth to avoid performance issues.
 #[tauri::command]
 pub async fn detect_repositories(path: String) -> Result<Vec<RepositoryInfo>, GitError> {
-    let mut repos = Vec::new();
-    let root = std::path::Path::new(&path);
-
-    // Directories to skip during recursive scan
-    let skip_dirs = [
-        "node_modules",
-        ".git",
-        "target",
-        "build",
-        "dist",
-        ".next",
-        "vendor",
-        "__pycache__",
-        ".venv",
-        "venv",
-        ".cargo",
-    ];
+    let root = PathBuf::from(&path);
+    let scan_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SCANS));
 
     // Walk directory recursively (max depth 5 to avoid performance issues)
-    detect_repos_recursive(root, &mut repos, &skip_dirs, 0, 5).await;
-
-    Ok(repos)
+    Ok(detect_repos_recursive(root, SKIP_DIRS, 0, 5, scan_limit).await)
 }
 
 /// Internal recursive helper for detect_repositories.
-/// Uses Box::pin for async recursion.
-fn detect_repos_recursive<'a>(
-    dir: &'a std::path::Path,
-    repos: &'a mut Vec<RepositoryInfo>,
-    skip_dirs: &'a [&'a str],
+///
+/// Returns this subtree's repositories in depth-first pre-order — the directory
+/// itself (when it qualifies) followed by each child's results in `read_dir`
+/// order — which is the order the serial version produced. Subdirectories are
+/// walked concurrently on a `JoinSet` and re-sorted by their child index, so
+/// the fan-out is invisible to callers. Uses `Box::pin` for async recursion;
+/// the arguments are owned/`'static` because `JoinSet` tasks must be.
+fn detect_repos_recursive(
+    dir: PathBuf,
+    skip_dirs: &'static [&'static str],
     depth: usize,
     max_depth: usize,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    scan_limit: std::sync::Arc<tokio::sync::Semaphore>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<RepositoryInfo>> + Send>> {
     Box::pin(async move {
+        let mut repos: Vec<RepositoryInfo> = Vec::new();
+
         if depth > max_depth {
-            return;
+            return repos;
         }
 
         // Check if this directory is a git repo
@@ -453,12 +465,18 @@ fn detect_repos_recursive<'a>(
         let is_git_repo = git_path.exists();
 
         if is_git_repo {
-            // Get current branch and remotes (best effort)
+            // Get current branch and remotes (best effort). The two probes are
+            // independent git processes, so they run together rather than
+            // back-to-back; the permit caps how many repos probe at once.
             let git = Git::new(dir.to_str().unwrap_or_default());
-            let current_branch = git.current_branch().await.ok();
+            let (current_branch, remotes) = {
+                let _permit = scan_limit.acquire().await;
+                tokio::join!(git.current_branch(), git.list_remotes())
+            };
+            let current_branch = current_branch.ok();
 
             // Get primary remote URL (prefer "origin", fall back to first remote)
-            let remote_url = match git.list_remotes().await {
+            let remote_url = match remotes {
                 Ok(remotes) => {
                     remotes
                         .iter()
@@ -494,29 +512,102 @@ fn detect_repos_recursive<'a>(
             });
         }
 
-        // Read directory entries
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return,
+        // Read directory entries. Async (so the walk never blocks a runtime
+        // thread) and under a permit, which is released before recursing —
+        // holding one across the child awaits would deadlock the pool.
+        let children = {
+            let _permit = scan_limit.acquire().await;
+            let mut entries = match tokio::fs::read_dir(&dir).await {
+                Ok(e) => e,
+                Err(_) => return repos,
+            };
+
+            let mut children: Vec<PathBuf> = Vec::new();
+            // Skip unreadable entries rather than ending the walk on the first
+            // one, matching the `flatten()` behaviour this replaced. A single
+            // sharing violation or unreadable junction must not silently drop
+            // every sibling after it — and with it every repo underneath.
+            // The consecutive-error cap stops a permanently-failing handle from
+            // spinning forever, which plain `continue` would allow.
+            let mut consecutive_errors = 0u32;
+            loop {
+                let entry = match entries.next_entry().await {
+                    Ok(Some(entry)) => {
+                        consecutive_errors = 0;
+                        entry
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        consecutive_errors += 1;
+                        if consecutive_errors >= 16 {
+                            log::warn!(
+                                "detect_repositories: giving up on {} after repeated read errors: {e}",
+                                dir.display()
+                            );
+                            break;
+                        }
+                        continue;
+                    }
+                };
+
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                // Skip hidden and excluded directories
+                if name.starts_with('.') || skip_dirs.contains(&name.as_str()) {
+                    continue;
+                }
+
+                children.push(path);
+            }
+            children
         };
 
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
+        // Recurse into children concurrently instead of one directory at a
+        // time, but keep at most MAX_CONCURRENT_SCANS of them in flight per
+        // directory. Spawning every child at every level would hold one live
+        // task per directory in the whole subtree; topping the pool up caps
+        // each directory's own fan-out instead. Note this bounds task objects,
+        // not work — the semaphore is what limits how much runs at once.
+        let mut results: Vec<(usize, Vec<RepositoryInfo>)> = Vec::new();
+        let mut tasks: tokio::task::JoinSet<(usize, Vec<RepositoryInfo>)> =
+            tokio::task::JoinSet::new();
+        let mut pending = children.into_iter().enumerate();
+
+        loop {
+            while tasks.len() < MAX_CONCURRENT_SCANS {
+                let Some((index, child)) = pending.next() else {
+                    break;
+                };
+                let limit = std::sync::Arc::clone(&scan_limit);
+                tasks.spawn(async move {
+                    (
+                        index,
+                        detect_repos_recursive(child, skip_dirs, depth + 1, max_depth, limit).await,
+                    )
+                });
             }
 
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            // Skip hidden and excluded directories
-            if name.starts_with('.') || skip_dirs.contains(&name.as_str()) {
-                continue;
+            match tasks.join_next().await {
+                Some(Ok(result)) => results.push(result),
+                // A panicking child must not take the whole scan down.
+                Some(Err(e)) => log::warn!("detect_repositories: scan task failed: {e}"),
+                None => break,
             }
-
-            detect_repos_recursive(&path, repos, skip_dirs, depth + 1, max_depth).await;
         }
+        // Restore `read_dir` order — the serial walk's ordering contract.
+        results.sort_by_key(|(index, _)| *index);
+        for (_, child_repos) in results {
+            repos.extend(child_repos);
+        }
+
+        repos
     })
 }

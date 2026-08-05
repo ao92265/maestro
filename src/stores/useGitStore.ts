@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
+import { invalidateCurrentBranchCache } from "@/lib/git";
 
 /** Branch info returned from the backend. */
 export interface BranchInfo {
@@ -223,6 +224,10 @@ export const useGitStore = create<GitState>()((set, get) => ({
     set({ isLoading: true, error: null });
     try {
       await invoke("git_checkout_branch", { repoPath, branchName });
+      // The branch just changed, so the shared TTL cache is now wrong. Drop it
+      // before anything re-reads, or every terminal header on this repo shows
+      // the old branch until the TTL expires.
+      invalidateCurrentBranchCache(repoPath);
       // Refresh current branch and commits after checkout
       const currentBranch = await invoke<string>("git_current_branch", { repoPath });
       set({ currentBranch, isLoading: false });

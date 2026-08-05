@@ -19,7 +19,7 @@ import { buildFontFamily, waitForFont } from "@/lib/fonts";
 import { getBackendInfo, killSession, onPtyOutput, resizePty, savePastedImage, signalTerminalReady, writeStdin, type BackendInfo } from "@/lib/terminal";
 import { DEFAULT_THEME, LIGHT_THEME, toXtermTheme } from "@/lib/terminalTheme";
 import { type AiMode, type BackendSessionStatus, useSessionStore } from "@/stores/useSessionStore";
-import { useTerminalSettingsStore } from "@/stores/useTerminalSettingsStore";
+import { DEFAULT_SCROLLBACK, useTerminalSettingsStore } from "@/stores/useTerminalSettingsStore";
 import { useShallow } from "zustand/react/shallow";
 import { QuickActionPills } from "./QuickActionPills";
 import { type AIProvider, type SessionStatus, TerminalHeader } from "./TerminalHeader";
@@ -438,9 +438,16 @@ export const TerminalView = memo(function TerminalView({
       if (disposed) return;
 
       const initialTheme = document.documentElement.getAttribute("data-theme") === "light" ? LIGHT_THEME : DEFAULT_THEME;
+      // Scrollback is user-configurable: every retained line costs cols × 3
+      // 32-bit cells for the life of the Terminal, and every open project keeps
+      // its terminals mounted, so this dominates renderer memory.
       // Reduce scrollback on Linux where the DOM renderer is slow in WebKitGTK.
-      // 10000 lines of scrollback with the DOM renderer causes severe lag.
+      // Deep scrollback with the DOM renderer causes severe lag — but only
+      // while the setting is untouched; an explicit user value wins.
       const isLinux = navigator.userAgent.toLowerCase().includes("linux");
+      const configuredScrollback = currentSettings.settings.scrollback;
+      const scrollback =
+        isLinux && configuredScrollback === DEFAULT_SCROLLBACK ? 2000 : configuredScrollback;
       term = new Terminal({
         cursorBlink: true,
         fontSize: currentSettings.getEffectiveFontSize(),
@@ -448,7 +455,7 @@ export const TerminalView = memo(function TerminalView({
         lineHeight: currentSettings.settings.lineHeight,
         theme: toXtermTheme(initialTheme),
         allowProposedApi: true,
-        scrollback: isLinux ? 2000 : 10000,
+        scrollback,
         tabStopWidth: 8,
       });
 
@@ -570,8 +577,9 @@ export const TerminalView = memo(function TerminalView({
             console.error("[TerminalView] Image too large to paste");
             return;
           }
-          const bytes = Array.from(new Uint8Array(arrayBuffer));
-          const filePath = await savePastedImage(bytes, mediaType);
+          // Hand the view straight to the IPC layer — building a JS array with
+          // one element per image byte first is what made large pastes freeze.
+          const filePath = await savePastedImage(new Uint8Array(arrayBuffer), mediaType);
           await writeStdin(sessionId, filePath);
         }).catch((err) => {
           console.error("[TerminalView] Failed to paste image:", err);

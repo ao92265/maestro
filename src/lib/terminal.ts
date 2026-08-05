@@ -21,9 +21,17 @@ export async function spawnShell(cwd?: string, env?: Record<string, string>): Pr
   return invoke<number>("spawn_shell", { cwd: cwd ?? null, env: env ?? null });
 }
 
-/** Saves pasted image data to a temporary file. Returns the absolute file path. */
-export async function savePastedImage(data: number[], mediaType: string): Promise<string> {
-  return invoke<string>("save_pasted_image", { data, mediaType });
+/**
+ * Saves pasted image data to a temporary file. Returns the absolute file path.
+ *
+ * The bytes are passed as the IPC *message body*, not as a field of an args
+ * object. Tauri only takes its raw `application/octet-stream` branch when the
+ * message itself is an ArrayBuffer / view / Array; anything else is
+ * `JSON.stringify`'d, which turns each image byte into ~4 characters of decimal
+ * text on the main thread. The media type rides along as a request header.
+ */
+export async function savePastedImage(data: Uint8Array, mediaType: string): Promise<string> {
+  return invoke<string>("save_pasted_image", data, { headers: { "media-type": mediaType } });
 }
 
 /**

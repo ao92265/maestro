@@ -10,6 +10,10 @@ import { WorktreeStatusList } from "./status/WorktreeStatusList";
 interface GitPanelContentProps {
   activeTab: GitPanelTab;
   repoPath: string;
+  /** `false` while the git panel is shut. The panel stays mounted at width 0
+   *  for the open/close animation, so tab content must stop polling itself
+   *  rather than rely on being unmounted. */
+  open?: boolean;
   currentBranch: string | null;
   onSelectCommit: (node: GraphNode) => void;
   selectedCommitHash: string | null;
@@ -24,6 +28,7 @@ interface GitPanelContentProps {
 export function GitPanelContent({
   activeTab,
   repoPath,
+  open = true,
   currentBranch,
   onSelectCommit,
   selectedCommitHash,
@@ -47,7 +52,7 @@ export function GitPanelContent({
     case "branches":
       return <BranchesPanel repoPath={repoPath} />;
     case "status":
-      return <WorktreeStatusList repoPath={repoPath} />;
+      return <WorktreeStatusList repoPath={repoPath} active={open} />;
     case "prs":
       return (
         <PullRequestList

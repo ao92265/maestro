@@ -7,7 +7,7 @@
 //! deltas are computed across successive polls.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::Serialize;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
@@ -28,6 +28,11 @@ const MAX_CMD_LEN: usize = 400;
 
 /// Upper bound when walking parent chains; also breaks PID-reuse cycles.
 const MAX_ANCESTRY_HOPS: usize = 64;
+
+/// How long a listening-port scan stays fresh. A dev server's port does not
+/// change second to second, so spawning `netstat`/`lsof` on every 3-second
+/// poll is pure waste; one scan per 15s keeps the chips accurate enough.
+const PORT_SCAN_TTL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Shared process probe. Wrapped in a `Mutex` so the refresh delta between
 /// successive polls yields accurate per-process CPU readings; `Arc` so the
@@ -199,6 +204,35 @@ async fn listening_ports_by_pid() -> HashMap<u32, Vec<u16>> {
     map
 }
 
+/// A port scan plus the moment it was taken.
+type PortScan = (std::time::Instant, HashMap<u32, Vec<u16>>);
+
+/// Last port scan. `None` means "never scanned", which forces a real scan on
+/// the first call — an `Instant` cannot portably be constructed far enough in
+/// the past to express that.
+static PORT_SCAN_CACHE: LazyLock<Mutex<Option<PortScan>>> = LazyLock::new(|| Mutex::new(None));
+
+/// `listening_ports_by_pid` behind a `PORT_SCAN_TTL` cache.
+///
+/// The scan shells out to `netstat`/`lsof`, so tying it to the 3-second poll
+/// rate meant a child process spawn every tick for data that barely changes.
+/// The lock is only held around the map clone — never across the await.
+async fn listening_ports_cached() -> HashMap<u32, Vec<u16>> {
+    let fresh = PORT_SCAN_CACHE.lock().ok().and_then(|cache| match &*cache {
+        Some((at, map)) if at.elapsed() < PORT_SCAN_TTL => Some(map.clone()),
+        _ => None,
+    });
+    if let Some(map) = fresh {
+        return map;
+    }
+
+    let map = listening_ports_by_pid().await;
+    if let Ok(mut cache) = PORT_SCAN_CACHE.lock() {
+        *cache = Some((std::time::Instant::now(), map.clone()));
+    }
+    map
+}
+
 /// Scans all OS processes and returns those matching the watchlist.
 ///
 /// The watchlist comes from the frontend (persisted, user-editable). Entries
@@ -222,8 +256,8 @@ pub async fn list_dev_processes(
     let own_pid = sysinfo::get_current_pid().map_err(|e| e.to_string())?;
 
     // Scan listening ports before taking the sysinfo lock — this shells out and
-    // we must not hold the mutex across it.
-    let ports_by_pid = listening_ports_by_pid().await;
+    // we must not hold the mutex across it. Cached, so most polls skip the spawn.
+    let ports_by_pid = listening_ports_cached().await;
 
     // Roots for the "spawned by Maestro" badge: the app itself plus every
     // PTY shell it launched.
@@ -238,14 +272,27 @@ pub async fn list_dev_processes(
             .lock()
             .map_err(|e| format!("Process scan state poisoned: {e}"))?;
 
+        // Both `OnlyIfNotSet` so this whole-table sweep costs no syscalls for a
+        // PID already seen. sysinfo gates its entire Windows parameter pipeline
+        // — OpenProcess, two NtQueryInformationProcess calls and three
+        // ReadProcessMemory reads of the PEB — on *any* of cmd/environ/cwd/root
+        // needing an update. One `Always` re-opens the lot for every process on
+        // the machine, 20x a minute, so both have to be lazy for the gate to
+        // close. `remove_dead_processes: true` drops dead PIDs, so a recycled
+        // PID still gets read fresh.
+        //
+        // cwd is refreshed below for the watchlist matches only: it *can*
+        // change (a process may chdir) and it drives row grouping, the repo
+        // label and stale-process classification, so it cannot simply be
+        // cached — but only a handful of PIDs are ever displayed.
         sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::new()
                 .with_cpu()
                 .with_memory()
-                .with_cmd(UpdateKind::Always)
-                .with_cwd(UpdateKind::Always),
+                .with_cmd(UpdateKind::OnlyIfNotSet)
+                .with_cwd(UpdateKind::OnlyIfNotSet),
         );
 
         let cpu_count = sys.cpus().len().max(1) as f32;
@@ -306,7 +353,8 @@ pub async fn list_dev_processes(
                 parent_pid: process.parent().map(|p| p.as_u32()),
                 name: name_stem.to_string(),
                 cmd: truncate_lossy(&cmd_joined, MAX_CMD_LEN),
-                cwd: process.cwd().map(|p| p.to_string_lossy().into_owned()),
+                // Filled in by the targeted cwd refresh below.
+                cwd: None,
                 memory_bytes: process.memory(),
                 cpu_percent: process.cpu_usage() / cpu_count,
                 run_time_secs: process.run_time(),
@@ -314,6 +362,28 @@ pub async fn list_dev_processes(
                 matched,
                 ports: ports_by_pid.get(&pid.as_u32()).cloned().unwrap_or_default(),
             });
+        }
+
+        // Now pay for an accurate cwd, but only on the rows the UI will show —
+        // typically a handful, against a table of several hundred. This is the
+        // one place the expensive PEB read is worth it, and scoping it here is
+        // what lets the sweep above stay syscall-free.
+        if !out.is_empty() {
+            let matched_pids: Vec<Pid> =
+                out.iter().map(|p| Pid::from_u32(p.pid)).collect();
+            sys.refresh_processes_specifics(
+                // `false`: this pass must not prune the snapshot that
+                // `kill_process_tree`'s ancestry guard later reads.
+                ProcessesToUpdate::Some(&matched_pids),
+                false,
+                ProcessRefreshKind::new().with_cwd(UpdateKind::Always),
+            );
+            for dev in &mut out {
+                dev.cwd = sys
+                    .process(Pid::from_u32(dev.pid))
+                    .and_then(|p| p.cwd())
+                    .map(|p| p.to_string_lossy().into_owned());
+            }
         }
 
         Ok(out)

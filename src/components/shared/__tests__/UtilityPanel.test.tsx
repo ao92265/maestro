@@ -129,10 +129,12 @@ describe("UtilityPanel", () => {
     expect(await screen.findByText("No watched processes running")).toBeInTheDocument();
   });
 
-  it("renders the Notes panel with its empty state", () => {
+  it("renders the Notes panel with its empty state", async () => {
     render(<UtilityPanel panel="notes" width={320} onResize={() => {}} onClose={() => {}} />);
     expect(screen.getByText("Notes")).toBeInTheDocument();
-    expect(screen.getByText("No notes yet.")).toBeInTheDocument();
+    // NotepadPanel is lazy-loaded (TipTap is heavy), so its body arrives a
+    // microtask after the header; the panel itself still renders synchronously.
+    expect(await screen.findByText("No notes yet.")).toBeInTheDocument();
   });
 
   it("renders note markdown formatted inside the editable surface itself", async () => {

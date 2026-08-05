@@ -1,16 +1,18 @@
 //! Watches Claude Code transcript JSONL files for new content and feeds
 //! parsed events into the [`EventBus`].
 //!
-//! Each session gets its own [`notify`] filesystem watcher and a dedicated
-//! tokio task that reads new lines incrementally, parses them via
+//! Each session gets a dedicated tokio task that reads new lines incrementally,
+//! parses them via
 //! [`parse_transcript_line`](super::transcript_parser::parse_transcript_line),
-//! and emits the resulting [`ClaudeEvent`]s.
+//! and emits the resulting [`ClaudeEvent`]s. The [`notify`] filesystem watch
+//! that wakes those tasks is shared: one per transcript *directory*, however
+//! many sessions tail files inside it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
 use notify::{Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher};
@@ -21,31 +23,57 @@ use super::claude_event::ClaudeEvent;
 use super::event_bus::EventBus;
 use super::transcript_parser::parse_transcript_line;
 
-/// Upper bound on concurrently watched sessions. Each watcher consumes an OS
-/// file-watch handle (e.g. an inotify instance) plus a tokio task, so an
+/// Upper bound on concurrently watched sessions. Each one costs a tokio task
+/// (and, for the first session in a directory, an OS file-watch handle), so an
 /// unbounded count is a resource-exhaustion vector when watch requests can be
 /// triggered by an unauthenticated caller. Far above any realistic number of
 /// live Claude sessions.
 const MAX_WATCHED_SESSIONS: usize = 256;
 
+/// Sessions listening to one directory: transcript file -> the sessions tailing
+/// it. Shared with that directory's `notify` callback, its only other holder.
+type Subscribers = Arc<Mutex<HashMap<PathBuf, HashMap<u32, mpsc::Sender<()>>>>>;
+
+/// One OS-level watch on one directory, feeding every session that tails a
+/// transcript inside it.
+struct DirWatcher {
+    _watcher: RecommendedWatcher,
+    subscribers: Subscribers,
+}
+
 /// Manages filesystem watchers for Claude Code transcript JSONL files.
 ///
-/// Each watched session has its own `notify` watcher monitoring the parent
-/// directory of the transcript file, plus a tokio task that reads new lines
-/// as they are appended.
+/// Each watched session gets a tokio task that reads new lines as they are
+/// appended. The `notify` watch that wakes it is held per directory, not per
+/// session.
 pub struct TranscriptWatcher {
     watchers: DashMap<u32, WatcherState>,
+    /// One watch per transcript DIRECTORY. Claude Code keeps every conversation
+    /// for a given cwd in one directory, so N Maestro terminals on the same
+    /// project all watch the same one — which used to mean N OS watch handles
+    /// and N watcher threads on it, each handed every write only for N-1 of
+    /// them to discard it.
+    dir_watchers: Mutex<HashMap<PathBuf, DirWatcher>>,
     event_bus: Arc<EventBus>,
 }
 
 struct WatcherState {
-    _watcher: RecommendedWatcher,
     task_handle: JoinHandle<()>,
     /// The transcript file this watcher tails — compared on re-registration
     /// so a session that mints a NEW transcript (e.g. `/clear`, or exiting and
     /// relaunching `claude` in the same terminal) replaces the stale watcher
-    /// instead of being ignored.
+    /// instead of being ignored. Also names the directory to unsubscribe from
+    /// when the session stops.
     transcript_path: PathBuf,
+}
+
+/// The directory whose watch covers `transcript_path`. The parent is watched
+/// rather than the file itself so file *creation* is caught too.
+fn watch_dir_of(transcript_path: &Path) -> PathBuf {
+    transcript_path
+        .parent()
+        .unwrap_or(transcript_path)
+        .to_path_buf()
 }
 
 impl TranscriptWatcher {
@@ -53,7 +81,141 @@ impl TranscriptWatcher {
     pub fn new(event_bus: Arc<EventBus>) -> Self {
         Self {
             watchers: DashMap::new(),
+            dir_watchers: Mutex::new(HashMap::new()),
             event_bus,
+        }
+    }
+
+    /// Register `session_id`'s wake-up channel against the watch on `dir`,
+    /// creating that watch if this is the directory's first session.
+    ///
+    /// Returns `false` only when the OS refuses a new watcher, which is the one
+    /// case where the caller must give up on watching this session.
+    fn subscribe(
+        &self,
+        dir: &Path,
+        session_id: u32,
+        transcript_path: &Path,
+        tx: mpsc::Sender<()>,
+    ) -> bool {
+        let mut dirs = self.dir_watchers.lock().unwrap_or_else(|e| e.into_inner());
+
+        if let Some(existing) = dirs.get(dir) {
+            existing
+                .subscribers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(transcript_path.to_path_buf())
+                .or_default()
+                .insert(session_id, tx);
+            return true;
+        }
+
+        let subscribers: Subscribers = Arc::new(Mutex::new(HashMap::new()));
+        subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(transcript_path.to_path_buf())
+            .or_default()
+            .insert(session_id, tx);
+
+        let callback_subscribers = Arc::clone(&subscribers);
+        let watcher_result =
+            notify::recommended_watcher(move |res: Result<NotifyEvent, notify::Error>| {
+                match res {
+                    Ok(event) => {
+                        // Collect under the lock, wake after releasing it: one
+                        // thread now serves every session in this directory, so
+                        // it must not sit on the lock while it wakes them.
+                        let targets: Vec<mpsc::Sender<()>> = {
+                            let subs = callback_subscribers
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            event
+                                .paths
+                                .iter()
+                                .filter_map(|p| subs.get(p))
+                                .flat_map(|sessions| sessions.values().cloned())
+                                .collect()
+                        };
+                        for tx in targets {
+                            // A full channel already holds unread wake-ups and
+                            // the reader always reads to EOF, so a dropped
+                            // signal loses nothing — whereas blocking here
+                            // would stall every other session in this
+                            // directory behind one slow reader.
+                            let _ = tx.try_send(());
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("TranscriptWatcher: notify error: {e}");
+                    }
+                }
+            });
+
+        // Don't panic if the OS refuses another watcher (e.g. inotify limit);
+        // just skip watching this session so a flood of requests can't crash
+        // the process.
+        let mut watcher = match watcher_result {
+            Ok(w) => w,
+            Err(e) => {
+                log::error!("TranscriptWatcher: failed to create filesystem watcher: {e}");
+                return false;
+            }
+        };
+
+        // Bail without caching if the watch itself fails. Caching a dead
+        // DirWatcher would make every later session in this directory join a
+        // watch that delivers nothing — their activity feed and agent graph
+        // would stay empty until the last subscriber left. Returning false
+        // contains the failure to this attempt, so the next session in this
+        // directory creates a fresh watcher rather than inheriting a dead one.
+        // This session is not itself retried until the next SessionStarted.
+        if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+            log::error!(
+                "TranscriptWatcher: failed to watch directory {}: {e}",
+                dir.display()
+            );
+            return false;
+        }
+
+        dirs.insert(
+            dir.to_path_buf(),
+            DirWatcher {
+                _watcher: watcher,
+                subscribers,
+            },
+        );
+        true
+    }
+
+    /// Drop `session_id`'s registration, and the directory's watch along with
+    /// it once no session is left listening there.
+    fn unsubscribe(&self, session_id: u32, transcript_path: &Path) {
+        let dir = watch_dir_of(transcript_path);
+        let mut dirs = self.dir_watchers.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir_is_idle = match dirs.get(&dir) {
+            Some(existing) => {
+                let mut subs = existing
+                    .subscribers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(sessions) = subs.get_mut(transcript_path) {
+                    sessions.remove(&session_id);
+                    if sessions.is_empty() {
+                        subs.remove(transcript_path);
+                    }
+                }
+                subs.is_empty()
+            }
+            None => false,
+        };
+
+        // Dropping the entry drops the RecommendedWatcher, releasing the OS
+        // handle. The next session opened here recreates it.
+        if dir_is_idle {
+            dirs.remove(&dir);
         }
     }
 
@@ -98,50 +260,12 @@ impl TranscriptWatcher {
 
         let (tx, rx) = mpsc::channel::<()>(64);
 
-        // Create the notify watcher that sends a signal on any file change.
-        let watcher = {
-            let tx = tx.clone();
-            let watched_path = transcript_path.clone();
-            let watcher_result = notify::recommended_watcher(move |res: Result<NotifyEvent, notify::Error>| {
-                match res {
-                    Ok(event) => {
-                        // Only care about events that touch our transcript file.
-                        let dominated = event.paths.iter().any(|p| p == &watched_path);
-                        if dominated {
-                            let _ = tx.blocking_send(());
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("TranscriptWatcher: notify error: {e}");
-                    }
-                }
-            });
-            // Don't panic if the OS refuses another watcher (e.g. inotify limit);
-            // just skip watching this session so a flood of requests can't crash
-            // the process.
-            let mut watcher = match watcher_result {
-                Ok(w) => w,
-                Err(e) => {
-                    log::error!("TranscriptWatcher: failed to create filesystem watcher: {e}");
-                    return;
-                }
-            };
-
-            // Watch the parent directory so we catch file creation as well.
-            let watch_dir = transcript_path
-                .parent()
-                .unwrap_or(&transcript_path)
-                .to_path_buf();
-
-            if let Err(e) = watcher.watch(&watch_dir, RecursiveMode::NonRecursive) {
-                log::error!(
-                    "TranscriptWatcher: failed to watch directory {}: {e}",
-                    watch_dir.display()
-                );
-            }
-
-            watcher
-        };
+        // Join the watch on this transcript's directory, creating it if this is
+        // the first session to tail a file there.
+        let watch_dir = watch_dir_of(&transcript_path);
+        if !self.subscribe(&watch_dir, session_id, &transcript_path, tx.clone()) {
+            return;
+        }
 
         // Spawn a tokio task that reads new lines whenever notified.
         let event_bus = Arc::clone(&self.event_bus);
@@ -153,7 +277,6 @@ impl TranscriptWatcher {
         self.watchers.insert(
             session_id,
             WatcherState {
-                _watcher: watcher,
                 task_handle,
                 transcript_path: transcript_path.clone(),
             },
@@ -173,6 +296,7 @@ impl TranscriptWatcher {
     pub fn stop_watching(&self, session_id: u32) {
         if let Some((_, state)) = self.watchers.remove(&session_id) {
             state.task_handle.abort();
+            self.unsubscribe(session_id, &state.transcript_path);
             log::info!("TranscriptWatcher: stopped watching session {session_id}");
         }
     }
@@ -845,6 +969,77 @@ mod tests {
         // 11. Cleanup: stop watching and verify it was removed
         watcher.stop_watching(1);
         assert!(watcher.watched_sessions().is_empty());
+    }
+
+    /// Two sessions on one project share a single directory watch, so stopping
+    /// one must not take its siblings' notifications down with it — and the
+    /// last one leaving must release the watch cleanly rather than leak it.
+    #[tokio::test]
+    async fn test_sessions_sharing_a_directory_are_independent() {
+        use std::time::Duration;
+
+        let (event_bus, captured) = test_event_bus();
+        let watcher = TranscriptWatcher::new(event_bus);
+
+        // Both transcripts live in ONE directory, as Claude Code writes them.
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("a.jsonl");
+        let path_b = dir.path().join("b.jsonl");
+        std::fs::write(&path_a, "").unwrap();
+        std::fs::write(&path_b, "").unwrap();
+        let path_a = path_a.canonicalize().unwrap();
+        let path_b = path_b.canonicalize().unwrap();
+
+        watcher.start_watching(1, path_a.clone());
+        watcher.start_watching(2, path_b.clone());
+        assert_eq!(watcher.dir_watchers.lock().unwrap().len(), 1, "one watch for the directory");
+
+        // Session 1 stops; session 2 must keep receiving.
+        watcher.stop_watching(1);
+        assert_eq!(
+            watcher.dir_watchers.lock().unwrap().len(),
+            1,
+            "the surviving session keeps the directory watch alive"
+        );
+
+        {
+            let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"sibling lives"}]},"uuid":"msg-b1","timestamp":"2026-02-24T10:00:00Z"}"#;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path_b).unwrap();
+            writeln!(f, "{}", line).unwrap();
+            f.flush().unwrap();
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            {
+                let events = captured.lock().unwrap();
+                if events.iter().any(|e| matches!(
+                    e,
+                    ClaudeEvent::UserMessage { text, .. } if text == "sibling lives"
+                )) {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "stopping session 1 killed session 2's notifications. Got {:?}",
+                        *events
+                    );
+                }
+            }
+        }
+
+        // The last session leaving releases the OS watch…
+        watcher.stop_watching(2);
+        assert!(
+            watcher.dir_watchers.lock().unwrap().is_empty(),
+            "the directory watch is dropped once nobody is listening"
+        );
+
+        // …and re-adding a session recreates it rather than watching nothing.
+        watcher.start_watching(3, path_a);
+        assert_eq!(watcher.dir_watchers.lock().unwrap().len(), 1);
+        watcher.stop_watching(3);
     }
 
     /// Regression: re-registering a session with a NEW transcript path (what

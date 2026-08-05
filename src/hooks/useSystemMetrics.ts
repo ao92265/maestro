@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
 
-const POLL_INTERVAL_MS = 2_000;
+const POLL_INTERVAL_MS = 5_000;
 
 export interface SystemMetrics {
   cpuPercent: number;
@@ -11,10 +11,12 @@ export interface SystemMetrics {
 }
 
 /**
- * Polls `get_system_metrics` every 2 seconds and returns the latest snapshot.
+ * Polls `get_system_metrics` every 5 seconds and returns the latest snapshot.
  *
- * - Skips polling while the window is blurred (`!document.hasFocus()`) to save
- *   resources.
+ * - Skips polling while the window is blurred (`!document.hasFocus()`) or
+ *   hidden (`document.visibilityState !== "visible"`) — the readout is always
+ *   mounted in the bottom bar, so an ungated tick would cost an IPC round trip
+ *   plus a React state update for the whole session.
  * - Cleans up the interval on unmount.
  * - Returns `null` until the first successful fetch.
  */
@@ -27,7 +29,7 @@ export function useSystemMetrics(): SystemMetrics | null {
 
     const fetchMetrics = () => {
       // Skip when the window is in the background — nobody's looking.
-      if (!document.hasFocus()) return;
+      if (!document.hasFocus() || document.visibilityState !== "visible") return;
 
       invoke<SystemMetrics>("get_system_metrics")
         .then((m) => {

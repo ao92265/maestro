@@ -3,9 +3,9 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { GitFork, RefreshCw, X } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MAC_TITLE_BAR_INSET_PX, useMacTitleBarPadding } from "@/hooks/useMacTitleBarPadding";
-import { getDeduplicatedCurrentBranch } from "@/lib/git";
+import { getDeduplicatedCurrentBranch, invalidateCurrentBranchCache } from "@/lib/git";
 import { isMac } from "@/lib/platform";
 import { projectColorFor } from "@/lib/projectColor";
 import { killSession } from "@/lib/terminal";
@@ -16,7 +16,6 @@ import { useSessionStore } from "@/stores/useSessionStore";
 import { type RepositoryInfo, useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { GitGraphPanel } from "./components/git/GitGraphPanel";
 import type { GitPanelTab } from "./components/git/GitPanelTabs";
-import { LandscapeView } from "./components/landscape/LandscapeView";
 import { BottomBar } from "./components/shared/BottomBar";
 import { FDADialog } from "./components/shared/FDADialog";
 import {
@@ -59,6 +58,16 @@ import { usePlanStore } from "@/stores/usePlanStore";
 import { useStandupStore } from "@/stores/useStandupStore";
 import { useUpdateStore } from "./stores/useUpdateStore";
 import { MAX_SESSIONS } from "./components/terminal/splitTree";
+
+/**
+ * Landscape graph, loaded on demand: it pulls in React Flow, which would
+ * otherwise sit in the entry chunk even though the view only renders when
+ * `landscapeView` is on. Already conditionally rendered, so the boundary is
+ * just the import.
+ */
+const LandscapeView = lazy(() =>
+  import("./components/landscape/LandscapeView").then((m) => ({ default: m.LandscapeView }))
+);
 
 /** Header title for each git-panel tab. */
 const GIT_PANEL_TITLES: Record<GitPanelTab, string> = {
@@ -205,7 +214,7 @@ function App() {
     };
   }, [initUpdateListeners]);
 
-  // Initialize activity event listener (claude-event from transcript watcher)
+  // Initialize activity event listener (batched claude-events from the transcript watcher)
   useEffect(() => {
     initActivityListener().catch((err) => {
       console.error("Failed to initialize activity listener:", err);
@@ -301,11 +310,19 @@ function App() {
   // Independent of the open tabs — it scans every project with saved memory
   // and the whole watched process table — so nothing here restarts the
   // interval or resets the CPU/RAM streaks.
+  // The first run is delayed rather than fired on mount: it enumerates the
+  // whole process table (and shells out for listening ports), which would
+  // compete with first paint and terminal spawn. The badge still populates
+  // long before the first interval tick, and first-run suppression via
+  // `baselineKeys` keeps the toast behaviour identical whenever it lands.
   useEffect(() => {
     const runCheck = () => void useHealthStore.getState().runCheck();
-    runCheck();
+    const firstRun = setTimeout(runCheck, 30_000);
     const interval = setInterval(runCheck, HEALTH_CHECK_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return () => {
+      clearTimeout(firstRun);
+      clearInterval(interval);
+    };
   }, []);
 
   // Daily-AI scheduler: a minute tick that fires the standup report AND the
@@ -400,8 +417,11 @@ function App() {
     enabled: tabs.length >= 2,
   });
 
-  // Git store for commit count and refresh
-  const { commits, fetchCommits } = useGitStore();
+  // Git store for commit count and refresh. Granular selectors, not the whole
+  // store: a selector-less subscription re-renders App on every git `set()`,
+  // and App has no memo barrier in front of the terminals.
+  const commitCount = useGitStore((s) => s.commits.length);
+  const fetchCommits = useGitStore((s) => s.fetchCommits);
   const [isRefreshingGit, setIsRefreshingGit] = useState(false);
 
   const handleRefreshGit = useCallback(async () => {
@@ -462,9 +482,12 @@ function App() {
           .catch((err) => console.error("Failed to refresh repos on focus:", err));
       }
 
-      // Refresh branch for the active repo
+      // Refresh branch for the active repo. The branch may have changed while
+      // the window was away, so drop the short-lived cache first — this path
+      // exists precisely to re-read git.
       const repoPath = tab.selectedRepoPath ?? tab.projectPath;
       if (repoPath) {
+        invalidateCurrentBranchCache(repoPath);
         getDeduplicatedCurrentBranch(repoPath)
           .then(setCurrentBranch)
           .catch(() => {});
@@ -814,9 +837,9 @@ function App() {
                 <span className="text-sm font-medium text-maestro-text">
                   {GIT_PANEL_TITLES[gitPanelTab]}
                 </span>
-                {gitPanelTab === "commits" && commits.length > 0 && (
+                {gitPanelTab === "commits" && commitCount > 0 && (
                   <span className="rounded-full bg-maestro-accent/15 px-1.5 py-px text-[10px] font-medium text-maestro-accent">
-                    {commits.length}
+                    {commitCount}
                   </span>
                 )}
                 <div className="flex-1" />
@@ -856,10 +879,18 @@ function App() {
               {/* Landscape graph — an overlay, never a replacement: unmounting
                   MultiProjectView would tear down every live terminal. */}
               {landscapeView && (
-                <LandscapeView
-                  onNavigate={handleLandscapeNavigate}
-                  onClose={() => setLandscapeView(false)}
-                />
+                <Suspense
+                  fallback={
+                    <div className="absolute inset-0 z-30 flex items-center justify-center bg-maestro-bg text-xs text-maestro-muted">
+                      Loading…
+                    </div>
+                  }
+                >
+                  <LandscapeView
+                    onNavigate={handleLandscapeNavigate}
+                    onClose={() => setLandscapeView(false)}
+                  />
+                </Suspense>
               )}
             </main>
 

@@ -13,6 +13,7 @@ import {
   useReactFlow,
   type Edge,
   type Node,
+  type NodeMouseHandler,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import {
@@ -48,6 +49,7 @@ import {
   projectNodeId,
   terminalNodeId,
   type LayoutProject,
+  type XY,
 } from "./layout";
 import {
   landscapeNodeTypes,
@@ -114,6 +116,33 @@ function sessionActive(session: SessionConfig): boolean {
     session.status === "NeedsInput" ||
     session.status === "Starting"
   );
+}
+
+/**
+ * Did anything about this node's data actually change?
+ *
+ * React Flow keys its internals off the *identity* of the node object it is
+ * handed, so a rebuilt-but-identical node re-renders the whole card for nothing.
+ * Every field of a node's data is a plain value or a store object that is
+ * replaced rather than mutated when it changes (see `useAgentStore`), so an
+ * `Object.is` per field is an exact answer — an agent whose counters ticked is a
+ * new object and compares unequal, as it must.
+ */
+function sameNodeData(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  if (a === b) return true;
+  const keys = Object.keys(a);
+  if (keys.length !== Object.keys(b).length) return false;
+  return keys.every((key) => Object.is(a[key], b[key]));
+}
+
+/** Same question for a node's position — the same spot is the same spot. */
+function samePosition(a: XY, b: XY): boolean {
+  return a === b || (a.x === b.x && a.y === b.y);
+}
+
+/** Same question for an edge's inline style (stroke/width/opacity is all we set). */
+function sameEdgeStyle(a: Edge["style"], b: Edge["style"]): boolean {
+  return a?.stroke === b?.stroke && a?.strokeWidth === b?.strokeWidth && a?.opacity === b?.opacity;
 }
 
 /** Markdown of the whole landscape, grouped project → terminal → agent. */
@@ -256,6 +285,13 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
   }, [clusters, query, activeOnly]);
 
   /* ── Nodes and edges ── */
+  // The layout only depends on the *shape* of the graph — which projects hold
+  // which terminals hold which agents. `clusters` is rebuilt on every status
+  // event, so laying out on it alone would re-run the whole tiling (and hand
+  // every node a fresh position object) just because one terminal went
+  // Working → Idle. Cache on the id structure instead: same structure, same
+  // Map, same position objects.
+  const layoutCache = useRef<{ key: string; positions: Map<string, XY> } | null>(null);
   const layout = useMemo(() => {
     const projects: LayoutProject[] = clusters.map((cluster) => ({
       tabId: cluster.tab.id,
@@ -264,7 +300,19 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
         agentIds: terminal.agents.map((a) => a.agentId),
       })),
     }));
-    return layoutLandscape(projects);
+    const key = projects
+      .map(
+        (p) =>
+          `${p.tabId}[${p.terminals
+            .map((t) => `${t.sessionId}:${t.agentIds.join(",")}`)
+            .join("|")}]`,
+      )
+      .join(";");
+    const cached = layoutCache.current;
+    if (cached && cached.key === key) return cached.positions;
+    const positions = layoutLandscape(projects);
+    layoutCache.current = { key, positions };
+    return positions;
   }, [clusters]);
 
   const model = useMemo(() => {
@@ -340,23 +388,63 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
   // Reorganize clears the saved spots. The one exception is a node being
   // dragged right now: agent events arrive every few seconds, and rebuilding
   // over a live drag would yank the node out from under the pointer.
+  //
+  // A node whose data and position are unchanged is handed back *as the very
+  // same object*: React Flow reuses its internal node when the one it is given
+  // is identical (`adoptUserNodes`), and only then does the node component skip
+  // its re-render. One terminal flipping status must cost one card, not the
+  // whole canvas — so when nothing at all moved we return the previous array
+  // and React drops the update entirely.
   useEffect(() => {
     setNodes((previous) => {
       const byId = new Map(previous.map((n) => [n.id, n]));
-      return model.nodes.map((node) => {
+      let changed = previous.length !== model.nodes.length;
+      const next = model.nodes.map((node, index) => {
         const existing = byId.get(node.id);
-        if (!existing) return node;
-        return {
-          ...existing,
-          ...node,
-          position: existing.dragging ? existing.position : node.position,
-        };
+        if (!existing) {
+          changed = true;
+          return node;
+        }
+        const position = existing.dragging ? existing.position : node.position;
+        if (
+          existing.type === node.type &&
+          samePosition(existing.position, position) &&
+          sameNodeData(existing.data, node.data)
+        ) {
+          // Same node, same place — but it may have moved in the ordering.
+          if (previous[index] !== existing) changed = true;
+          return existing;
+        }
+        changed = true;
+        return { ...existing, ...node, position };
       });
+      return changed ? next : previous;
     });
   }, [model.nodes, setNodes]);
 
+  // Same deal for the edges: an edge object React Flow already holds is left
+  // alone unless its ends, its animation or its stroke actually changed.
   useEffect(() => {
-    setEdges(model.edges);
+    setEdges((previous) => {
+      const byId = new Map(previous.map((e) => [e.id, e]));
+      let changed = previous.length !== model.edges.length;
+      const next = model.edges.map((edge, index) => {
+        const existing = byId.get(edge.id);
+        if (
+          existing &&
+          existing.source === edge.source &&
+          existing.target === edge.target &&
+          existing.animated === edge.animated &&
+          sameEdgeStyle(existing.style, edge.style)
+        ) {
+          if (previous[index] !== existing) changed = true;
+          return existing;
+        }
+        changed = true;
+        return edge;
+      });
+      return changed ? next : previous;
+    });
   }, [model.edges, setEdges]);
 
   /* ── Camera ── */
@@ -370,6 +458,15 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
   const fitAll = useCallback(() => {
     fitView({ duration: 450, padding: 0.12 });
   }, [fitView]);
+
+  // Stable on purpose. React Flow threads this handler down to every node
+  // wrapper, and those wrappers are memoized on their props — a fresh arrow
+  // function per render would break that memo and re-render every card on every
+  // store event, however carefully the nodes themselves are diffed above.
+  const handleNodeDoubleClick = useCallback<NodeMouseHandler>(
+    (_, node) => zoomToNode(node.id),
+    [zoomToNode],
+  );
 
   // Fit once, and only after React Flow has measured the nodes — fitting before
   // that leaves the graph at zoom 1 with half the landscape off-screen.
@@ -597,7 +694,7 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
               onEdgesChange={onEdgesChange}
               nodeTypes={landscapeNodeTypes}
               onNodeDragStop={(_, node) => setManualPosition(node.id, node.position)}
-              onNodeDoubleClick={(_, node) => zoomToNode(node.id)}
+              onNodeDoubleClick={handleNodeDoubleClick}
               // Double-click is "zoom into this node", so the canvas must not
               // also treat it as a plain zoom step.
               zoomOnDoubleClick={false}

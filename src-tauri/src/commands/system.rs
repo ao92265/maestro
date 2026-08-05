@@ -50,8 +50,14 @@ pub struct SystemMetrics {
 ///
 /// Refreshes the managed `System` on each call; the delta against the previous
 /// poll gives an accurate global CPU percentage (sysinfo 0.32 API).
+///
+/// `async` so Tauri dispatches it to the async runtime rather than running it
+/// inline on the IPC/main thread — the frontend re-invokes this every ~2s and
+/// the sysinfo refresh is not free.
 #[tauri::command]
-pub fn get_system_metrics(state: State<'_, SystemMetricsState>) -> Result<SystemMetrics, String> {
+pub async fn get_system_metrics(
+    state: State<'_, SystemMetricsState>,
+) -> Result<SystemMetrics, String> {
     let mut sys = state
         .0
         .lock()

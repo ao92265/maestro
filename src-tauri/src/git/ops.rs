@@ -194,6 +194,11 @@ pub struct FileDiff {
 /// Maximum size (in bytes) of an untracked file the diff viewer will load.
 const MAX_DIFF_FILE_BYTES: u64 = 1024 * 1024;
 
+/// How many worktrees `all_worktrees_status` inspects at once. Each worktree
+/// costs ~7 git subprocesses, so this caps the burst at ~56 processes rather
+/// than one-per-worktree-times-seven all at once.
+const WORKTREE_STATUS_CONCURRENCY: usize = 8;
+
 impl Git {
     /// Lists all local and remote branches, excluding `HEAD` pointer entries.
     ///
@@ -1325,22 +1330,48 @@ impl Git {
     /// Aggregates [`worktree_status`] across every worktree returned by
     /// `git worktree list`. Worktrees that fail to inspect are skipped with a
     /// log warning so a single bad worktree does not poison the response.
+    ///
+    /// Worktrees are inspected concurrently, at most
+    /// [`WORKTREE_STATUS_CONCURRENCY`] at a time — each `worktree_status` fans
+    /// out ~7 git subprocesses, so a repo with many worktrees was previously
+    /// serialising hundreds of process spawns. Results are written into
+    /// index-keyed slots so the returned order still matches
+    /// `git worktree list` regardless of completion order.
     pub async fn all_worktrees_status(&self) -> Result<Vec<WorktreeStatus>, GitError> {
         let worktrees = self.worktree_list().await?;
-        let mut result = Vec::with_capacity(worktrees.len());
-        for wt in worktrees {
-            let git = Git::new(&wt.path);
-            match git
-                .worktree_status(wt.path.clone(), wt.is_main_worktree)
-                .await
-            {
-                Ok(status) => result.push(status),
+        let mut slots: Vec<Option<WorktreeStatus>> = Vec::with_capacity(worktrees.len());
+        slots.resize_with(worktrees.len(), || None);
+
+        let mut queue = worktrees.into_iter().enumerate();
+        let mut tasks = tokio::task::JoinSet::new();
+
+        loop {
+            // Top the pool back up to the concurrency cap.
+            while tasks.len() < WORKTREE_STATUS_CONCURRENCY {
+                let Some((idx, wt)) = queue.next() else { break };
+                tasks.spawn(async move {
+                    let path = wt.path;
+                    let git = Git::new(&path);
+                    let status = git.worktree_status(path.clone(), wt.is_main_worktree).await;
+                    (idx, path, status)
+                });
+            }
+
+            let Some(joined) = tasks.join_next().await else {
+                break;
+            };
+            match joined {
+                Ok((idx, _, Ok(status))) => slots[idx] = Some(status),
+                Ok((_, path, Err(e))) => {
+                    log::warn!("worktree_status failed for {}: {:?}", path, e);
+                }
                 Err(e) => {
-                    log::warn!("worktree_status failed for {}: {:?}", wt.path, e);
+                    log::warn!("worktree_status task failed: {:?}", e);
                 }
             }
         }
-        Ok(result)
+
+        Ok(slots.into_iter().flatten().collect())
     }
 }
 

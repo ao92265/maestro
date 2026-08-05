@@ -43,19 +43,28 @@ impl Utf8Decoder {
         }
     }
 
-    /// Decodes bytes, buffering incomplete trailing sequences.
+    /// Decodes bytes into `out`, buffering incomplete trailing sequences.
     ///
-    /// Returns a valid UTF-8 string. Invalid bytes are replaced with U+FFFD
-    /// and decoding continues AFTER them — they are never buffered (buffering
-    /// them made a single bad byte swallow the whole remaining stream). Only
-    /// a genuinely incomplete trailing sequence — at most 3 bytes — is kept
-    /// for the next call. Mirrors process_manager::Utf8Decoder.
-    fn decode(&mut self, input: &[u8]) -> String {
+    /// Appends valid UTF-8 to the caller's buffer. Invalid bytes are replaced
+    /// with U+FFFD and decoding continues AFTER them — they are never buffered
+    /// (buffering them made a single bad byte swallow the whole remaining
+    /// stream). Only a genuinely incomplete trailing sequence — at most 3
+    /// bytes — is kept for the next call. The common case (nothing carried
+    /// over, chunk fully valid) allocates nothing. Mirrors
+    /// process_manager::Utf8Decoder.
+    fn decode_into(&mut self, input: &[u8], out: &mut String) {
+        // Fast path: nothing carried over and the whole chunk is valid UTF-8.
+        if self.incomplete.is_empty() {
+            if let Ok(s) = std::str::from_utf8(input) {
+                out.push_str(s);
+                return;
+            }
+        }
+
         // Prepend any previously incomplete bytes
         let mut data = std::mem::take(&mut self.incomplete);
         data.extend_from_slice(input);
 
-        let mut out = String::with_capacity(data.len());
         let mut rest: &[u8] = &data;
 
         loop {
@@ -84,8 +93,6 @@ impl Utf8Decoder {
                 }
             }
         }
-
-        out
     }
 }
 
@@ -243,14 +250,17 @@ impl TerminalBackend for XtermPassthroughBackend {
         let app = config.app_handle.clone();
         tokio::spawn(async move {
             let mut decoder = Utf8Decoder::new();
+            // Reused across chunks so the decode doesn't allocate per chunk.
+            let mut text = String::new();
             loop {
                 tokio::select! {
                     data = rx.recv() => {
                         match data {
                             Some(bytes) => {
-                                let text = decoder.decode(&bytes);
+                                text.clear();
+                                decoder.decode_into(&bytes, &mut text);
                                 if !text.is_empty() {
-                                    let _ = app.emit(&event_name, text);
+                                    let _ = app.emit(&event_name, text.as_str());
                                 }
                             }
                             None => break,

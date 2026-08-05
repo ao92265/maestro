@@ -59,30 +59,61 @@ export function useTerminalDragDrop({
     const appWindow = getCurrentWindow();
 
     /**
-     * Hit-test physical coordinates against `[data-slot-id]` elements.
+     * Geometry of every visible slot, captured once per drag. `over` fires on
+     * every pointer tick while files hover the window, and both
+     * `getComputedStyle` and `getBoundingClientRect` force a synchronous
+     * style-recalc + layout flush — per element, document-wide, and once per
+     * mounted grid (every project's grid registers this hook in eagle view).
+     * Nothing re-lays-out mid-drag (the drop overlay is an absolute overlay
+     * inside the pane), so one snapshot on `enter` serves the whole drag.
+     * Null means "not captured yet".
+     */
+    let slotRects:
+      | { slotId: string; left: number; top: number; right: number; bottom: number }[]
+      | null = null;
+
+    /**
+     * Skips invisible elements two ways, because hidden grids hide two ways:
+     * - inactive project stacks are `display:none` (see MultiProjectView), so
+     *   their slots report an all-zero rect — a zero-area box must never win a
+     *   hit test, hence the width/height check;
+     * - eagle-obscured tiles are `visibility:hidden` (see TerminalGrid) and DO
+     *   report a full-size rect at the same coordinates, hence the style check.
+     */
+    function snapshotSlots() {
+      const rects: NonNullable<typeof slotRects> = [];
+      for (const el of document.querySelectorAll<HTMLElement>("[data-slot-id]")) {
+        const slotId = el.dataset.slotId;
+        if (!slotId) continue;
+        if (getComputedStyle(el).visibility === "hidden") continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        rects.push({
+          slotId,
+          left: rect.left,
+          top: rect.top,
+          right: rect.right,
+          bottom: rect.bottom,
+        });
+      }
+      return rects;
+    }
+
+    /**
+     * Hit-test physical coordinates against the snapshot.
      * Tauri provides PhysicalPosition — divide by devicePixelRatio to get CSS pixels.
-     *
-     * Skips invisible elements: inactive project grids stay mounted with
-     * `visibility: hidden` (see MultiProjectView) and their slots still
-     * report full-size client rects at the same coordinates, so without
-     * this check the first project's hidden slots would win the hit test.
      */
     function findSlotAtPosition(physX: number, physY: number): string | null {
+      // `enter` normally seeds the snapshot; fall back in case a drag starts
+      // with an `over`/`drop` (e.g. the tab was switched mid-drag).
+      const rects = slotRects ?? (slotRects = snapshotSlots());
       const scale = window.devicePixelRatio || 1;
       const cssX = physX / scale;
       const cssY = physY / scale;
 
-      const slotElements = document.querySelectorAll<HTMLElement>("[data-slot-id]");
-      for (const el of slotElements) {
-        if (getComputedStyle(el).visibility === "hidden") continue;
-        const rect = el.getBoundingClientRect();
-        if (
-          cssX >= rect.left &&
-          cssX <= rect.right &&
-          cssY >= rect.top &&
-          cssY <= rect.bottom
-        ) {
-          return el.dataset.slotId ?? null;
+      for (const r of rects) {
+        if (cssX >= r.left && cssX <= r.right && cssY >= r.top && cssY <= r.bottom) {
+          return r.slotId;
         }
       }
       return null;
@@ -90,6 +121,8 @@ export function useTerminalDragDrop({
 
     const unlisten = appWindow.onDragDropEvent((event) => {
       if (event.payload.type === "enter" || event.payload.type === "over") {
+        // Re-measure once per drag, on the way in.
+        if (event.payload.type === "enter") slotRects = snapshotSlots();
         setIsDraggingFiles(true);
         const pos = event.payload.position;
         const slotId = findSlotAtPosition(pos.x, pos.y);
@@ -108,9 +141,11 @@ export function useTerminalDragDrop({
             onDrop(sessionId, event.payload.paths, slotId);
           }
         }
+        slotRects = null;
         setDropTargetSlotId(null);
         setIsDraggingFiles(false);
       } else if (event.payload.type === "leave") {
+        slotRects = null;
         setDropTargetSlotId(null);
         setIsDraggingFiles(false);
       }

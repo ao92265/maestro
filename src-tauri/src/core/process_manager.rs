@@ -36,20 +36,34 @@ impl Utf8Decoder {
         }
     }
 
-    /// Decodes bytes, buffering incomplete trailing sequences.
+    /// Decodes bytes into `out`, buffering incomplete trailing sequences.
     ///
-    /// Returns a valid UTF-8 string. Invalid bytes are replaced with U+FFFD
-    /// and decoding continues AFTER them — they are never buffered. (Buffering
-    /// from the first invalid byte onward made a single bad byte swallow the
-    /// whole remaining stream: unbounded memory growth and quadratic
-    /// re-copying on any non-UTF-8 output.) Only a genuinely incomplete
-    /// trailing sequence — at most 3 bytes — is kept for the next call.
-    pub fn decode(&mut self, input: &[u8]) -> String {
+    /// Appends valid UTF-8 to the caller's buffer. Invalid bytes are replaced
+    /// with U+FFFD and decoding continues AFTER them — they are never
+    /// buffered. (Buffering from the first invalid byte onward made a single
+    /// bad byte swallow the whole remaining stream: unbounded memory growth
+    /// and quadratic re-copying on any non-UTF-8 output.) Only a genuinely
+    /// incomplete trailing sequence — at most 3 bytes — is kept for the next
+    /// call.
+    ///
+    /// The common case — no carried-over bytes and a fully valid chunk — takes
+    /// a fast path that allocates nothing and copies the bytes exactly once,
+    /// straight into `out`.
+    pub fn decode_into(&mut self, input: &[u8], out: &mut String) {
+        // Fast path: nothing carried over and the whole chunk is valid UTF-8.
+        // `self.incomplete` is empty on essentially every call — it only holds
+        // a 1-3 byte tail when a code point straddles a read boundary.
+        if self.incomplete.is_empty() {
+            if let Ok(s) = std::str::from_utf8(input) {
+                out.push_str(s);
+                return;
+            }
+        }
+
         // Prepend any previously incomplete bytes
         let mut data = std::mem::take(&mut self.incomplete);
         data.extend_from_slice(input);
 
-        let mut out = String::with_capacity(data.len());
         let mut rest: &[u8] = &data;
 
         loop {
@@ -78,7 +92,15 @@ impl Utf8Decoder {
                 }
             }
         }
+    }
 
+    /// Convenience wrapper around [`Self::decode_into`] that allocates a fresh
+    /// `String`. Only used by the unit tests — the hot path appends directly
+    /// into the emitter's batch buffer.
+    #[cfg(test)]
+    pub fn decode(&mut self, input: &[u8]) -> String {
+        let mut out = String::with_capacity(input.len());
+        self.decode_into(input, &mut out);
         out
     }
 }
@@ -116,6 +138,32 @@ struct Inner {
     /// spawns instead of rejecting them.
     #[cfg(windows)]
     last_spawn_time: tokio::sync::Mutex<std::time::Instant>,
+}
+
+/// Windows ConPTY workaround: respond to a DSR (Device Status Report) cursor
+/// position request (ESC[6n) found anywhere in `bytes`.
+///
+/// ConPTY sends this query on startup and BLOCKS all output until it receives
+/// a response (ESC[{row};{col}R). xterm.js may not be mounted yet, so we
+/// answer immediately to unblock it. Returns `true` if a request was found and
+/// answered, so the caller can stop scanning subsequent chunks.
+#[cfg(windows)]
+fn handle_dsr(inner: &Inner, id: u32, bytes: &[u8]) -> bool {
+    if !bytes.windows(4).any(|w| w == b"\x1b[6n") {
+        return false;
+    }
+
+    log::info!(
+        "PTY emitter {}: detected DSR request (ESC[6n), responding with cursor position",
+        id
+    );
+    if let Some(session) = inner.sessions.get(&id) {
+        if let Ok(mut w) = session.writer.lock() {
+            let _ = w.write_all(b"\x1b[1;1R");
+            let _ = w.flush();
+        }
+    }
+    true
 }
 
 /// Owns and manages all PTY sessions for the application lifetime.
@@ -351,6 +399,12 @@ impl ProcessManager {
         tokio::spawn(async move {
             let mut decoder = Utf8Decoder::new();
             let mut batch_buf = String::new();
+            // ConPTY only asks for the cursor position once, at startup. Once
+            // answered, stop scanning every chunk for the rest of the session
+            // (xterm.js is mounted by then and answers any later DSR itself,
+            // with the real cursor position).
+            #[cfg(windows)]
+            let mut dsr_answered = false;
             const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
             const MAX_BATCH_BYTES: usize = 64 * 1024; // 64KB safety valve
 
@@ -363,34 +417,10 @@ impl ProcessManager {
                             match data {
                                 Some(bytes) => {
                                     #[cfg(windows)]
-                                    {
-                                        if bytes.len() >= 4 {
-                                            for i in 0..bytes.len().saturating_sub(3) {
-                                                if bytes[i] == 0x1b
-                                                    && bytes[i + 1] == 0x5b
-                                                    && bytes[i + 2] == 0x36
-                                                    && bytes[i + 3] == 0x6e
-                                                {
-                                                    log::info!(
-                                                        "PTY emitter {}: detected DSR request (ESC[6n), \
-                                                         responding with cursor position",
-                                                        id
-                                                    );
-                                                    if let Some(session) = inner_ref.sessions.get(&id) {
-                                                        if let Ok(mut w) = session.writer.lock() {
-                                                            let _ = w.write_all(b"\x1b[1;1R");
-                                                            let _ = w.flush();
-                                                        }
-                                                    }
-                                                    break;
-                                                }
-                                            }
-                                        }
+                                    if !dsr_answered && handle_dsr(&inner_ref, id, &bytes) {
+                                        dsr_answered = true;
                                     }
-                                    let text = decoder.decode(&bytes);
-                                    if !text.is_empty() {
-                                        batch_buf.push_str(&text);
-                                    }
+                                    decoder.decode_into(&bytes, &mut batch_buf);
                                     // Flush immediately if buffer exceeds safety valve
                                     if batch_buf.len() >= MAX_BATCH_BYTES {
                                         let _ = app.emit(&event_name, std::mem::take(&mut batch_buf));
@@ -410,34 +440,10 @@ impl ProcessManager {
                             match data {
                                 Some(bytes) => {
                                     #[cfg(windows)]
-                                    {
-                                        if bytes.len() >= 4 {
-                                            for i in 0..bytes.len().saturating_sub(3) {
-                                                if bytes[i] == 0x1b
-                                                    && bytes[i + 1] == 0x5b
-                                                    && bytes[i + 2] == 0x36
-                                                    && bytes[i + 3] == 0x6e
-                                                {
-                                                    log::info!(
-                                                        "PTY emitter {}: detected DSR request (ESC[6n), \
-                                                         responding with cursor position",
-                                                        id
-                                                    );
-                                                    if let Some(session) = inner_ref.sessions.get(&id) {
-                                                        if let Ok(mut w) = session.writer.lock() {
-                                                            let _ = w.write_all(b"\x1b[1;1R");
-                                                            let _ = w.flush();
-                                                        }
-                                                    }
-                                                    break;
-                                                }
-                                            }
-                                        }
+                                    if !dsr_answered && handle_dsr(&inner_ref, id, &bytes) {
+                                        dsr_answered = true;
                                     }
-                                    let text = decoder.decode(&bytes);
-                                    if !text.is_empty() {
-                                        batch_buf.push_str(&text);
-                                    }
+                                    decoder.decode_into(&bytes, &mut batch_buf);
                                     // Flush immediately if buffer exceeds safety valve
                                     if batch_buf.len() >= MAX_BATCH_BYTES {
                                         let _ = app.emit(&event_name, std::mem::take(&mut batch_buf));
@@ -643,13 +649,17 @@ impl ProcessManager {
 
         #[cfg(windows)]
         {
-            use std::process::Command;
-            use super::windows_process::StdCommandExt;
-            // Use taskkill to terminate process tree
+            use super::windows_process::TokioCommandExt;
+            use tokio::process::Command;
+            // Use taskkill to terminate process tree. Async spawn: taskkill
+            // takes ~1.2s to return on this platform, and a blocking spawn
+            // here stalls a whole runtime worker (kill_all_sessions runs
+            // several of these at once).
             let result = Command::new("taskkill")
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
                 .hide_console_window()
-                .output();
+                .output()
+                .await;
 
             if let Err(e) = result {
                 log::warn!("Failed to taskkill session {session_id} (pid={pid}): {e}");
@@ -709,7 +719,14 @@ impl ProcessManager {
     ///
     /// This is used to clean up orphaned sessions when the frontend reloads.
     /// Returns the number of sessions that were killed.
+    ///
+    /// Kills run concurrently, at most `MAX_CONCURRENT_KILLS` in flight. Each
+    /// kill costs ~1.2s (taskkill on Windows, the SIGTERM grace poll on Unix),
+    /// so a serial loop made quitting with a dozen terminals take ~15s. The
+    /// cap keeps a 30-terminal quit from forking 30 processes at once.
     pub async fn kill_all_sessions(&self) -> Result<u32, PtyError> {
+        const MAX_CONCURRENT_KILLS: usize = 8;
+
         let session_ids: Vec<u32> = self
             .inner
             .sessions
@@ -720,9 +737,28 @@ impl ProcessManager {
         let count = session_ids.len() as u32;
         log::info!("Killing all {} PTY sessions", count);
 
-        for id in session_ids {
-            if let Err(e) = self.kill_session(id).await {
-                log::warn!("Failed to kill session {}: {}", id, e);
+        let mut pending = session_ids.into_iter();
+        let mut tasks = tokio::task::JoinSet::new();
+
+        loop {
+            // Top the in-flight set back up to the concurrency cap.
+            while tasks.len() < MAX_CONCURRENT_KILLS {
+                match pending.next() {
+                    Some(id) => {
+                        let manager = self.clone();
+                        tasks.spawn(async move {
+                            if let Err(e) = manager.kill_session(id).await {
+                                log::warn!("Failed to kill session {}: {}", id, e);
+                            }
+                        });
+                    }
+                    None => break,
+                }
+            }
+
+            // `None` means the set is empty and nothing is left to queue.
+            if tasks.join_next().await.is_none() {
+                break;
             }
         }
 

@@ -50,7 +50,7 @@ const COL_GAP = 80;
  *
  * Self-subscribing (no props beyond sessionId) so mounting one per terminal
  * doesn't re-render every terminal on each agent event. Updates are live via
- * the zustand subscriptions — claude-event -> useAgentStore -> re-render.
+ * the zustand subscriptions — claude-events -> useAgentStore -> re-render.
  */
 export function AgentGraph({ sessionId }: AgentGraphProps) {
   const agents = useAgentStore((s) => s.agents);

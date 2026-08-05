@@ -23,6 +23,18 @@ export interface BranchWithWorktreeStatus {
 const activeFetches = new Map<string, Promise<string>>();
 
 /**
+ * Last successfully resolved branch per repo. In-flight sharing alone only
+ * collapses calls that overlap, and the per-terminal 15 s polls start at
+ * different moments so they never do — N terminals in one repo meant N
+ * identical `git symbolic-ref` spawns per window. Successful results are
+ * therefore held for {@link BRANCH_CACHE_TTL_MS}. Failures are never cached.
+ */
+const branchCache = new Map<string, { value: string; at: number }>();
+
+/** How long a resolved branch name is reused before re-spawning git. */
+const BRANCH_CACHE_TTL_MS = 10_000;
+
+/**
  * Fetches all branches for a repository.
  * @param repoPath - Path to the git repository
  * @returns List of branch info from the backend
@@ -77,21 +89,48 @@ export async function isGitWorktree(repoPath: string): Promise<boolean> {
 }
 
 /**
- * Gets the current branch name, deduplicating simultaneous requests for the same path.
- * Useful when multiple sessions or components need the branch status at once.
+ * Gets the current branch name, deduplicating requests for the same path:
+ * simultaneous callers share the one in-flight fetch, and callers arriving
+ * within {@link BRANCH_CACHE_TTL_MS} of the last success reuse that result.
+ *
+ * The TTL bounds staleness at 10 s. Anything that changes the branch itself
+ * should call {@link invalidateCurrentBranchCache} so the next read is exact.
  *
  * @param repoPath - Path to the git repository
  * @returns Current branch name
  */
 export async function getDeduplicatedCurrentBranch(repoPath: string): Promise<string> {
+  const cached = branchCache.get(repoPath);
+  if (cached && Date.now() - cached.at < BRANCH_CACHE_TTL_MS) return cached.value;
+
   const existing = activeFetches.get(repoPath);
   if (existing) return existing;
 
-  const promise = getCurrentBranch(repoPath).finally(() => {
-    activeFetches.delete(repoPath);
-  });
+  const promise = getCurrentBranch(repoPath)
+    .then((name) => {
+      branchCache.set(repoPath, { value: name, at: Date.now() });
+      return name;
+    })
+    .finally(() => {
+      activeFetches.delete(repoPath);
+    });
   activeFetches.set(repoPath, promise);
   return promise;
+}
+
+/**
+ * Drops the cached branch name so the next {@link getDeduplicatedCurrentBranch}
+ * re-reads git. Call after a checkout (or any other branch change) to keep the
+ * headers exact instead of waiting out the TTL.
+ *
+ * @param repoPath - Repo to invalidate; omit to clear every entry
+ */
+export function invalidateCurrentBranchCache(repoPath?: string): void {
+  if (repoPath === undefined) {
+    branchCache.clear();
+  } else {
+    branchCache.delete(repoPath);
+  }
 }
 
 // ── Worktree status (per-worktree "what's at risk if I delete this") ──

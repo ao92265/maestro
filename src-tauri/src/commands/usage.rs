@@ -5,11 +5,16 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 /// Flag to skip credential store after first failure (prevents repeated prompts).
 static CREDENTIAL_STORE_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Process-wide HTTP client. A `reqwest::Client` owns the connection pool and
+/// TLS configuration, so building one per poll means a fresh DNS lookup, TCP
+/// connect and TLS handshake every 60s. Built once, reused forever.
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 /// Minimum seconds between actual API calls. Requests within this window return cached data.
 const CACHE_TTL_SECS: u64 = 30;
@@ -342,7 +347,7 @@ async fn fetch_usage_from_api() -> Result<UsageData, String> {
         }
     };
 
-    let client = reqwest::Client::new();
+    let client = HTTP_CLIENT.get_or_init(reqwest::Client::new);
     let response = client
         .get("https://api.anthropic.com/api/oauth/usage")
         .header("Authorization", format!("Bearer {}", token))

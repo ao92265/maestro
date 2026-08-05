@@ -80,12 +80,16 @@ let toastSeq = 0;
  */
 async function checkMemory(now: number): Promise<HealthFlag[]> {
   const projects = await listMemoryProjects("");
-  const flags: HealthFlag[] = [];
-  for (const project of projects) {
-    const files = await listMemoryFiles(project.dirName);
-    flags.push(...evaluateMemory({ dirName: project.dirName, files, now }));
-  }
-  return flags;
+  // Per-project listings are independent and `evaluateMemory` is pure, so the
+  // round trips run together instead of one-at-a-time. Order is preserved by
+  // `Promise.all`, so the resulting flag list is identical.
+  const perProject = await Promise.all(
+    projects.map(async (project) => {
+      const files = await listMemoryFiles(project.dirName);
+      return evaluateMemory({ dirName: project.dirName, files, now });
+    })
+  );
+  return perProject.flat();
 }
 
 export const useHealthStore = create<HealthState & HealthActions>()((set, get) => ({

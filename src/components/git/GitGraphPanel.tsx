@@ -363,6 +363,7 @@ export function GitGraphPanel({
                 // Tab content
                 <GitPanelContent
                   activeTab={activeTab}
+                  open={open}
                   repoPath={repoPath!}
                   currentBranch={currentBranch}
                   onSelectCommit={handleSelectCommit}

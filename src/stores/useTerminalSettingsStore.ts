@@ -21,6 +21,12 @@ export type TerminalSettings = {
   lineHeight: number;
   /** Zoom level as a percentage (25–500). Default 100. */
   zoomLevel: number;
+  /**
+   * Scrollback lines retained per terminal. Each line costs `cols × 3` 32-bit
+   * cells for the life of the xterm instance, and every open project keeps all
+   * of its terminals mounted, so this dominates renderer memory.
+   */
+  scrollback: number;
 };
 
 /** Read-only slice of the terminal settings store; persisted to disk. */
@@ -58,11 +64,20 @@ type TerminalSettingsActions = {
 
 // --- Default Settings ---
 
+/**
+ * Default scrollback lines per terminal.
+ *
+ * Exported so callers can tell "user never touched this" from an explicit
+ * choice — Linux still drops to a lower value while the setting is untouched.
+ */
+export const DEFAULT_SCROLLBACK = 3000;
+
 const DEFAULT_SETTINGS: TerminalSettings = {
   fontFamily: EMBEDDED_FONT,
   fontSize: 14,
   lineHeight: 1.2,
   zoomLevel: 100,
+  scrollback: DEFAULT_SCROLLBACK,
 };
 
 // --- Tauri LazyStore-backed StateStorage adapter ---
@@ -237,11 +252,14 @@ export const useTerminalSettingsStore = create<
       name: "maestro-terminal-settings",
       storage: createJSONStorage(() => tauriStorage),
       partialize: (state) => ({ settings: state.settings }),
-      version: 2,
+      version: 3,
       migrate: (persisted, version) => {
         const state = persisted as { settings: TerminalSettings };
         if (version < 2) {
           state.settings = { ...state.settings, zoomLevel: 100 };
+        }
+        if (version < 3) {
+          state.settings = { ...state.settings, scrollback: DEFAULT_SCROLLBACK };
         }
         return state;
       },

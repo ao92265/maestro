@@ -1,3 +1,4 @@
+import { Suspense, lazy } from "react";
 import { Activity, Brain, Sparkles, StickyNote, X } from "lucide-react";
 import {
   PanelResizeHandle,
@@ -5,9 +6,16 @@ import {
   RIGHT_PANEL_MIN_WIDTH,
 } from "@/components/shared/PanelResizeHandle";
 import { AiPanel } from "@/components/ai/AiPanel";
-import { NotepadPanel } from "@/components/notepad/NotepadPanel";
 import { MemorySection } from "@/components/sidebar/MemorySection";
 import { ProcessesSection } from "@/components/sidebar/ProcessesSection";
+
+// NotepadPanel drags in TipTap + ProseMirror, which are only needed once the
+// user opens the Notes panel; a static import parses them all at startup.
+const NotepadPanel = lazy(() =>
+  import("@/components/notepad/NotepadPanel").then((m) => ({
+    default: m.NotepadPanel,
+  })),
+);
 
 export type UtilityPanelKind = "memory" | "processes" | "notes" | "ai";
 
@@ -64,7 +72,9 @@ export function UtilityPanel({
       {panel === "notes" ? (
         // NotepadPanel lays itself out (tab strip + editor) edge-to-edge and
         // scrolls internally, so it skips the padded scroll wrapper.
-        <NotepadPanel />
+        <Suspense fallback={<div className="flex-1" />}>
+          <NotepadPanel />
+        </Suspense>
       ) : (
         <div className="flex-1 overflow-y-auto px-2.5 py-3">
           {panel === "memory" ? (

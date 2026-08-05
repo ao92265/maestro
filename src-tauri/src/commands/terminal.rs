@@ -125,6 +125,13 @@ pub async fn spawn_shell(
 
 /// Exposes `ProcessManager::write_stdin` to the frontend.
 /// Sends raw text (including control sequences like `\r`) to the PTY.
+///
+/// The body is fully blocking — it takes a `std::sync::Mutex` guard and calls
+/// `write_all` + `flush` on the PTY input pipe, which has no bounded completion
+/// time when the child is not draining stdin. Running that inline would occupy
+/// a tokio runtime worker, so it is handed to the blocking pool instead.
+/// Ordering is unaffected: the frontend awaits each write before issuing the
+/// next one for a given session.
 #[tauri::command]
 pub async fn write_stdin(
     state: State<'_, ProcessManager>,
@@ -132,11 +139,17 @@ pub async fn write_stdin(
     data: String,
 ) -> Result<(), PtyError> {
     let pm = state.inner().clone();
-    pm.write_stdin(session_id, &data)
+    tokio::task::spawn_blocking(move || pm.write_stdin(session_id, &data))
+        .await
+        .map_err(|e| PtyError::write_failed(format!("Write task failed: {e}")))?
 }
 
 /// Exposes `ProcessManager::resize_pty` to the frontend.
 /// Rejects dimensions that are zero or exceed 500 to prevent misuse.
+///
+/// Like `write_stdin`, the body is blocking (`ResizePseudoConsole` under a
+/// `std::sync::Mutex`), so it runs on the blocking pool rather than holding a
+/// tokio runtime worker.
 #[tauri::command]
 pub async fn resize_pty(
     state: State<'_, ProcessManager>,
@@ -148,7 +161,9 @@ pub async fn resize_pty(
         return Err(PtyError::resize_failed("Invalid dimensions"));
     }
     let pm = state.inner().clone();
-    pm.resize_pty(session_id, rows, cols)
+    tokio::task::spawn_blocking(move || pm.resize_pty(session_id, rows, cols))
+        .await
+        .map_err(|e| PtyError::resize_failed(format!("Resize task failed: {e}")))?
 }
 
 /// Exposes `ProcessManager::kill_session` to the frontend.
@@ -189,9 +204,36 @@ pub async fn kill_session(
 /// Called by the frontend when the user pastes an image into the terminal.
 /// The image bytes are written to a temp file and the absolute path is returned
 /// so the frontend can insert it into the terminal input for Claude to read.
+///
+/// The bytes arrive as the raw IPC request body (`application/octet-stream`)
+/// rather than a JSON field: as JSON, Tauri renders every image byte as a
+/// decimal-digit string (~4x expansion) on the webview's main thread, which
+/// froze the UI for large screenshots. The media type rides in a header.
 #[tauri::command]
-pub async fn save_pasted_image(data: Vec<u8>, media_type: String) -> Result<String, String> {
+pub async fn save_pasted_image(request: tauri::ipc::Request<'_>) -> Result<String, String> {
     const MAX_IMAGE_SIZE: usize = 50 * 1024 * 1024; // 50 MB
+
+    // Normally the bytes arrive raw. Tauri falls back to `postMessage` when the
+    // custom protocol is unavailable (e.g. a restrictive CSP), and that path
+    // JSON-encodes the payload into an array of numbers — so accept both, or
+    // pasting an image fails outright on the fallback.
+    let data: std::borrow::Cow<'_, [u8]> = match request.body() {
+        tauri::ipc::InvokeBody::Raw(data) => std::borrow::Cow::Borrowed(data.as_slice()),
+        tauri::ipc::InvokeBody::Json(value) => {
+            let array = value
+                .as_array()
+                .ok_or_else(|| "Expected image bytes in the request body".to_string())?;
+            let mut bytes = Vec::with_capacity(array.len());
+            for entry in array {
+                let byte = entry
+                    .as_u64()
+                    .filter(|n| *n <= u8::MAX as u64)
+                    .ok_or_else(|| "Image body contained a non-byte value".to_string())?;
+                bytes.push(byte as u8);
+            }
+            std::borrow::Cow::Owned(bytes)
+        }
+    };
     if data.len() > MAX_IMAGE_SIZE {
         return Err(format!(
             "Image too large: {} bytes (max {MAX_IMAGE_SIZE})",
@@ -199,7 +241,13 @@ pub async fn save_pasted_image(data: Vec<u8>, media_type: String) -> Result<Stri
         ));
     }
 
-    let extension = match media_type.as_str() {
+    let media_type = request
+        .headers()
+        .get("media-type")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| "Missing media-type header".to_string())?;
+
+    let extension = match media_type {
         "image/png" => "png",
         "image/jpeg" | "image/jpg" => "jpg",
         "image/gif" => "gif",
@@ -213,7 +261,7 @@ pub async fn save_pasted_image(data: Vec<u8>, media_type: String) -> Result<Stri
     let filename = format!("maestro-paste-{}.{}", uuid::Uuid::new_v4(), extension);
     let path = std::env::temp_dir().join(filename);
 
-    tokio::fs::write(&path, &data)
+    tokio::fs::write(&path, data)
         .await
         .map_err(|e| format!("Failed to save pasted image: {e}"))?;
 

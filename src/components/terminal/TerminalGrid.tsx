@@ -20,7 +20,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { ask, open } from "@tauri-apps/plugin-dialog";
 import { GripVertical } from "lucide-react";
 
-import { getBranchesWithWorktreeStatus, type BranchWithWorktreeStatus } from "@/lib/git";
+import {
+  getBranchesWithWorktreeStatus,
+  invalidateCurrentBranchCache,
+  type BranchWithWorktreeStatus,
+} from "@/lib/git";
 import { removeSessionMcpConfig, removeOpenCodeMcpConfig, setSessionMcpServers, writeSessionMcpConfig, writeOpenCodeMcpConfig, type McpServerConfig } from "@/lib/mcp";
 import {
   loadBranchConfig,
@@ -1549,6 +1553,9 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
           repoPath: targetRepo,
           branchName: name,
         });
+        // HEAD moved, so the shared branch TTL cache is stale — drop it or the
+        // terminal headers keep showing the previous branch for up to 10 s.
+        invalidateCurrentBranchCache(targetRepo);
       }
       refreshBranches();
     },

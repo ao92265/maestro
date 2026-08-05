@@ -63,7 +63,7 @@ export interface MultiProjectViewHandle {
 
 /**
  * Root content view that renders ALL open projects simultaneously.
- * Uses CSS opacity/pointer-events to show only the active project
+ * Uses CSS display/opacity/pointer-events to show only the active project
  * while keeping terminal state alive in inactive projects (ZStack pattern).
  *
  * This is modeled after the Swift app's MultiProjectContentView which
@@ -514,19 +514,29 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
               ? tab.sessionsLaunched
                 ? "contents"
                 : "hidden"
-              : `absolute inset-0 transition-opacity duration-150 ${
+              : // Inactive projects are `display:none`, NOT `visibility:hidden`.
+                // xterm.js pauses its render loop from an IntersectionObserver,
+                // which never fires for visibility:hidden — every background
+                // terminal would keep a live WebGL render loop burning GPU and
+                // main-thread time for zero visible pixels, and the terminal the
+                // user is typing in competes with all of them. display:none is
+                // the only thing that makes the element non-intersecting.
+                //
+                // Cost: the crossfade is gone in BOTH directions — display isn't
+                // animatable, and an element flipped from display:none has no
+                // before-change style, so the opacity transition never starts.
+                // Switching projects is an instant cut. Deliberate trade.
+                //
+                // Re-showing still refits: a display:none pane reports a 0x0
+                // content box, so the pane's ResizeObserver fires on the
+                // none → block transition — including at a new size after a
+                // window resize that happened while the project was hidden
+                // (see TerminalView's runFit).
+                `absolute inset-0 transition-opacity duration-150 ${
                   tab.active
                     ? "opacity-100 pointer-events-auto z-10"
-                    : "opacity-0 pointer-events-none z-0"
+                    : "hidden opacity-0 pointer-events-none z-0"
                 }`
-          }
-          style={
-            eagleView
-              ? undefined
-              : {
-                  // Keep in DOM but visually hidden when inactive
-                  visibility: tab.active ? "visible" : "hidden",
-                }
           }
         >
           {tab.sessionsLaunched ? (

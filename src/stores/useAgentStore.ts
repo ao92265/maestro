@@ -46,6 +46,12 @@ export interface SubagentInfo {
 interface AgentState {
   agents: SubagentInfo[];
   handleEvent: (event: ClaudeEvent) => void;
+  /**
+   * Fold a whole batch of events in ONE set() call. The backend coalesces
+   * events on a 16ms timer, so a transcript replay arrives as a few
+   * hundred-event batches instead of hundreds of individual messages.
+   */
+  handleEvents: (events: ClaudeEvent[]) => void;
   /** Remove one agent from the graph. Nothing else ever removes them. */
   dismiss: (agentId: string) => void;
   /** Remove every finished agent of one session, leaving the running ones. */
@@ -62,117 +68,121 @@ interface AgentState {
  * removals are [`dismiss`] and [`clearFinished`], plus quitting the app, since
  * this store is in memory only.
  */
+/**
+ * Apply one event to the agent list, returning the SAME array reference when
+ * nothing changed (which lets `set` skip the subscriber notification, exactly
+ * as the old per-event `return state` did). Pure, so a whole batch can be
+ * folded through it inside a single `set` call.
+ */
+function applyEvent(agents: SubagentInfo[], event: ClaudeEvent): SubagentInfo[] {
+  switch (event.event_type) {
+    case "SubagentSpawned": {
+      // Identity is (session, agent): resuming a conversation in a new
+      // terminal replays the same Task tool_use ids, and the new session
+      // must get its own nodes rather than be hidden by the dead one's.
+      if (agents.some((a) => a.agentId === event.agent_id && a.sessionId === event.session_id))
+        return agents;
+      return [
+        ...agents,
+        {
+          agentId: event.agent_id,
+          sessionId: event.session_id,
+          agentType: event.agent_type,
+          description: event.description,
+          prompt: event.prompt,
+          runInBackground: event.run_in_background,
+          spawnedAt: event.timestamp,
+          completedAt: null,
+          success: null,
+          report: "",
+          status: null,
+          model: null,
+          durationMs: null,
+          totalTokens: null,
+          toolUseCount: null,
+          toolStats: null,
+          agentRunId: null,
+        },
+      ];
+    }
+    // A background agent's launch acknowledgement: still running, but now we
+    // know the run id and which model it got. Only an async agent is ever
+    // acknowledged this way, so this — not the spawn's `run_in_background`,
+    // which real transcripts often omit — is what marks it as one.
+    case "SubagentLaunched": {
+      if (!agents.some((a) => a.agentId === event.agent_id && a.sessionId === event.session_id))
+        return agents;
+      return agents.map((a) =>
+        a.agentId === event.agent_id && a.sessionId === event.session_id
+          ? {
+              ...a,
+              runInBackground: true,
+              agentRunId: event.agent_run_id || a.agentRunId,
+              model: event.model || a.model,
+            }
+          : a
+      );
+    }
+    case "SubagentCompleted": {
+      const target = agents.find(
+        (a) => a.agentId === event.agent_id && a.sessionId === event.session_id
+      );
+      if (!target) return agents;
+      // A detailed completion must not be clobbered by a bare one replayed
+      // on catch-up. A later notification carrying a fresh report does
+      // update it, because a background agent can be resumed and report
+      // again under the same id.
+      if (target.completedAt !== null && !event.report) return agents;
+      // Use the transcript timestamp: catch-up reads replay old history, and
+      // a wall-clock stamp would date every agent to the moment the session
+      // was resumed.
+      const parsed = Date.parse(event.timestamp);
+      const completedAt = Number.isNaN(parsed) ? Date.now() : parsed;
+      return agents.map((a) =>
+        a.agentId === event.agent_id && a.sessionId === event.session_id
+          ? {
+              ...a,
+              completedAt,
+              success: event.success,
+              report: event.report || a.report,
+              status: event.status ?? a.status,
+              // The spawn names no subagent_type for Claude's default
+              // agent; the result resolves it.
+              agentType: event.agent_type || a.agentType,
+              model: event.model ?? a.model,
+              durationMs: event.duration_ms ?? a.durationMs,
+              totalTokens: event.total_tokens ?? a.totalTokens,
+              toolUseCount: event.tool_use_count ?? a.toolUseCount,
+              toolStats: event.tool_stats ?? a.toolStats,
+              agentRunId: event.agent_run_id ?? a.agentRunId,
+            }
+          : a
+      );
+    }
+    default:
+      return agents;
+  }
+}
+
 export const useAgentStore = create<AgentState>((set) => ({
   agents: [],
 
   handleEvent: (event: ClaudeEvent) => {
-    switch (event.event_type) {
-      case "SubagentSpawned":
-        set((state) => {
-          // Identity is (session, agent): resuming a conversation in a new
-          // terminal replays the same Task tool_use ids, and the new session
-          // must get its own nodes rather than be hidden by the dead one's.
-          if (
-            state.agents.some(
-              (a) => a.agentId === event.agent_id && a.sessionId === event.session_id
-            )
-          )
-            return state;
-          return {
-            agents: [
-              ...state.agents,
-              {
-                agentId: event.agent_id,
-                sessionId: event.session_id,
-                agentType: event.agent_type,
-                description: event.description,
-                prompt: event.prompt,
-                runInBackground: event.run_in_background,
-                spawnedAt: event.timestamp,
-                completedAt: null,
-                success: null,
-                report: "",
-                status: null,
-                model: null,
-                durationMs: null,
-                totalTokens: null,
-                toolUseCount: null,
-                toolStats: null,
-                agentRunId: null,
-              },
-            ],
-          };
-        });
-        break;
-      // A background agent's launch acknowledgement: still running, but now we
-      // know the run id and which model it got. Only an async agent is ever
-      // acknowledged this way, so this — not the spawn's `run_in_background`,
-      // which real transcripts often omit — is what marks it as one.
-      case "SubagentLaunched":
-        set((state) => {
-          if (
-            !state.agents.some(
-              (a) => a.agentId === event.agent_id && a.sessionId === event.session_id
-            )
-          )
-            return state;
-          return {
-            agents: state.agents.map((a) =>
-              a.agentId === event.agent_id && a.sessionId === event.session_id
-                ? {
-                    ...a,
-                    runInBackground: true,
-                    agentRunId: event.agent_run_id || a.agentRunId,
-                    model: event.model || a.model,
-                  }
-                : a
-            ),
-          };
-        });
-        break;
-      case "SubagentCompleted":
-        set((state) => {
-          const target = state.agents.find(
-            (a) => a.agentId === event.agent_id && a.sessionId === event.session_id
-          );
-          if (!target) return state;
-          // A detailed completion must not be clobbered by a bare one replayed
-          // on catch-up. A later notification carrying a fresh report does
-          // update it, because a background agent can be resumed and report
-          // again under the same id.
-          if (target.completedAt !== null && !event.report) return state;
-          // Use the transcript timestamp: catch-up reads replay old history, and
-          // a wall-clock stamp would date every agent to the moment the session
-          // was resumed.
-          const parsed = Date.parse(event.timestamp);
-          const completedAt = Number.isNaN(parsed) ? Date.now() : parsed;
-          return {
-            agents: state.agents.map((a) =>
-              a.agentId === event.agent_id && a.sessionId === event.session_id
-                ? {
-                    ...a,
-                    completedAt,
-                    success: event.success,
-                    report: event.report || a.report,
-                    status: event.status ?? a.status,
-                    // The spawn names no subagent_type for Claude's default
-                    // agent; the result resolves it.
-                    agentType: event.agent_type || a.agentType,
-                    model: event.model ?? a.model,
-                    durationMs: event.duration_ms ?? a.durationMs,
-                    totalTokens: event.total_tokens ?? a.totalTokens,
-                    toolUseCount: event.tool_use_count ?? a.toolUseCount,
-                    toolStats: event.tool_stats ?? a.toolStats,
-                    agentRunId: event.agent_run_id ?? a.agentRunId,
-                  }
-                : a
-            ),
-          };
-        });
-        break;
-      default:
-        break;
-    }
+    set((state) => {
+      const agents = applyEvent(state.agents, event);
+      return agents === state.agents ? state : { agents };
+    });
+  },
+
+  handleEvents: (events: ClaudeEvent[]) => {
+    if (events.length === 0) return;
+    set((state) => {
+      let agents = state.agents;
+      for (const event of events) {
+        agents = applyEvent(agents, event);
+      }
+      return agents === state.agents ? state : { agents };
+    });
   },
 
   dismiss: (agentId: string) =>
@@ -200,8 +210,8 @@ let active = false;
 export async function initAgentListener(): Promise<void> {
   active = true;
   if (unlisten || starting) return;
-  starting = listen<ClaudeEvent>("claude-event", (event) => {
-    useAgentStore.getState().handleEvent(event.payload);
+  starting = listen<ClaudeEvent[]>("claude-events", (event) => {
+    useAgentStore.getState().handleEvents(event.payload);
   })
     .then((fn) => {
       if (!active) {

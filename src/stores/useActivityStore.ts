@@ -19,6 +19,13 @@ interface SessionActivity {
 interface ActivityState {
   sessions: Record<number, SessionActivity>;
   addEvent: (event: ClaudeEvent) => void;
+  /**
+   * Fold a whole batch of events into the store in ONE set() call. The backend
+   * coalesces events on a 16ms timer, so a transcript replay arrives as a few
+   * hundred-event batches instead of hundreds of individual messages; folding
+   * them together collapses hundreds of renders into one.
+   */
+  addEvents: (events: ClaudeEvent[]) => void;
   getSession: (sessionId: number) => SessionActivity;
   clearSession: (sessionId: number) => void;
 }
@@ -41,6 +48,69 @@ function createEmptySession(): SessionActivity {
 // loop ("Maximum update depth exceeded").
 const EMPTY_SESSION: SessionActivity = Object.freeze(createEmptySession());
 
+/**
+ * Apply a batch of events to the sessions map and return the new map.
+ *
+ * Each touched session is copied exactly once (one events-array copy, one
+ * record spread) no matter how many events the batch carries, and the
+ * MAX_EVENTS_PER_SESSION cap is applied once at the end — "keep the last N"
+ * gives the same result applied per-event or once, and a SessionStarted reset
+ * mid-batch restarts the array so each run is capped on its own events.
+ */
+function foldEvents(
+  sessions: Record<number, SessionActivity>,
+  batch: ClaudeEvent[]
+): Record<number, SessionActivity> {
+  // Mutable working copies, keyed by session. `events` is always a fresh array
+  // so pushing into it never touches the previous state.
+  const drafts = new Map<number, SessionActivity>();
+
+  for (const event of batch) {
+    const sessionId = event.session_id;
+    let draft = drafts.get(sessionId);
+    if (!draft) {
+      const session = sessions[sessionId] ?? createEmptySession();
+      draft = { ...session, events: [...session.events] };
+      drafts.set(sessionId, draft);
+    }
+
+    // A SessionStarted hook marks a fresh claude process in this terminal,
+    // and the transcript watcher then replays its conversation from byte 0.
+    // Reset the activity so the replay rebuilds it exactly once —
+    // accumulating across runs double-counted every resumed token. The
+    // conversation UUIDs survive the reset: they are identity, not activity.
+    if (event.event_type === "SessionStarted") {
+      const conversationUuids = draft.conversationUuids.includes(event.claude_session_uuid)
+        ? draft.conversationUuids
+        : [...draft.conversationUuids, event.claude_session_uuid];
+      drafts.set(sessionId, { ...createEmptySession(), events: [event], conversationUuids });
+      continue;
+    }
+
+    draft.events.push(event);
+
+    // Update aggregates
+    if (event.event_type === "TokenUsageUpdate") {
+      draft.totalInputTokens += event.input_tokens;
+      draft.totalOutputTokens += event.output_tokens;
+    } else if (event.event_type === "FileEdited" || event.event_type === "FileCreated") {
+      if (!draft.filesModified.includes(event.file_path)) {
+        draft.filesModified = [...draft.filesModified, event.file_path];
+      }
+    }
+  }
+
+  const next = { ...sessions };
+  for (const [sessionId, draft] of drafts) {
+    // Apply the cap once, to the folded array
+    if (draft.events.length > MAX_EVENTS_PER_SESSION) {
+      draft.events.splice(0, draft.events.length - MAX_EVENTS_PER_SESSION);
+    }
+    next[sessionId] = draft;
+  }
+  return next;
+}
+
 export const useActivityStore = create<ActivityState>((set, get) => ({
   sessions: {},
 
@@ -49,58 +119,12 @@ export const useActivityStore = create<ActivityState>((set, get) => ({
   },
 
   addEvent: (event: ClaudeEvent) => {
-    set((state) => {
-      const sessionId = event.session_id;
-      const session = state.sessions[sessionId] ?? createEmptySession();
+    set((state) => ({ sessions: foldEvents(state.sessions, [event]) }));
+  },
 
-      // A SessionStarted hook marks a fresh claude process in this terminal,
-      // and the transcript watcher then replays its conversation from byte 0.
-      // Reset the activity so the replay rebuilds it exactly once —
-      // accumulating across runs double-counted every resumed token. The
-      // conversation UUIDs survive the reset: they are identity, not activity.
-      if (event.event_type === "SessionStarted") {
-        const conversationUuids = session.conversationUuids.includes(event.claude_session_uuid)
-          ? session.conversationUuids
-          : [...session.conversationUuids, event.claude_session_uuid];
-        return {
-          sessions: {
-            ...state.sessions,
-            [sessionId]: { ...createEmptySession(), events: [event], conversationUuids },
-          },
-        };
-      }
-
-      // Add event with cap
-      const events = [...session.events, event];
-      if (events.length > MAX_EVENTS_PER_SESSION) {
-        events.splice(0, events.length - MAX_EVENTS_PER_SESSION);
-      }
-
-      // Update aggregates
-      let { totalInputTokens, totalOutputTokens, filesModified } = session;
-
-      if (event.event_type === "TokenUsageUpdate") {
-        totalInputTokens += event.input_tokens;
-        totalOutputTokens += event.output_tokens;
-      } else if (event.event_type === "FileEdited" || event.event_type === "FileCreated") {
-        if (!filesModified.includes(event.file_path)) {
-          filesModified = [...filesModified, event.file_path];
-        }
-      }
-
-      return {
-        sessions: {
-          ...state.sessions,
-          [sessionId]: {
-            events,
-            totalInputTokens,
-            totalOutputTokens,
-            filesModified,
-            conversationUuids: session.conversationUuids,
-          },
-        },
-      };
-    });
+  addEvents: (events: ClaudeEvent[]) => {
+    if (events.length === 0) return;
+    set((state) => ({ sessions: foldEvents(state.sessions, events) }));
   },
 
   clearSession: (sessionId: number) => {
@@ -121,8 +145,8 @@ let active = false;
 export async function initActivityListener(): Promise<void> {
   active = true;
   if (unlisten || starting) return;
-  starting = listen<ClaudeEvent>("claude-event", (event) => {
-    useActivityStore.getState().addEvent(event.payload);
+  starting = listen<ClaudeEvent[]>("claude-events", (event) => {
+    useActivityStore.getState().addEvents(event.payload);
   })
     .then((fn) => {
       if (!active) {

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowUp,
@@ -30,6 +30,11 @@ import { FileDiffModal } from "./FileDiffModal";
 
 interface WorktreeStatusListProps {
   repoPath: string;
+  /** Poll only while the git panel is actually open — a full status sweep
+   *  spawns ~7 git subprocesses per worktree and used to run forever behind
+   *  the permanently-mounted (width-0) panel. Mirrors the `enabled` gate in
+   *  `useDevProcesses`. */
+  active?: boolean;
 }
 
 /** File selected in the list, shown in the side-by-side diff modal. */
@@ -42,13 +47,17 @@ interface SelectedFile {
 
 const POLL_INTERVAL_MS = 15_000;
 
-export function WorktreeStatusList({ repoPath }: WorktreeStatusListProps) {
+export function WorktreeStatusList({ repoPath, active = true }: WorktreeStatusListProps) {
   const [worktrees, setWorktrees] = useState<WorktreeStatus[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null);
+  // Guards the interval only. Manual refreshes and post-file-action refreshes
+  // must never be swallowed, so this is deliberately not inside `refresh`.
+  const inFlight = useRef(false);
 
   const refresh = useCallback(async () => {
+    inFlight.current = true;
     try {
       setError(null);
       const data = await getWorktreesStatus(repoPath);
@@ -56,16 +65,27 @@ export function WorktreeStatusList({ repoPath }: WorktreeStatusListProps) {
     } catch (e) {
       setError(typeof e === "string" ? e : (e as Error).message);
     } finally {
+      inFlight.current = false;
       setIsLoading(false);
     }
   }, [repoPath]);
 
   useEffect(() => {
+    if (!active) return;
+
     setIsLoading(true);
-    refresh();
-    const id = setInterval(refresh, POLL_INTERVAL_MS);
+    void refresh();
+
+    const tick = () => {
+      // A sweep can outlast the interval on repos with many worktrees — skip
+      // rather than stack. Also skip when nobody is looking at the window.
+      if (inFlight.current || !document.hasFocus()) return;
+      void refresh();
+    };
+
+    const id = setInterval(tick, POLL_INTERVAL_MS);
     return () => clearInterval(id);
-  }, [refresh]);
+  }, [active, refresh]);
 
   if (isLoading && worktrees.length === 0) {
     return (
