@@ -31,9 +31,10 @@ import { type EagleProjectOption, TopBar } from "./components/shared/TopBar";
 import { UtilityPanel, type UtilityPanelKind } from "./components/shared/UtilityPanel";
 import { Sidebar } from "./components/sidebar/Sidebar";
 import { UpdateNotification } from "./components/update/UpdateNotification";
+import { HEALTH_CHECK_INTERVAL_MS } from "./lib/healthRules";
 import { useAppKeyboard } from "./hooks/useAppKeyboard";
 import { useSwipeNavigation } from "./hooks/useSwipeNavigation";
-import { GitHubWatchdogToasts } from "./components/shared/GitHubWatchdogToasts";
+import { NotificationToasts } from "./components/shared/NotificationToasts";
 import { initActivityListener, stopActivityListener } from "./stores/useActivityStore";
 import { initAgentListener, stopAgentListener } from "./stores/useAgentStore";
 import { useGitHubStore } from "./stores/useGitHubStore";
@@ -44,6 +45,7 @@ import {
   watchedProjectsFromTabs,
 } from "./stores/useGitHubWatchdogStore";
 import { useGitStore } from "./stores/useGitStore";
+import { useHealthStore } from "./stores/useHealthStore";
 import { useTerminalSettingsStore } from "./stores/useTerminalSettingsStore";
 import { useStandupStore } from "@/stores/useStandupStore";
 import { useUpdateStore } from "./stores/useUpdateStore";
@@ -274,6 +276,21 @@ function App() {
       .getState()
       .syncProjects(JSON.parse(watchedProjectsJson));
   }, [watchedProjectsJson]);
+
+  // Health checker: rule-based memory/process checks on a quiet interval.
+  // Reads the open tabs at tick time (like the standup scheduler) so tab
+  // churn never restarts the interval and never resets the CPU/RAM streaks.
+  useEffect(() => {
+    const tick = () => {
+      const openTabs = useWorkspaceStore.getState().tabs;
+      void useHealthStore.getState().runCheck(
+        openTabs.map((t) => ({ projectPath: t.selectedRepoPath ?? t.projectPath })),
+      );
+    };
+    tick();
+    const interval = setInterval(tick, HEALTH_CHECK_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, []);
 
   // Standup scheduler: a minute tick that fires the daily report generation
   // once the configured local time has passed (at most once per day; the
@@ -811,7 +828,7 @@ function App() {
       )}
 
       <UpdateNotification />
-      <GitHubWatchdogToasts />
+      <NotificationToasts />
     </div>
   );
 }

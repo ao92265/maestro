@@ -12,7 +12,7 @@ import {
   User,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ContextDocEditorModal } from "@/components/claudemd";
 import { MarkdownEditor } from "@/components/shared/MarkdownEditor";
 import { type ContextDoc, listContextDocs, readContextDoc } from "@/lib/claudemd";
@@ -26,8 +26,22 @@ import {
   readMemoryFile,
   writeMemoryFile,
 } from "@/lib/memory";
+import { reasonsByRow, useHealthStore } from "@/stores/useHealthStore";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { cardClass, SectionHeader } from "./sectionChrome";
+
+/** One-line health reasons under a flagged memory row (never an action). */
+function HealthReasons({ reasons }: { reasons: string[] }) {
+  return (
+    <>
+      {reasons.map((reason) => (
+        <span key={reason} className="block truncate text-[10px] text-maestro-orange">
+          {reason}
+        </span>
+      ))}
+    </>
+  );
+}
 
 /** Badge styling per memory type (frontmatter `type:`). */
 const TYPE_BADGES: Record<string, string> = {
@@ -184,6 +198,10 @@ export function MemorySection() {
 
   const totalFiles = projects.reduce((n, p) => n + p.fileCount, 0);
 
+  /* ── Health checker flags (rule-based, read-only) ── */
+  const healthFlags = useHealthStore((s) => s.flags);
+  const healthReasons = useMemo(() => reasonsByRow(healthFlags, "memory"), [healthFlags]);
+
   return (
     <>
       {/* User level */}
@@ -265,9 +283,14 @@ export function MemorySection() {
             {projects.map((project) => {
               const expanded = expandedDirs.has(project.dirName);
               const files = filesByDir[project.dirName];
+              const projectReasons = healthReasons.get(`${project.dirName}|${project.dirName}`);
               return (
                 <div key={project.dirName}>
-                  <div className="group flex items-center gap-1.5 rounded-md px-1 py-1 hover:bg-maestro-border/40">
+                  <div
+                    className={`group flex items-center gap-1.5 rounded-md px-1 py-1 hover:bg-maestro-border/40 ${
+                      projectReasons ? "bg-maestro-orange/5" : ""
+                    }`}
+                  >
                     <button
                       type="button"
                       onClick={() => toggleProject(project.dirName)}
@@ -307,6 +330,12 @@ export function MemorySection() {
                     </button>
                   </div>
 
+                  {projectReasons && (
+                    <div className="pb-0.5 pl-5 pr-1">
+                      <HealthReasons reasons={projectReasons} />
+                    </div>
+                  )}
+
                   {expanded && (
                     <div className="ml-2 border-l border-maestro-border/40 pl-1.5">
                       {!files ? (
@@ -316,10 +345,15 @@ export function MemorySection() {
                       ) : (
                         files.map((file) => {
                           const badgeCls = file.memType ? TYPE_BADGES[file.memType] : undefined;
+                          const fileReasons = healthReasons.get(
+                            `${project.dirName}|${file.relPath}`,
+                          );
                           return (
                             <div
                               key={file.relPath}
-                              className="group flex items-center gap-1.5 rounded-md px-1 py-0.5 hover:bg-maestro-border/40"
+                              className={`group flex items-center gap-1.5 rounded-md px-1 py-0.5 hover:bg-maestro-border/40 ${
+                                fileReasons ? "bg-maestro-orange/5" : ""
+                              }`}
                             >
                               <button
                                 type="button"
@@ -342,6 +376,7 @@ export function MemorySection() {
                                       {file.description}
                                     </span>
                                   )}
+                                  {fileReasons && <HealthReasons reasons={fileReasons} />}
                                 </span>
                               </button>
                               {file.isIndex ? (

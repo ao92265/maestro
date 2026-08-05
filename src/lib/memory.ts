@@ -34,6 +34,30 @@ export interface MemoryFile {
   modified: string | null;
 }
 
+/**
+ * Encodes a project path into the directory name Claude Code uses under
+ * `~/.claude/projects` — every character that isn't ASCII alphanumeric, `_`
+ * or `-` becomes a `-`, so `C:\git\maestro` → `C--git-maestro`.
+ *
+ * Mirrors `encode_project_path` in `src-tauri/src/commands/claude_sessions.rs`,
+ * which is what `list_memory_projects` uses to mark the active project. Needed
+ * on this side to map a memory directory back to the repo it describes: the
+ * encoding is lossy (`/` and `.` both become `-`), so it can only ever be
+ * applied forwards, from a known project path.
+ */
+export function encodeProjectDirName(projectPath: string): string {
+  return projectPath.replace(/[^A-Za-z0-9_-]/g, "-");
+}
+
+/**
+ * Returns the subset of `relPaths` that do NOT exist under `root`. Paths that
+ * cannot be safely checked (absolute, traversal, Windows-style) are skipped
+ * rather than reported missing.
+ */
+export async function checkPathsExist(root: string, relPaths: string[]): Promise<string[]> {
+  return invoke<string[]>("check_paths_exist", { root, relPaths });
+}
+
 /** List every project with saved memory; the active project sorts first. */
 export async function listMemoryProjects(activeProjectPath: string): Promise<MemoryProject[]> {
   return invoke<MemoryProject[]>("list_memory_projects", { activeProjectPath });

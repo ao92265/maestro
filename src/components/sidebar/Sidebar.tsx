@@ -56,8 +56,8 @@ import type {
   McpManagedServer,
 } from "@/lib/mcp";
 import { listContextDocs, readContextDoc, type ContextDoc } from "@/lib/claudemd";
-import { GitHubSettingsSection } from "./GitHubSettingsSection";
 import { HistorySection } from "./HistorySection";
+import { NotificationsSettingsSection } from "./NotificationsSettingsSection";
 import { cardClass, divider, SectionHeader } from "./sectionChrome";
 
 interface SidebarProps {
@@ -357,7 +357,7 @@ function ConfigTab({
             onStopAll={onStopAll}
           />
           {divider}
-          <GitHubSettingsSection />
+          <NotificationsSettingsSection />
         </>
       );
   }
