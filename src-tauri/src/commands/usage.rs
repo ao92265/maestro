@@ -615,4 +615,26 @@ mod tests {
         assert_eq!(usage.session_percent, None);
         assert_eq!(usage.session_resets_at, None);
     }
+
+    #[test]
+    fn withholds_spend_dollars_when_spend_utilization_is_null() {
+        // Dollar figures ride along only while the spend window itself is
+        // reported — a null utilization must not leak them through.
+        let parsed: ApiUsageResponse = serde_json::from_str(
+            r#"{
+                "cinder_cove": {
+                    "utilization": null,
+                    "resets_at": "2026-09-06T10:33:51.866730+00:00",
+                    "limit_dollars": 1000,
+                    "used_dollars": 857.000393
+                }
+            }"#,
+        )
+        .unwrap();
+        let usage = to_usage_data(parsed);
+        assert_eq!(usage.spend_percent, None);
+        assert_eq!(usage.spend_resets_at, None);
+        assert_eq!(usage.spend_used_dollars, None);
+        assert_eq!(usage.spend_limit_dollars, None);
+    }
 }

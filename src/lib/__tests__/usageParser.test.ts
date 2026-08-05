@@ -123,6 +123,17 @@ describe("getUsageBars", () => {
     ]);
   });
 
+  it("degrades to a percent-only Budget row when either dollar figure is missing", () => {
+    const bars = getUsageBars({
+      ...noWindows,
+      spendPercent: 85.7,
+      spendUsedDollars: 857.000393,
+      spendLimitDollars: null,
+    });
+    expect(bars).toEqual([{ label: "Budget", percent: 85.7, resetsAt: null }]);
+    expect(bars[0]).not.toHaveProperty("detail");
+  });
+
   it("treats 0% as a reported window, not an absent one", () => {
     const bars = getUsageBars({ ...noWindows, sessionPercent: 0, weeklyPercent: 0 });
     expect(bars.map((b) => b.label)).toEqual(["Session", "Week"]);
@@ -186,5 +197,13 @@ describe("mostCriticalBar", () => {
       { label: "Week", percent: 50, resetsAt: null },
     ]);
     expect(top?.label).toBe("Session");
+  });
+
+  it("skips non-finite percents instead of letting NaN win", () => {
+    const top = mostCriticalBar([
+      { label: "Session", percent: NaN, resetsAt: null },
+      { label: "Week", percent: 99, resetsAt: null },
+    ]);
+    expect(top?.label).toBe("Week");
   });
 });

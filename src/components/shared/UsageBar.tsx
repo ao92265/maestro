@@ -49,6 +49,18 @@ export function UsageBar() {
     };
   }, [open]);
 
+  const bars = usage ? getUsageBars(usage) : [];
+
+  // A background poll can flip us into the auth/error/empty render, which
+  // unmounts the panel while `open` stays true — it would then pop back open
+  // uninvited on the next good poll (and with rootRef unmounted, every
+  // pointerdown reads as "outside"). Reset `open` whenever the panel's
+  // render branch goes away.
+  const hasBars = !needsAuth && !error && bars.length > 0;
+  useEffect(() => {
+    if (!hasBars) setOpen(false);
+  }, [hasBars]);
+
   if (needsAuth) {
     return (
       <div className="flex items-center gap-2 text-[10px] text-maestro-muted/70">
@@ -58,8 +70,6 @@ export function UsageBar() {
       </div>
     );
   }
-
-  const bars = usage ? getUsageBars(usage) : [];
 
   if (error || !usage || bars.length === 0) {
     return (
@@ -104,7 +114,10 @@ export function UsageBar() {
       </button>
 
       {open && (
-        <div className="absolute bottom-full right-0 z-50 mb-1 w-72 rounded-lg border border-maestro-border bg-maestro-card p-3 shadow-xl shadow-black/40">
+        /* z-[60] (PluginInstallModal precedent): UpdateNotification and the
+           zoom indicator share this corner at z-50 — a deliberately opened
+           panel must paint above passive notifications. */
+        <div className="absolute bottom-full right-0 z-[60] mb-1 w-72 rounded-lg border border-maestro-border bg-maestro-card p-3 shadow-xl shadow-black/40">
           <p className="mb-2 text-[10px] font-bold uppercase tracking-wider text-maestro-muted/70">
             Claude usage
           </p>

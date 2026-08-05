@@ -99,6 +99,10 @@ export function getUsageBars(usage: UsageData): UsageWindowBar[] {
 export function mostCriticalBar(bars: UsageWindowBar[]): UsageWindowBar | null {
   let top: UsageWindowBar | null = null;
   for (const bar of bars) {
+    // NaN compares false against everything — an early NaN bar would win
+    // over any later real percent. Unreachable via the Rust mapping (it
+    // clamps non-finite values), but stay defensive like clampPercent.
+    if (!Number.isFinite(bar.percent)) continue;
     if (top === null || bar.percent > top.percent) top = bar;
   }
   return top;
