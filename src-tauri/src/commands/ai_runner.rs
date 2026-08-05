@@ -20,8 +20,11 @@ use tokio::io::AsyncWriteExt;
 
 use crate::core::status_server::StatusServer;
 
-/// `claude -p` can take a while on a big context; kill it after this.
-const CLAUDE_TIMEOUT_SECS: u64 = 300;
+/// `claude -p` can take a while on a big context; kill it after this. It is
+/// the ceiling for the features that summarise pre-gathered material in one
+/// pass. Features whose run also has the model EXPLORE the repo (many tool
+/// calls, minutes of work) pass their own — see [`run_and_save_with_timeout`].
+pub const CLAUDE_TIMEOUT_SECS: u64 = 300;
 
 /// Base directory for one artifact kind: `<app data>/<kind>/`.
 pub fn artifact_base_dir(kind: &str) -> PathBuf {
@@ -209,8 +212,21 @@ pub fn or_none(s: &str) -> &str {
     }
 }
 
-/// Run `claude -p` headlessly in the project directory, prompt via stdin.
-pub async fn run_claude_print(project_path: &str, prompt: String) -> Result<String, String> {
+/// Run `claude -p` headlessly in the project directory, prompt via stdin,
+/// killed after `timeout_secs`. A run that has the model read its way around a
+/// repository needs far longer than one that summarises material we already
+/// gathered, so the ceiling is the caller's choice — [`CLAUDE_TIMEOUT_SECS`]
+/// is the default the summarising features pass.
+///
+/// `tools` restricts the run to the named built-in tools; an empty slice
+/// leaves the CLI's own defaults alone (what the summarising features want,
+/// since they hand the model everything in the prompt and expect no tool use).
+pub async fn run_claude_print_with_timeout(
+    project_path: &str,
+    prompt: String,
+    timeout_secs: u64,
+    tools: &[&str],
+) -> Result<String, String> {
     #[cfg(windows)]
     let mut cmd = {
         use crate::core::windows_process::TokioCommandExt;
@@ -229,6 +245,16 @@ pub async fn run_claude_print(project_path: &str, prompt: String) -> Result<Stri
         c.env("PATH", crate::core::cli_path::augmented_path());
         c
     };
+
+    if !tools.is_empty() {
+        // `--tools` decides which built-in tools EXIST for the run, so a
+        // permissive project settings.json cannot hand the model Bash or
+        // Write; `--allowedTools` then spares the survivors a permission
+        // prompt that a headless run has no way to answer. Both flags take a
+        // comma- or space-separated list (`claude --help`).
+        let list = tools.join(",");
+        cmd.args(["--tools", list.as_str(), "--allowedTools", list.as_str()]);
+    }
 
     cmd.current_dir(project_path)
         .stdin(Stdio::piped())
@@ -252,11 +278,11 @@ pub async fn run_claude_print(project_path: &str, prompt: String) -> Result<Stri
     }
 
     let output = tokio::time::timeout(
-        std::time::Duration::from_secs(CLAUDE_TIMEOUT_SECS),
+        std::time::Duration::from_secs(timeout_secs),
         child.wait_with_output(),
     )
     .await
-    .map_err(|_| format!("Claude run timed out after {}s", CLAUDE_TIMEOUT_SECS))?
+    .map_err(|_| format!("Claude run timed out after {}s", timeout_secs))?
     .map_err(|e| format!("Claude run failed: {}", e))?;
 
     if !output.status.success() {
@@ -281,7 +307,20 @@ pub async fn run_and_save(
     date: &str,
     noun: &str,
 ) -> Result<String, String> {
-    let raw = run_claude_print(cwd, prompt).await?;
+    run_and_save_with_timeout(cwd, prompt, dir, date, CLAUDE_TIMEOUT_SECS, &[]).await
+}
+
+/// Same, with an explicit run timeout and tool restriction (see
+/// [`run_claude_print_with_timeout`]).
+pub async fn run_and_save_with_timeout(
+    cwd: &str,
+    prompt: String,
+    dir: &Path,
+    date: &str,
+    timeout_secs: u64,
+    tools: &[&str],
+) -> Result<String, String> {
+    let raw = run_claude_print_with_timeout(cwd, prompt, timeout_secs, tools).await?;
     let markdown = strip_ansi(&raw).trim().to_string();
     if markdown.is_empty() {
         return Err(format!("Claude returned an empty {}", noun));
