@@ -1,14 +1,14 @@
 import { useEffect } from "react";
 
 /** Right-side utility panels reachable via Cmd/Ctrl+3-6. */
-export type UtilityPanelShortcut = "memory" | "processes" | "notes" | "standup";
+export type UtilityPanelShortcut = "memory" | "processes" | "notes" | "ai";
 
 /** Cmd/Ctrl+digit → right-side utility panel (2 is the git panel, handled separately). */
 const UTILITY_PANEL_BY_DIGIT: Record<string, UtilityPanelShortcut> = {
   "3": "memory",
   "4": "processes",
   "5": "notes",
-  "6": "standup",
+  "6": "ai",
 };
 
 interface UseAppKeyboardOptions {
@@ -43,7 +43,7 @@ function isMac(): boolean {
  * Shortcuts:
  * - Alt+1-4: Toggle the left sidebar on tab N (General/History/Infra/Settings)
  * - Cmd/Ctrl+2: Toggle the git panel
- * - Cmd/Ctrl+3-6: Toggle the Memory/Processes/Notes/Standup panels
+ * - Cmd/Ctrl+3-6: Toggle the Memory/Processes/Notes/AI panels
  * - Cmd/Ctrl+T: Add a new terminal (project picker in eagle view)
  * - Cmd/Ctrl+G: Toggle the eagle all-projects terminals view
  * - Ctrl+Tab / Ctrl+Shift+Tab (all platforms): Next / previous project tab

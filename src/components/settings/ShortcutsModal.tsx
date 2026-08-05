@@ -34,7 +34,7 @@ function buildGroups(mod: string, alt: string): ShortcutGroup[] {
         { keys: [mod, "3"], description: "Toggle the Memory panel" },
         { keys: [mod, "4"], description: "Toggle the Processes panel" },
         { keys: [mod, "5"], description: "Toggle the Notes panel" },
-        { keys: [mod, "6"], description: "Toggle the Standup panel" },
+        { keys: [mod, "6"], description: "Toggle the AI panel" },
       ],
     },
     {
