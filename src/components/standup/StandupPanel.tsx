@@ -12,7 +12,7 @@ import {
 
 import { MarkdownBody } from "@/components/git/shared/MarkdownBody";
 import { projectColorFor } from "@/lib/projectColor";
-import { useStandupStore } from "@/stores/useStandupStore";
+import { localDateString, useStandupStore } from "@/stores/useStandupStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 import { cardClass } from "@/components/sidebar/sectionChrome";
 
@@ -192,6 +192,9 @@ function StandupCard({
   onGenerate: () => void;
 }) {
   const color = projectColorFor(tab.name);
+  // Retention keeps the newest report visible until the next one exists, so
+  // the badge flags a previous day's date to avoid passing it off as today's.
+  const reportIsToday = !state?.report || state.report.date === localDateString();
   return (
     <div className={`${cardClass} mb-2`}>
       <div className="mb-1.5 flex items-center gap-1.5">
@@ -199,7 +202,14 @@ function StandupCard({
           {tab.name}
         </span>
         {state?.report && (
-          <span className="shrink-0 text-[9px] text-maestro-muted">{state.report.date}</span>
+          <span
+            className={`shrink-0 text-[9px] ${
+              reportIsToday ? "text-maestro-muted" : "font-semibold text-maestro-orange"
+            }`}
+            title={reportIsToday ? undefined : "Latest report — from a previous day"}
+          >
+            {state.report.date}
+          </span>
         )}
         <button
           type="button"

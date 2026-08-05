@@ -41,6 +41,7 @@ describe("useStandupStore", () => {
       scheduleEnabled: true,
       scheduleTime: "08:30",
       lastRunDate: null,
+      runInProgress: false,
     });
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 6, 30, 9, 0, 0)); // 09:00 local, past 08:30
@@ -114,13 +115,72 @@ describe("useStandupStore", () => {
   });
 
   it("scheduled run does not generate when the existence check fails", async () => {
-    // If we can't tell whether the report exists, don't risk overwriting it.
+    // If we can't tell whether the report exists, don't risk overwriting it:
+    // surface the failure in the panel and leave the day open for a retry.
     invokeMock.mockImplementation(async (cmd) => {
       if (cmd === "load_standup_report") throw new Error("disk error");
       return report("C:/git/proj");
     });
     await useStandupStore.getState().maybeRunScheduled(["C:/git/proj"]);
     expect(invokeMock).not.toHaveBeenCalledWith("generate_standup_report", expect.anything());
+    const state = useStandupStore.getState().reports["C:/git/proj"];
+    expect(state.status).toBe("error");
+    expect(state.error).toContain("disk error");
+    expect(useStandupStore.getState().lastRunDate).toBeNull();
+    expect(useStandupStore.getState().runInProgress).toBe(false);
+  });
+
+  it("scheduled run fires again after midnight when lastRunDate is yesterday", async () => {
+    useStandupStore.setState({ lastRunDate: "2026-07-29" });
+    await useStandupStore.getState().maybeRunScheduled(["C:/git/proj"]);
+    expect(invokeMock).toHaveBeenCalledWith("generate_standup_report", {
+      projectPath: "C:/git/proj",
+      promptTemplate: null,
+    });
+    expect(useStandupStore.getState().lastRunDate).toBe("2026-07-30");
+  });
+
+  it("one project's failed existence check does not block the others", async () => {
+    invokeMock.mockImplementation(async (cmd, args) => {
+      const { projectPath } = args as { projectPath: string };
+      if (cmd === "load_standup_report") {
+        if (projectPath === "C:/git/bad") throw new Error("disk error");
+        return null;
+      }
+      return report(projectPath);
+    });
+    await useStandupStore.getState().maybeRunScheduled(["C:/git/bad", "C:/git/good"]);
+    expect(invokeMock).toHaveBeenCalledWith("generate_standup_report", {
+      projectPath: "C:/git/good",
+      promptTemplate: null,
+    });
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "generate_standup_report",
+      expect.objectContaining({ projectPath: "C:/git/bad" })
+    );
+    expect(useStandupStore.getState().reports["C:/git/bad"].status).toBe("error");
+    expect(useStandupStore.getState().reports["C:/git/good"].status).toBe("ready");
+    // The failed project leaves the day open so the next tick retries it;
+    // the generated one is protected from a rerun by its on-disk report.
+    expect(useStandupStore.getState().lastRunDate).toBeNull();
+  });
+
+  it("loadLatest does not clobber a slot taken while it was reading", async () => {
+    let resolveLoad!: (r: StandupReport | null) => void;
+    invokeMock.mockImplementationOnce(
+      () => new Promise<StandupReport | null>((res) => (resolveLoad = res))
+    );
+    const pending = useStandupStore.getState().loadLatest("C:/git/proj");
+    // A generation fails and takes the slot while the disk read is in flight.
+    useStandupStore.setState({
+      reports: { "C:/git/proj": { status: "error", report: null, error: "boom" } },
+    });
+    resolveLoad({ ...report("C:/git/proj"), date: "2026-07-29" });
+    await pending;
+    // The stale read must not mask the error with yesterday's report.
+    const state = useStandupStore.getState().reports["C:/git/proj"];
+    expect(state.status).toBe("error");
+    expect(state.error).toBe("boom");
   });
 
   it("scheduled run does not fire before the configured time", async () => {

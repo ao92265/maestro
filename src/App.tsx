@@ -245,14 +245,23 @@ function App() {
   // once the configured local time has passed (at most once per day; the
   // store gates on lastRunDate and skips reports already on disk). Besides
   // the minute tick, a tick fires when the persisted schedule settings finish
-  // hydrating and whenever the restored tabs change — the settings and tabs
-  // both load async from disk after mount, so these extra ticks are what let
-  // a report missed while the app was closed catch up right at startup
-  // instead of a minute later.
+  // hydrating and whenever the set of open repo paths changes — the settings
+  // and tabs both load async from disk after mount, so these extra ticks are
+  // what let a report missed while the app was closed catch up right at
+  // startup instead of a minute later.
   const maybeRunScheduledStandup = useStandupStore((s) => s.maybeRunScheduled);
+  // Stable projection of the open repo paths (newline-joined so string
+  // equality skips re-renders): tab switches flip flags and rebuild the tabs
+  // array every time, and depending on `tabs` directly would tear down and
+  // recreate the interval on each switch. This only changes when a path is
+  // actually added/removed — which is exactly when a fresh tick is wanted.
+  const standupRepoPathsKey = useWorkspaceStore((s) =>
+    s.tabs.map((t) => t.selectedRepoPath ?? t.projectPath).join("\n")
+  );
   useEffect(() => {
+    const repoPaths = standupRepoPathsKey === "" ? [] : standupRepoPathsKey.split("\n");
     const tick = () => {
-      void maybeRunScheduledStandup(tabs.map((t) => t.selectedRepoPath ?? t.projectPath));
+      void maybeRunScheduledStandup(repoPaths);
     };
     tick();
     const unsubHydration = useStandupStore.persist.onFinishHydration(tick);
@@ -261,7 +270,7 @@ function App() {
       unsubHydration();
       clearInterval(interval);
     };
-  }, [maybeRunScheduledStandup, tabs]);
+  }, [maybeRunScheduledStandup, standupRepoPathsKey]);
 
   const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
   const macTitleBarPadding = useMacTitleBarPadding();

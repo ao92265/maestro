@@ -26,8 +26,18 @@ interface StandupState {
   scheduleEnabled: boolean;
   /** Local time of day the daily run fires, "HH:MM". */
   scheduleTime: string;
-  /** Local date (YYYY-MM-DD) of the last scheduled run — prevents refiring. */
+  /**
+   * Local date (YYYY-MM-DD) of the last COMPLETED scheduled run — prevents
+   * refiring across restarts. Only persisted once the run's reports exist, so
+   * quitting mid-run can't silently consume the day.
+   */
   lastRunDate: string | null;
+  /**
+   * True while a scheduled/catch-up run is in flight. In-memory only (never
+   * persisted): it gates same-session re-entry, while restarts are covered by
+   * the per-report disk-existence check.
+   */
+  runInProgress: boolean;
   /**
    * Custom prompt template for the headless run (persisted). `null` means
    * "use the built-in default". Placeholders: {project} {date} {since}
@@ -49,9 +59,10 @@ interface StandupState {
    * Generate only when no report for `date` is saved yet; an existing one is
    * adopted as-is. The scheduled/catch-up path goes through this so it never
    * overwrites a report that was already generated (manually or by an
-   * earlier app run) that day.
+   * earlier app run) that day. Resolves false when the existence check itself
+   * failed — i.e. the day must not be marked as done for this project.
    */
-  generateIfMissing: (repoPath: string, date: string) => Promise<void>;
+  generateIfMissing: (repoPath: string, date: string) => Promise<boolean>;
   /** Fired by the App-level minute tick; runs at most once per day. */
   maybeRunScheduled: (repoPaths: string[]) => Promise<void>;
 }
@@ -90,6 +101,7 @@ export const useStandupStore = create<StandupState>()(
       scheduleEnabled: false,
       scheduleTime: "08:30",
       lastRunDate: null,
+      runInProgress: false,
       promptTemplate: null,
 
       setScheduleEnabled: (enabled) => set({ scheduleEnabled: enabled }),
@@ -105,6 +117,11 @@ export const useStandupStore = create<StandupState>()(
             projectPath: repoPath,
             date: null,
           });
+          // Re-check after the await: a scheduled/manual run may have taken
+          // the slot while we read from disk — its state (spinner, fresh
+          // report, or error) must win over this stale read.
+          const current = get().reports[repoPath];
+          if (current && current.status !== "idle") return;
           set((state) => ({
             reports: {
               ...state.reports,
@@ -162,26 +179,44 @@ export const useStandupStore = create<StandupState>()(
             date,
           });
           if (existing) {
-            set((state) => ({
-              reports: {
-                ...state.reports,
-                [repoPath]: { status: "ready", report: existing, error: null },
-              },
-            }));
-            return;
+            // Adopt it — unless a manual regeneration started while we were
+            // reading; its spinner (and eventual result) must not be clobbered.
+            if (get().reports[repoPath]?.status !== "generating") {
+              set((state) => ({
+                reports: {
+                  ...state.reports,
+                  [repoPath]: { status: "ready", report: existing, error: null },
+                },
+              }));
+            }
+            return true;
           }
         } catch (err) {
           // If we can't tell whether the report exists, don't risk overwriting
-          // it — the user can still hit Generate manually.
-          console.error("Failed to check for an existing standup report:", err);
-          return;
+          // it. Surface the failure in the panel and report the day as not
+          // done, so the next tick retries instead of silently skipping.
+          if (get().reports[repoPath]?.status !== "generating") {
+            set((state) => ({
+              reports: {
+                ...state.reports,
+                [repoPath]: {
+                  status: "error",
+                  report: state.reports[repoPath]?.report ?? null,
+                  error: `Failed to check for an existing report: ${String(err)}`,
+                },
+              },
+            }));
+          }
+          return false;
         }
         await get().generate(repoPath);
+        return true;
       },
 
       maybeRunScheduled: async (repoPaths) => {
-        const { scheduleEnabled, scheduleTime, lastRunDate } = get();
+        const { scheduleEnabled, scheduleTime, lastRunDate, runInProgress } = get();
         if (!scheduleEnabled || repoPaths.length === 0) return;
+        if (runInProgress) return;
         const now = new Date();
         const today = localDateString(now);
         if (lastRunDate === today) return;
@@ -189,13 +224,25 @@ export const useStandupStore = create<StandupState>()(
         if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return;
         const due = now.getHours() > hours || (now.getHours() === hours && now.getMinutes() >= minutes);
         if (!due) return;
-        // Mark before generating (synchronously, before the first await) so a
-        // slow run can't double-fire on the next tick, and so the catch-up
-        // ticks fired at startup can't race the regular minute tick.
-        set({ lastRunDate: today });
-        // Per project: skip days whose report already exists on disk (e.g.
-        // generated manually, or by a previous app run before a restart).
-        await Promise.all(repoPaths.map((repoPath) => get().generateIfMissing(repoPath, today)));
+        // Gate re-entry with the in-memory flag (set synchronously, before the
+        // first await) so the catch-up ticks fired at startup can't race the
+        // regular minute tick. lastRunDate is only persisted AFTER the run
+        // settles: quitting mid-run must not consume the day on disk while
+        // reports are still missing.
+        set({ runInProgress: true });
+        try {
+          // Per project: skip days whose report already exists on disk (e.g.
+          // generated manually, or by a previous app run before a restart).
+          const done = await Promise.all(
+            repoPaths.map((repoPath) => get().generateIfMissing(repoPath, today))
+          );
+          // A failed existence check leaves the day open so the next minute
+          // tick retries it; already-generated projects are skipped by their
+          // on-disk report, so the retry stays cheap.
+          if (done.every(Boolean)) set({ lastRunDate: today });
+        } finally {
+          set({ runInProgress: false });
+        }
       },
     }),
     {
