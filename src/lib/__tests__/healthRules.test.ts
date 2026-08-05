@@ -1,9 +1,8 @@
-import { describe, expect, it } from "vitest";
+﻿import { describe, expect, it } from "vitest";
 import {
   diffNewFlags,
   evaluateMemory,
   evaluateProcesses,
-  extractPathRefs,
   HEALTH_THRESHOLDS,
   processKey,
   type ProcessStreaks,
@@ -43,41 +42,6 @@ function proc(overrides: Partial<DevProcess> = {}): DevProcess {
     ...overrides,
   };
 }
-
-describe("extractPathRefs", () => {
-  it("accepts backtick-quoted repo-relative files with an extension", () => {
-    const body = "See `src/lib/memory.ts` and `docs/adr/0001-thing.md` for detail.";
-    expect(extractPathRefs(body).sort()).toEqual([
-      "docs/adr/0001-thing.md",
-      "src/lib/memory.ts",
-    ]);
-  });
-
-  it("ignores everything that is not clearly a repo path", () => {
-    const body = [
-      "url `https://example.com/a/b.html`",
-      "windows `src\\lib\\a.ts`",
-      "absolute `/etc/passwd.conf`, home `~/.ssh/config.txt`",
-      "traversal `../outside/a.ts`",
-      "glob `src/**/*.ts`, brace `src/{a,b}.ts`",
-      "spaces `my folder/a.ts`",
-      "branch `feat/health-checker`, media `application/json`",
-      "bare filename `package.json`",
-      "empty segment `src//a.ts`",
-    ].join("\n");
-    expect(extractPathRefs(body)).toEqual([]);
-  });
-
-  it("skips fenced code blocks and deduplicates", () => {
-    const body = "```\n`src/fenced.ts`\n```\n`src/a.ts` again `src/a.ts`";
-    expect(extractPathRefs(body)).toEqual(["src/a.ts"]);
-  });
-
-  it("caps the number of references taken from one file", () => {
-    const body = Array.from({ length: 100 }, (_, i) => `\`src/f${i}.ts\``).join(" ");
-    expect(extractPathRefs(body)).toHaveLength(HEALTH_THRESHOLDS.maxPathRefsPerFile);
-  });
-});
 
 describe("evaluateMemory", () => {
   it("stays silent on a healthy project", () => {
@@ -127,23 +91,6 @@ describe("evaluateMemory", () => {
     expect(evaluateMemory({ dirName: "P", files, now: NOW })).toEqual([]);
   });
 
-  it("flags files whose references are missing, summarising extras", () => {
-    const files = [file("a.md"), file("b.md")];
-    const flags = evaluateMemory({
-      dirName: "P",
-      files,
-      missingRefs: { "a.md": ["src/gone.ts", "src/also-gone.ts"] },
-      now: NOW,
-    });
-    expect(flags).toHaveLength(1);
-    expect(flags[0].target).toBe("a.md");
-    expect(flags[0].reason).toBe("references missing src/gone.ts +1 more");
-  });
-
-  it("raises no path flags when the repo root is unknown", () => {
-    const files = [file("a.md")];
-    expect(evaluateMemory({ dirName: "P", files, now: NOW })).toEqual([]);
-  });
 });
 
 describe("evaluateProcesses", () => {
@@ -158,7 +105,8 @@ describe("evaluateProcesses", () => {
     }
     const final = evaluateProcesses([hot], streaks);
     expect(final.flags).toHaveLength(1);
-    expect(final.flags[0].reason).toMatch(/^CPU >80% for \d+\+ min$/);
+    // Three samples span two intervals, not three: 6 minutes of evidence.
+    expect(final.flags[0].reason).toBe("CPU >80% for 6+ min");
   });
 
   it("resets the streak when a process drops below the threshold", () => {

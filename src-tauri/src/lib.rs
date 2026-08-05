@@ -412,8 +412,6 @@ pub fn run() {
             commands::memory::write_memory_file,
             commands::memory::delete_memory_file,
             commands::memory::delete_memory_project,
-            // Health checker (memory path references)
-            commands::health::check_paths_exist,
             // Font detection commands
             commands::fonts::get_available_fonts,
             commands::fonts::check_font_available,

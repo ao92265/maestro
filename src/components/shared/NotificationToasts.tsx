@@ -9,6 +9,16 @@ import { Toast, ToastStack } from "./Toast";
 const HEALTH_ACCENT = "rgb(var(--maestro-orange))";
 
 /**
+ * Hard cap on cards on screen at once, across both queues.
+ *
+ * The stores each keep up to 6, and a burst on both at the same moment would
+ * stack 12 cards ~870px tall — taller than the space above the status bar on
+ * a laptop, so the oldest would render off-screen with no way to reach them.
+ * Newest win; the rest stay queued and appear as these are dismissed.
+ */
+const MAX_VISIBLE_TOASTS = 5;
+
+/**
  * Every background notification Maestro raises, in one bottom-right stack:
  *
  * - GitHub watchdog: one card per newly-appeared review request / assigned
@@ -30,9 +40,14 @@ export function NotificationToasts() {
 
   if (watchdogToasts.length === 0 && healthToasts.length === 0) return null;
 
+  // Both queues are oldest-first, so trimming from the front keeps the newest.
+  // Split proportionally rather than letting one queue crowd the other out.
+  const healthShown = healthToasts.slice(-Math.ceil(MAX_VISIBLE_TOASTS / 2));
+  const watchdogShown = watchdogToasts.slice(-(MAX_VISIBLE_TOASTS - healthShown.length));
+
   return (
     <ToastStack>
-      {watchdogToasts.map((toast) => (
+      {watchdogShown.map((toast) => (
         <Toast
           key={toast.id}
           accentColor={projectColors.get(toast.projectName) ?? projectColorFor(toast.projectName)}
@@ -45,7 +60,7 @@ export function NotificationToasts() {
           onDismiss={() => dismissWatchdogToast(toast.id)}
         />
       ))}
-      {healthToasts.map((toast) => (
+      {healthShown.map((toast) => (
         <Toast
           key={toast.id}
           accentColor={HEALTH_ACCENT}

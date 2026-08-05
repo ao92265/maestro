@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+﻿import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 
 // The persisted stores hydrate through the Tauri store plugin at import time;
@@ -17,7 +17,7 @@ vi.mock("@tauri-apps/plugin-store", () => ({
 import { HEALTH_THRESHOLDS } from "../../lib/healthRules";
 import type { DevProcess } from "../../lib/processes";
 import { useGitHubWatchdogStore } from "../useGitHubWatchdogStore";
-import { countForArea, reasonsByRow, useHealthStore } from "../useHealthStore";
+import { countForArea, flagsByRow, useHealthStore } from "../useHealthStore";
 
 const invokeMock = vi.mocked(invoke);
 
@@ -43,15 +43,12 @@ function proc(overrides: Partial<DevProcess> = {}): DevProcess {
 }
 
 /**
- * Wires the four commands one check makes. `memoryFiles` is keyed by memory
- * dir; `bodies` by memory file rel path; `missing` is what the path probe
- * reports as absent.
+ * Wires the three commands one check makes. `memoryFiles` is keyed by memory
+ * dir; `fail` names a command that should throw.
  */
 function mockBackend({
   memoryProjects = [] as Array<{ dirName: string }>,
   memoryFiles = {} as Record<string, unknown[]>,
-  bodies = {} as Record<string, string>,
-  missing = [] as string[],
   processes = [] as DevProcess[],
   fail = null as null | string,
 } = {}) {
@@ -67,10 +64,6 @@ function mockBackend({
         }));
       case "list_memory_files":
         return memoryFiles[args?.dirName as string] ?? [];
-      case "read_memory_file":
-        return bodies[args?.relPath as string] ?? "";
-      case "check_paths_exist":
-        return missing;
       case "list_dev_processes":
         return processes;
       default:
@@ -104,8 +97,6 @@ function sprawlingProject() {
   };
 }
 
-const OPEN = [{ projectPath: APP_PATH }];
-
 describe("useHealthStore", () => {
   beforeEach(() => {
     invokeMock.mockReset();
@@ -113,6 +104,7 @@ describe("useHealthStore", () => {
       flags: [],
       streaks: {},
       baselineKeys: { memory: null, processes: null },
+      dismissedKeys: [],
       toasts: [],
       lastCheckedAt: null,
       isChecking: false,
@@ -122,7 +114,7 @@ describe("useHealthStore", () => {
 
   it("raises flags but no toasts on the first check", async () => {
     mockBackend(sprawlingProject());
-    await useHealthStore.getState().runCheck(OPEN);
+    await useHealthStore.getState().runCheck();
 
     const { flags, toasts, lastCheckedAt } = useHealthStore.getState();
     expect(countForArea(flags, "memory")).toBe(1);
@@ -132,14 +124,14 @@ describe("useHealthStore", () => {
 
   it("toasts only flags that are new since the previous check", async () => {
     mockBackend(sprawlingProject());
-    await useHealthStore.getState().runCheck(OPEN);
+    await useHealthStore.getState().runCheck();
 
     // Second check: same sprawl, plus a long-running process.
     mockBackend({
       ...sprawlingProject(),
       processes: [proc({ runTimeSecs: HEALTH_THRESHOLDS.runTimeSecs + 60 })],
     });
-    await useHealthStore.getState().runCheck(OPEN);
+    await useHealthStore.getState().runCheck();
 
     const { toasts } = useHealthStore.getState();
     expect(toasts).toHaveLength(1);
@@ -147,17 +139,17 @@ describe("useHealthStore", () => {
     expect(toasts[0].reason).toBe("running 24h");
 
     // Third check with unchanged data: no repeat toast.
-    await useHealthStore.getState().runCheck(OPEN);
+    await useHealthStore.getState().runCheck();
     expect(useHealthStore.getState().toasts).toHaveLength(1);
   });
 
   it("keeps badges but queues no toasts while notifications are off", async () => {
     useGitHubWatchdogStore.setState({ notificationsEnabled: false });
     mockBackend({ processes: [] });
-    await useHealthStore.getState().runCheck(OPEN);
+    await useHealthStore.getState().runCheck();
 
     mockBackend({ processes: [proc({ runTimeSecs: HEALTH_THRESHOLDS.runTimeSecs + 60 })] });
-    await useHealthStore.getState().runCheck(OPEN);
+    await useHealthStore.getState().runCheck();
 
     const { flags, toasts } = useHealthStore.getState();
     expect(countForArea(flags, "processes")).toBe(1);
@@ -166,38 +158,54 @@ describe("useHealthStore", () => {
 
   it("keeps the last-known flags of an area whose check failed", async () => {
     mockBackend(sprawlingProject());
-    await useHealthStore.getState().runCheck(OPEN);
+    await useHealthStore.getState().runCheck();
     expect(countForArea(useHealthStore.getState().flags, "memory")).toBe(1);
 
     mockBackend({ ...sprawlingProject(), fail: "list_memory_projects" });
-    await useHealthStore.getState().runCheck(OPEN);
+    await useHealthStore.getState().runCheck();
 
     // Badge survives the blip, and recovery does not re-toast the same flag.
     expect(countForArea(useHealthStore.getState().flags, "memory")).toBe(1);
     mockBackend(sprawlingProject());
-    await useHealthStore.getState().runCheck(OPEN);
+    await useHealthStore.getState().runCheck();
     expect(useHealthStore.getState().toasts).toEqual([]);
   });
 
-  it("checks path references only for projects open in Maestro", async () => {
+  it("never reads a memory file body â€” every rule works off the listing", async () => {
+    mockBackend(sprawlingProject());
+    await useHealthStore.getState().runCheck();
+
+    const commands = invokeMock.mock.calls.map(([cmd]) => cmd);
+    expect(commands).not.toContain("read_memory_file");
+    expect(commands).not.toContain("check_paths_exist");
+  });
+
+  it("hides a dismissed flag until it clears and comes back", async () => {
+    mockBackend(sprawlingProject());
+    await useHealthStore.getState().runCheck();
+    const key = useHealthStore.getState().flags[0].key;
+
+    useHealthStore.getState().dismissFlag(key);
+    expect(useHealthStore.getState().flags).toEqual([]);
+
+    // Still raised by the rules, still hidden â€” and no toast for it.
+    await useHealthStore.getState().runCheck();
+    expect(useHealthStore.getState().flags).toEqual([]);
+    expect(useHealthStore.getState().toasts).toEqual([]);
+
+    // The project is pruned back under the threshold: flag clears, and so
+    // does the dismissal.
     mockBackend({
-      memoryProjects: [{ dirName: APP_DIR }, { dirName: "C--git-other" }],
-      memoryFiles: { [APP_DIR]: [memFile("a.md")], "C--git-other": [memFile("b.md")] },
-      bodies: { "a.md": "see `src/gone.ts`", "b.md": "see `src/also.ts`" },
-      missing: ["src/gone.ts"],
+      memoryProjects: [{ dirName: APP_DIR }],
+      memoryFiles: { [APP_DIR]: [memFile("a.md")] },
     });
-    await useHealthStore.getState().runCheck(OPEN);
+    await useHealthStore.getState().runCheck();
+    expect(useHealthStore.getState().dismissedKeys).toEqual([]);
 
-    const { flags } = useHealthStore.getState();
-    expect(flags).toHaveLength(1);
-    expect(flags[0].scope).toBe(APP_DIR);
-    expect(flags[0].reason).toBe("references missing src/gone.ts");
-
-    // The unopened project's files are never read — its repo root is unknown.
-    const readPaths = invokeMock.mock.calls
-      .filter(([cmd]) => cmd === "read_memory_file")
-      .map(([, args]) => (args as { relPath: string }).relPath);
-    expect(readPaths).toEqual(["a.md"]);
+    // Sprawls again: shown again.
+    mockBackend(sprawlingProject());
+    await useHealthStore.getState().runCheck();
+    expect(countForArea(useHealthStore.getState().flags, "memory")).toBe(1);
   });
 
   it("exposes reasons keyed by scope and target for inline highlighting", async () => {
@@ -205,19 +213,25 @@ describe("useHealthStore", () => {
       ...sprawlingProject(),
       processes: [proc({ runTimeSecs: HEALTH_THRESHOLDS.runTimeSecs + 60 })],
     });
-    await useHealthStore.getState().runCheck(OPEN);
+    await useHealthStore.getState().runCheck();
 
     const { flags } = useHealthStore.getState();
-    expect(reasonsByRow(flags, "memory").get(`${APP_DIR}|${APP_DIR}`)).toEqual([
-      `${HEALTH_THRESHOLDS.maxFactFiles + 1} facts`,
-    ]);
-    expect(reasonsByRow(flags, "processes").get("100:node|vite")).toEqual(["running 24h"]);
+    expect(
+      flagsByRow(flags, "memory")
+        .get(`${APP_DIR}|${APP_DIR}`)
+        ?.map((f) => f.reason),
+    ).toEqual([`${HEALTH_THRESHOLDS.maxFactFiles + 1} facts`]);
+    expect(
+      flagsByRow(flags, "processes")
+        .get("100:node|vite")
+        ?.map((f) => f.reason),
+    ).toEqual(["running 24h"]);
   });
 
   it("ignores a re-entrant check while one is in flight", async () => {
     mockBackend(sprawlingProject());
-    const first = useHealthStore.getState().runCheck(OPEN);
-    await useHealthStore.getState().runCheck(OPEN);
+    const first = useHealthStore.getState().runCheck();
+    await useHealthStore.getState().runCheck();
     await first;
     const projectListCalls = invokeMock.mock.calls.filter(
       ([cmd]) => cmd === "list_memory_projects",

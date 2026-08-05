@@ -1,14 +1,17 @@
 /**
  * Rule-based health checks for project memory files and watched processes.
  *
- * Pure rules — no AI, no network, no side effects. Everything here is a
- * function of data Maestro already fetches (`lib/memory.ts`, `lib/processes.ts`)
- * plus a batch path-existence probe (`check_paths_exist`). The checker never
- * deletes a file or kills a process; it only produces {@link HealthFlag}s that
- * the UI renders as an attention badge plus a one-line reason.
+ * Pure rules — no AI, no network, no side effects, and no backend of their
+ * own: every input is data Maestro already fetches (`lib/memory.ts`,
+ * `lib/processes.ts`). The checker never deletes a file or kills a process; it
+ * only produces {@link HealthFlag}s that the UI renders as an attention badge
+ * plus a one-line reason.
  *
- * Design bias: **false positives are worse than misses.** Every rule below
- * errs towards staying silent when the data is ambiguous.
+ * Design bias: **false positives are worse than misses.** Every rule here is
+ * a threshold on something the OS states outright — a count, a size, an mtime,
+ * a CPU share — rather than an inference about meaning. One rule that tried to
+ * infer was measured against real data and removed; see the note below it, and
+ * hold anything new to the same bar.
  */
 
 import type { MemoryFile } from "@/lib/memory";
@@ -45,6 +48,14 @@ export const HEALTH_THRESHOLDS = {
   /**
    * Sustained CPU share of the whole machine (`DevProcess.cpuPercent` is
    * already normalized 0-100 across all cores).
+   *
+   * Caveat worth knowing: `cpuPercent` is the average since the shared
+   * `ProcessScanState` was last refreshed by *any* caller. With the Processes
+   * panel closed that is this checker's own interval — a clean multi-minute
+   * average. With the panel open it polls every 3 seconds, so each of our
+   * samples measures only the ~3 seconds before it. The consecutive-sample
+   * requirement is what makes the rule survive that: N short windows spread
+   * across N intervals still means the load was there each time we looked.
    */
   cpuPercent: 80,
 
@@ -63,12 +74,6 @@ export const HEALTH_THRESHOLDS = {
    * server rather than something actively in use. 24 hours, in seconds.
    */
   runTimeSecs: 24 * 60 * 60,
-
-  /**
-   * Upper bound on path references extracted from one memory file. Guards a
-   * pathological file from turning one check into thousands of stat calls.
-   */
-  maxPathRefsPerFile: 40,
 } as const;
 
 /** How often the background checker runs. Quiet by design — this is not a monitor. */
@@ -111,52 +116,45 @@ export interface MemoryCheckInput {
   /** Encoded project dir under ~/.claude/projects (e.g. "C--git-maestro"). */
   dirName: string;
   files: MemoryFile[];
-  /**
-   * Repo-relative paths, per memory file, that were confirmed missing from
-   * that project's repo. Empty/absent when the repo root is unknown (the
-   * project is not open in Maestro) — the rule then simply does not fire.
-   */
-  missingRefs?: Record<string, string[]>;
   /** Evaluation time, injected so tests are deterministic. */
   now: number;
 }
 
-/**
- * Backtick-quoted repo-relative file paths referenced in a memory file body.
+/*
+ * ── Dropped rule: "memory file references repo paths that no longer exist" ──
  *
- * Memory files are prose with inline code spans, and only a narrow slice of
- * those spans are checkable file paths. A candidate must:
+ * Shipped, measured against the user's real 24-file memory corpus, and
+ * REMOVED. Do not reinstate it in this form.
  *
- * - be inside single backticks;
- * - contain a `/` (bare filenames are too ambiguous to attribute to a repo);
- * - contain no whitespace (rules out commands, sentences, "and / or");
- * - contain no `\` or `:` (Windows paths, `http://`, `note: x`);
- * - contain no glob/brace/wildcard characters;
- * - not be absolute (`/x`, `~/x`) or contain `..`;
- * - end in a file extension — 1-5 alphanumerics after a final dot.
+ * v1 (backtick-quoted, must have a file extension) raised 7 flags: 0 true.
+ * All were module shorthand — `commands/memory.rs`, `lib/processes.ts` — for
+ * files that exist, just deeper in the tree. That is simply how people write
+ * about a codebase, and it is indistinguishable from a repo-root-relative
+ * path without knowing what is at the root.
  *
- * The extension requirement is what makes the rule safe: it drops branch names
- * (`feat/health-checker`), media types (`application/json`), dates and
- * `n/a`-style slashes, at the cost of missing directory references. That
- * trade is deliberate.
+ * v2 added a repo-root top-level gate plus build/dependency/dotfolder
+ * exclusions. That killed all 7, and left 1 flag: still 0 true. The survivor
+ * was a note whose own first line reads "built on branch `featGraph`" —
+ * the file exists on that branch, not on the checked-out one.
+ *
+ * That last class is structural, and it is not alone. A memory file records
+ * work done on a branch; the working tree is one branch. Memory also exists
+ * partly to record deletions ("we removed X"), which would flag forever and
+ * could only be silenced by editing the memory. Add gitignored files and
+ * build artifacts and the rule has four independent ways to be wrong and, on
+ * real data, none to be right. The user's standing instruction is that false
+ * positives are worse than misses.
+ *
+ * The only version that could work would ask git, not the filesystem: flag a
+ * path that exists in neither the working tree NOR anywhere in history on any
+ * branch, which is the "typo or invented path" case rather than the "stale
+ * note" case. That is a different rule with a different meaning and a real
+ * implementation cost, and it should only be built if someone can show it
+ * finds something.
+ *
+ * Removing this also removed the checker's entire Rust surface and every
+ * `read_memory_file` call it made per tick.
  */
-export function extractPathRefs(body: string): string[] {
-  const refs = new Set<string>();
-  // Single-backtick spans only; ``` fenced blocks are code samples, not
-  // references to this repo's files.
-  const withoutFences = body.replace(/```[\s\S]*?```/g, "");
-  for (const match of withoutFences.matchAll(/`([^`\n]+)`/g)) {
-    const candidate = match[1].trim();
-    if (!candidate.includes("/")) continue;
-    if (/[\s\\:*?[\]{}()<>|"'`]/.test(candidate)) continue;
-    if (candidate.startsWith("/") || candidate.startsWith("~")) continue;
-    if (candidate.split("/").some((seg) => seg === "" || seg === "." || seg === "..")) continue;
-    if (!/\.[A-Za-z0-9]{1,5}$/.test(candidate)) continue;
-    refs.add(candidate);
-    if (refs.size >= HEALTH_THRESHOLDS.maxPathRefsPerFile) break;
-  }
-  return [...refs];
-}
 
 /** Whole-days elapsed since an RFC 3339 timestamp; null when unparseable. */
 function daysSince(modified: string | null, now: number): number | null {
@@ -167,21 +165,20 @@ function daysSince(modified: string | null, now: number): number | null {
 }
 
 /**
- * Evaluates the four memory rules for one project:
+ * Evaluates the memory rules for one project:
  *
  * 1. more than {@link HEALTH_THRESHOLDS.maxFactFiles} fact files;
  * 2. MEMORY.md larger than {@link HEALTH_THRESHOLDS.maxIndexBytes};
- * 3. a fact file untouched for {@link HEALTH_THRESHOLDS.staleFactDays};
- * 4. a fact file referencing repo-relative paths that no longer exist.
+ * 3. a fact file untouched for {@link HEALTH_THRESHOLDS.staleFactDays}.
  *
- * Rules 3 and 4 flag the individual file; 1 and 2 flag the project.
+ * All three are thresholds on facts the filesystem states directly — a count,
+ * a size, an mtime — which is why they survive contact with real data. A
+ * fourth rule that tried to *infer* staleness from the file's prose was
+ * dropped; see the note above.
+ *
+ * Rule 3 flags the individual file, 1 flags the project, 2 flags the index.
  */
-export function evaluateMemory({
-  dirName,
-  files,
-  missingRefs = {},
-  now,
-}: MemoryCheckInput): HealthFlag[] {
+export function evaluateMemory({ dirName, files, now }: MemoryCheckInput): HealthFlag[] {
   const flags: HealthFlag[] = [];
   const facts = files.filter((f) => !f.isIndex);
 
@@ -217,19 +214,6 @@ export function evaluateMemory({
         reason: `not touched in ${Math.floor(age / 30)} months`,
       });
     }
-  }
-
-  for (const file of files) {
-    const missing = missingRefs[file.relPath];
-    if (!missing || missing.length === 0) continue;
-    const extra = missing.length > 1 ? ` +${missing.length - 1} more` : "";
-    flags.push({
-      key: `memory:${dirName}:${file.relPath}:missing-paths`,
-      area: "memory",
-      scope: dirName,
-      target: file.relPath,
-      reason: `references missing ${missing[0]}${extra}`,
-    });
   }
 
   return flags;
@@ -285,11 +269,14 @@ export function evaluateProcesses(
     const mem = p.memoryBytes > HEALTH_THRESHOLDS.memoryBytes ? before.mem + 1 : 0;
     streaks[key] = { cpu, mem };
 
-    // Sustained-load minutes, derived from the sample count rather than
-    // guessed, so the copy stays honest if the interval changes.
-    const sustainedMin = Math.round(
-      (cpu * HEALTH_CHECK_INTERVAL_MS) / 60_000,
-    );
+    // Elapsed time the streak actually covers: N samples span N-1 intervals
+    // (three samples at t=0/3/6 min is 6 minutes of evidence, not 9). Derived
+    // from the sample count so the copy stays honest if the interval changes.
+    //
+    // This is the span between the first and last over-threshold sample. What
+    // each individual sample measures is a separate question — see the
+    // `cpuPercent` threshold docs.
+    const sustainedMin = Math.round(((cpu - 1) * HEALTH_CHECK_INTERVAL_MS) / 60_000);
 
     if (cpu >= HEALTH_THRESHOLDS.consecutiveSamples) {
       flags.push({

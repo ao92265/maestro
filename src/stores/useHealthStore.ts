@@ -3,19 +3,11 @@ import {
   diffNewFlags,
   evaluateMemory,
   evaluateProcesses,
-  extractPathRefs,
   type HealthArea,
   type HealthFlag,
   type ProcessStreaks,
 } from "@/lib/healthRules";
-import {
-  checkPathsExist,
-  encodeProjectDirName,
-  listMemoryFiles,
-  listMemoryProjects,
-  readMemoryFile,
-  type MemoryFile,
-} from "@/lib/memory";
+import { listMemoryFiles, listMemoryProjects } from "@/lib/memory";
 import { listDevProcesses } from "@/lib/processes";
 import { useGitHubWatchdogStore } from "@/stores/useGitHubWatchdogStore";
 import { useProcessWatchlistStore } from "@/stores/useProcessWatchlistStore";
@@ -39,15 +31,8 @@ export interface HealthToast {
   reason: string;
 }
 
-/** Keep at most this many queued toasts; oldest are dropped first. */
+/** Keep at most this many queued toasts per source; oldest are dropped first. */
 const MAX_TOASTS = 6;
-
-/**
- * Memory files whose body is read for path references, per project. Bounds
- * the IPC cost of one check; projects with more facts get their oldest-sorted
- * tail skipped rather than the whole rule being abandoned.
- */
-const MAX_FILES_SCANNED_PER_PROJECT = 60;
 
 type HealthState = {
   flags: HealthFlag[];
@@ -59,6 +44,12 @@ type HealthState = {
    * toasting every pre-existing problem.
    */
   baselineKeys: Record<HealthArea, string[] | null>;
+  /**
+   * Flag keys the user has waved off. Kept in memory only (a restart brings
+   * them back), and pruned to the keys still being raised so a flag that
+   * clears and later returns is shown again.
+   */
+  dismissedKeys: string[];
   toasts: HealthToast[];
   lastCheckedAt: number | null;
   isChecking: boolean;
@@ -66,11 +57,13 @@ type HealthState = {
 
 type HealthActions = {
   /**
-   * Runs one full check. `projects` are the repos open in Maestro — only
-   * those can have their memory path references verified, since a memory
-   * directory name cannot be decoded back into a filesystem path.
+   * Runs one full check across every project with saved memory and every
+   * watched process. Takes no arguments: the rules read only the memory
+   * directories and the process table, never the open workspace.
    */
-  runCheck: (projects: Array<{ projectPath: string }>) => Promise<void>;
+  runCheck: () => Promise<void>;
+  /** Hides one flag until it clears and comes back. Never touches a file. */
+  dismissFlag: (key: string) => void;
   dismissToast: (id: string) => void;
   /** Clears the queue outright — used when notifications are switched off. */
   dismissAllToasts: () => void;
@@ -78,85 +71,62 @@ type HealthActions = {
 
 let toastSeq = 0;
 
-/** Per-project memory scan; throws so the caller can keep the last-known flags. */
-async function checkMemory(
-  repoByDirName: Map<string, string>,
-  now: number,
-): Promise<HealthFlag[]> {
+/**
+ * Per-project memory scan; throws so the caller can keep the last-known flags.
+ *
+ * Two IPC calls plus one per project with saved memory, and no file bodies are
+ * read: every surviving rule works off the listing `list_memory_files` already
+ * returns (count, size, mtime).
+ */
+async function checkMemory(now: number): Promise<HealthFlag[]> {
   const projects = await listMemoryProjects("");
   const flags: HealthFlag[] = [];
-
   for (const project of projects) {
     const files = await listMemoryFiles(project.dirName);
-    const repoPath = repoByDirName.get(project.dirName);
-    const missingRefs = repoPath
-      ? await missingPathRefs(project.dirName, files, repoPath)
-      : undefined;
-    flags.push(...evaluateMemory({ dirName: project.dirName, files, missingRefs, now }));
+    flags.push(...evaluateMemory({ dirName: project.dirName, files, now }));
   }
   return flags;
-}
-
-/**
- * Reads each memory file, extracts its backtick-quoted repo-relative path
- * references and returns, per file, the ones that no longer exist in the repo.
- * One existence probe per project rather than per file.
- */
-async function missingPathRefs(
-  dirName: string,
-  files: MemoryFile[],
-  repoPath: string,
-): Promise<Record<string, string[]>> {
-  const refsByFile = new Map<string, string[]>();
-  const allRefs = new Set<string>();
-
-  for (const file of files.slice(0, MAX_FILES_SCANNED_PER_PROJECT)) {
-    const body = await readMemoryFile(dirName, file.relPath).catch(() => "");
-    const refs = extractPathRefs(body);
-    if (refs.length === 0) continue;
-    refsByFile.set(file.relPath, refs);
-    for (const ref of refs) allRefs.add(ref);
-  }
-  if (allRefs.size === 0) return {};
-
-  const missing = new Set(await checkPathsExist(repoPath, [...allRefs]));
-  const result: Record<string, string[]> = {};
-  for (const [relPath, refs] of refsByFile) {
-    const gone = refs.filter((ref) => missing.has(ref));
-    if (gone.length > 0) result[relPath] = gone;
-  }
-  return result;
 }
 
 export const useHealthStore = create<HealthState & HealthActions>()((set, get) => ({
   flags: [],
   streaks: {},
   baselineKeys: { memory: null, processes: null },
+  dismissedKeys: [],
   toasts: [],
   lastCheckedAt: null,
   isChecking: false,
 
-  runCheck: async (projects) => {
+  runCheck: async () => {
     if (get().isChecking) return;
     set({ isChecking: true });
     try {
       const now = Date.now();
-      const repoByDirName = new Map(
-        projects
-          .filter((p) => p.projectPath)
-          .map((p) => [encodeProjectDirName(p.projectPath), p.projectPath] as const),
-      );
-
-      const { flags: prevFlags, streaks: prevStreaks, baselineKeys, toasts } = get();
+      const {
+        flags: prevFlags,
+        streaks: prevStreaks,
+        baselineKeys,
+        dismissedKeys,
+        toasts,
+      } = get();
 
       // Areas are checked independently: a failing one keeps its last-known
       // flags and its baseline, so a transient error neither clears the badge
       // nor re-toasts everything on recovery.
-      const memoryFlags = await checkMemory(repoByDirName, now).catch((err) => {
+      const memoryFlags = await checkMemory(now).catch((err) => {
         console.error("Health check (memory) failed:", err);
         return null;
       });
 
+      // Deliberate cost note: this enumerates the whole process table (and
+      // shells out for listening ports) once per interval even with the
+      // Processes panel closed — roughly 20 scans an hour, against the 1200
+      // that panel does per hour while open. Reusing the panel's samples was
+      // rejected: they only exist while it is open and focused, which would
+      // make a "sustained load" streak depend on whether you happened to be
+      // looking. The shared `ProcessScanState` refresh does perturb one of
+      // the panel's CPU deltas per interval; that is the price of a single
+      // shared probe, and it is documented on the `cpuPercent` threshold.
       const watchlist = useProcessWatchlistStore.getState().watchlist;
       const processResult = await listDevProcesses(watchlist)
         .then((processes) => evaluateProcesses(processes, prevStreaks))
@@ -178,31 +148,49 @@ export const useHealthStore = create<HealthState & HealthActions>()((set, get) =
       }
 
       const keep = (area: HealthArea) => prevFlags.filter((f) => f.area === area);
-      const flags = [
+      const raised = [
         ...(memoryFlags ?? keep("memory")),
         ...(processResult?.flags ?? keep("processes")),
       ];
 
+      // Dismissals only hide what is currently raised; pruning them here is
+      // what lets a flag that clears and later returns show up again.
+      const raisedKeys = new Set(raised.map((f) => f.key));
+      const nextDismissed = dismissedKeys.filter((key) => raisedKeys.has(key));
+      const dismissed = new Set(nextDismissed);
+
       const notificationsEnabled = useGitHubWatchdogStore.getState().notificationsEnabled;
       const queued: HealthToast[] = notificationsEnabled
-        ? newFlags.map((flag) => ({
-            id: `health-${++toastSeq}`,
-            area: flag.area,
-            target: flag.target,
-            reason: flag.reason,
-          }))
+        ? newFlags
+            .filter((flag) => !dismissed.has(flag.key))
+            .map((flag) => ({
+              id: `health-${++toastSeq}`,
+              area: flag.area,
+              target: flag.target,
+              reason: flag.reason,
+            }))
         : [];
 
       set({
-        flags,
+        flags: raised.filter((flag) => !dismissed.has(flag.key)),
         streaks: processResult?.streaks ?? prevStreaks,
         baselineKeys: nextBaseline,
+        dismissedKeys: nextDismissed,
         toasts: [...toasts, ...queued].slice(-MAX_TOASTS),
         lastCheckedAt: now,
       });
     } finally {
       set({ isChecking: false });
     }
+  },
+
+  dismissFlag: (key) => {
+    const { flags, dismissedKeys } = get();
+    if (dismissedKeys.includes(key)) return;
+    set({
+      dismissedKeys: [...dismissedKeys, key],
+      flags: flags.filter((f) => f.key !== key),
+    });
   },
 
   dismissToast: (id) => {
@@ -213,20 +201,20 @@ export const useHealthStore = create<HealthState & HealthActions>()((set, get) =
 }));
 
 /**
- * Reasons for one area, keyed `scope|target` — the identity a section row can
+ * Flags for one area, keyed `scope|target` — the identity a section row can
  * reconstruct (memory: `dirName|relPath`; processes: `pid:name|matched`).
- * Rows carry one line per reason.
+ * Whole flags rather than bare reasons, so a row can also offer to dismiss one.
  */
-export function reasonsByRow(flags: HealthFlag[], area: HealthArea): Map<string, string[]> {
-  const map = new Map<string, string[]>();
+export function flagsByRow(flags: HealthFlag[], area: HealthArea): Map<string, HealthFlag[]> {
+  const map = new Map<string, HealthFlag[]>();
   for (const flag of flags) {
     if (flag.area !== area) continue;
     const rowKey = `${flag.scope}|${flag.target}`;
     const list = map.get(rowKey);
     if (list) {
-      list.push(flag.reason);
+      list.push(flag);
     } else {
-      map.set(rowKey, [flag.reason]);
+      map.set(rowKey, [flag]);
     }
   }
   return map;

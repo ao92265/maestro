@@ -26,22 +26,10 @@ import {
   readMemoryFile,
   writeMemoryFile,
 } from "@/lib/memory";
-import { reasonsByRow, useHealthStore } from "@/stores/useHealthStore";
+import { HealthReasonLines } from "@/components/shared/HealthReasonLines";
+import { flagsByRow, useHealthStore } from "@/stores/useHealthStore";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { cardClass, SectionHeader } from "./sectionChrome";
-
-/** One-line health reasons under a flagged memory row (never an action). */
-function HealthReasons({ reasons }: { reasons: string[] }) {
-  return (
-    <>
-      {reasons.map((reason) => (
-        <span key={reason} className="block truncate text-[10px] text-maestro-orange">
-          {reason}
-        </span>
-      ))}
-    </>
-  );
-}
 
 /** Badge styling per memory type (frontmatter `type:`). */
 const TYPE_BADGES: Record<string, string> = {
@@ -200,7 +188,7 @@ export function MemorySection() {
 
   /* ── Health checker flags (rule-based, read-only) ── */
   const healthFlags = useHealthStore((s) => s.flags);
-  const healthReasons = useMemo(() => reasonsByRow(healthFlags, "memory"), [healthFlags]);
+  const healthRows = useMemo(() => flagsByRow(healthFlags, "memory"), [healthFlags]);
 
   return (
     <>
@@ -283,7 +271,7 @@ export function MemorySection() {
             {projects.map((project) => {
               const expanded = expandedDirs.has(project.dirName);
               const files = filesByDir[project.dirName];
-              const projectReasons = healthReasons.get(`${project.dirName}|${project.dirName}`);
+              const projectReasons = healthRows.get(`${project.dirName}|${project.dirName}`);
               return (
                 <div key={project.dirName}>
                   <div
@@ -332,7 +320,7 @@ export function MemorySection() {
 
                   {projectReasons && (
                     <div className="pb-0.5 pl-5 pr-1">
-                      <HealthReasons reasons={projectReasons} />
+                      <HealthReasonLines flags={projectReasons} />
                     </div>
                   )}
 
@@ -345,12 +333,10 @@ export function MemorySection() {
                       ) : (
                         files.map((file) => {
                           const badgeCls = file.memType ? TYPE_BADGES[file.memType] : undefined;
-                          const fileReasons = healthReasons.get(
-                            `${project.dirName}|${file.relPath}`,
-                          );
+                          const fileReasons = healthRows.get(`${project.dirName}|${file.relPath}`);
                           return (
+                            <div key={file.relPath}>
                             <div
-                              key={file.relPath}
                               className={`group flex items-center gap-1.5 rounded-md px-1 py-0.5 hover:bg-maestro-border/40 ${
                                 fileReasons ? "bg-maestro-orange/5" : ""
                               }`}
@@ -376,7 +362,6 @@ export function MemorySection() {
                                       {file.description}
                                     </span>
                                   )}
-                                  {fileReasons && <HealthReasons reasons={fileReasons} />}
                                 </span>
                               </button>
                               {file.isIndex ? (
@@ -400,6 +385,12 @@ export function MemorySection() {
                               >
                                 <Trash2 size={10} className="text-maestro-red" />
                               </button>
+                            </div>
+                            {fileReasons && (
+                              <div className="pb-0.5 pl-5 pr-1">
+                                <HealthReasonLines flags={fileReasons} />
+                              </div>
+                            )}
                             </div>
                           );
                         })

@@ -18,9 +18,10 @@ import {
   type DevProcess,
   type DockerContainer,
 } from "@/lib/processes";
-import { processKey } from "@/lib/healthRules";
+import { HealthReasonLines } from "@/components/shared/HealthReasonLines";
+import { processKey, type HealthFlag } from "@/lib/healthRules";
 import { assessStaleness } from "@/lib/staleProcess";
-import { reasonsByRow, useHealthStore } from "@/stores/useHealthStore";
+import { flagsByRow, useHealthStore } from "@/stores/useHealthStore";
 import {
   DEFAULT_WATCHLIST,
   useProcessWatchlistStore,
@@ -163,17 +164,17 @@ export function ProcessesSection() {
   // Health checker flags, resolved per PID. A group inherits every flag raised
   // against any of its processes (the rows are grouped, the rules are not).
   const healthFlags = useHealthStore((s) => s.flags);
-  const healthReasons = useMemo(() => reasonsByRow(healthFlags, "processes"), [healthFlags]);
-  const reasonsForProcess = useCallback(
-    (p: DevProcess) => healthReasons.get(`${processKey(p)}|${p.matched}`),
-    [healthReasons],
+  const healthRows = useMemo(() => flagsByRow(healthFlags, "processes"), [healthFlags]);
+  const flagsForProcess = useCallback(
+    (p: DevProcess) => healthRows.get(`${processKey(p)}|${p.matched}`),
+    [healthRows],
   );
-  const reasonsForGroup = useCallback(
-    (g: ProcessGroup) => {
-      const reasons = g.procs.flatMap((p) => reasonsForProcess(p) ?? []);
-      return reasons.length > 0 ? [...new Set(reasons)] : undefined;
+  const flagsForGroup = useCallback(
+    (g: ProcessGroup): HealthFlag[] | undefined => {
+      const groupFlags = g.procs.flatMap((p) => flagsForProcess(p) ?? []);
+      return groupFlags.length > 0 ? groupFlags : undefined;
     },
-    [reasonsForProcess],
+    [flagsForProcess],
   );
 
   // One confirm dialog per target: guards double-clicks on kill buttons.
@@ -334,7 +335,7 @@ export function ProcessesSection() {
                 const groupExpanded = expandedGroups.has(group.key);
                 const repo = dirBasename(group.cwd);
                 const isStale = stale.level === "stale";
-                const groupReasons = reasonsForGroup(group);
+                const groupReasons = flagsForGroup(group);
                 return (
                   <div key={group.key}>
                     <div
@@ -387,14 +388,7 @@ export function ProcessesSection() {
                             {group.cmd || group.procs[0].name}
                           </span>
                         )}
-                        {groupReasons?.map((reason) => (
-                          <span
-                            key={reason}
-                            className="block truncate text-[10px] text-maestro-orange"
-                          >
-                            {reason}
-                          </span>
-                        ))}
+                        {groupReasons && <HealthReasonLines flags={groupReasons} />}
                       </span>
                       <span className="shrink-0 text-[10px] tabular-nums text-maestro-muted">
                         {formatMem(group.memoryBytes)}
@@ -422,7 +416,7 @@ export function ProcessesSection() {
                           <div
                             key={p.pid}
                             className={`group flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-maestro-border/30 ${
-                              reasonsForProcess(p) ? "bg-maestro-orange/5" : ""
+                              flagsForProcess(p) ? "bg-maestro-orange/5" : ""
                             }`}
                             title={p.cmd}
                           >
@@ -430,14 +424,9 @@ export function ProcessesSection() {
                               <span className="block truncate text-[11px] text-maestro-text/80">
                                 PID {p.pid}
                               </span>
-                              {reasonsForProcess(p)?.map((reason) => (
-                                <span
-                                  key={reason}
-                                  className="block truncate text-[10px] text-maestro-orange"
-                                >
-                                  {reason}
-                                </span>
-                              ))}
+                              {flagsForProcess(p) && (
+                                <HealthReasonLines flags={flagsForProcess(p) ?? []} />
+                              )}
                             </span>
                             {p.isMaestro && maestroBadge}
                             {portChips(p.ports)}

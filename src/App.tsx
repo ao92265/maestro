@@ -278,17 +278,13 @@ function App() {
   }, [watchedProjectsJson]);
 
   // Health checker: rule-based memory/process checks on a quiet interval.
-  // Reads the open tabs at tick time (like the standup scheduler) so tab
-  // churn never restarts the interval and never resets the CPU/RAM streaks.
+  // Independent of the open tabs — it scans every project with saved memory
+  // and the whole watched process table — so nothing here restarts the
+  // interval or resets the CPU/RAM streaks.
   useEffect(() => {
-    const tick = () => {
-      const openTabs = useWorkspaceStore.getState().tabs;
-      void useHealthStore.getState().runCheck(
-        openTabs.map((t) => ({ projectPath: t.selectedRepoPath ?? t.projectPath })),
-      );
-    };
-    tick();
-    const interval = setInterval(tick, HEALTH_CHECK_INTERVAL_MS);
+    const runCheck = () => void useHealthStore.getState().runCheck();
+    runCheck();
+    const interval = setInterval(runCheck, HEALTH_CHECK_INTERVAL_MS);
     return () => clearInterval(interval);
   }, []);
 
