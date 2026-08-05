@@ -1,11 +1,12 @@
 import { Bell } from "lucide-react";
 import { useGitHubWatchdogStore } from "@/stores/useGitHubWatchdogStore";
+import { useHealthStore } from "@/stores/useHealthStore";
 import { cardClass, SectionHeader } from "./sectionChrome";
 
 function formatTimeAgo(timestamp: number | null): string {
-  if (!timestamp) return "Never";
+  if (!timestamp) return "never";
   const seconds = Math.floor((Date.now() - timestamp) / 1000);
-  if (seconds < 60) return "Just now";
+  if (seconds < 60) return "just now";
   const minutes = Math.floor(seconds / 60);
   if (minutes < 60) return `${minutes}m ago`;
   const hours = Math.floor(minutes / 60);
@@ -15,38 +16,42 @@ function formatTimeAgo(timestamp: number | null): string {
 }
 
 /**
- * Sidebar settings card for the GitHub watchdog (follows the
- * UpdateSettingsSection pattern). The toggle mutes toast notifications only:
- * polling and the top-bar badge keep working either way.
+ * Sidebar settings card for every background notification Maestro raises
+ * (follows the UpdateSettingsSection pattern).
+ *
+ * One toggle covers both notifying watchers — the GitHub watchdog and the
+ * memory/process health checker. It mutes toasts only: both keep polling, and
+ * their badges (top-bar totals, Memory/Processes attention counts) stay on
+ * either way, so nothing is ever silently missed.
  */
-export function GitHubSettingsSection() {
+export function NotificationsSettingsSection() {
   const notificationsEnabled = useGitHubWatchdogStore((s) => s.notificationsEnabled);
   const setNotificationsEnabled = useGitHubWatchdogStore((s) => s.setNotificationsEnabled);
   const status = useGitHubWatchdogStore((s) => s.status);
   const lastPolledAt = useGitHubWatchdogStore((s) => s.lastPolledAt);
+  const lastCheckedAt = useHealthStore((s) => s.lastCheckedAt);
+  const dismissHealthToasts = useHealthStore((s) => s.dismissAllToasts);
+
+  const handleToggle = () => {
+    const next = !notificationsEnabled;
+    setNotificationsEnabled(next);
+    // Muting clears what is already on screen, for both queues.
+    if (!next) dismissHealthToasts();
+  };
 
   return (
     <div className={cardClass}>
-      <SectionHeader
-        icon={Bell}
-        label="GitHub"
-        iconColor="text-maestro-accent"
-        right={
-          <span className="text-[10px] normal-case tracking-normal text-maestro-muted">
-            {formatTimeAgo(lastPolledAt)}
-          </span>
-        }
-      />
+      <SectionHeader icon={Bell} label="Notifications" iconColor="text-maestro-accent" />
 
       <div className="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs text-maestro-text hover:bg-maestro-border/40">
-        <span className="flex-1">GitHub notifications</span>
+        <span className="flex-1">Show notifications</span>
         <button
           type="button"
-          onClick={() => setNotificationsEnabled(!notificationsEnabled)}
+          onClick={handleToggle}
           className={`relative h-4 w-7 rounded-full transition-colors ${
             notificationsEnabled ? "bg-maestro-accent" : "bg-maestro-border"
           }`}
-          aria-label="Toggle GitHub notifications"
+          aria-label="Toggle notifications"
         >
           <span
             className={`absolute top-0.5 h-3 w-3 rounded-full bg-white transition-transform ${
@@ -57,8 +62,13 @@ export function GitHubSettingsSection() {
       </div>
 
       <p className="px-2 pt-0.5 text-[10px] text-maestro-muted/70">
-        Toasts for new review requests and assigned issues. The top-bar badge
-        stays on either way.
+        Toasts for new review requests, assigned issues, and memory/process
+        health flags. Badges stay on either way.
+      </p>
+
+      <p className="px-2 pt-1 text-[10px] text-maestro-muted">
+        GitHub checked {formatTimeAgo(lastPolledAt)} · health checked{" "}
+        {formatTimeAgo(lastCheckedAt)}
       </p>
 
       {status === "gh-missing" && (

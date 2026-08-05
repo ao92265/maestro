@@ -17,6 +17,7 @@ import { isMac } from "@/lib/platform";
 import { modLabel, titleWithShortcut } from "@/lib/shortcuts";
 import { MAX_SESSIONS } from "@/components/terminal/splitTree";
 import { GitHubWatchdogBadge } from "./GitHubWatchdogBadge";
+import { HealthAttentionBadge } from "./HealthAttentionBadge";
 
 /** One entry of the eagle-view "add terminal" project dropdown. */
 export interface EagleProjectOption {
@@ -224,7 +225,7 @@ export function TopBar({
           <button
             type="button"
             onClick={onToggleMemoryPanel}
-            className={`rounded p-1.5 transition-colors ${
+            className={`relative rounded p-1.5 transition-colors ${
               memoryPanelOpen
                 ? "text-maestro-accent hover:bg-maestro-accent/10"
                 : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
@@ -233,13 +234,14 @@ export function TopBar({
             title={titleWithShortcut("Memory", modLabel(), "3")}
           >
             <Brain size={14} />
+            <HealthAttentionBadge area="memory" />
           </button>
         )}
         {onToggleProcessesPanel && (
           <button
             type="button"
             onClick={onToggleProcessesPanel}
-            className={`rounded p-1.5 transition-colors ${
+            className={`relative rounded p-1.5 transition-colors ${
               processesPanelOpen
                 ? "text-maestro-accent hover:bg-maestro-accent/10"
                 : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
@@ -248,6 +250,7 @@ export function TopBar({
             title={titleWithShortcut("Processes", modLabel(), "4")}
           >
             <Activity size={14} />
+            <HealthAttentionBadge area="processes" />
           </button>
         )}
         {onToggleNotesPanel && (

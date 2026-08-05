@@ -38,9 +38,10 @@ import {
   type SidebarTabId,
 } from "./components/sidebar/Sidebar";
 import { UpdateNotification } from "./components/update/UpdateNotification";
+import { HEALTH_CHECK_INTERVAL_MS } from "./lib/healthRules";
 import { useAppKeyboard } from "./hooks/useAppKeyboard";
 import { useSwipeNavigation } from "./hooks/useSwipeNavigation";
-import { GitHubWatchdogToasts } from "./components/shared/GitHubWatchdogToasts";
+import { NotificationToasts } from "./components/shared/NotificationToasts";
 import { initActivityListener, stopActivityListener } from "./stores/useActivityStore";
 import { initAgentListener, stopAgentListener } from "./stores/useAgentStore";
 import { useGitHubStore } from "./stores/useGitHubStore";
@@ -51,6 +52,7 @@ import {
   watchedProjectsFromTabs,
 } from "./stores/useGitHubWatchdogStore";
 import { useGitStore } from "./stores/useGitStore";
+import { useHealthStore } from "./stores/useHealthStore";
 import { useTerminalSettingsStore } from "./stores/useTerminalSettingsStore";
 import { usePlanStore } from "@/stores/usePlanStore";
 import { useStandupStore } from "@/stores/useStandupStore";
@@ -286,6 +288,17 @@ function App() {
       .getState()
       .syncProjects(JSON.parse(watchedProjectsJson));
   }, [watchedProjectsJson]);
+
+  // Health checker: rule-based memory/process checks on a quiet interval.
+  // Independent of the open tabs — it scans every project with saved memory
+  // and the whole watched process table — so nothing here restarts the
+  // interval or resets the CPU/RAM streaks.
+  useEffect(() => {
+    const runCheck = () => void useHealthStore.getState().runCheck();
+    runCheck();
+    const interval = setInterval(runCheck, HEALTH_CHECK_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, []);
 
   // Daily-AI scheduler: a minute tick that fires the standup report AND the
   // cross-project plan once the configured local time has passed (at most
@@ -892,7 +905,7 @@ function App() {
       )}
 
       <UpdateNotification />
-      <GitHubWatchdogToasts />
+      <NotificationToasts />
     </div>
   );
 }
