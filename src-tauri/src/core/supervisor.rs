@@ -169,6 +169,27 @@ impl Supervisor {
         epic: String,
         generation: u32,
     ) -> Result<SessionSnapshot, String> {
+        self.register_session_with_details(
+            session_id,
+            project,
+            epic,
+            generation,
+            serde_json::Value::Null,
+        )
+    }
+
+    /// [`register_session`](Self::register_session) with extra key/values
+    /// merged into the SPAWN audit row's `details` (issue #55: a successor's
+    /// SPAWN row links it to its predecessor). Non-object `extra` values are
+    /// ignored, so the plain path passes `Null`.
+    pub fn register_session_with_details(
+        &self,
+        session_id: u32,
+        project: String,
+        epic: String,
+        generation: u32,
+        extra: serde_json::Value,
+    ) -> Result<SessionSnapshot, String> {
         let snapshot = {
             let mut sessions = self
                 .sessions
@@ -190,6 +211,11 @@ impl Supervisor {
             snapshot
         };
 
+        let mut details = json!({ "state": SupervisorState::Working.as_str() });
+        if let (Some(map), serde_json::Value::Object(extra_map)) = (details.as_object_mut(), extra)
+        {
+            map.extend(extra_map);
+        }
         self.audit.append(
             &snapshot.project,
             AuditEvent::now(
@@ -197,7 +223,7 @@ impl Supervisor {
                 AuditEventKind::Spawn,
                 snapshot.generation,
                 session_id,
-                json!({ "state": SupervisorState::Working.as_str() }),
+                details,
             ),
         );
         self.notify(&snapshot);
@@ -279,6 +305,24 @@ impl Supervisor {
                 Err(reason)
             }
         }
+    }
+
+    /// Drops a session from supervision without a transition (fresh-eyes
+    /// finding H). This is TEARDOWN, not a state change: the terminal was
+    /// closed outside the samurai pipeline (manual kill, project close,
+    /// frontend reload), so no `samurai-supervisor-event` is emitted — the
+    /// frontend initiated the close and already dropped its entry, and an
+    /// event for a gone session would only confuse late listeners. No audit
+    /// row either, deliberately: the kill paths are user-driven, visible in
+    /// the UI as they happen, and the audit log records the *supervisor's*
+    /// lifecycle decisions — a row per manual tile close would be noise.
+    /// Returns whether an entry existed (idempotent otherwise).
+    pub fn remove_session(&self, session_id: u32) -> bool {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&session_id)
+            .is_some()
     }
 
     /// Snapshots of every supervised session, ordered by session id.
@@ -760,6 +804,65 @@ mod tests {
             err.contains("already under supervision"),
             "unexpected reason: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_register_with_details_merges_into_spawn_row() {
+        let dir = tempdir().unwrap();
+        let (supervisor, audit, _seen) = harness(dir.path());
+        let project = "C:/git/proj-details";
+        supervisor
+            .register_session_with_details(
+                9,
+                project.into(),
+                "epic-s".into(),
+                3,
+                json!({ "predecessor_session_id": 4, "predecessor_generation": 2 }),
+            )
+            .unwrap();
+
+        let rows = audit.read(project, None, None).await.unwrap().events;
+        let spawn = rows
+            .iter()
+            .find(|r| r.event == AuditEventKind::Spawn)
+            .unwrap();
+        // The base detail survives and the extras ride along.
+        assert_eq!(spawn.details["state"], "WORKING");
+        assert_eq!(spawn.details["predecessor_session_id"], 4);
+        assert_eq!(spawn.details["predecessor_generation"], 2);
+        assert_eq!(spawn.generation, 3);
+        assert_eq!(spawn.session_id, 9);
+    }
+
+    #[tokio::test]
+    async fn test_remove_session_is_silent_teardown() {
+        // Fresh-eyes finding H: removal is teardown, not a state change —
+        // no frontend event, no audit row, and the entry is simply gone.
+        let dir = tempdir().unwrap();
+        let (supervisor, audit, seen) = harness(dir.path());
+        let project = "C:/git/proj-remove";
+        supervisor
+            .register_session(1, project.into(), "epic-r".into(), 2)
+            .unwrap();
+        let notifications_before = seen.lock().unwrap().len();
+        let rows_before = audit.read(project, None, None).await.unwrap().events.len();
+
+        assert!(supervisor.remove_session(1));
+        assert!(supervisor.list_sessions().is_empty());
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            notifications_before,
+            "no event for teardown"
+        );
+        let rows = audit.read(project, None, None).await.unwrap().events;
+        assert_eq!(rows.len(), rows_before, "no audit row for teardown");
+
+        // Idempotent, and the session is genuinely unsupervised afterwards.
+        assert!(!supervisor.remove_session(1));
+        let err = supervisor
+            .transition(1, SupervisorState::HandoffRequested)
+            .unwrap_err();
+        assert!(err.contains("not under supervision"));
     }
 
     #[tokio::test]
