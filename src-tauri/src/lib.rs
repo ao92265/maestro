@@ -343,6 +343,16 @@ pub fn run() {
             app.manage(audit_log.clone());
             app.manage(supervisor.clone());
 
+            // Samurai silent-death watchdog (issue #44): one periodic tick
+            // that declares a supervised session DEAD when its transcript
+            // went stale AND no claude process survives under its shell.
+            // Detection + alert only; recovery spawning is Phase 2/3.
+            core::samurai_watchdog::spawn_watchdog(
+                supervisor.clone(),
+                app.state::<Arc<TranscriptWatcher>>().inner().clone(),
+                app.state::<ProcessManager>().inner().clone(),
+            );
+
             // Samurai (issue #45): thresholds config + backend allowance
             // watcher. The config is seeded from the settings store and
             // shared (Arc<RwLock<…>>) between the get/set commands and the
