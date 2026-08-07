@@ -265,13 +265,13 @@ export function AgentGraph({ sessionId }: AgentGraphProps) {
                   onClick={(e) => {
                     e.stopPropagation();
                     if (openAgentId === agent.agentId) setOpenAgentId(null);
-                    dismiss(agent.agentId);
+                    dismiss(agent.agentId, sessionId);
                   }}
                   onKeyDown={(e) => {
                     if (e.key !== "Enter" && e.key !== " ") return;
                     e.stopPropagation();
                     e.preventDefault();
-                    dismiss(agent.agentId);
+                    dismiss(agent.agentId, sessionId);
                   }}
                   className="shrink-0 rounded p-0.5 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-text"
                 >
