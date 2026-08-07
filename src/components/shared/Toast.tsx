@@ -1,4 +1,4 @@
-import { X } from "lucide-react";
+import { ExternalLink, X } from "lucide-react";
 import { useEffect, useRef } from "react";
 
 /** Default time a toast stays on screen before auto-dismissing. */
@@ -7,8 +7,16 @@ export const TOAST_DURATION_MS = 8000;
 interface ToastProps {
   /** Accent for the left border + dot (e.g. a project color). */
   accentColor?: string;
+  /**
+   * What happened, in two or three words ("Review requested", "Memory").
+   * Rendered small and uppercase above the subject: the reader answers
+   * "what is this?" before reading anything else.
+   */
+  kicker: string;
+  /** The subject itself — the PR/issue, the file, the process. One line. */
   title: string;
-  subtitle?: string;
+  /** Optional supporting line: where it is, or why it was raised. */
+  detail?: string;
   /** Auto-dismiss delay; the dismiss button always works immediately. */
   durationMs?: number;
   /** Optional action when the toast body is clicked. */
@@ -20,11 +28,16 @@ interface ToastProps {
  * Minimal reusable toast card. Purely presentational: the caller owns the
  * queue (what shows, in which order) and receives dismiss/click callbacks.
  * Render inside a {@link ToastStack}.
+ *
+ * The card reads top-down as three separate facts — kind, subject, context —
+ * rather than one run-on sentence, so it can be understood at a glance without
+ * parsing punctuation. Clickable cards say so with an arrow rather than words.
  */
 export function Toast({
   accentColor,
+  kicker,
   title,
-  subtitle,
+  detail,
   durationMs = TOAST_DURATION_MS,
   onClick,
   onDismiss,
@@ -53,7 +66,8 @@ export function Toast({
         type="button"
         onClick={onClick}
         disabled={!onClick}
-        className="flex min-w-0 flex-1 flex-col items-start gap-0.5 text-left disabled:cursor-default"
+        title={onClick ? "Open on GitHub" : undefined}
+        className="group flex min-w-0 flex-1 flex-col items-start gap-1 text-left disabled:cursor-default"
       >
         <span className="flex w-full min-w-0 items-center gap-1.5">
           {accentColor && (
@@ -62,10 +76,21 @@ export function Toast({
               style={{ backgroundColor: accentColor }}
             />
           )}
-          <span className="truncate text-xs font-semibold text-maestro-text">{title}</span>
+          <span className="truncate text-[10px] font-semibold uppercase tracking-wider text-maestro-muted">
+            {kicker}
+          </span>
+          {onClick && (
+            <ExternalLink
+              size={10}
+              className="ml-auto shrink-0 text-maestro-muted transition-colors group-hover:text-maestro-text"
+            />
+          )}
         </span>
-        {subtitle && (
-          <span className="line-clamp-2 w-full text-[11px] text-maestro-muted">{subtitle}</span>
+        <span className="line-clamp-2 w-full text-xs font-medium leading-snug text-maestro-text">
+          {title}
+        </span>
+        {detail && (
+          <span className="truncate w-full text-[11px] text-maestro-muted">{detail}</span>
         )}
       </button>
       <button

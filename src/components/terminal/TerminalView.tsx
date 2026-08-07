@@ -14,8 +14,12 @@ import { QuickActionsManager } from "@/components/quickactions/QuickActionsManag
 import { ActivityFeed } from "@/components/session/ActivityFeed";
 import { AgentGraph } from "@/components/session/AgentGraph";
 import { isGitWorktree } from "@/lib/git";
+import { useBranchPullRequest } from "@/hooks/useBranchPullRequest";
 import { useSessionBranch } from "@/hooks/useSessionBranch";
 import { buildFontFamily, waitForFont } from "@/lib/fonts";
+import { describeSessionContext } from "@/lib/sessionContext";
+import { useActivityStore } from "@/stores/useActivityStore";
+import type { ClaudeEvent } from "@/types/claude-events";
 import { getBackendInfo, killSession, onPtyOutput, resizePty, savePastedImage, signalTerminalReady, writeStdin, type BackendInfo } from "@/lib/terminal";
 import { DEFAULT_THEME, LIGHT_THEME, toXtermTheme } from "@/lib/terminalTheme";
 import { type AiMode, type BackendSessionStatus, useSessionStore } from "@/stores/useSessionStore";
@@ -121,6 +125,10 @@ function mapStatus(status: BackendSessionStatus): SessionStatus {
   return mapped;
 }
 
+/** Stable empties for sessions with no recorded activity yet (see below). */
+const NO_EVENTS: ClaudeEvent[] = [];
+const NO_FILES: string[] = [];
+
 /** Map session status to CSS class for border/glow */
 function cellStatusClass(status: SessionStatus): string {
   switch (status) {
@@ -211,6 +219,22 @@ export const TerminalView = memo(function TerminalView({
   const hasSessionWorktree = Boolean(sessionData?.worktreePath);
   const projectPath = sessionData?.workingDirectory ?? sessionData?.projectPath ?? "";
 
+  // One line saying what this terminal is about, recomputed from the session's
+  // own transcript + status so a terminal left alone for an hour still says
+  // what it was for. Derived INSIDE the selector on purpose: it returns a
+  // string, so an event batch that doesn't change the wording re-renders
+  // nothing — subscribing to the events array itself would re-render this
+  // (xterm-hosting) component on every 16 ms batch.
+  const contextLine = useActivityStore((s) => {
+    const activity = s.sessions[sessionId];
+    return describeSessionContext({
+      statusMessage: sessionData?.statusMessage,
+      needsInputPrompt: sessionData?.needsInputPrompt,
+      events: activity?.events ?? NO_EVENTS,
+      filesModified: activity?.filesModified ?? NO_FILES,
+    });
+  });
+
   // Detect if the project path itself is a git worktree (not the main working tree).
   // This handles the case where the user opens a worktree directory as their project.
   const [isProjectWorktree, setIsProjectWorktree] = useState(false);
@@ -227,6 +251,8 @@ export const TerminalView = memo(function TerminalView({
   const effectiveBranch = liveBranch ?? "...";
   // For the UI badge: show "worktree" if either Maestro created one or the project itself is a worktree.
   const isWorktree = hasSessionWorktree || isProjectWorktree;
+  // The branch's PR, so the header can hand the user straight to GitHub.
+  const pullRequest = useBranchPullRequest(projectPath, liveBranch, isActive);
 
   // Get terminal settings from store (select individual primitives for granular updates)
   const fontSize = useTerminalSettingsStore((s) => s.settings.fontSize);
@@ -898,6 +924,7 @@ export const TerminalView = memo(function TerminalView({
         provider={effectiveProvider}
         sessionName={sessionData?.name}
         branchName={effectiveBranch}
+        pullRequest={pullRequest}
         isWorktree={isWorktree}
         onKill={handleKill}
         onRename={handleRename}
@@ -915,6 +942,20 @@ export const TerminalView = memo(function TerminalView({
         onToggleFlag={handleToggleFlag}
         showShortcutHints={showShortcutHints}
       />
+
+      {/* What this terminal is about, in one line. Rendered only when the
+          session has produced something to say, so an empty shell keeps its
+          full height. */}
+      {contextLine && (
+        <div
+          className="flex h-5 shrink-0 items-center border-b border-maestro-border/50 bg-maestro-surface/40 px-2"
+          title={contextLine}
+        >
+          <span className="truncate text-[10px] leading-none text-maestro-muted">
+            {contextLine}
+          </span>
+        </div>
+      )}
 
       {/* Tab bar — clicking its background or the already-active tab toggles
           the warning flag (yellow), in sync with the header above. */}
