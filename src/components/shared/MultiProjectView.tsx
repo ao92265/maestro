@@ -147,17 +147,17 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
     );
   }, [eagleSessions, eagleTabOrder]);
 
-  // Stale-zoom guard: if the zoomed session disappears from the strip, keep
-  // the user in zoom-in when it was parked — the next terminal (same order as
-  // Alt+Arrow, via the previous strip order) takes over the zoom. Drop the
-  // zoom only when the session was killed or nothing is left to zoom —
-  // otherwise every tile stays visibility:hidden and the view blanks.
+  // Stale-zoom guard: if the zoomed session disappears from the strip
+  // (parked, killed or closed), keep the user in zoom-in — the next terminal
+  // (same order as Alt+Arrow, via the previous strip order) takes over the
+  // zoom, matching the per-project zoom's passZoomToNeighbor. Drop the zoom
+  // only when nothing is left to zoom — otherwise every tile stays
+  // visibility:hidden and the view blanks.
   const prevEagleOrderRef = useRef<number[]>([]);
   useEffect(() => {
     if (eagleZoom !== null && !eagleSessions.some((s) => s.sessionId === eagleZoom)) {
-      const wasParked = useSessionStore.getState().parkedSessionIds.includes(eagleZoom);
       let next: number | null = null;
-      if (wasParked && orderedEagleSessions.length > 0) {
+      if (orderedEagleSessions.length > 0) {
         const prevIds = prevEagleOrderRef.current;
         const oldIdx = prevIds.indexOf(eagleZoom);
         for (let step = 1; oldIdx >= 0 && step <= prevIds.length; step++) {

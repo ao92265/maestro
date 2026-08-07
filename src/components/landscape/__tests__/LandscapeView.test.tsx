@@ -208,8 +208,17 @@ describe("LandscapeView", () => {
       ],
     });
     renderLandscape();
-    fireEvent.click(screen.getByText(/Clear finished \(1\)/));
+    fireEvent.click(screen.getByText(/Clear done \(1\)/));
     expect(useAgentStore.getState().agents.map((a) => a.agentId)).toEqual(["a1"]);
+  });
+
+  it("clears dead agents — still 'running' but their terminal ended", () => {
+    // Session 1 is Done: its running agent can never complete.
+    useSessionStore.setState({ sessions: [buildSession({ status: "Done" })] });
+    useAgentStore.setState({ agents: [buildAgent("a1")] });
+    renderLandscape();
+    fireEvent.click(screen.getByText(/Clear done \(1\)/));
+    expect(useAgentStore.getState().agents).toHaveLength(0);
   });
 
   it("'Reorganize' throws away every manual position", () => {

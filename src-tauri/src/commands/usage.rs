@@ -63,10 +63,26 @@ pub struct UsageData {
     pub spend_used_dollars: Option<f64>,
     /// Total dollar limit of the monthly budget window.
     pub spend_limit_dollars: Option<f64>,
+    /// Per-model weekly windows reported only through the `limits` array
+    /// (e.g. Fable). Models that already have a dedicated top-level window
+    /// (Opus/Sonnet) are excluded when that window is reported.
+    pub model_windows: Vec<ModelWindow>,
     /// Error message if token is expired or unavailable.
     pub error_message: Option<String>,
     /// Whether authentication is needed (token expired or missing).
     pub needs_auth: bool,
+}
+
+/// One model-scoped weekly window from the `limits` array.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelWindow {
+    /// The model's display name as the API reports it (e.g. "Fable").
+    pub label: String,
+    /// Usage percentage (0-100).
+    pub percent: f64,
+    /// When the window resets (ISO 8601).
+    pub resets_at: Option<String>,
 }
 
 /// Response from Anthropic's /api/oauth/usage endpoint.
@@ -86,6 +102,31 @@ struct ApiUsageResponse {
     seven_day_sonnet: Option<UsageWindow>,
     seven_day_oauth_apps: Option<UsageWindow>,
     cinder_cove: Option<UsageWindow>,
+    /// Structured limit entries. Model-scoped weekly windows (e.g. Fable)
+    /// appear ONLY here — there is no `seven_day_fable` top-level key
+    /// (observed 2026-08-07: `kind: "weekly_scoped"` with
+    /// `scope.model.display_name: "Fable"`).
+    #[serde(default)]
+    limits: Vec<ApiLimit>,
+}
+
+/// One entry of the `limits` array.
+#[derive(Debug, Deserialize)]
+struct ApiLimit {
+    kind: Option<String>,
+    percent: Option<f64>,
+    resets_at: Option<String>,
+    scope: Option<ApiLimitScope>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiLimitScope {
+    model: Option<ApiLimitModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiLimitModel {
+    display_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,6 +319,45 @@ fn to_usage_data(api: ApiUsageResponse) -> UsageData {
         parse_window(api.seven_day_oauth_apps);
     let (spend_percent, spend_resets_at) = parse_window(api.cinder_cove);
 
+    // Model-scoped weekly limits (kind "weekly_scoped" + a model display
+    // name). Skip models whose dedicated top-level window is already
+    // reported, and repeats of the same name, so each model gets one bar.
+    let mut model_windows: Vec<ModelWindow> = Vec::new();
+    for limit in api.limits {
+        if limit.kind.as_deref() != Some("weekly_scoped") {
+            continue;
+        }
+        let Some(label) = limit
+            .scope
+            .and_then(|s| s.model)
+            .and_then(|m| m.display_name)
+        else {
+            continue;
+        };
+        let Some(percent) = limit.percent else {
+            continue;
+        };
+        let covered_by_top_level = (label.eq_ignore_ascii_case("opus")
+            && weekly_opus_percent.is_some())
+            || (label.eq_ignore_ascii_case("sonnet") && weekly_sonnet_percent.is_some());
+        if covered_by_top_level
+            || model_windows
+                .iter()
+                .any(|w| w.label.eq_ignore_ascii_case(&label))
+        {
+            continue;
+        }
+        model_windows.push(ModelWindow {
+            label,
+            percent: if percent.is_finite() {
+                percent.clamp(0.0, 100.0)
+            } else {
+                0.0
+            },
+            resets_at: limit.resets_at,
+        });
+    }
+
     UsageData {
         session_percent,
         session_resets_at,
@@ -293,6 +373,7 @@ fn to_usage_data(api: ApiUsageResponse) -> UsageData {
         spend_resets_at,
         spend_used_dollars,
         spend_limit_dollars,
+        model_windows,
         error_message: None,
         needs_auth: false,
     }
@@ -550,8 +631,91 @@ mod tests {
         );
         assert_eq!(usage.spend_used_dollars, Some(857.000393));
         assert_eq!(usage.spend_limit_dollars, Some(1000.0));
+        assert!(usage.model_windows.is_empty());
         assert!(!usage.needs_auth);
         assert_eq!(usage.error_message, None);
+    }
+
+    /// Trimmed real /api/oauth/usage response captured from a Pro/Max seat
+    /// (2026-08-07): the Fable weekly window is NOT a top-level key — it
+    /// arrives only as a `weekly_scoped` entry of the `limits` array, with
+    /// the model named in `scope.model.display_name`.
+    const SCOPED_LIMITS_RESPONSE: &str = r#"{
+        "five_hour": {"utilization": 6.0, "resets_at": "2026-08-07T14:20:00.640222+00:00"},
+        "seven_day": {"utilization": 46.0, "resets_at": "2026-08-12T02:00:00.640245+00:00"},
+        "seven_day_opus": null,
+        "seven_day_sonnet": null,
+        "limits": [
+            {
+                "kind": "session",
+                "group": "session",
+                "percent": 6,
+                "severity": "normal",
+                "resets_at": "2026-08-07T14:20:00.640222+00:00",
+                "scope": null,
+                "is_active": false
+            },
+            {
+                "kind": "weekly_all",
+                "group": "weekly",
+                "percent": 46,
+                "severity": "normal",
+                "resets_at": "2026-08-12T02:00:00.640245+00:00",
+                "scope": null,
+                "is_active": false
+            },
+            {
+                "kind": "weekly_scoped",
+                "group": "weekly",
+                "percent": 71,
+                "severity": "normal",
+                "resets_at": "2026-08-12T02:00:00.640504+00:00",
+                "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null},
+                "is_active": true
+            }
+        ]
+    }"#;
+
+    #[test]
+    fn maps_model_scoped_limits_to_model_windows() {
+        let parsed: ApiUsageResponse = serde_json::from_str(SCOPED_LIMITS_RESPONSE).unwrap();
+        let usage = to_usage_data(parsed);
+        // The unscoped session/weekly_all limit entries must not duplicate
+        // the five_hour/seven_day windows.
+        assert_eq!(usage.session_percent, Some(6.0));
+        assert_eq!(usage.weekly_percent, Some(46.0));
+        assert_eq!(
+            usage.model_windows,
+            vec![ModelWindow {
+                label: "Fable".to_string(),
+                percent: 71.0,
+                resets_at: Some("2026-08-12T02:00:00.640504+00:00".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn skips_scoped_limits_already_covered_by_top_level_windows() {
+        let parsed: ApiUsageResponse = serde_json::from_str(
+            r#"{
+                "seven_day_opus": {"utilization": 30.0, "resets_at": null},
+                "limits": [
+                    {"kind": "weekly_scoped", "percent": 30,
+                     "scope": {"model": {"display_name": "Opus"}}},
+                    {"kind": "weekly_scoped", "percent": 71,
+                     "scope": {"model": {"display_name": "Fable"}}},
+                    {"kind": "weekly_scoped", "percent": 71,
+                     "scope": {"model": {"display_name": "Fable"}}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let usage = to_usage_data(parsed);
+        assert_eq!(usage.weekly_opus_percent, Some(30.0));
+        // Opus is covered by its top-level window; Fable appears once.
+        assert_eq!(usage.model_windows.len(), 1);
+        assert_eq!(usage.model_windows[0].label, "Fable");
+        assert_eq!(usage.model_windows[0].resets_at, None);
     }
 
     #[test]

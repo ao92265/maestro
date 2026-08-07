@@ -224,4 +224,23 @@ describe("useAgentStore", () => {
       "toolu_other_done",
     ]);
   });
+
+  it("clearFinishedAndDead drops finished agents everywhere plus dead ones", () => {
+    useAgentStore.getState().handleEvent(spawned(1, "toolu_running"));
+    useAgentStore.getState().handleEvent(spawned(1, "toolu_done"));
+    // Session 2 is not live — its still-"running" agent is dead.
+    useAgentStore.getState().handleEvent(spawned(2, "toolu_dead"));
+    useAgentStore.getState().handleEvent(completed(1, "toolu_done", true));
+
+    useAgentStore.getState().clearFinishedAndDead(new Set([1]));
+
+    expect(useAgentStore.getState().agents.map((a) => a.agentId)).toEqual(["toolu_running"]);
+  });
+
+  it("clearFinishedAndDead with nothing to clear leaves the state untouched", () => {
+    useAgentStore.getState().handleEvent(spawned(1, "toolu_running"));
+    const before = useAgentStore.getState().agents;
+    useAgentStore.getState().clearFinishedAndDead(new Set([1]));
+    expect(useAgentStore.getState().agents).toBe(before);
+  });
 });

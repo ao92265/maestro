@@ -73,6 +73,7 @@ describe("getUsageBars", () => {
     spendResetsAt: null,
     spendUsedDollars: null,
     spendLimitDollars: null,
+    modelWindows: [],
     errorMessage: null,
     needsAuth: false,
   };
@@ -173,6 +174,22 @@ describe("getUsageBars", () => {
       "Week (Sonnet)",
       "Week (OAuth apps)",
       "Budget",
+    ]);
+  });
+
+  it("adds a Week bar per model-scoped window (e.g. Fable)", () => {
+    // Fable has no dedicated top-level window — the backend surfaces it from
+    // the API's `limits` array as a model window.
+    const bars = getUsageBars({
+      ...noWindows,
+      sessionPercent: 6,
+      weeklyPercent: 46,
+      modelWindows: [{ label: "Fable", percent: 71, resetsAt: "2026-08-12T02:00:00.000Z" }],
+    });
+    expect(bars).toEqual([
+      { label: "Session", percent: 6, resetsAt: null },
+      { label: "Week", percent: 46, resetsAt: null },
+      { label: "Week (Fable)", percent: 71, resetsAt: "2026-08-12T02:00:00.000Z" },
     ]);
   });
 });

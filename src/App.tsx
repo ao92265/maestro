@@ -881,7 +881,9 @@ function App() {
               {landscapeView && (
                 <Suspense
                   fallback={
-                    <div className="absolute inset-0 z-30 flex items-center justify-center bg-maestro-bg text-xs text-maestro-muted">
+                    /* z-50 like the landscape itself: the zoomed eagle pane is
+                       z-40, and the fallback must cover it too. */
+                    <div className="absolute inset-0 z-50 flex items-center justify-center bg-maestro-bg text-xs text-maestro-muted">
                       Loading…
                     </div>
                   }
