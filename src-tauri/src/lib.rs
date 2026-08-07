@@ -494,6 +494,7 @@ pub fn run() {
             commands::github::github_auth_status,
             commands::github::github_list_prs,
             commands::github::github_get_pr,
+            commands::github::github_pr_for_branch,
             commands::github::github_create_pr,
             commands::github::github_merge_pr,
             commands::github::github_close_pr,
