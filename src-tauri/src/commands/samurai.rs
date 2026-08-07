@@ -19,6 +19,9 @@ use crate::core::samurai_audit::{AuditLog, AuditReadResult};
 use crate::core::samurai_config::{SamuraiConfig, SharedSamuraiConfig};
 use crate::core::samurai_files::{self, SamuraiFileEntry, SamuraiFilesRoots};
 use crate::core::samurai_injector::strip_extended_prefix;
+use crate::core::samurai_journal::{
+    default_journal_file, JournalCategory, JournalEntry, JournalListResult, JournalStore,
+};
 use crate::core::samurai_prompts::{self, epic_slug};
 use crate::core::samurai_replicator::{derive_repo_pin, SamuraiReplicator};
 use crate::core::samurai_run_config::{RunConfigStatus, RunConfigStore, SamuraiRunConfig};
@@ -359,6 +362,20 @@ pub struct SamuraiLaunchResult {
     pub stale_timer_cancelled: bool,
 }
 
+/// The gen-1 opening brief: the launch instruction plus the issue-#72
+/// journaling rider, so the first orchestrator records its own friction in
+/// the ops journal (PRD §5.12). The journal path is resolved at this call
+/// site per the P5.1 contract (`default_journal_file`); a single space
+/// joins the two single-line instructions, keeping the brief one
+/// paste-able line.
+fn launch_brief(epic: &str, repo_pin: Option<&str>) -> String {
+    format!(
+        "{} {}",
+        samurai_prompts::launch_instruction(epic, repo_pin),
+        samurai_prompts::journal_instruction(&default_journal_file()),
+    )
+}
+
 /// The launch sequence after preflight, extracted from the Tauri command for
 /// testability (the `cleanup_epic_inner` precedent; `preflight` is passed in
 /// so tests never hit gh or the usage API, `worktree_base` exists only so
@@ -451,7 +468,7 @@ pub(crate) async fn launch_run_inner(
     config.thresholds = thresholds;
     run_configs.save(&config)?;
 
-    let instruction = samurai_prompts::launch_instruction(&epic, repo_pin.as_deref());
+    let instruction = launch_brief(&epic, repo_pin.as_deref());
     replicator.spawn_first_generation(project, &epic, &worktree_path, instruction);
 
     log::info!(
@@ -766,6 +783,40 @@ pub fn samurai_timer_cancel(
     timer_cancel_inner(&schedule, &project, &epic)
 }
 
+// ---------------------------------------------------------------------------
+// Issue #69 (P5.1): ops journal — add + list
+// ---------------------------------------------------------------------------
+
+/// Adds one user-authored ops-journal entry (PRD §5.12). The optional
+/// project is canonicalized at this boundary like every samurai command.
+/// There is deliberately no agent parameter — agents append their entries
+/// to the JSONL directly from shell prompts; this command is the user/UI
+/// path, so `agent` stays unset.
+#[tauri::command]
+pub fn samurai_journal_add(
+    journal: State<'_, Arc<JournalStore>>,
+    category: JournalCategory,
+    text: String,
+    project: Option<String>,
+) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("journal entry text must not be empty".to_string());
+    }
+    let project = project.map(|p| canonical_project_path(&p));
+    journal.append_entry(&JournalEntry::now(category, text, project, None))
+}
+
+/// The active journal (`journal.jsonl`) — every entry with its consumption
+/// status derived from the harvest markers, newest last, plus the file size
+/// (the `samurai_audit_read` reporting convention). All logic lives in
+/// `core::samurai_journal` (unit-tested there); this command only reads.
+#[tauri::command]
+pub fn samurai_journal_list(
+    journal: State<'_, Arc<JournalStore>>,
+) -> Result<JournalListResult, String> {
+    journal.list()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -862,6 +913,27 @@ mod tests {
         assert_eq!(epic_branch("Epic 12: Auth"), "samurai/epic-12-auth");
         // The empty-ref fallback still yields a legal branch name.
         assert_eq!(epic_branch(""), "samurai/epic");
+    }
+
+    #[test]
+    fn test_launch_brief_is_launch_instruction_plus_journal_rider() {
+        // Issue #72: the composed gen-1 brief = the unmodified launch
+        // instruction, then the journaling rider, one paste-able line.
+        let brief = launch_brief("#38", Some("nachogl1/maestro"));
+        let launch = samurai_prompts::launch_instruction("#38", Some("nachogl1/maestro"));
+        assert!(
+            brief.starts_with(&launch),
+            "launch text must ride first, unmodified"
+        );
+        assert!(brief.contains("journal.jsonl"));
+        for category in ["BOTTLENECK", "ERROR", "IMPROVEMENT", "SKILL", "CONCERN"] {
+            assert!(
+                brief.contains(&format!("\"{category}\"")),
+                "missing category {category}"
+            );
+        }
+        assert!(brief.contains("NEVER rewrite or delete existing lines"));
+        assert!(!brief.contains('\n'), "brief must stay a single line");
     }
 
     // --- worktree + cleanup (tempfile git fixtures) ---

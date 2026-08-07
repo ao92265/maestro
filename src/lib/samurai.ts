@@ -355,3 +355,105 @@ export interface SamuraiConfig {
 export function samuraiGetConfig(): Promise<SamuraiConfig> {
   return invoke("samurai_get_config");
 }
+
+// ---------------------------------------------------------------------------
+// Issue #69: ops journal — add + list
+// ---------------------------------------------------------------------------
+
+/** Journal entry categories (PRD §5.12) — mirrors the Rust `JournalCategory`. */
+export type SamuraiJournalCategory =
+  | "BOTTLENECK"
+  | "ERROR"
+  | "IMPROVEMENT"
+  | "SKILL"
+  | "CONCERN";
+
+/**
+ * One ops-journal JSONL line — mirrors the Rust `JournalEntry`
+ * (`core/samurai_journal.rs`). `project` and `agent` are ABSENT (not null)
+ * when unset — agents hand-write these lines from shell prompts, the
+ * minimal shape is the contract.
+ */
+export interface SamuraiJournalEntry {
+  /** RFC 3339 UTC timestamp. */
+  ts: string;
+  category: SamuraiJournalCategory;
+  text: string;
+  /** Owning project path (Windows `\\?\` prefix already stripped). */
+  project?: string;
+  /** The agent that recorded the entry; absent for user entries. */
+  agent?: string;
+}
+
+/**
+ * Consumption status derived from the harvest markers — mirrors the Rust
+ * `JournalEntryStatus`: after the last marker = UNCONSUMED, between the
+ * last two = CONSUMED; ARCHIVED shows only for stragglers a crashed
+ * harvest left in the active file (the next harvest moves them to
+ * `archive.jsonl`).
+ */
+export type SamuraiJournalEntryStatus = "UNCONSUMED" | "CONSUMED" | "ARCHIVED";
+
+/**
+ * Mirrors the Rust `JournalListResult`: the active file's entries (newest
+ * last) with derived status, plus the file size in bytes.
+ */
+export interface SamuraiJournalListResult {
+  entries: { entry: SamuraiJournalEntry; status: SamuraiJournalEntryStatus }[];
+  file_size_bytes: number;
+}
+
+/**
+ * Adds one user-authored journal entry (the UI path — agents append to the
+ * JSONL directly, so there is no agent parameter). Rejects empty text.
+ */
+export function samuraiJournalAdd(
+  category: SamuraiJournalCategory,
+  text: string,
+  project?: string,
+): Promise<void> {
+  return invoke("samurai_journal_add", { category, text, project });
+}
+
+/** The active journal with per-entry consumption status, newest last. */
+export function samuraiJournalList(): Promise<SamuraiJournalListResult> {
+  return invoke("samurai_journal_list");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #70: harvest — journal digest via headless claude -p
+// ---------------------------------------------------------------------------
+
+/**
+ * A generated harvest report — mirrors the Rust `HarvestReport`
+ * (`src-tauri/src/commands/harvest.rs`). One per date, account-wide, saved
+ * as `<app data>/harvest/<date>.md` (the Second Brain's `HARVEST_REPORT`
+ * rows).
+ */
+export interface SamuraiHarvestReport {
+  /** Local calendar date the report belongs to (YYYY-MM-DD). */
+  date: string;
+  markdown: string;
+  /** RFC 3339 timestamp of when the report was generated. */
+  generated_at: string;
+}
+
+/**
+ * Digests the unconsumed journal entries into today's harvest report via a
+ * headless `claude -p` run, then marks them consumed (Rust
+ * `samurai_harvest_run`). Rejects with "Nothing to harvest…" when the
+ * journal has no unconsumed entries; a failed run never consumes them.
+ */
+export function samuraiHarvestRun(): Promise<SamuraiHarvestReport> {
+  return invoke("samurai_harvest_run");
+}
+
+/**
+ * Reads one saved harvest report by absolute path — the Second Brain lists
+ * `HARVEST_REPORT` rows by path, this serves their content (Rust
+ * `samurai_harvest_read`). The backend refuses anything that is not a
+ * regular file directly under the harvest directory.
+ */
+export function samuraiHarvestRead(path: string): Promise<string> {
+  return invoke("samurai_harvest_read", { path });
+}
