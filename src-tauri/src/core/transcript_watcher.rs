@@ -334,10 +334,6 @@ async fn reader_task(
     // tool_result already came back with "async_launched", so the generic
     // completion must not be mistaken for the agent finishing.
     let mut async_task_ids: HashSet<String> = HashSet::new();
-    // Agents whose completion already went out: a resumed background agent
-    // can notify again under the same id with a fresh report, and that
-    // repeat must reach the bus too (the store updates it in place).
-    let mut completed_task_ids: HashSet<String> = HashSet::new();
 
     while rx.recv().await.is_some() {
         // Coalesce rapid notifications: drain any buffered signals so we
@@ -353,7 +349,6 @@ async fn reader_task(
         let bus = event_bus.clone();
         let mut pending = std::mem::take(&mut pending_task_ids);
         let mut asyncs = std::mem::take(&mut async_task_ids);
-        let mut completed = std::mem::take(&mut completed_task_ids);
         let read_result = tokio::task::spawn_blocking(move || {
             let offset = read_new_lines(
                 session_id,
@@ -362,17 +357,15 @@ async fn reader_task(
                 &bus,
                 &mut pending,
                 &mut asyncs,
-                &mut completed,
             );
-            (offset, pending, asyncs, completed)
+            (offset, pending, asyncs)
         })
         .await;
         match read_result {
-            Ok((offset, pending, asyncs, completed)) => {
+            Ok((offset, pending, asyncs)) => {
                 byte_offset = offset;
                 pending_task_ids = pending;
                 async_task_ids = asyncs;
-                completed_task_ids = completed;
             }
             Err(e) => {
                 log::error!("TranscriptWatcher: read pass for session {session_id} failed: {e}");
@@ -408,7 +401,6 @@ fn read_new_lines(
     event_bus: &EventBus,
     pending_task_ids: &mut HashSet<String>,
     async_task_ids: &mut HashSet<String>,
-    completed_task_ids: &mut HashSet<String>,
 ) -> u64 {
     let file = match File::open(path) {
         Ok(f) => f,
@@ -470,18 +462,18 @@ fn read_new_lines(
                             }
                             // The parser already resolved the outcome from the
                             // transcript's own metadata; trust it over the
-                            // generic tool_result that follows.
+                            // generic tool_result that follows. Forwarded even
+                            // when this watcher never saw the spawn: an orphan
+                            // completion (the spawn lives in a transcript this
+                            // watcher never read) would otherwise vanish, and
+                            // the store synthesizes a node from it instead.
+                            // Repeats pass too — a resumed background agent
+                            // notifies again under the same id with a fresh
+                            // report the store updates in place.
                             ClaudeEvent::SubagentCompleted { ref agent_id, .. } => {
-                                if pending_task_ids.remove(agent_id) {
-                                    async_task_ids.remove(agent_id);
-                                    completed_task_ids.insert(agent_id.clone());
-                                    event_bus.emit(event);
-                                } else if completed_task_ids.contains(agent_id) {
-                                    // Repeat notification from a resumed
-                                    // background agent — carries a fresh
-                                    // report the store updates in place.
-                                    event_bus.emit(event);
-                                }
+                                pending_task_ids.remove(agent_id);
+                                async_task_ids.remove(agent_id);
+                                event_bus.emit(event);
                             }
                             ClaudeEvent::ToolUseCompleted {
                                 tool_use_id,
@@ -557,7 +549,7 @@ mod tests {
         let path = file.path().to_path_buf();
         let (bus, collected) = test_event_bus();
 
-        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new(), &mut HashSet::new());
+        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new());
 
         assert_eq!(new_offset, 0, "empty file should keep offset at 0");
         assert!(
@@ -575,7 +567,7 @@ mod tests {
         let path = file.path().to_path_buf();
         let (bus, collected) = test_event_bus();
 
-        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new(), &mut HashSet::new());
+        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new());
 
         assert!(new_offset > 0, "offset should advance past the written line");
 
@@ -610,7 +602,7 @@ mod tests {
         let mut task_ids = HashSet::new();
 
         // First read picks up the first line.
-        let offset1 = read_new_lines(1, &path, 0, &bus, &mut task_ids, &mut HashSet::new(), &mut HashSet::new());
+        let offset1 = read_new_lines(1, &path, 0, &bus, &mut task_ids, &mut HashSet::new());
         assert_eq!(
             collected.lock().unwrap().len(),
             1,
@@ -623,7 +615,7 @@ mod tests {
         file.flush().expect("flush");
 
         // Second read starts from offset1 and should only pick up the new line.
-        let offset2 = read_new_lines(1, &path, offset1, &bus, &mut task_ids, &mut HashSet::new(), &mut HashSet::new());
+        let offset2 = read_new_lines(1, &path, offset1, &bus, &mut task_ids, &mut HashSet::new());
         assert!(
             offset2 > offset1,
             "offset should advance after reading second line"
@@ -659,7 +651,7 @@ mod tests {
         file.flush().unwrap();
 
         let (bus, collected) = test_event_bus();
-        read_new_lines(7, &file.path().to_path_buf(), 0, &bus, &mut HashSet::new(), &mut HashSet::new(), &mut HashSet::new());
+        read_new_lines(7, &file.path().to_path_buf(), 0, &bus, &mut HashSet::new(), &mut HashSet::new());
 
         let events = collected.lock().unwrap();
         // The Task's result surfaces as SubagentCompleted…
@@ -694,7 +686,6 @@ mod tests {
         let (bus, collected) = test_event_bus();
         let mut pending = HashSet::new();
         let mut async_ids = HashSet::new();
-        let mut completed = HashSet::new();
 
         // The spawn and the launch ack: still running, no completion yet.
         writeln!(file, "{spawn}").unwrap();
@@ -707,7 +698,6 @@ mod tests {
             &bus,
             &mut pending,
             &mut async_ids,
-            &mut completed,
         );
 
         {
@@ -744,7 +734,6 @@ mod tests {
             &bus,
             &mut pending,
             &mut async_ids,
-            &mut completed,
         );
 
         let events = collected.lock().unwrap();
@@ -787,7 +776,6 @@ mod tests {
             &bus,
             &mut HashSet::new(),
             &mut HashSet::new(),
-            &mut HashSet::new(),
         );
 
         let events = collected.lock().unwrap();
@@ -814,6 +802,65 @@ mod tests {
         }
     }
 
+    /// A completion whose spawn this watcher never saw — the spawn lives in a
+    /// transcript file it never read, e.g. the conversation was resumed into a
+    /// new file while a background agent kept running — must still reach the
+    /// bus. It used to be dropped, losing the agent forever; the store now
+    /// synthesizes a node from the orphan completion.
+    #[test]
+    fn test_orphan_rich_completion_is_forwarded() {
+        let mut file = NamedTempFile::new().expect("create temp file");
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_orphan","content":[{"type":"text","text":"late report"}]}]},"toolUseResult":{"status":"completed","agentId":"a77","agentType":"general-purpose","content":[{"type":"text","text":"late report"}]},"uuid":"u1","timestamp":"2026-08-07T10:00:00Z"}"#;
+        writeln!(file, "{result}").unwrap();
+        file.flush().unwrap();
+
+        let (bus, collected) = test_event_bus();
+        read_new_lines(9, &file.path().to_path_buf(), 0, &bus, &mut HashSet::new(), &mut HashSet::new());
+
+        let events = collected.lock().unwrap();
+        let completions: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, ClaudeEvent::SubagentCompleted { .. }))
+            .collect();
+        assert_eq!(
+            completions.len(),
+            1,
+            "the orphan completion is forwarded exactly once (no bare duplicate): {:?}",
+            *events
+        );
+        if let ClaudeEvent::SubagentCompleted {
+            agent_id, report, ..
+        } = completions[0]
+        {
+            assert_eq!(agent_id, "toolu_orphan");
+            assert_eq!(report, "late report");
+        }
+    }
+
+    /// Same for a background agent's task notification landing without its
+    /// spawn in this transcript.
+    #[test]
+    fn test_orphan_notification_completion_is_forwarded() {
+        let mut file = NamedTempFile::new().expect("create temp file");
+        let notification = r#"{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>a11070c</task-id>\n<tool-use-id>toolu_bg_orphan</tool-use-id>\n<status>completed</status>\n<summary>Agent \"summarize docs\" finished</summary>\n<result>All done.</result>\n</task-notification>"},"uuid":"u1","timestamp":"2026-08-07T10:00:00Z"}"#;
+        writeln!(file, "{notification}").unwrap();
+        file.flush().unwrap();
+
+        let (bus, collected) = test_event_bus();
+        read_new_lines(9, &file.path().to_path_buf(), 0, &bus, &mut HashSet::new(), &mut HashSet::new());
+
+        let events = collected.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ClaudeEvent::SubagentCompleted { agent_id, report, .. }
+                    if agent_id == "toolu_bg_orphan" && report == "All done."
+            )),
+            "expected the orphan notification to complete, got {:?}",
+            *events
+        );
+    }
+
     /// A trailing line without '\n' is an entry still being written: the
     /// reader must leave the offset at the line start and pick the whole
     /// entry up once the writer finishes it — consuming the fragment loses
@@ -829,7 +876,7 @@ mod tests {
         write!(file, "{first_half}").unwrap();
         file.flush().unwrap();
 
-        let offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new(), &mut HashSet::new());
+        let offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new());
         assert_eq!(offset, 0, "offset must stay at the unfinished line's start");
         assert!(collected.lock().unwrap().is_empty(), "no events from a fragment");
 
@@ -837,7 +884,7 @@ mod tests {
         writeln!(file, "{second_half}").unwrap();
         file.flush().unwrap();
 
-        let offset = read_new_lines(1, &path, offset, &bus, &mut HashSet::new(), &mut HashSet::new(), &mut HashSet::new());
+        let offset = read_new_lines(1, &path, offset, &bus, &mut HashSet::new(), &mut HashSet::new());
         assert!(offset > 0, "offset advances once the line is complete");
         let events = collected.lock().unwrap();
         assert_eq!(events.len(), 1, "the completed line parses exactly once");
@@ -849,7 +896,7 @@ mod tests {
         let path = PathBuf::from("/tmp/nonexistent_transcript_test_file_12345.jsonl");
         let (bus, collected) = test_event_bus();
 
-        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new(), &mut HashSet::new());
+        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new());
 
         assert_eq!(
             new_offset, 0,

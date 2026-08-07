@@ -152,11 +152,40 @@ describe("useAgentStore", () => {
     expect(useAgentStore.getState().agents[0].completedAt).toBe(Date.parse(oldTs));
   });
 
-  it("SubagentCompleted for an unknown id changes nothing", () => {
-    useAgentStore.getState().handleEvent(spawned(1, "toolu_a"));
-    const before = useAgentStore.getState().agents;
-    useAgentStore.getState().handleEvent(completed(1, "toolu_other"));
-    expect(useAgentStore.getState().agents).toBe(before);
+  // The watcher can attach after a spawn scrolled by (the spawn lives in a
+  // transcript file it never read); the completion alone must still show the
+  // agent instead of losing the run forever.
+  it("an orphan SubagentCompleted synthesizes a minimal finished agent", () => {
+    useAgentStore.getState().handleEvent(
+      completed(3, "toolu_orphan", true, {
+        report: "late report",
+        status: "completed",
+        agent_type: "general-purpose",
+        model: "claude-fable-5",
+        timestamp: "2026-08-07T10:00:00.000Z",
+      })
+    );
+    const agents = useAgentStore.getState().agents;
+    expect(agents).toHaveLength(1);
+    expect(agents[0]).toMatchObject({
+      agentId: "toolu_orphan",
+      sessionId: 3,
+      agentType: "general-purpose",
+      prompt: "",
+      description: "",
+      report: "late report",
+      success: true,
+      model: "claude-fable-5",
+      completedAt: Date.parse("2026-08-07T10:00:00.000Z"),
+    });
+  });
+
+  it("a repeat completion updates a synthesized orphan in place", () => {
+    useAgentStore.getState().handleEvent(completed(3, "toolu_orphan", true, { report: "first" }));
+    useAgentStore.getState().handleEvent(completed(3, "toolu_orphan", true, { report: "second" }));
+    const agents = useAgentStore.getState().agents;
+    expect(agents).toHaveLength(1);
+    expect(agents[0].report).toBe("second");
   });
 
   it("a bare re-completion does not clobber a completed agent", () => {
