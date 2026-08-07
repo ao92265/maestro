@@ -25,6 +25,22 @@ export type BackendSessionStatus =
 const SESSION_STARTUP_TIMEOUT_MS = 30000;
 
 /**
+ * Statuses that mean the terminal is done running and the next move is the
+ * user's — the "ready to go" states. Reaching one of these while parked brings
+ * the session back into the grid (see the auto-unpark rule in `initListeners`).
+ *
+ * `Done` and `Error` matter as much as `NeedsInput`: an agent that reports
+ * `finished` or `error` over MCP never emits NeedsInput afterwards, so a parked
+ * session that completed its work used to stay hidden indefinitely.
+ */
+const READY_FOR_USER_STATUSES: BackendSessionStatus[] = [
+  "NeedsInput",
+  "Done",
+  "Error",
+  "Timeout",
+];
+
+/**
  * Mirrors the Rust `SessionConfig` struct returned by `get_sessions`.
  *
  * @property id - Unique numeric session ID assigned by the backend.
@@ -467,19 +483,20 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
             }
 
             set((state) => {
-              // Auto-unpark on the TRANSITION into NeedsInput: a parked agent
-              // that stops and asks for the user must come back into view,
+              // Auto-unpark on the TRANSITION into a ready-for-the-user state:
+              // a parked agent that stops — because it needs an answer, or
+              // because it finished or failed — must come back into view,
               // marked for attention (yellow chrome) until the user selects
               // it. Edge-triggered on purpose — if the user re-parks the
-              // still-NeedsInput session, repeated NeedsInput events are not
-              // a new transition and must not undo that manual choice.
+              // still-stopped session, repeated events for the same status are
+              // not a new transition and must not undo that manual choice.
               const existing = state.sessions.find(
                 (s) => s.id === session_id && s.project_path === project_path
               );
               const autoUnpark =
                 existing !== undefined &&
-                status === "NeedsInput" &&
-                existing.status !== "NeedsInput" &&
+                READY_FOR_USER_STATUSES.includes(status) &&
+                existing.status !== status &&
                 state.parkedSessionIds.includes(session_id);
 
               return {

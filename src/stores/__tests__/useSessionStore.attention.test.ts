@@ -126,6 +126,55 @@ describe("useSessionStore auto-unpark attention", () => {
     expect(state.attentionSessionIds).toEqual([1]);
   });
 
+  it("auto-unparks a parked session that finishes its work (Done)", () => {
+    // An agent reporting `finished` over MCP never emits NeedsInput after it,
+    // so a parked session used to stay hidden once it was ready to go.
+    useSessionStore.setState({ sessions: [session(1, "Working")] });
+    useSessionStore.getState().parkSession(1);
+
+    emitStatus(1, "Done");
+
+    const state = useSessionStore.getState();
+    expect(state.parkedSessionIds).toEqual([]);
+    expect(state.attentionSessionIds).toEqual([1]);
+    expect(state.sessions[0].status).toBe("Done");
+  });
+
+  it("auto-unparks a parked session that errors out", () => {
+    useSessionStore.setState({ sessions: [session(1, "Working")] });
+    useSessionStore.getState().parkSession(1);
+
+    emitStatus(1, "Error");
+
+    const state = useSessionStore.getState();
+    expect(state.parkedSessionIds).toEqual([]);
+    expect(state.attentionSessionIds).toEqual([1]);
+  });
+
+  it("leaves a parked session alone while it is only working", () => {
+    useSessionStore.setState({ sessions: [session(1, "Idle")] });
+    useSessionStore.getState().parkSession(1);
+
+    emitStatus(1, "Working");
+
+    const state = useSessionStore.getState();
+    expect(state.parkedSessionIds).toEqual([1]);
+    expect(state.attentionSessionIds).toEqual([]);
+  });
+
+  it("edge-triggered: a manual re-park survives repeated Done events", () => {
+    useSessionStore.setState({ sessions: [session(1, "Working")] });
+    useSessionStore.getState().parkSession(1);
+    emitStatus(1, "Done"); // auto-unparked
+
+    useSessionStore.getState().parkSession(1); // user re-parks it
+    emitStatus(1, "Done"); // same state, not a new transition
+
+    const state = useSessionStore.getState();
+    expect(state.parkedSessionIds).toEqual([1]);
+    expect(state.attentionSessionIds).toEqual([]);
+  });
+
   it("parkSession clears a stale attention highlight", () => {
     useSessionStore.setState({ sessions: [session(1, "Working")] });
     useSessionStore.getState().parkSession(1);
