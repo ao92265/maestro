@@ -56,6 +56,38 @@ pub fn handoff_written_retry_value(generation: u32) -> String {
     format!("gen-{generation} retry")
 }
 
+/// The park instruction's ACK value (issue #60). Kind-scoped (`park …`, never
+/// the handoff spelling): a transcript replay of an earlier handoff ACK for
+/// the same generation must not acknowledge a park instruction.
+pub fn park_ack_value(generation: u32) -> String {
+    format!("park gen-{generation}")
+}
+
+/// The park CORRECTIVE round's ACK value — round-scoped for the same replay
+/// reason as [`handoff_ack_retry_value`].
+pub fn park_ack_retry_value(generation: u32) -> String {
+    format!("park gen-{generation} retry")
+}
+
+/// The park instruction's written-marker value. Kind-scoped (`… park`): the
+/// park reuses the handoff written TAG and file, so only the value keeps a
+/// replayed handoff marker (`gen-N`) from validating a park.
+pub fn park_written_value(generation: u32) -> String {
+    format!("gen-{generation} park")
+}
+
+/// The park CORRECTIVE round's written-marker value.
+pub fn park_written_retry_value(generation: u32) -> String {
+    format!("gen-{generation} park retry")
+}
+
+/// The soft wind-down instruction's ACK value (issue #60). Generation-scoped
+/// like every other marker value; there is no written stage — the ACK alone
+/// completes the instruction.
+pub fn soft_winddown_ack_value(generation: u32) -> String {
+    format!("winddown gen-{generation}")
+}
+
 /// Filesystem-safe slug of an epic ref for the handoff filename: `#37` →
 /// `37`, `https://github.com/o/r/issues/9` → `https-github-com-o-r-issues-9`.
 /// ASCII alphanumerics are kept (lowercased); every other run of characters
@@ -91,6 +123,23 @@ pub fn epic_slug(epic: &str) -> String {
 /// and `Path::join` accepts them on every platform.
 pub fn handoff_file_relpath(epic: &str, generation: u32) -> String {
     format!(".maestro/handoffs/{}-gen{generation}.md", epic_slug(epic))
+}
+
+/// Parses the generation number out of a handoff FILENAME shaped by
+/// [`handoff_file_relpath`] — `<slug>-gen<N>.md` → `Some(N)`. The resume path
+/// (issue #61) scans `.maestro/handoffs/` with this to find the latest
+/// generation on disk. Anything else returns `None` — including the
+/// `-recovery` digests ([`recovery_digest_relpath`]), whose tail after
+/// `-gen<N>` is not all digits. `rsplit_once` takes the LAST `-gen`, so an
+/// epic slug that itself contains `-gen` (e.g. `x-gen5-gen2.md`) still
+/// parses the real generation.
+pub fn parse_handoff_generation(filename: &str) -> Option<u32> {
+    let stem = filename.strip_suffix(".md")?;
+    let (_, tail) = stem.rsplit_once("-gen")?;
+    if tail.is_empty() || !tail.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    tail.parse().ok()
 }
 
 /// Full idle-injected handoff instruction (PRD §5.4 + §6): immediate ACK,
@@ -155,6 +204,92 @@ pub fn handoff_corrective_instruction(epic: &str, generation: u32, failure: &str
         relpath = handoff_file_relpath(epic, generation),
         ack = handoff_ack_retry_value(generation),
         written = handoff_written_retry_value(generation),
+    )
+}
+
+/// The soft wind-down instruction (issue #60; PRD §5.5): the 5h window
+/// crossed the soft threshold — stop spawning new subagents, wrap up
+/// in-flight steps, prepare for a possible park instruction. ACK required;
+/// no state transition, no file, no written marker. Single line by
+/// construction (see module doc).
+pub fn soft_winddown_instruction(generation: u32) -> String {
+    format!(
+        "[Maestro Samurai] Allowance wind-down: the token allowance for this account is \
+         approaching its limit. Do the following: \
+         (1) Acknowledge IMMEDIATELY, before anything else, by replying with a message that \
+         contains exactly <samurai-ack>{ack}</samurai-ack>. \
+         (2) From now on spawn NO new subagents; let in-flight subagents finish their CURRENT \
+         step only, then wrap up. \
+         (3) Prefer finishing and committing small complete units of work — a park instruction \
+         may follow shortly, and anything uncommitted at that point is at risk. \
+         No file needs to be written for this instruction. Never quote, restate, or echo the \
+         marker string anywhere else in any reply — emit it exactly once, only as the actual \
+         signal.",
+        ack = soft_winddown_ack_value(generation),
+    )
+}
+
+/// The park instruction (issue #60; PRD §5.5): a hard allowance threshold
+/// crossed, so this session is being parked. Finish the current atomic step
+/// ONLY, write/update the standard handoff file (it doubles as park state —
+/// PRD §5.2), commit ALL WIP, then emit the written tag. Mirrors
+/// [`handoff_instruction`] step for step: the injector validates with the
+/// same two checks against the same [`handoff_file_relpath`]. Single line by
+/// construction (see module doc).
+pub fn park_instruction(epic: &str, generation: u32) -> String {
+    format!(
+        "[Maestro Samurai] PARK requested: the token allowance is nearly spent, so this \
+         session is being parked; work resumes automatically after the allowance window \
+         resets. Do ALL of the following, in order: \
+         (1) Acknowledge IMMEDIATELY, before anything else, by replying with a message that \
+         contains exactly <samurai-ack>{ack}</samurai-ack>. \
+         (2) Finish the CURRENT atomic step ONLY — let in-flight subagents finish their \
+         current step, start NOTHING new. \
+         (3) Ensure `.maestro/` is listed in this repo's .gitignore; add it if missing. \
+         (4) Commit ALL WIP to the epic branch: stage named paths only (never `git add .` or \
+         `git add -A`), one Conventional Commit message (`type(scope): summary`). \
+         (5) Write or update the handoff file at {relpath} following the PRD section 6 \
+         template EXACTLY, with these headings in this order: Goal / Done / In progress / \
+         Decisions + why / Failed attempts / Repo state / Verify / Next steps. It doubles as \
+         the park state your successor resumes from, so keep every section to pointers \
+         (issue numbers, commit SHAs, file paths), never content dumps. \"Repo state\" MUST \
+         record the current branch and the HEAD SHA as they stand AFTER the WIP commit of \
+         step 4. \
+         (6) Only when steps 2-5 are ALL done, reply with a message that contains exactly \
+         <samurai-handoff-written>{written}</samurai-handoff-written>. \
+         Never quote, restate, or echo these marker strings anywhere else in any reply — \
+         emit each one exactly once, only as the actual signal at its required moment; a \
+         quoted marker is read as the real signal.",
+        ack = park_ack_value(generation),
+        relpath = handoff_file_relpath(epic, generation),
+        written = park_written_value(generation),
+    )
+}
+
+/// The single corrective re-instruction after park validation failed —
+/// mirrors [`handoff_corrective_instruction`] with the park's round-scoped
+/// marker values. `failure` is whitespace-normalized for the same
+/// paste-safety reason.
+pub fn park_corrective_instruction(epic: &str, generation: u32, failure: &str) -> String {
+    let failure = failure.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!(
+        "[Maestro Samurai] Park INVALID: {failure}. The gen-{generation} park is only \
+         complete when BOTH checks pass: the handoff file exists at {relpath} (PRD section 6 \
+         template), AND `git status --porcelain` reports no modified or staged tracked files \
+         (untracked files are fine). \
+         (1) Acknowledge IMMEDIATELY by replying with a message that contains exactly \
+         <samurai-ack>{ack}</samurai-ack> — note the value differs from the first \
+         instruction's; use exactly this one. \
+         (2) Fix the failure above: write/update the handoff file and/or commit ALL WIP to \
+         the epic branch (stage named paths only, Conventional Commit message). \
+         (3) Then reply with a message that contains exactly \
+         <samurai-handoff-written>{written}</samurai-handoff-written>. \
+         Never quote, restate, or echo these marker strings anywhere else in any reply — \
+         emit each one exactly once, only as the actual signal at its required moment. \
+         This is the final attempt before a human is alerted.",
+        relpath = handoff_file_relpath(epic, generation),
+        ack = park_ack_retry_value(generation),
+        written = park_written_retry_value(generation),
     )
 }
 
@@ -257,6 +392,64 @@ pub fn successor_ritual_instruction(
              then continue with the handoff's Next steps."
         )
     }
+}
+
+/// The gen-1 opening brief (issue #63, PRD §5.8 + §12): what the FIRST
+/// generation of a freshly launched epic run receives on its first
+/// `SessionStarted` — there is no handoff and no predecessor, so neither
+/// ritual applies. The orchestrator reads the epic and its child issues from
+/// GitHub, plans, works the issues via small idempotent subagent tasks with
+/// per-step commits (PRD §10: tree-kill containment), comments progress on
+/// the epic, and opens PRs. Single line by construction (see module doc);
+/// the epic ref is whitespace-normalized so a pathological ref can never
+/// smuggle a newline into the paste.
+///
+/// `repo_pin` is the `owner/repo` derived from the epic worktree's `origin`
+/// remote — PRD §10: gen-1 runs with `--dangerously-skip-permissions`, so
+/// every `gh` command must carry `--repo` explicitly. `None` (remote missing
+/// or unparseable — never blocks the launch) keeps the unpinned wording plus
+/// the same explicit caution sentence as [`recovery_ritual_instruction`].
+pub fn launch_instruction(epic: &str, repo_pin: Option<&str>) -> String {
+    let epic_text = epic.split_whitespace().collect::<Vec<_>>().join(" ");
+    let (gh_read, gh_progress, caution) = match repo_pin {
+        Some(pin) => (
+            format!(
+                "read the epic's GitHub issue, ALL of its comments, and EVERY child issue it \
+                 references with the `gh` CLI, passing `--repo {pin}` explicitly on every `gh` \
+                 command"
+            ),
+            format!(
+                "comment progress on the epic's GitHub issue as issues complete, and open pull \
+                 requests for finished work (again via `gh` with `--repo {pin}` on every command)"
+            ),
+            String::new(),
+        ),
+        None => (
+            "read the epic's GitHub issue, ALL of its comments, and EVERY child issue it \
+             references with the `gh` CLI, run from this directory"
+                .to_string(),
+            "comment progress on the epic's GitHub issue as issues complete, and open pull \
+             requests for finished work"
+                .to_string(),
+            " CAUTION: Maestro could not determine this repository's origin remote, so no \
+             `--repo` pin is available — before running any `gh` command, double-check it \
+             targets the correct repository."
+                .to_string(),
+        ),
+    };
+    format!(
+        "[Maestro Samurai] You are generation 1, the FIRST orchestrator, for GitHub epic \
+         {epic_text}. This directory is the epic's dedicated worktree on its own branch. \
+         Do the following: \
+         (1) {gh_read}. \
+         (2) Plan the work across the epic's issues before touching code. \
+         (3) Work the issues via SMALL idempotent subagent tasks, each committing its \
+         completed step to THIS branch (stage named paths only, never `git add .` or \
+         `git add -A`; Conventional Commit messages `type(scope): summary`). \
+         (4) {gh_progress}. \
+         (5) NEVER switch to, commit to, or push any other branch, and NEVER touch any \
+         repository other than this one.{caution}"
+    )
 }
 
 /// Repo-relative path of the pre-digested transcript summary Maestro writes
@@ -402,6 +595,36 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_handoff_generation_roundtrips_the_relpath() {
+        // The parser must accept exactly what handoff_file_relpath produces.
+        for (epic, generation) in [("#37", 1), ("#37", 42), ("Epic 12: Auth", 10), ("", 3)] {
+            let relpath = handoff_file_relpath(epic, generation);
+            let filename = relpath.rsplit('/').next().unwrap();
+            assert_eq!(
+                parse_handoff_generation(filename),
+                Some(generation),
+                "roundtrip failed for {relpath}"
+            );
+        }
+        // A slug that itself contains `-gen<digits>`: the LAST -gen wins.
+        assert_eq!(parse_handoff_generation("x-gen5-gen2.md"), Some(2));
+    }
+
+    #[test]
+    fn test_parse_handoff_generation_rejects_non_handoffs() {
+        // Recovery digests are not handoffs.
+        assert_eq!(parse_handoff_generation("37-gen3-recovery.md"), None);
+        // Missing/garbled pieces.
+        assert_eq!(parse_handoff_generation("37-gen.md"), None);
+        assert_eq!(parse_handoff_generation("37-gen2"), None); // no .md
+        assert_eq!(parse_handoff_generation("37-gen2x.md"), None);
+        assert_eq!(parse_handoff_generation("37.md"), None);
+        assert_eq!(parse_handoff_generation(""), None);
+        // Overflow parses as None rather than panicking.
+        assert_eq!(parse_handoff_generation("37-gen99999999999999999999.md"), None);
+    }
+
+    #[test]
     fn test_instruction_carries_the_full_handoff_brief() {
         let text = handoff_instruction("#37", 2);
         // The written marker with its exact value.
@@ -452,6 +675,90 @@ mod tests {
         assert!(!text.contains("<samurai-handoff-written>gen-4</samurai-handoff-written>"));
         assert!(text.contains(".maestro/handoffs/37-gen4.md"));
         // Marker hygiene rides on the corrective too (finding J).
+        assert!(text.contains("Never quote, restate, or echo"));
+    }
+
+    // --- issue #60: park + soft wind-down ---
+
+    #[test]
+    fn test_park_marker_values_are_kind_and_round_scoped() {
+        // Kind-scoped: a replayed handoff marker for the same generation must
+        // never satisfy a park (same tag, distinct value), and vice versa.
+        assert_eq!(park_ack_value(3), "park gen-3");
+        assert_eq!(park_written_value(3), "gen-3 park");
+        assert_ne!(park_ack_value(3), handoff_ack_value(3));
+        assert_ne!(park_written_value(3), handoff_written_value(3));
+        // Round-scoped, same replay reasoning as the handoff retry values.
+        assert_eq!(park_ack_retry_value(3), "park gen-3 retry");
+        assert_eq!(park_written_retry_value(3), "gen-3 park retry");
+        assert_ne!(park_ack_retry_value(3), park_ack_value(3));
+        assert_ne!(park_written_retry_value(3), park_written_value(3));
+        // And the park retry values never collide with the handoff ones.
+        assert_ne!(park_written_retry_value(3), handoff_written_retry_value(3));
+        assert_eq!(soft_winddown_ack_value(4), "winddown gen-4");
+        assert_ne!(soft_winddown_ack_value(4), handoff_ack_value(4));
+        assert_ne!(soft_winddown_ack_value(4), park_ack_value(4));
+    }
+
+    #[test]
+    fn test_park_instruction_is_single_line_with_full_brief() {
+        let text = park_instruction("#37", 2);
+        assert!(!text.contains('\n'), "park must not contain \\n");
+        assert!(!text.contains('\r'), "park must not contain \\r");
+        // The exact markers the injector's scanners expect.
+        assert!(text.contains("<samurai-ack>park gen-2</samurai-ack>"));
+        assert!(text.contains("<samurai-handoff-written>gen-2 park</samurai-handoff-written>"));
+        // The standard handoff relpath — the file doubles as park state.
+        assert!(text.contains(".maestro/handoffs/37-gen2.md"));
+        // Finish the atomic step only, commit ALL WIP, template headings.
+        assert!(text.contains("atomic step ONLY"));
+        assert!(text.contains("start NOTHING new"));
+        assert!(text.contains("Commit ALL WIP"));
+        assert!(text.contains("stage named paths only"));
+        for heading in [
+            "Goal",
+            "Done",
+            "In progress",
+            "Decisions + why",
+            "Failed attempts",
+            "Repo state",
+            "Verify",
+            "Next steps",
+        ] {
+            assert!(text.contains(heading), "missing heading {heading}");
+        }
+        assert!(text.contains("HEAD SHA"));
+        // Marker hygiene (finding J) rides on the park too.
+        assert!(text.contains("Never quote, restate, or echo"));
+    }
+
+    #[test]
+    fn test_park_corrective_is_single_line_with_retry_markers() {
+        let text = park_corrective_instruction("#37", 4, "WIP is not\ncommitted");
+        assert!(!text.contains('\n'));
+        assert!(!text.contains('\r'));
+        assert!(text.contains("Park INVALID"));
+        assert!(text.contains("WIP is not committed"));
+        assert!(text.contains("<samurai-ack>park gen-4 retry</samurai-ack>"));
+        assert!(text.contains("<samurai-handoff-written>gen-4 park retry</samurai-handoff-written>"));
+        assert!(!text.contains("<samurai-ack>park gen-4</samurai-ack>"));
+        assert!(text.contains(".maestro/handoffs/37-gen4.md"));
+        assert!(text.contains("final attempt"));
+    }
+
+    #[test]
+    fn test_soft_winddown_instruction_shape() {
+        let text = soft_winddown_instruction(3);
+        assert!(!text.contains('\n'));
+        assert!(!text.contains('\r'));
+        assert!(text.contains("<samurai-ack>winddown gen-3</samurai-ack>"));
+        // Wind down: no new subagents, wrap up, park may follow.
+        assert!(text.contains("NO new subagents"));
+        assert!(text.contains("CURRENT step only"));
+        assert!(text.contains("park instruction"));
+        // No file and no written marker are involved.
+        assert!(text.contains("No file needs to be written"));
+        assert!(!text.contains("<samurai-handoff-written>"));
         assert!(text.contains("Never quote, restate, or echo"));
     }
 
@@ -638,6 +945,70 @@ mod tests {
         // No pinned `gh` usage (the caution itself mentions the missing pin).
         assert!(!text.contains("passing `--repo"));
         assert!(!text.contains("again via `gh`"));
+        assert!(text.contains("CAUTION"));
+        assert!(text.contains("double-check it targets the correct repository"));
+    }
+
+    // --- issue #63: gen-1 launch brief ---
+
+    #[test]
+    fn test_launch_instruction_is_single_line() {
+        for pin in [None, Some("owner/repo")] {
+            let text = launch_instruction("#38", pin);
+            assert!(!text.contains('\n'), "launch brief must not contain \\n");
+            assert!(!text.contains('\r'), "launch brief must not contain \\r");
+        }
+        // A pathological epic ref cannot smuggle a newline into the paste.
+        let text = launch_instruction("epic\nwith newline", None);
+        assert!(!text.contains('\n'));
+        assert!(text.contains("epic with newline"));
+    }
+
+    #[test]
+    fn test_launch_instruction_content() {
+        let text = launch_instruction("#38", None);
+        // Identity: gen-1, the epic, its dedicated worktree.
+        assert!(text.contains("generation 1"));
+        assert!(text.contains("epic #38"));
+        assert!(text.contains("worktree"));
+        // Read the epic AND its child issues, plan first.
+        assert!(text.contains("`gh` CLI"));
+        assert!(text.contains("ALL of its comments"));
+        assert!(text.contains("EVERY child issue"));
+        assert!(text.contains("Plan the work"));
+        // Small idempotent subagent tasks with per-step commits (PRD §10).
+        assert!(text.contains("SMALL idempotent subagent tasks"));
+        assert!(text.contains("stage named paths only"));
+        assert!(text.contains("Conventional Commit"));
+        // Progress comments + PRs, and the hard containment rule.
+        assert!(text.contains("comment progress"));
+        assert!(text.contains("open pull requests"));
+        assert!(text.contains("NEVER switch to, commit to, or push any other branch"));
+        assert!(text.contains("NEVER touch any repository other than this one"));
+        // No successor/recovery language: there is nothing to hand off from.
+        assert!(!text.contains("handoff"));
+        assert!(!text.contains("RECOVERY"));
+    }
+
+    #[test]
+    fn test_launch_instruction_pins_the_repo_when_known() {
+        // PRD §10: gen-1 runs with --dangerously-skip-permissions, so BOTH
+        // the issue reads and the progress/PR clause carry --repo explicitly
+        // (mirrors recovery_ritual_instruction's pinning language).
+        let text = launch_instruction("#38", Some("nachogl1/maestro"));
+        assert_eq!(
+            text.matches("--repo nachogl1/maestro").count(),
+            2,
+            "read AND progress clauses must be pinned: {text}"
+        );
+        assert!(text.contains("passing `--repo nachogl1/maestro` explicitly"));
+        assert!(!text.contains("CAUTION"));
+    }
+
+    #[test]
+    fn test_launch_instruction_without_pin_carries_a_caution() {
+        let text = launch_instruction("#38", None);
+        assert!(!text.contains("passing `--repo"));
         assert!(text.contains("CAUTION"));
         assert!(text.contains("double-check it targets the correct repository"));
     }

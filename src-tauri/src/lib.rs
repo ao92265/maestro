@@ -565,6 +565,10 @@ pub fn run() {
                         }
                     });
                 });
+            // The parker (issue #60) tears parked sessions down with this
+            // same closure — a PARKED terminal serves no purpose, every
+            // wake-up is a fresh spawn (PRD decision #6).
+            let teardown_for_parker = teardown.clone();
             let replicator = Arc::new(core::samurai_replicator::SamuraiReplicator::new(
                 supervisor.clone(),
                 audit_log.clone(),
@@ -585,21 +589,163 @@ pub fn run() {
                 samurai_config.clone(),
                 app.state::<ProcessManager>().inner().clone(),
                 audit_log.clone(),
-                session_dirs,
-                Some(replicator),
+                session_dirs.clone(),
+                Some(replicator.clone()),
             ));
             // Managed for the same teardown propagation as the progress
             // tracker above (finding H): pending instruction + idle flag.
             app.manage(injector.clone());
             let _ = samurai_injector.set(injector.clone());
-            core::samurai_injector::spawn_injector(injector);
+            core::samurai_injector::spawn_injector(injector.clone());
+
+            // Samurai (issue #59): per-epic run-config store + persisted
+            // resume timers. Both managed so the later command layers reach
+            // them via `app.state()`.
+            let run_configs = Arc::new(core::samurai_run_config::RunConfigStore::new(
+                commands::ai_runner::artifact_base_dir("runs"),
+            ));
+            app.manage(run_configs.clone());
+            // Review F4: the replicator resolves the per-run `model` at
+            // spawn-emit time, and the injector's trigger pass consults the
+            // per-run `thresholds` override (handoff trigger only — park
+            // thresholds stay global, see allowance_watcher). Late-bound
+            // like set_absorber/set_parker: the store is constructed after
+            // both controllers.
+            replicator.set_run_configs(run_configs.clone());
+            injector.set_run_configs(run_configs.clone());
+            // Samurai (issue #61): the resume handler — a fired park timer
+            // becomes a FRESH generation spawn (guards → working dir →
+            // next generation → RESUME row → replicator.spawn_generation).
+            // Constructed before the schedule because it IS the fire
+            // callback; the schedule and parker are late-bound below (the
+            // construction order is circular: schedule → resumer → parker →
+            // schedule).
+            let samurai_resumer = core::samurai_resumer::SamuraiResumer::new(
+                supervisor.clone(),
+                replicator.clone(),
+                run_configs.clone(),
+                audit_log.clone(),
+                session_dirs,
+            );
+            let resumer_for_fire = samurai_resumer.clone();
+            // Issue #61: every schedule mutation (arm/cancel/fire) pushes
+            // the full timer list to the frontend — the park-countdown chip
+            // stays live without polling.
+            let schedule_event_handle = app.handle().clone();
+            let (samurai_schedule, samurai_schedule_task) =
+                core::samurai_schedule::SamuraiSchedule::new(
+                    commands::ai_runner::artifact_base_dir("samurai"),
+                    Arc::new(move |entry: core::samurai_schedule::ScheduleEntry| {
+                        resumer_for_fire.on_fire(entry);
+                    }),
+                    Some(Arc::new(
+                        move |entries: &[core::samurai_schedule::ScheduleEntry]| {
+                            let _ = schedule_event_handle.emit("samurai-schedule-event", entries);
+                        },
+                    )),
+                );
+            // Issue #62: snapshot the pending timers BEFORE the fire loop is
+            // spawned — a past-due entry fires on the loop's first tick and
+            // self-cleans, so reading `list()` from the reconciliation task
+            // later would race it and double-spawn the fired epic. A fire
+            // cannot precede its own task spawn, so this snapshot is complete.
+            // The fire loop itself is spawned BELOW, after `samurai_resumer
+            // .bind(...)` — fires must never precede the bind (review F2):
+            // a past-due timer firing in that gap would be dropped by the
+            // resumer's unset OnceLocks yet still self-clean from
+            // schedule.json, stranding the epic (the reconciler snapshot
+            // lists it as timer-owned, so nothing respawns it either).
+            let reconcile_timers = samurai_schedule.list();
+            app.manage(samurai_schedule.clone());
+
+            // Samurai (issue #60): the allowance parker — the backend
+            // consumer of the watcher's threshold events. Soft crossing →
+            // wind-down instructions through the injector's ladder; hard
+            // crossing → sequential park sweep (highest context first),
+            // teardown per parked session, one persisted resume timer per
+            // parked/absorbed epic. The injector chains park outcomes back
+            // in (set_parker) and the replicator consults the parking-
+            // engaged check before staging a successor (set_absorber).
+            let samurai_parker = core::samurai_parker::SamuraiParker::new(
+                supervisor.clone(),
+                samurai_context.clone(),
+                injector.clone(),
+                samurai_schedule.clone(),
+                audit_log.clone(),
+                teardown_for_parker,
+            );
+            app.manage(samurai_parker.clone());
+            injector.set_parker(samurai_parker.clone());
+            let parker_for_absorb = samurai_parker.clone();
+            replicator.set_absorber(Arc::new(move |project: &str, epic: &str| {
+                parker_for_absorb.absorb_handoff(project, epic)
+            }));
+            // Issue #61: closes the circular construction order — the
+            // resumer can now re-arm deferred timers and consult the
+            // parking-engaged guard.
+            samurai_resumer.bind(samurai_schedule, samurai_parker.clone());
+            // Ordering invariant (review F2): the schedule's fire loop is
+            // spawned only AFTER the bind above — its first tick fires every
+            // past-due timer immediately, and a fire before the bind would
+            // hit unset OnceLocks (dropped resume) while still self-cleaning
+            // the entry from schedule.json.
+            tauri::async_runtime::spawn(samurai_schedule_task);
+
+            // Samurai (issue #63): periodic gh auth re-check while any run
+            // config is ACTIVE — corporate SSO tokens expire mid-run (PRD
+            // §5.8: park + ALERT, not a crash loop). The probe is injected
+            // (the reconciler's closure pattern); gh runs in the active
+            // config's project directory — auth is account-global, the cwd
+            // only anchors it to a repo.
+            let auth_probe: core::samurai_auth_watch::AuthProbe = Arc::new(|project: String| {
+                Box::pin(async move {
+                    github::GitHub::new(project)
+                        .auth_status()
+                        .await
+                        .map(|status| status.logged_in)
+                        .map_err(|e| e.to_string())
+                })
+            });
+            core::samurai_auth_watch::spawn_auth_watch(
+                run_configs.clone(),
+                samurai_parker.clone(),
+                auth_probe,
+            );
 
             core::allowance_watcher::spawn_allowance_loop(
                 app.handle().clone(),
                 samurai_config,
-                supervisor,
-                audit_log,
+                supervisor.clone(),
+                audit_log.clone(),
+                samurai_parker,
             );
+
+            // Samurai (issue #62): cold-start reconciliation — PRD §5.6's
+            // first-class flow. Runs ONCE, after every samurai component
+            // above is constructed: for each ACTIVE run config, skip epics a
+            // pending timer or live session already owns, alert on probable
+            // pre-restart survivors, and fresh-spawn the next generation for
+            // the rest (the replicator's spawn-retry tolerates the frontend
+            // not being mounted yet). The probes are the watchdog's process
+            // scan and the project's newest transcript age — both real IO,
+            // injected so the module stays harness-testable.
+            let transcript_ages: core::samurai_reconciler::TranscriptAgeProbe =
+                Arc::new(|project| {
+                    commands::claude_sessions::newest_transcript_for_project(project)
+                        .and_then(|path| core::samurai_watchdog::transcript_age(&path))
+                });
+            let claude_alive: core::samurai_reconciler::ClaudeAliveProbe = Arc::new(|| {
+                !core::samurai_watchdog::scan_claude_ancestor_pids().is_empty()
+            });
+            tauri::async_runtime::spawn(core::samurai_reconciler::reconcile(
+                run_configs,
+                reconcile_timers,
+                supervisor,
+                replicator,
+                audit_log,
+                transcript_ages,
+                claude_alive,
+            ));
 
             // GitHub watchdog: background poller for review requests /
             // assigned issues across all configured projects. The frontend
@@ -819,8 +965,14 @@ pub fn run() {
             commands::samurai::samurai_list_sessions,
             commands::samurai::samurai_audit_read,
             commands::samurai::samurai_audit_clear,
+            commands::samurai::samurai_schedule_list,
             commands::samurai::samurai_get_config,
             commands::samurai::samurai_set_config,
+            // Samurai run launcher (issue #63)
+            commands::samurai::samurai_preflight,
+            commands::samurai::samurai_launch_run,
+            commands::samurai::samurai_list_runs,
+            commands::samurai::samurai_cleanup_epic,
             // CLI commands
             commands::cli::install_cli,
             commands::cli::uninstall_cli,

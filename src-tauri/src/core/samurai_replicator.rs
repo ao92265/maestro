@@ -51,6 +51,21 @@
 //! through `write_stdin`. A missing transcript still produces the file,
 //! with a note — git + GitHub are the primary reconstruction sources.
 //!
+//! Issue #61 adds [`SamuraiReplicator::spawn_generation`] — the fresh-spawn
+//! entry point for generations with NO live predecessor session (timer
+//! resumes and P3.4 cold-start reconciliation): the ritual is chosen by
+//! whether the prior generation's handoff file exists on disk, and the spawn
+//! event is re-emitted once per timeout window while no registration arrives
+//! (the frontend drops the event when no project tab is open), bounded by
+//! [`MAX_SPAWN_EMITS`] and closed out with a `spawn_dropped` ALERT.
+//!
+//! Issue #63 adds [`SamuraiReplicator::spawn_first_generation`] — the gen-1
+//! seam for the P3.5 launcher: a brand-new epic has no handoff and no
+//! predecessor, so the caller supplies the opening brief
+//! (`samurai_prompts::launch_instruction`) directly and the entry rides the
+//! exact same staging / spawn-retry / delivery machinery as every other
+//! fresh spawn.
+//!
 //! Same shape as the watchdog/injector: decisions as pure functions, I/O at
 //! the edges, one periodic timeout pass (driven by the injector's tick).
 
@@ -98,6 +113,14 @@ pub type StdinWriter = Arc<dyn Fn(u32, String) + Send + Sync>;
 /// blocking the spawn.
 pub type TranscriptPathResolver = Arc<dyn Fn(u32) -> Option<PathBuf> + Send + Sync>;
 
+/// Issue #60: consulted with (project, epic) just before a successor is
+/// staged for a completed handoff. `true` = a hard park sweep is engaged;
+/// the handoff is absorbed as park state (the parker records the epic for a
+/// resume timer) and NO successor spawns. The production closure wraps
+/// `SamuraiParker::absorb_handoff`; late-bound because the parker is
+/// constructed after this controller.
+pub type HandoffAbsorber = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
 /// Payload of the `samurai-spawn-successor` event. Deliberately does NOT
 /// carry the ritual prompt: frontend write-timing is unreliable (claude may
 /// not be up yet), so the prompt stays queued here and is delivered on the
@@ -114,6 +137,30 @@ pub struct SuccessorSpawn {
     pub working_dir: String,
     /// Display name for the new terminal, e.g. `samurai gen-3 37`.
     pub session_name: String,
+    /// Model preference from the epic's run config (review F4) — the
+    /// frontend appends `--model <value>` to the successor's CLI launch.
+    /// `None` = the spawn flow's default model. Resolved at emit time via
+    /// [`SamuraiReplicator::set_run_configs`].
+    pub model: Option<String>,
+}
+
+/// How many times a fresh-spawn ([`Self::spawn_generation`] /
+/// [`Self::spawn_first_generation`]) event is emitted in total before the
+/// entry gives up with a `spawn_dropped` ALERT (issue #61; renamed from
+/// `resume_spawn_dropped` in #63 — gen-1 launches ride it too). The frontend
+/// listener drops the event when no tab for the project is open
+/// (`spawnSession.ts` returns false), so a resume that fires while the user
+/// has the project closed needs re-emits — one per `ack_timeout_secs`
+/// window. Five windows (~15 min at the default 180s) is long enough to
+/// survive a slow frontend start and short enough that a genuinely closed
+/// project alerts the same day it parked.
+const MAX_SPAWN_EMITS: u32 = 5;
+
+/// Retry state for a fresh-spawn entry (issue #61): the payload to re-emit
+/// and how many emits happened so far.
+struct RespawnState {
+    spawn: SuccessorSpawn,
+    attempts: u32,
 }
 
 /// One staged ritual prompt, from kill to delivery (or the no-start ALERT).
@@ -129,6 +176,11 @@ struct PendingRitual {
     /// True for a RECOVERY successor (issue #56): the predecessor died or
     /// its handoff vanished. Rides into the SPAWN audit row's details.
     recovery: bool,
+    /// True for a gen-1 LAUNCH entry (issue #63,
+    /// [`SamuraiReplicator::spawn_first_generation`]): there is no
+    /// predecessor at all, so the SPAWN audit details carry
+    /// `trigger: "launch"` instead of predecessor linkage.
+    launch: bool,
     queued_at: Instant,
     /// Set when the frontend registered the successor: (session id, when).
     /// The no-start clock runs from here; before registration it runs from
@@ -140,6 +192,17 @@ struct PendingRitual {
     /// delivered. Never re-alerts; pruned when the ritual is claimed or when
     /// no supervised session remains for the (project, epic).
     alerted: bool,
+    /// `Some` for entries staged by [`SamuraiReplicator::spawn_generation`]
+    /// (issue #61 — timer resumes; P3.4 cold-start reconciliation and the
+    /// P3.5 gen-1 launcher reuse it): while unregistered, the tick re-emits
+    /// the spawn event per timeout window up to [`MAX_SPAWN_EMITS`], then
+    /// latches with a `spawn_dropped` ALERT (which REPLACES the generic
+    /// `successor_no_start` for this path — one clear ALERT, not two vague
+    /// ones). These entries also skip the epic-gone prune: a resumed epic
+    /// has NO supervised session until its successor registers, so the
+    /// heuristic would delete them instantly; they are pruned on delivery
+    /// instead (bounded: one per (project, epic, generation)).
+    respawn: Option<RespawnState>,
 }
 
 /// HEAD gate (PRD §5.4/§5.6): verify is skippable only when both the
@@ -248,8 +311,10 @@ fn parse_owner_repo(url: &str) -> Option<String> {
 /// PRD §10: successors run with `--dangerously-skip-permissions`, so every
 /// orchestrator prompt pins `--repo`). `None` (logged) when the remote is
 /// missing or unparseable — recovery is never blocked on it; the prompt then
-/// carries an explicit caution instead.
-fn derive_repo_pin(dir: &Path) -> Option<String> {
+/// carries an explicit caution instead. `pub(crate)`: the P3.5 launcher
+/// (issue #63, `commands::samurai`) derives the run config's `repo_pin` from
+/// the freshly created epic worktree with this same helper.
+pub(crate) fn derive_repo_pin(dir: &Path) -> Option<String> {
     match read_repo_origin(dir) {
         Ok(url) => match parse_owner_repo(&url) {
             Some(pin) => Some(pin),
@@ -450,6 +515,15 @@ pub struct SamuraiReplicator {
     emit_spawn: SuccessorEmitter,
     write_stdin: StdinWriter,
     pending: Mutex<Vec<PendingRitual>>,
+    /// Issue #60: the parking-engaged check (see [`HandoffAbsorber`]).
+    /// Unset (tests without a parker, or before setup finishes) = never
+    /// absorb — successors spawn as in Phase 2.
+    absorber: std::sync::OnceLock<HandoffAbsorber>,
+    /// Review F4: the run-config store, consulted at spawn-emit time for the
+    /// epic's per-run `model` preference. Late-bound like the absorber
+    /// (constructed after this controller in lib.rs); unset (tests, early
+    /// setup) = no model preference on any spawn.
+    run_configs: std::sync::OnceLock<Arc<super::samurai_run_config::RunConfigStore>>,
 }
 
 impl SamuraiReplicator {
@@ -473,7 +547,34 @@ impl SamuraiReplicator {
             emit_spawn,
             write_stdin,
             pending: Mutex::new(Vec::new()),
+            absorber: std::sync::OnceLock::new(),
+            run_configs: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Issue #60: late-binds the parking-engaged check (the parker is
+    /// constructed after this controller). Second calls are ignored, like
+    /// every OnceLock slot in setup.
+    pub fn set_absorber(&self, absorber: HandoffAbsorber) {
+        let _ = self.absorber.set(absorber);
+    }
+
+    /// Review F4: late-binds the run-config store (constructed after this
+    /// controller in lib.rs), the `set_absorber` pattern. Second calls are
+    /// ignored.
+    pub fn set_run_configs(&self, store: Arc<super::samurai_run_config::RunConfigStore>) {
+        let _ = self.run_configs.set(store);
+    }
+
+    /// The epic's per-run model preference, when a run config carries one
+    /// (review F4). Resolved at emit time — a relaunch with a different
+    /// model applies to the next spawn without a restart. One small JSON
+    /// read; `None` on every miss (no store bound, no config, no model).
+    fn model_for(&self, project: &str, epic: &str) -> Option<String> {
+        self.run_configs
+            .get()?
+            .get(project, epic)?
+            .model
     }
 
     /// One `successor_spawn_failed` ALERT (P2.4 pattern): the successor for
@@ -568,11 +669,30 @@ impl SamuraiReplicator {
         // Killed transition so the audit row records an accomplished fact.
         (self.teardown)(snapshot.session_id).await;
 
+        // Issue #60: while a hard park sweep is engaged, a completed handoff
+        // is ABSORBED instead of replicated — the handoff file already IS the
+        // park state (PRD §5.2) and a successor would burn the exhausted
+        // allowance. Evaluated BEFORE the Killed transition (review F3b):
+        // Killed is terminal and stops blocking the sweep
+        // (`blocks_completion`), so consulting the absorber after it opened
+        // a window where a concurrent complete_sweep disengaged between the
+        // two — the successor then spawned into an exhausted allowance, or
+        // the epic was swallowed into a disengaged sweep with no resume
+        // timer. `absorb_handoff` records the epic while HANDOFF_WRITTEN
+        // still holds the sweep open, so the stored verdict stays valid
+        // after the transition.
+        let absorbed = self
+            .absorber
+            .get()
+            .is_some_and(|absorber| absorber(&snapshot.project, &snapshot.epic));
+
         // HANDOFF_WRITTEN → KILLED: writes the `HANDOFF phase=killed` audit
         // row and emits the supervisor event the frontend clears the dead
         // tile on. A rejection (e.g. the watchdog declared the session DEAD
         // mid-teardown) aborts the successor — DEAD has its own recovery
-        // path and must not race a second spawn.
+        // path and must not race a second spawn. (An absorbed epic stays
+        // recorded with the parker then — correct either way: the handoff
+        // on disk is the park state a resume timer restarts from.)
         let killed = match self
             .supervisor
             .transition(snapshot.session_id, SupervisorState::Killed)
@@ -586,6 +706,29 @@ impl SamuraiReplicator {
                 return;
             }
         };
+
+        if absorbed {
+            // ONLY the successor staging + spawn emit are suppressed — the
+            // teardown and Killed transition above happened in full. The
+            // PARK row explains why no successor appears; the parker arms
+            // the epic's resume timer when the sweep completes.
+            log::info!(
+                "samurai replicator: parking engaged — gen-{} handoff for epic {} absorbed as park state, no successor staged",
+                snapshot.generation,
+                snapshot.epic,
+            );
+            self.audit.append(
+                &snapshot.project,
+                AuditEvent::now(
+                    snapshot.epic.clone(),
+                    AuditEventKind::Park,
+                    snapshot.generation,
+                    snapshot.session_id,
+                    json!({ "phase": "handoff_absorbed" }),
+                ),
+            );
+            return;
+        }
 
         let generation = snapshot.generation + 1;
         let (instruction, recovery) = match head_gate {
@@ -612,8 +755,15 @@ impl SamuraiReplicator {
                     snapshot.generation,
                     snapshot.epic,
                 );
-                self.write_recovery_digest(&snapshot, &working_dir, &killed.ts, transcript)
-                    .await;
+                self.write_recovery_digest(
+                    &snapshot.epic,
+                    snapshot.generation,
+                    snapshot.session_id,
+                    &working_dir,
+                    &killed.ts,
+                    transcript,
+                )
+                .await;
                 // Finding D: pin `--repo` in the recovery prompt (PRD §10).
                 // Blocking git → blocking pool; failure never blocks recovery.
                 let pin_dir = PathBuf::from(working_dir.clone());
@@ -636,6 +786,7 @@ impl SamuraiReplicator {
             generation,
             working_dir,
             session_name: samurai_prompts::successor_session_name(&snapshot.epic, generation),
+            model: self.model_for(&snapshot.project, &snapshot.epic),
         };
         self.lock_pending().push(PendingRitual {
             project: snapshot.project.clone(),
@@ -645,9 +796,11 @@ impl SamuraiReplicator {
             predecessor_session_id: snapshot.session_id,
             predecessor_generation: snapshot.generation,
             recovery,
+            launch: false,
             queued_at: Instant::now(),
             registered: None,
             alerted: false,
+            respawn: None,
         });
         (self.emit_spawn)(&spawn);
     }
@@ -661,6 +814,37 @@ impl SamuraiReplicator {
     /// error and demands attention, and the human dismisses it.
     pub fn on_dead(self: &Arc<Self>, snapshot: &SessionSnapshot) {
         if snapshot.state != SupervisorState::Dead {
+            return;
+        }
+        // Review F7: while a hard park sweep is engaged, a DEAD session's
+        // epic is ABSORBED like a completed handoff (`replicate` above) —
+        // the parker records it for a resume timer and NO recovery successor
+        // is staged: spawning one would burn the exhausted allowance the
+        // sweep exists to protect. The PARK row explains the missing
+        // successor (`dead_absorbed` — the handoff-less sibling of
+        // `handoff_absorbed`); the resume path respawns the generation from
+        // disk once the window resets. No lock is held here, so the
+        // parker→injector→supervisor ordering is untouched.
+        if self
+            .absorber
+            .get()
+            .is_some_and(|absorber| absorber(&snapshot.project, &snapshot.epic))
+        {
+            log::info!(
+                "samurai replicator: parking engaged — DEAD gen-{} for epic {} absorbed, no recovery successor staged",
+                snapshot.generation,
+                snapshot.epic,
+            );
+            self.audit.append(
+                &snapshot.project,
+                AuditEvent::now(
+                    snapshot.epic.clone(),
+                    AuditEventKind::Park,
+                    snapshot.generation,
+                    snapshot.session_id,
+                    json!({ "phase": "dead_absorbed" }),
+                ),
+            );
             return;
         }
         let Some(dir) = (self.session_dirs)(snapshot.session_id) else {
@@ -706,9 +890,11 @@ impl SamuraiReplicator {
                 predecessor_session_id: snapshot.session_id,
                 predecessor_generation: snapshot.generation,
                 recovery: true,
+                launch: false,
                 queued_at: Instant::now(),
                 registered: None,
                 alerted: false,
+                respawn: None,
             });
         }
         let spawn = SuccessorSpawn {
@@ -717,6 +903,7 @@ impl SamuraiReplicator {
             generation,
             working_dir: working_dir.clone(),
             session_name: samurai_prompts::successor_session_name(&snapshot.epic, generation),
+            model: self.model_for(&snapshot.project, &snapshot.epic),
         };
         let this = self.clone();
         let snapshot = snapshot.clone();
@@ -756,26 +943,281 @@ impl SamuraiReplicator {
                 .unwrap_or(None);
             // Digest before the spawn event so the file exists before the
             // successor can look; failure never blocks the spawn.
-            this.write_recovery_digest(&snapshot, &working_dir, &snapshot.ts, transcript)
-                .await;
+            this.write_recovery_digest(
+                &snapshot.epic,
+                snapshot.generation,
+                snapshot.session_id,
+                &working_dir,
+                &snapshot.ts,
+                transcript,
+            )
+            .await;
             (this.emit_spawn)(&spawn);
         });
     }
 
-    /// Builds and writes the recovery digest file for `snapshot`'s successor
+    /// Issue #61: the reusable FRESH-SPAWN entry point — a generation spawned
+    /// with no live predecessor session (PRD §5.5: every wake-up is a fresh
+    /// spawn from the handoff file). The resume path calls it when a park
+    /// timer fires; P3.4's cold-start reconciliation and P3.5's gen-1 launch
+    /// call this same method.
+    ///
+    /// `prior_generation = Some(n)`: the ritual is chosen by whether gen-n's
+    /// handoff file exists in `working_dir` — present → the normal successor
+    /// ritual, HEAD-gated exactly like [`Self::replicate`]; missing (e.g. the
+    /// registry knew a later generation than the last handoff on disk) →
+    /// the recovery ritual with a `--repo` pin and a no-transcript digest
+    /// file (there is no predecessor transcript to digest on this path).
+    ///
+    /// `prior_generation = None` still refuses loudly: a brand-new epic has
+    /// no handoff AND no predecessor transcript, so neither ritual applies —
+    /// gen-1 launches go through [`Self::spawn_first_generation`] (issue
+    /// #63), which carries its opening brief explicitly.
+    ///
+    /// Callers pass `generation = prior + 1` (the resumer derives `prior` as
+    /// the highest generation across the supervisor registry and the handoff
+    /// files, so the ritual's self-description matches the badge); a caller
+    /// that breaks that invariant gets a logged warning, not a panic.
+    ///
+    /// Staging is synchronous and idempotent — a second call for the same
+    /// (project, epic, generation) is a no-op, which is what makes the
+    /// schedule's crash-mid-callback re-fire safe. The spawn event is emitted
+    /// from a spawned task (the ritual decision reads files + git); if the
+    /// frontend drops it (no open project tab), [`Self::tick`] re-emits — see
+    /// [`MAX_SPAWN_EMITS`].
+    pub fn spawn_generation(
+        self: &Arc<Self>,
+        project: &str,
+        epic: &str,
+        working_dir: &str,
+        generation: u32,
+        prior_generation: Option<u32>,
+    ) {
+        let Some(prior) = prior_generation else {
+            log::error!(
+                "samurai replicator: spawn_generation for epic {epic} without a prior generation has no ritual — gen-1 launches must go through spawn_first_generation (issue #63); nothing staged"
+            );
+            return;
+        };
+        if generation != prior + 1 {
+            log::warn!(
+                "samurai replicator: spawn_generation gen-{generation} for epic {epic} does not follow prior gen-{prior} — the ritual text will name gen-{}",
+                prior + 1,
+            );
+        }
+        let working_dir = strip_extended_prefix(working_dir).to_string();
+        let spawn = SuccessorSpawn {
+            project: project.to_string(),
+            epic: epic.to_string(),
+            generation,
+            working_dir: working_dir.clone(),
+            session_name: samurai_prompts::successor_session_name(epic, generation),
+            model: self.model_for(project, epic),
+        };
+        // Stage synchronously, under the one lock, so a repeated fire (the
+        // schedule re-fires after a crash mid-callback) can never
+        // double-stage — same discipline as on_dead.
+        {
+            let mut pending = self.lock_pending();
+            if pending
+                .iter()
+                .any(|p| p.generation == generation && p.epic == epic && p.project == project)
+            {
+                log::warn!(
+                    "samurai replicator: gen-{generation} for epic {epic} is already staged — ignoring repeated spawn_generation"
+                );
+                return;
+            }
+            log::info!(
+                "samurai replicator: staging fresh gen-{generation} for epic {epic} in {working_dir} (prior gen-{prior})"
+            );
+            pending.push(PendingRitual {
+                project: project.to_string(),
+                epic: epic.to_string(),
+                generation,
+                // Staged provisionally as UNPINNED recovery (this synchronous
+                // path must not touch files or git); the async task below
+                // swaps in the real ritual before the spawn event fires —
+                // and delivery only happens on the successor's
+                // SessionStarted, which cannot precede that event.
+                instruction: samurai_prompts::recovery_ritual_instruction(epic, prior, None),
+                predecessor_session_id: 0,
+                predecessor_generation: prior,
+                recovery: true,
+                launch: false,
+                queued_at: Instant::now(),
+                registered: None,
+                alerted: false,
+                respawn: Some(RespawnState {
+                    spawn: spawn.clone(),
+                    attempts: 1,
+                }),
+            });
+        }
+        let this = self.clone();
+        let project = project.to_string();
+        let epic = epic.to_string();
+        tauri::async_runtime::spawn(async move {
+            // Ritual decision on the blocking pool: read gen-`prior`'s
+            // handoff and, when present, HEAD-gate it (same gate as
+            // replicate); a missing/unreadable file selects recovery.
+            let gate_dir = PathBuf::from(working_dir.clone());
+            let gate_epic = epic.clone();
+            let head_gate: Option<bool> = tokio::task::spawn_blocking(move || {
+                let relpath = samurai_prompts::handoff_file_relpath(&gate_epic, prior);
+                let handoff = std::fs::read_to_string(gate_dir.join(&relpath))
+                    .map_err(|e| {
+                        log::info!(
+                            "samurai replicator: no gen-{prior} handoff at {relpath} ({e}) — fresh spawn uses recovery mode"
+                        );
+                    })
+                    .ok()?;
+                let handoff_sha = samurai_prompts::handoff_head_sha(&handoff);
+                let head = read_repo_head(&gate_dir)
+                    .map_err(|e| log::warn!("samurai replicator: {e}"))
+                    .ok();
+                Some(head_matches(handoff_sha.as_deref(), head.as_deref()))
+            })
+            .await
+            // A join failure is not evidence the handoff is missing; verify-
+            // required is the safe default (same policy as replicate).
+            .unwrap_or(Some(false));
+
+            let (instruction, recovery) = match head_gate {
+                Some(head_matched) => {
+                    log::info!(
+                        "samurai replicator: fresh gen-{generation} for epic {epic} reads the gen-{prior} handoff (HEAD gate: {})",
+                        if head_matched { "match, verify skipped" } else { "mismatch, verify required" },
+                    );
+                    (
+                        samurai_prompts::successor_ritual_instruction(&epic, prior, head_matched),
+                        false,
+                    )
+                }
+                None => {
+                    // Finding D: pin `--repo`; failure never blocks the spawn.
+                    let pin_dir = PathBuf::from(working_dir.clone());
+                    let repo_pin = tokio::task::spawn_blocking(move || derive_repo_pin(&pin_dir))
+                        .await
+                        .unwrap_or(None);
+                    // No predecessor transcript exists on this path — the
+                    // digest file still gets written, carrying its
+                    // no-transcript note (git + GitHub are the sources).
+                    this.write_recovery_digest(
+                        &epic,
+                        prior,
+                        0,
+                        &working_dir,
+                        &chrono::Utc::now().to_rfc3339(),
+                        None,
+                    )
+                    .await;
+                    (
+                        samurai_prompts::recovery_ritual_instruction(
+                            &epic,
+                            prior,
+                            repo_pin.as_deref(),
+                        ),
+                        true,
+                    )
+                }
+            };
+            {
+                let mut pending = this.lock_pending();
+                if let Some(p) = pending.iter_mut().find(|p| {
+                    p.generation == generation && p.epic == epic && p.project == project
+                }) {
+                    p.instruction = instruction;
+                    p.recovery = recovery;
+                }
+            }
+            (this.emit_spawn)(&spawn);
+        });
+    }
+
+    /// Issue #63: the gen-1 LAUNCH entry point — the P3.5 launcher's seam.
+    /// A brand-new epic has no handoff and no predecessor, so no ritual can
+    /// be derived; the caller passes the opening brief
+    /// (`samurai_prompts::launch_instruction`, `--repo`-pinned) directly.
+    /// Everything downstream is the shared fresh-spawn machinery: staged
+    /// under the (project, epic, generation 1) idempotence guard, the spawn
+    /// event re-emitted per timeout window while unregistered (bounded by
+    /// [`MAX_SPAWN_EMITS`], closed out with a `spawn_dropped` ALERT), and
+    /// the brief typed in on the session's first `SessionStarted`. Fully
+    /// synchronous — there is no file or git I/O to defer, the instruction
+    /// is already complete.
+    pub fn spawn_first_generation(
+        self: &Arc<Self>,
+        project: &str,
+        epic: &str,
+        working_dir: &str,
+        instruction: String,
+    ) {
+        let generation = 1;
+        let working_dir = strip_extended_prefix(working_dir).to_string();
+        let spawn = SuccessorSpawn {
+            project: project.to_string(),
+            epic: epic.to_string(),
+            generation,
+            working_dir,
+            session_name: samurai_prompts::successor_session_name(epic, generation),
+            model: self.model_for(project, epic),
+        };
+        {
+            let mut pending = self.lock_pending();
+            if pending
+                .iter()
+                .any(|p| p.generation == generation && p.epic == epic && p.project == project)
+            {
+                log::warn!(
+                    "samurai replicator: gen-1 for epic {epic} is already staged — ignoring repeated spawn_first_generation"
+                );
+                return;
+            }
+            log::info!(
+                "samurai replicator: staging gen-1 LAUNCH for epic {epic} in {}",
+                spawn.working_dir
+            );
+            pending.push(PendingRitual {
+                project: project.to_string(),
+                epic: epic.to_string(),
+                generation,
+                instruction,
+                // 0 sentinels: gen-1 has no predecessor (finding F's "can
+                // never collide" rationale — ProcessManager ids start at 1).
+                predecessor_session_id: 0,
+                predecessor_generation: 0,
+                recovery: false,
+                launch: true,
+                queued_at: Instant::now(),
+                registered: None,
+                alerted: false,
+                respawn: Some(RespawnState {
+                    spawn: spawn.clone(),
+                    attempts: 1,
+                }),
+            });
+        }
+        (self.emit_spawn)(&spawn);
+    }
+
+    /// Builds and writes the recovery digest file for the gen-
+    /// `predecessor_generation + 1` successor
     /// (`<working_dir>/.maestro/handoffs/<slug>-gen<N+1>-recovery.md`). Best
     /// effort: failures are logged, never propagated — git + GitHub are the
-    /// primary reconstruction sources, the digest is only hints.
+    /// primary reconstruction sources, the digest is only hints. Field-wise
+    /// (not a snapshot) because the resume path (issue #61) has no live
+    /// predecessor session — it passes the 0 sentinel id and no transcript.
     async fn write_recovery_digest(
         &self,
-        snapshot: &SessionSnapshot,
+        epic: &str,
+        predecessor_generation: u32,
+        predecessor_session_id: u32,
         working_dir: &str,
         ended_at: &str,
         transcript: Option<PathBuf>,
     ) {
-        let epic = snapshot.epic.clone();
-        let predecessor_generation = snapshot.generation;
-        let predecessor_session_id = snapshot.session_id;
+        let epic = epic.to_string();
         let ended_at = ended_at.to_string();
         let dir = PathBuf::from(working_dir);
         let result = tokio::task::spawn_blocking(move || {
@@ -834,6 +1276,11 @@ impl SamuraiReplicator {
                     && p.project == project
             })
             .map(|p| {
+                // Issue #63: a gen-1 LAUNCH has no predecessor — its SPAWN
+                // row names the trigger instead of a fabricated linkage.
+                if p.launch {
+                    return json!({ "trigger": "launch" });
+                }
                 let mut details = json!({
                     "predecessor_session_id": p.predecessor_session_id,
                     "predecessor_generation": p.predecessor_generation,
@@ -936,10 +1383,49 @@ impl SamuraiReplicator {
             predecessor_session_id: u32,
             predecessor_generation: u32,
         }
+        struct DroppedSpawn {
+            project: String,
+            epic: String,
+            generation: u32,
+        }
+        let mut re_emits: Vec<SuccessorSpawn> = Vec::new();
+        let mut dropped: Vec<DroppedSpawn> = Vec::new();
         let alerts: Vec<NoStartAlert> = {
             let mut pending = self.lock_pending();
             let mut alerts = Vec::new();
             pending.retain_mut(|p| {
+                // Issue #61: an UNREGISTERED fresh-spawn entry owns its
+                // whole timeout story here — re-emit per window, then a
+                // single spawn_dropped ALERT — and never reaches the
+                // generic branches below (their successor_no_start would be
+                // a second, vaguer alert; and their epic-gone prune would
+                // delete a resume entry instantly, because a resumed epic
+                // has no supervised session until its successor registers).
+                // A registration hands the entry to the generic machinery.
+                if let Some(respawn) = &mut p.respawn {
+                    if p.registered.is_none() {
+                        if p.alerted {
+                            return true; // latched; pruned on delivery only
+                        }
+                        if no_start_expired(p.queued_at, None, timeout) {
+                            if respawn.attempts >= MAX_SPAWN_EMITS {
+                                p.alerted = true;
+                                dropped.push(DroppedSpawn {
+                                    project: p.project.clone(),
+                                    epic: p.epic.clone(),
+                                    generation: p.generation,
+                                });
+                            } else {
+                                respawn.attempts += 1;
+                                // Restart the window so each emit gets a
+                                // full ack_timeout to land.
+                                p.queued_at = Instant::now();
+                                re_emits.push(respawn.spawn.clone());
+                            }
+                        }
+                        return true;
+                    }
+                }
                 if p.alerted {
                     let epic_gone = !sessions
                         .iter()
@@ -974,6 +1460,42 @@ impl SamuraiReplicator {
             });
             alerts
         };
+        // Issue #61 re-emits: outside the lock, same policy as every other
+        // emit. The frontend consumes duplicates idempotently — an already-
+        // consumed launch was claimed by the grid, and a re-emit for it can
+        // only happen while nothing registered, i.e. nothing was consumed.
+        for spawn in re_emits {
+            log::warn!(
+                "samurai replicator: spawn event for gen-{} of epic {} got no registration within the window — re-emitting (no project tab open?)",
+                spawn.generation,
+                spawn.epic,
+            );
+            (self.emit_spawn)(&spawn);
+        }
+        for d in dropped {
+            log::error!(
+                "samurai replicator: spawn event for gen-{} of epic {} was dropped {MAX_SPAWN_EMITS} times — giving up with an ALERT (a late registration still delivers the ritual)",
+                d.generation,
+                d.epic,
+            );
+            self.audit.append(
+                &d.project,
+                AuditEvent::now(
+                    d.epic.clone(),
+                    AuditEventKind::Alert,
+                    d.generation,
+                    // 0 sentinel: no successor session exists (finding F).
+                    0,
+                    json!({
+                        // Issue #63 renamed resume_spawn_dropped: launches
+                        // ride this path too, the kind is caller-neutral.
+                        "kind": "spawn_dropped",
+                        "epic": d.epic,
+                        "generation": d.generation,
+                    }),
+                ),
+            );
+        }
         for a in alerts {
             log::error!(
                 "samurai replicator: successor gen-{} for epic {} never started (registered: {}) — ALERT (latched; a late registration still delivers)",
@@ -2177,5 +2699,468 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(alerts, 1);
+    }
+
+    // --- issue #60: parking-engaged handoff absorption ---
+
+    #[tokio::test]
+    async fn test_engaged_absorber_suppresses_successor_and_writes_park_row() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-rep-absorb";
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        let head = read_repo_head(repo.path()).unwrap();
+        write_handoff(repo.path(), "epic-9", 2, &head);
+        h.dirs
+            .lock()
+            .unwrap()
+            .insert(1, repo.path().to_string_lossy().into_owned());
+
+        // A hard park sweep is engaged: the absorber says so and records
+        // what it was asked about — and the session state AT consult time
+        // (review F3b: the absorber must be evaluated BEFORE the Killed
+        // transition, while HANDOFF_WRITTEN still holds the sweep open).
+        let asked: Arc<Mutex<Vec<(String, String, Option<SupervisorState>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let asked_rec = asked.clone();
+        let supervisor_for_absorb = h.supervisor.clone();
+        h.replicator.set_absorber(Arc::new(move |project, epic| {
+            asked_rec.lock().unwrap().push((
+                project.to_string(),
+                epic.to_string(),
+                state_of(&supervisor_for_absorb, 1),
+            ));
+            true
+        }));
+
+        let snapshot = to_handoff_written(&h.supervisor, project, "epic-9", 2);
+        h.replicator.on_handoff_written(&snapshot);
+
+        // The kill still happens in full (teardown + Killed transition) …
+        wait_until(|| state_of(&h.supervisor, 1) == Some(SupervisorState::Killed)).await;
+        assert_eq!(*h.torn_down.lock().unwrap(), vec![1]);
+        // … and the trail explains the missing successor with a PARK row.
+        let mut absorbed = false;
+        for _ in 0..200 {
+            let rows = h.audit.read(project, None, None).await.unwrap().events;
+            absorbed = rows.iter().any(|r| {
+                r.event == AuditEventKind::Park && r.details["phase"] == "handoff_absorbed"
+            });
+            if absorbed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(absorbed, "PARK handoff_absorbed row must land");
+
+        // ONLY the staging + spawn emit were suppressed.
+        assert!(h.spawns.lock().unwrap().is_empty(), "no spawn event");
+        assert_eq!(h.replicator.pending_count(3), 0, "no staged ritual");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![(
+                project.to_string(),
+                "epic-9".to_string(),
+                // Review F3b: consulted BEFORE the Killed transition, while
+                // the state still blocks a concurrent sweep completion.
+                Some(SupervisorState::HandoffWritten),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disengaged_absorber_spawns_normally() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-rep-noabsorb";
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        let head = read_repo_head(repo.path()).unwrap();
+        write_handoff(repo.path(), "epic-9", 2, &head);
+        h.dirs
+            .lock()
+            .unwrap()
+            .insert(1, repo.path().to_string_lossy().into_owned());
+        h.replicator.set_absorber(Arc::new(|_, _| false));
+
+        let snapshot = to_handoff_written(&h.supervisor, project, "epic-9", 2);
+        h.replicator.on_handoff_written(&snapshot);
+        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
+
+        // Not engaged: the Phase-2 behavior is untouched.
+        assert_eq!(h.replicator.pending_count(3), 1);
+        let rows = h.audit.read(project, None, None).await.unwrap().events;
+        assert!(!rows
+            .iter()
+            .any(|r| r.details["phase"] == "handoff_absorbed"));
+    }
+
+    #[tokio::test]
+    async fn test_dead_session_is_absorbed_while_sweep_engaged() {
+        // Review F7: a DEAD session during an engaged sweep must not stage a
+        // recovery successor into the exhausted allowance — the epic is
+        // absorbed (resume timer) and the trail carries a PARK row.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-rep-dead-absorb";
+        let repo = tempdir().unwrap();
+        h.dirs
+            .lock()
+            .unwrap()
+            .insert(1, repo.path().to_string_lossy().into_owned());
+        let asked: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let asked_rec = asked.clone();
+        h.replicator.set_absorber(Arc::new(move |project, epic| {
+            asked_rec
+                .lock()
+                .unwrap()
+                .push((project.to_string(), epic.to_string()));
+            true
+        }));
+        let snapshot = to_dead(&h.supervisor, project, "epic-9", 2);
+
+        h.replicator.on_dead(&snapshot);
+
+        // Absorbed: nothing staged, nothing emitted, epic recorded.
+        assert_eq!(h.replicator.pending_count(3), 0, "no recovery staged");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![(project.to_string(), "epic-9".to_string())]
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(h.spawns.lock().unwrap().is_empty(), "no spawn event");
+        // The PARK dead_absorbed row explains the missing successor.
+        let mut absorbed = false;
+        for _ in 0..200 {
+            let rows = h.audit.read(project, None, None).await.unwrap().events;
+            absorbed = rows.iter().any(|r| {
+                r.event == AuditEventKind::Park
+                    && r.details["phase"] == "dead_absorbed"
+                    && r.generation == 2
+                    && r.session_id == 1
+            });
+            if absorbed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(absorbed, "PARK dead_absorbed row must land");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_events_carry_the_run_config_model() {
+        // Review F4: the stored `model` preference must reach the spawn
+        // event — resolved at emit time from the bound run-config store.
+        use crate::core::samurai_run_config::{RunConfigStore, SamuraiRunConfig};
+
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-rep-model";
+        let store = Arc::new(RunConfigStore::new(dir.path().join("runs")));
+        let repo = tempdir().unwrap();
+        let working_dir = repo.path().to_string_lossy().into_owned();
+        let mut config = SamuraiRunConfig::new(project, "epic-9", working_dir.clone());
+        config.model = Some("opus".to_string());
+        store.save(&config).unwrap();
+        h.replicator.set_run_configs(store);
+
+        // A fresh spawn (resume/reconcile path) carries the config's model …
+        h.replicator
+            .spawn_generation(project, "epic-9", &working_dir, 4, Some(3));
+        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
+        assert_eq!(
+            h.spawns.lock().unwrap()[0].model.as_deref(),
+            Some("opus"),
+            "spawn_generation must emit the run config's model"
+        );
+
+        // … and an epic WITHOUT a config (or model) emits None.
+        h.replicator.spawn_first_generation(
+            project,
+            "epic-77",
+            &working_dir,
+            "opening brief".to_string(),
+        );
+        wait_until(|| h.spawns.lock().unwrap().len() >= 2).await;
+        assert_eq!(h.spawns.lock().unwrap()[1].model, None);
+    }
+
+    // --- issue #61: spawn_generation (fresh spawns) + spawn retry ---
+
+    #[tokio::test]
+    async fn test_spawn_generation_with_handoff_stages_head_gated_successor_ritual() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        let head = read_repo_head(repo.path()).unwrap();
+        write_handoff(repo.path(), "epic-9", 3, &head);
+        let working_dir = repo.path().to_string_lossy().into_owned();
+
+        h.replicator
+            .spawn_generation("C:/git/proj-sg-match", "epic-9", &working_dir, 4, Some(3));
+        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
+
+        // The spawn event names the fresh generation and its working dir.
+        let spawns = h.spawns.lock().unwrap().clone();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].generation, 4);
+        assert_eq!(spawns[0].session_name, "samurai gen-4 epic-9");
+        assert_eq!(spawns[0].working_dir, working_dir);
+
+        // Handoff present + HEAD match → the normal ritual, verify skipped.
+        let (registered, instruction) = h.replicator.pending_view(4).unwrap();
+        assert_eq!(registered, None);
+        assert!(instruction.contains("SKIP"));
+        assert!(instruction.contains("generation 4"));
+        assert!(instruction.contains(".maestro/handoffs/epic-9-gen3.md"));
+        assert!(!instruction.contains("RECOVERY"));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_generation_without_handoff_stages_recovery_and_digest() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let repo = tempdir().unwrap();
+        init_repo(repo.path()); // a repo, but NO handoff file for gen 3
+        let working_dir = repo.path().to_string_lossy().into_owned();
+
+        h.replicator
+            .spawn_generation("C:/git/proj-sg-rec", "epic-9", &working_dir, 4, Some(3));
+        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
+
+        let (_, instruction) = h.replicator.pending_view(4).unwrap();
+        assert!(instruction.contains("RECOVERY"));
+        assert!(instruction.contains("generation 4"));
+        // The digest file exists before the spawn event fired, carrying the
+        // no-transcript note (there is no predecessor transcript to digest).
+        let digest_path = repo
+            .path()
+            .join(samurai_prompts::recovery_digest_relpath("epic-9", 4));
+        let digest = std::fs::read_to_string(&digest_path).expect("digest file must exist");
+        assert!(digest.contains("No transcript available"));
+        assert!(digest.contains("epic epic-9"));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_generation_is_idempotent_per_generation() {
+        // The schedule re-fires an entry after a crash mid-callback; a
+        // second spawn_generation for the same triple must be a no-op.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        let working_dir = repo.path().to_string_lossy().into_owned();
+
+        h.replicator
+            .spawn_generation("C:/git/proj-sg-idem", "epic-9", &working_dir, 4, Some(3));
+        h.replicator
+            .spawn_generation("C:/git/proj-sg-idem", "epic-9", &working_dir, 4, Some(3));
+        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
+        // Give the (single) async prep task time to finish emitting.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(h.replicator.pending_count(4), 1, "staged exactly once");
+        assert_eq!(h.spawns.lock().unwrap().len(), 1, "emitted exactly once");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_generation_without_prior_still_refuses() {
+        // No prior generation → no ritual can be derived; gen-1 goes through
+        // spawn_first_generation (issue #63), never this arm.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        h.replicator
+            .spawn_generation("C:/git/proj-sg-gen1", "epic-9", "C:/tmp/wt", 1, None);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(h.replicator.pending_count(1), 0);
+        assert!(h.spawns.lock().unwrap().is_empty());
+    }
+
+    // --- issue #63: spawn_first_generation (gen-1 launch seam) ---
+
+    #[tokio::test]
+    async fn test_spawn_first_generation_stages_and_delivers_the_launch_brief() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-launch";
+        let brief = samurai_prompts::launch_instruction("#38", Some("nachogl1/maestro"));
+
+        h.replicator
+            .spawn_first_generation(project, "#38", "C:/tmp/wt-38", brief.clone());
+
+        // Synchronous: the spawn event is out before the call returns.
+        let spawns = h.spawns.lock().unwrap().clone();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].generation, 1);
+        assert_eq!(spawns[0].session_name, "samurai gen-1 38");
+        assert_eq!(spawns[0].working_dir, "C:/tmp/wt-38");
+        // The staged instruction is EXACTLY the caller's brief.
+        let (registered, instruction) = h.replicator.pending_view(1).unwrap();
+        assert_eq!(registered, None);
+        assert_eq!(instruction, brief);
+
+        // SPAWN details name the trigger, not a fabricated predecessor.
+        let details = h.replicator.spawn_details(project, "#38", 1).unwrap();
+        assert_eq!(details, json!({ "trigger": "launch" }));
+
+        // Registration + first SessionStarted deliver the brief verbatim.
+        let snapshot = h
+            .supervisor
+            .register_session_with_details(5, project.into(), "#38".into(), 1, details)
+            .unwrap();
+        h.replicator.on_registered(&snapshot);
+        h.replicator.observe_hook(&session_started(5));
+        let writes = h.writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0], (5, format!("{brief}\r")));
+        assert!(h.replicator.pending_view(1).is_none(), "claimed = pruned");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_first_generation_is_idempotent_and_retries_like_a_resume() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-launch-retry";
+        let brief = samurai_prompts::launch_instruction("#38", None);
+
+        h.replicator
+            .spawn_first_generation(project, "#38", "C:/tmp/wt", brief.clone());
+        h.replicator
+            .spawn_first_generation(project, "#38", "C:/tmp/wt", brief);
+        assert_eq!(h.replicator.pending_count(1), 1, "staged exactly once");
+        assert_eq!(h.spawns.lock().unwrap().len(), 1, "emitted exactly once");
+
+        // Unregistered launches ride the same re-emit machinery as resumes
+        // (issue #61): one re-emit per expired window.
+        h.replicator.backdate(1, SHA_TIMEOUT + Duration::from_secs(1));
+        h.replicator.tick();
+        assert_eq!(h.spawns.lock().unwrap().len(), 2, "dropped launch re-emits");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_retry_reemits_then_alerts_and_still_delivers_late() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-sg-retry";
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        let head = read_repo_head(repo.path()).unwrap();
+        write_handoff(repo.path(), "epic-9", 3, &head);
+        let working_dir = repo.path().to_string_lossy().into_owned();
+
+        h.replicator
+            .spawn_generation(project, "epic-9", &working_dir, 4, Some(3));
+        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
+        assert_eq!(h.spawns.lock().unwrap().len(), 1);
+
+        // Inside the window: no re-emit.
+        h.replicator.tick();
+        assert_eq!(h.spawns.lock().unwrap().len(), 1);
+
+        // Each expired window re-emits once, up to MAX_SPAWN_EMITS total.
+        for expected in 2..=MAX_SPAWN_EMITS as usize {
+            h.replicator.backdate(4, SHA_TIMEOUT + Duration::from_secs(1));
+            h.replicator.tick();
+            assert_eq!(h.spawns.lock().unwrap().len(), expected);
+        }
+
+        // The next expiry gives up: ONE spawn_dropped ALERT, no further
+        // emits — and NO generic successor_no_start for this path.
+        h.replicator.backdate(4, SHA_TIMEOUT + Duration::from_secs(1));
+        h.replicator.tick();
+        assert_eq!(h.spawns.lock().unwrap().len(), MAX_SPAWN_EMITS as usize);
+        let mut alerts = Vec::new();
+        for _ in 0..200 {
+            let rows = h.audit.read(project, None, None).await.unwrap().events;
+            alerts = rows
+                .into_iter()
+                .filter(|r| r.details["kind"] == "spawn_dropped")
+                .collect();
+            if !alerts.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].generation, 4);
+        assert_eq!(alerts[0].session_id, 0, "0 sentinel — no session exists");
+        assert_eq!(alerts[0].details["epic"], "epic-9");
+
+        // Latched, never re-alerts, and NOT pruned — even though the epic
+        // has no supervised session at all (the resume situation).
+        h.replicator.tick();
+        h.replicator.tick();
+        assert!(h.replicator.pending_view(4).is_some(), "kept for a late registration");
+        let rows = h.audit.read(project, None, None).await.unwrap().events;
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.details["kind"] == "spawn_dropped")
+                .count(),
+            1
+        );
+        assert!(
+            !rows.iter().any(|r| r.details["kind"] == "successor_no_start"),
+            "the retry path suppresses the generic no-start ALERT"
+        );
+
+        // A late registration + SessionStarted still delivers the ritual.
+        let details = h.replicator.spawn_details(project, "epic-9", 4).unwrap();
+        assert_eq!(details["predecessor_session_id"], 0);
+        assert_eq!(details["predecessor_generation"], 3);
+        let snapshot = h
+            .supervisor
+            .register_session_with_details(9, project.into(), "epic-9".into(), 4, details)
+            .unwrap();
+        h.replicator.on_registered(&snapshot);
+        h.replicator.observe_hook(&session_started(9));
+        let writes = h.writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 1, "late registration still gets the ritual");
+        assert_eq!(writes[0].0, 9);
+        assert!(h.replicator.pending_view(4).is_none(), "claimed = pruned");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_retry_stops_once_registered() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-sg-reg";
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        let head = read_repo_head(repo.path()).unwrap();
+        write_handoff(repo.path(), "epic-9", 3, &head);
+        let working_dir = repo.path().to_string_lossy().into_owned();
+
+        h.replicator
+            .spawn_generation(project, "epic-9", &working_dir, 4, Some(3));
+        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
+
+        let details = h.replicator.spawn_details(project, "epic-9", 4).unwrap();
+        let snapshot = h
+            .supervisor
+            .register_session_with_details(9, project.into(), "epic-9".into(), 4, details)
+            .unwrap();
+        h.replicator.on_registered(&snapshot);
+
+        // Registered: an expired window re-emits nothing; the generic
+        // no-start machinery owns the entry from here (it has a session id).
+        h.replicator.backdate(4, SHA_TIMEOUT + Duration::from_secs(1));
+        h.replicator.tick();
+        assert_eq!(h.spawns.lock().unwrap().len(), 1, "no re-emit after registration");
+        let mut alerts = Vec::new();
+        for _ in 0..200 {
+            let rows = h.audit.read(project, None, None).await.unwrap().events;
+            alerts = rows
+                .into_iter()
+                .filter(|r| r.details["kind"] == "successor_no_start")
+                .collect();
+            if !alerts.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].session_id, 9);
     }
 }
