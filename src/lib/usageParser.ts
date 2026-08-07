@@ -24,6 +24,12 @@ export interface UsageData {
   /** Dollars spent / total in the monthly budget window (enterprise only). */
   spendUsedDollars: number | null;
   spendLimitDollars: number | null;
+  /**
+   * Per-model weekly windows the API reports only through its `limits`
+   * array (e.g. Fable) — models with a dedicated top-level window
+   * (Opus/Sonnet) never appear here when that window is reported.
+   */
+  modelWindows: { label: string; percent: number; resetsAt: string | null }[];
   errorMessage: string | null;
   needsAuth: boolean;
 }
@@ -67,6 +73,13 @@ export function getUsageBars(usage: UsageData): UsageWindowBar[] {
       label: "Week (Sonnet)",
       percent: usage.weeklySonnetPercent,
       resetsAt: usage.weeklySonnetResetsAt,
+    });
+  }
+  for (const window of usage.modelWindows) {
+    bars.push({
+      label: `Week (${window.label})`,
+      percent: window.percent,
+      resetsAt: window.resetsAt,
     });
   }
   if (usage.weeklyOauthAppsPercent !== null) {
