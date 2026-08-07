@@ -221,7 +221,14 @@ pub async fn samurai_harvest_run(
 
     // Fix M1: consume exactly the snapshot the model digested — entries
     // appended during the run (or withheld by the cap) stay unconsumed.
-    journal.commit_harvest(&today, snapshot_len)?;
+    // The commit rewrites the journal and can retry-sleep on a Windows
+    // rename collision, so it runs on the blocking pool rather than parking
+    // a runtime worker for up to 400 ms.
+    let store = journal.inner().clone();
+    let commit_date = today.clone();
+    tokio::task::spawn_blocking(move || store.commit_harvest(&commit_date, snapshot_len))
+        .await
+        .map_err(|e| format!("harvest commit task failed: {e}"))??;
 
     Ok(HarvestReport {
         date: today,
@@ -236,9 +243,15 @@ pub async fn samurai_harvest_run(
 fn canonical_stripped(path: &Path) -> Option<PathBuf> {
     let canonical = std::fs::canonicalize(path).ok()?;
     let s = canonical.to_string_lossy();
-    Some(PathBuf::from(
-        s.strip_prefix(r"\\?\").unwrap_or(&s).to_string(),
-    ))
+    // `\\?\UNC\server\share\…` is a NETWORK path: it must strip back to
+    // `\\server\share\…`. Dropping only `\\?\` would leave a RELATIVE
+    // `UNC\…` path, which resolves against the process cwd and fails the
+    // containment check — the same twin fixed in core::samurai_files.
+    let stripped = match s.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => s.strip_prefix(r"\\?\").unwrap_or(&s).to_string(),
+    };
+    Some(PathBuf::from(stripped))
 }
 
 /// The guarded read behind [`samurai_harvest_read`], extracted for

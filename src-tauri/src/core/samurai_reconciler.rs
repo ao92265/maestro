@@ -30,7 +30,9 @@
 //! 3. **Living orphan** ([`orphan_verdict`]) → `ALERT (reconcile_orphan)`
 //!    and skip. A claude that survived the app restart may still be working
 //!    in the epic's worktree; never double-spawn over a survivor — the human
-//!    decides (kill it, or archive the config).
+//!    decides (kill it, or archive the config). The verdict is a guess, so a
+//!    pass that produced one is retried ONCE a staleness window later
+//!    ([`reconcile_gated`]) instead of stranding the epic for the app run.
 //! 4. **Prior generation found** (handoff filenames in the worktree, or the
 //!    audit tail — rows persist across restarts, a legitimate source when
 //!    handoff files are missing) → `RESUME {trigger: "cold_start"}` row,
@@ -38,7 +40,11 @@
 //!    replicator picks the ritual (handoff present → successor, missing →
 //!    recovery + digest), retries the spawn event while the frontend is not
 //!    ready yet, and its per-(project, epic, generation) staging guard makes
-//!    a repeated call idempotent.
+//!    a repeated call idempotent. Gated on `gh auth status` when the probe
+//!    is wired ([`reconcile_with_auth`]): a spawn into a dead `gh` is
+//!    `ALERT (reconcile_gh_auth)` instead — the launcher's preflight refuses
+//!    the same state, and an epic parked for `gh_auth_lost` reaches exactly
+//!    here (that park arms no timer and leaves the config ACTIVE by design).
 //! 5. **No generation anywhere** → `ALERT (reconcile_unstartable)`. An
 //!    active config whose run never produced a handoff, an audit row, or a
 //!    registration (e.g. a crash between the launcher's config write and the
@@ -62,6 +68,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use super::samurai_audit::{AuditEvent, AuditEventKind, AuditLog};
+use super::samurai_auth_watch::AuthProbe;
 use super::samurai_injector::strip_extended_prefix;
 use super::samurai_replicator::SamuraiReplicator;
 use super::samurai_resumer::latest_handoff_generation;
@@ -103,6 +110,8 @@ enum ReconcileAction {
     AlertOrphan { transcript_age_secs: u64 },
     /// Spawn gen-`next` (= `prior + 1`) via the replicator's ritual.
     Spawn { prior: u32, next: u32 },
+    /// A spawn is due but `gh` is not authenticated — alert, never spawn.
+    AlertNoGhAuth,
     /// Active config but no generation evidence anywhere — human relaunches.
     AlertUnstartable,
 }
@@ -167,9 +176,12 @@ fn orphan_verdict(
 // IO shell
 // ---------------------------------------------------------------------------
 
-/// The one-shot startup pass (module doc). `timers` is the pending-timer
+/// The startup reconciliation (module doc). `timers` is the pending-timer
 /// snapshot taken BEFORE the schedule's fire loop was spawned — see decision
 /// order step 1 for why it cannot be read here.
+///
+/// Without a `gh` probe the spawn decision is not auth-gated; prefer
+/// [`reconcile_with_auth`].
 pub async fn reconcile(
     run_configs: Arc<RunConfigStore>,
     timers: Vec<ScheduleEntry>,
@@ -179,12 +191,128 @@ pub async fn reconcile(
     transcript_ages: TranscriptAgeProbe,
     claude_alive: ClaudeAliveProbe,
 ) {
+    reconcile_gated(
+        run_configs,
+        timers,
+        supervisor,
+        replicator,
+        audit,
+        transcript_ages,
+        claude_alive,
+        None,
+        TRANSCRIPT_STALE_AFTER,
+    )
+    .await
+}
+
+/// [`reconcile`] with the auth watcher's `gh auth status` probe wired in:
+/// an epic parked for `gh_auth_lost` keeps its ACTIVE run config and arms NO
+/// resume timer by design, so at the next launch reconciliation is the only
+/// thing that would resurrect it — and it must not resurrect it into a dead
+/// `gh` (the successor could not read issues, comment, or open PRs). The
+/// launcher refuses exactly this state via preflight; this is the same gate
+/// on the cold-start path. Data-gap policy is the auth watcher's:
+/// `Ok(false)` blocks, `Err` (gh missing/timeout) does not.
+#[allow(clippy::too_many_arguments)]
+pub async fn reconcile_with_auth(
+    run_configs: Arc<RunConfigStore>,
+    timers: Vec<ScheduleEntry>,
+    supervisor: Arc<Supervisor>,
+    replicator: Arc<SamuraiReplicator>,
+    audit: AuditLog,
+    transcript_ages: TranscriptAgeProbe,
+    claude_alive: ClaudeAliveProbe,
+    auth: AuthProbe,
+) {
+    reconcile_gated(
+        run_configs,
+        timers,
+        supervisor,
+        replicator,
+        audit,
+        transcript_ages,
+        claude_alive,
+        Some(auth),
+        TRANSCRIPT_STALE_AFTER,
+    )
+    .await
+}
+
+/// One pass, plus ONE deferred retry pass when some epic ended in "probable
+/// orphan". [`orphan_verdict`] is a GUESS (the process scan is machine-wide),
+/// and a wrong guess used to strand every active epic for the whole app run —
+/// nothing re-evaluates it: `reconcile` has a single caller in the setup
+/// closure and the watchdog skips its scan when nothing is supervised. Costing
+/// it one staleness window instead makes the second pass self-resolving: a
+/// truly dead orchestrator's transcript is stale by then (so it spawns), a
+/// real survivor has written again (so it ALERTs and stays skipped). The
+/// live-session guard at step 2 is what makes the second pass idempotent.
+/// `retry_after` is injected for the tests; production is always
+/// [`TRANSCRIPT_STALE_AFTER`].
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_gated(
+    run_configs: Arc<RunConfigStore>,
+    timers: Vec<ScheduleEntry>,
+    supervisor: Arc<Supervisor>,
+    replicator: Arc<SamuraiReplicator>,
+    audit: AuditLog,
+    transcript_ages: TranscriptAgeProbe,
+    claude_alive: ClaudeAliveProbe,
+    auth: Option<AuthProbe>,
+    retry_after: Duration,
+) {
+    let orphaned = reconcile_pass(
+        &run_configs,
+        &timers,
+        &supervisor,
+        &replicator,
+        &audit,
+        &transcript_ages,
+        &claude_alive,
+        auth.as_ref(),
+    )
+    .await;
+    if !orphaned {
+        return;
+    }
+    log::info!(
+        "samurai reconciler: at least one epic looked like a probable orphan — one retry pass in {}s",
+        retry_after.as_secs()
+    );
+    tokio::time::sleep(retry_after).await;
+    reconcile_pass(
+        &run_configs,
+        &timers,
+        &supervisor,
+        &replicator,
+        &audit,
+        &transcript_ages,
+        &claude_alive,
+        auth.as_ref(),
+    )
+    .await;
+}
+
+/// One reconciliation pass over every ACTIVE run config. Returns whether any
+/// epic ended in [`ReconcileAction::AlertOrphan`] — the only verdict worth
+/// retrying (see [`reconcile_gated`]).
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_pass(
+    run_configs: &Arc<RunConfigStore>,
+    timers: &[ScheduleEntry],
+    supervisor: &Arc<Supervisor>,
+    replicator: &Arc<SamuraiReplicator>,
+    audit: &AuditLog,
+    transcript_ages: &TranscriptAgeProbe,
+    claude_alive: &ClaudeAliveProbe,
+    auth: Option<&AuthProbe>,
+) -> bool {
     let configs = run_configs.load_active();
     if configs.is_empty() {
         // The normal state until the P3.5 launcher exists, and afterwards
         // whenever no epic is live. No process scan, no audit noise.
         log::info!("samurai reconciler: no active run configs — nothing to reconcile");
-        return;
+        return false;
     }
     log::info!(
         "samurai reconciler: reconciling {} active run config(s)",
@@ -192,8 +320,8 @@ pub async fn reconcile(
     );
 
     let timered: HashSet<(String, String)> = timers
-        .into_iter()
-        .map(|t| (t.project_path, t.epic))
+        .iter()
+        .map(|t| (t.project_path.clone(), t.epic.clone()))
         .collect();
     let sessions = supervisor.list_sessions();
     let guards = |config: &SamuraiRunConfig| -> (bool, bool) {
@@ -222,6 +350,12 @@ pub async fn reconcile(
         false
     };
 
+    // The `gh auth status` verdict for this pass: probed at most once, and
+    // only when some epic actually reaches the Spawn decision (the
+    // `needs_scan` discipline — no subprocess for a pass that spawns nothing).
+    let mut gh_ok: Option<bool> = None;
+    let mut orphaned = false;
+
     for config in &configs {
         let (timer_pending, live_session) = guards(config);
         let facts = if timer_pending || live_session {
@@ -238,13 +372,22 @@ pub async fn reconcile(
             // project dir. Probing the project path would miss a surviving
             // orchestrator entirely (fresh-eyes review F1). `\\?\`-stripped,
             // same as every other consumer of the stored path.
-            let age = (transcript_ages)(strip_extended_prefix(&config.worktree_path));
+            //
+            // Blocking pool, like the process scan above: the probe walks the
+            // encoded Claude project dir with a `metadata()` per `.jsonl`, and
+            // this crate's rule for that FS work is "never inline on the
+            // runtime". A join failure (probe panic) reads as "no transcript".
+            let probe = transcript_ages.clone();
+            let path = strip_extended_prefix(&config.worktree_path).to_string();
+            let age = tokio::task::spawn_blocking(move || probe(&path))
+                .await
+                .unwrap_or(None);
             EpicFacts {
                 timer_pending,
                 live_session,
                 orphan_age_secs: orphan_verdict(age, alive, TRANSCRIPT_STALE_AFTER),
                 prior_generation: prior_generation(
-                    &audit,
+                    audit,
                     Path::new(strip_extended_prefix(&config.worktree_path)),
                     &config.project_path,
                     &config.epic,
@@ -252,8 +395,32 @@ pub async fn reconcile(
                 .await,
             }
         };
-        apply(&replicator, &audit, config, decide(&facts));
+        let mut action = decide(&facts);
+        orphaned |= matches!(action, ReconcileAction::AlertOrphan { .. });
+        if matches!(action, ReconcileAction::Spawn { .. }) {
+            let ok = match gh_ok {
+                Some(ok) => ok,
+                None => {
+                    // gh runs in the config's project directory — auth is
+                    // account-global, the cwd only anchors it to a repo (the
+                    // auth watcher's wiring). `Err` is a data gap, not a loss.
+                    let ok = match auth {
+                        Some(probe) => {
+                            !matches!(probe(config.project_path.clone()).await, Ok(false))
+                        }
+                        None => true,
+                    };
+                    gh_ok = Some(ok);
+                    ok
+                }
+            };
+            if !ok {
+                action = ReconcileAction::AlertNoGhAuth;
+            }
+        }
+        apply(replicator, audit, config, action);
     }
+    orphaned
 }
 
 /// Highest generation either persisted source knows: the epic's handoff
@@ -369,6 +536,23 @@ fn apply(
                 Some(prior),
             );
         }
+        ReconcileAction::AlertNoGhAuth => {
+            log::error!(
+                "samurai reconciler: epic {} in {} is due a generation but `gh` is not authenticated — NOT spawning (a successor could not read issues, comment, or open PRs); fix auth and relaunch",
+                config.epic,
+                config.project_path,
+            );
+            audit.append(
+                &config.project_path,
+                AuditEvent::now(
+                    config.epic.clone(),
+                    AuditEventKind::Alert,
+                    0,
+                    0,
+                    json!({ "kind": "reconcile_gh_auth", "epic": config.epic }),
+                ),
+            );
+        }
         ReconcileAction::AlertUnstartable => {
             log::error!(
                 "samurai reconciler: epic {} in {} is ACTIVE but no handoff file, audit row, or registration knows any generation — nothing to resume from, ALERT (relaunch via the launcher)",
@@ -399,7 +583,7 @@ mod tests {
     use crate::core::samurai_run_config::SamuraiRunConfig;
     use crate::core::supervisor::SupervisorState;
     use crate::core::windows_process::StdCommandExt;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Mutex, RwLock};
     use tempfile::tempdir;
 
@@ -644,6 +828,17 @@ mod tests {
         Arc::new(move || alive)
     }
 
+    fn auth(result: Result<bool, &'static str>) -> AuthProbe {
+        Arc::new(move |_| {
+            let result = result.map_err(str::to_string);
+            Box::pin(async move { result })
+        })
+    }
+
+    /// The production retry wait is a whole staleness window (120s); the
+    /// tests only care that the second pass happens.
+    const TEST_RETRY: Duration = Duration::from_millis(10);
+
     fn timer(project: &str, epic: &str, fire_at: &str) -> ScheduleEntry {
         ScheduleEntry {
             project_path: project.to_string(),
@@ -654,7 +849,7 @@ mod tests {
     }
 
     async fn run(h: &Harness, timers: Vec<ScheduleEntry>, age: Option<Duration>, live: bool) {
-        reconcile(
+        reconcile_gated(
             h.run_configs.clone(),
             timers,
             h.supervisor.clone(),
@@ -662,6 +857,8 @@ mod tests {
             h.audit.clone(),
             ages(age),
             alive(live),
+            None,
+            TEST_RETRY,
         )
         .await;
     }
@@ -843,6 +1040,188 @@ mod tests {
             "never double-spawn over a probable survivor"
         );
         assert!(!rows.iter().any(|r| r.event == AuditEventKind::Resume));
+    }
+
+    #[tokio::test]
+    async fn test_probable_orphan_is_retried_once_a_staleness_window_later() {
+        // The verdict is a guess (machine-wide process scan): a wrong one
+        // must cost ONE staleness window, not the whole app run — nothing
+        // else re-evaluates it. Second pass: the transcript is stale by
+        // then, so the epic spawns instead of staying dead.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-recon-retry";
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        write_handoff(repo.path(), "#37", 2);
+        h.run_configs
+            .save(&SamuraiRunConfig::new(
+                project,
+                "#37",
+                repo.path().to_string_lossy().into_owned(),
+            ))
+            .unwrap();
+
+        // Fresh on the first pass, stale on every later one.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_probe = calls.clone();
+        let probe: TranscriptAgeProbe = Arc::new(move |_| {
+            let n = calls_probe.fetch_add(1, Ordering::SeqCst);
+            Some(Duration::from_secs(if n == 0 { 5 } else { 600 }))
+        });
+
+        reconcile_gated(
+            h.run_configs.clone(),
+            Vec::new(),
+            h.supervisor.clone(),
+            h.replicator.clone(),
+            h.audit.clone(),
+            probe,
+            alive(true),
+            None,
+            TEST_RETRY,
+        )
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "exactly two passes");
+        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
+        let spawns = h.spawns.lock().unwrap().clone();
+        assert_eq!(spawns.len(), 1, "the retry pass spawns exactly once");
+        assert_eq!(spawns[0].generation, 3, "handoff gen 2 + 1");
+        // The first pass' ALERT stays in the trail; the retry explains it.
+        let rows = rows(&h.audit, project).await;
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.details["kind"] == "reconcile_orphan")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.event == AuditEventKind::Resume)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gh_auth_loss_blocks_the_cold_start_spawn() {
+        // An epic parked for gh_auth_lost keeps its ACTIVE config and gets no
+        // resume timer, so reconciliation is what would resurrect it — into a
+        // `gh` that still cannot read issues, comment, or open PRs.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-recon-ghauth";
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        write_handoff(repo.path(), "#37", 2); // WOULD spawn gen-3 otherwise
+        h.run_configs
+            .save(&SamuraiRunConfig::new(
+                project,
+                "#37",
+                repo.path().to_string_lossy().into_owned(),
+            ))
+            .unwrap();
+
+        reconcile_gated(
+            h.run_configs.clone(),
+            Vec::new(),
+            h.supervisor.clone(),
+            h.replicator.clone(),
+            h.audit.clone(),
+            ages(None),
+            alive(false),
+            Some(auth(Ok(false))),
+            TEST_RETRY,
+        )
+        .await;
+
+        let rows = rows(&h.audit, project).await;
+        let alert = rows
+            .iter()
+            .find(|r| r.details["kind"] == "reconcile_gh_auth")
+            .expect("gh-auth ALERT must land");
+        assert_eq!(alert.event, AuditEventKind::Alert);
+        assert_eq!(alert.epic, "#37");
+        assert_eq!(alert.details["epic"], "#37");
+        assert_eq!(alert.generation, 0);
+        assert!(
+            h.spawns.lock().unwrap().is_empty(),
+            "never spawn a successor into a dead gh"
+        );
+        assert!(!rows.iter().any(|r| r.event == AuditEventKind::Resume));
+
+        // A transient probe failure is a data gap, not an auth loss (the auth
+        // watcher's policy): it must NOT block the recovery spawn.
+        let dir2 = tempdir().unwrap();
+        let h2 = harness(dir2.path());
+        let repo2 = tempdir().unwrap();
+        init_repo(repo2.path());
+        write_handoff(repo2.path(), "#37", 2);
+        h2.run_configs
+            .save(&SamuraiRunConfig::new(
+                "C:/git/proj-recon-ghgap",
+                "#37",
+                repo2.path().to_string_lossy().into_owned(),
+            ))
+            .unwrap();
+        reconcile_gated(
+            h2.run_configs.clone(),
+            Vec::new(),
+            h2.supervisor.clone(),
+            h2.replicator.clone(),
+            h2.audit.clone(),
+            ages(None),
+            alive(false),
+            Some(auth(Err("gh not found"))),
+            TEST_RETRY,
+        )
+        .await;
+        wait_until(|| !h2.spawns.lock().unwrap().is_empty()).await;
+        assert_eq!(h2.spawns.lock().unwrap()[0].generation, 3);
+    }
+
+    #[tokio::test]
+    async fn test_transcript_probe_runs_on_the_blocking_pool() {
+        // The probe walks the encoded Claude project dir with a metadata()
+        // syscall per .jsonl — this crate's rule for that FS work is "never
+        // inline on the runtime" (the sibling process scan already obeys it).
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        write_handoff(repo.path(), "#37", 1);
+        h.run_configs
+            .save(&SamuraiRunConfig::new(
+                "C:/git/proj-recon-blocking",
+                "#37",
+                repo.path().to_string_lossy().into_owned(),
+            ))
+            .unwrap();
+
+        let probe_thread: Arc<Mutex<Option<std::thread::ThreadId>>> = Arc::new(Mutex::new(None));
+        let probe_thread_rec = probe_thread.clone();
+        let probe: TranscriptAgeProbe = Arc::new(move |_| {
+            *probe_thread_rec.lock().unwrap() = Some(std::thread::current().id());
+            None
+        });
+        reconcile(
+            h.run_configs.clone(),
+            Vec::new(),
+            h.supervisor.clone(),
+            h.replicator.clone(),
+            h.audit.clone(),
+            probe,
+            alive(false),
+        )
+        .await;
+
+        let probed = probe_thread.lock().unwrap().expect("the probe must run");
+        assert_ne!(
+            probed,
+            std::thread::current().id(),
+            "the transcript probe must run on the blocking pool, not the task's thread"
+        );
     }
 
     #[tokio::test]

@@ -415,6 +415,20 @@ pub fn run() {
             // teardown commands) reach it via `app.state()`.
             app.manage(samurai_context.clone());
 
+            // Samurai (issue #45): thresholds config + backend allowance
+            // watcher. The config is seeded from the settings store and
+            // shared (Arc<RwLock<…>>) between the get/set commands and the
+            // allowance loop, which polls the usage API on its own ~60s
+            // timer — independent of the frontend — and emits edge-triggered
+            // ALERT audit rows + `samurai-allowance-event` on threshold
+            // crossings (events only; parking is Phase 3).
+            // Constructed before the watchdog below: that loop reads
+            // `staleness_window_secs` from it once per tick.
+            let samurai_config: core::samurai_config::SharedSamuraiConfig = Arc::new(
+                std::sync::RwLock::new(commands::samurai::load_config_from_store(app.handle())),
+            );
+            app.manage(samurai_config.clone());
+
             // Samurai silent-death watchdog (issue #44): one periodic tick
             // that declares a supervised session DEAD when its transcript
             // went stale AND no claude process survives under its shell.
@@ -424,19 +438,8 @@ pub fn run() {
                 supervisor.clone(),
                 app.state::<Arc<TranscriptWatcher>>().inner().clone(),
                 app.state::<ProcessManager>().inner().clone(),
+                samurai_config.clone(),
             );
-
-            // Samurai (issue #45): thresholds config + backend allowance
-            // watcher. The config is seeded from the settings store and
-            // shared (Arc<RwLock<…>>) between the get/set commands and the
-            // allowance loop, which polls the usage API on its own ~60s
-            // timer — independent of the frontend — and emits edge-triggered
-            // ALERT audit rows + `samurai-allowance-event` on threshold
-            // crossings (events only; parking is Phase 3).
-            let samurai_config: core::samurai_config::SharedSamuraiConfig = Arc::new(
-                std::sync::RwLock::new(commands::samurai::load_config_from_store(app.handle())),
-            );
-            app.manage(samurai_config.clone());
 
             // Samurai (issue #53): injection controller. Its 30s tick moves
             // WORKING sessions past `handoff_context_pct` into
@@ -605,6 +608,27 @@ pub fn run() {
                 commands::ai_runner::artifact_base_dir("runs"),
             ));
             app.manage(run_configs.clone());
+            // PRD §8 row 1 (issue #45's `handoff_retention_days`): handoff
+            // files auto-clean once their epic has completed — i.e. its run
+            // config is ARCHIVED. One sweep per app start: it is the only
+            // moment every stored config is looked at, and the window is
+            // measured in days, so a periodic tick would be pure noise.
+            {
+                let retention_days = samurai_config
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .handoff_retention_days;
+                let swept = core::samurai_files::sweep_handoff_retention(
+                    &run_configs.list_with_paths(),
+                    retention_days,
+                );
+                if !swept.is_empty() {
+                    log::info!(
+                        "samurai retention: removed {} handoff file(s) older than {retention_days} days from archived epics",
+                        swept.len()
+                    );
+                }
+            }
             // Review F4: the replicator resolves the per-run `model` at
             // spawn-emit time, and the injector's trigger pass consults the
             // per-run `thresholds` override (handoff trigger only — park
@@ -717,7 +741,7 @@ pub fn run() {
             core::samurai_auth_watch::spawn_auth_watch(
                 run_configs.clone(),
                 samurai_parker.clone(),
-                auth_probe,
+                auth_probe.clone(),
             );
 
             core::allowance_watcher::spawn_allowance_loop(
@@ -745,7 +769,11 @@ pub fn run() {
             let claude_alive: core::samurai_reconciler::ClaudeAliveProbe = Arc::new(|| {
                 !core::samurai_watchdog::scan_claude_ancestor_pids().is_empty()
             });
-            tauri::async_runtime::spawn(core::samurai_reconciler::reconcile(
+            // The auth probe gates the resume side: an epic parked because gh
+            // auth died must not be respawned before gh is healthy again
+            // (PRD §5.8) — otherwise a restart resurrects it straight into
+            // the same failure.
+            tauri::async_runtime::spawn(core::samurai_reconciler::reconcile_with_auth(
                 run_configs,
                 reconcile_timers,
                 supervisor,
@@ -753,6 +781,7 @@ pub fn run() {
                 audit_log,
                 transcript_ages,
                 claude_alive,
+                auth_probe,
             ));
 
             // GitHub watchdog: background poller for review requests /

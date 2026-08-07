@@ -15,7 +15,7 @@
 //!   `ack_timeout` / `staleness_window`; unitless duration fields are a
 //!   footgun, so the unit is in the name).
 //! - `staleness_window_secs` is consumed by the silent-death watchdog
-//!   (issue #44, parallel branch) — it lives here so that merge is trivial.
+//!   (`core/samurai_watchdog.rs`), which reads it once per tick.
 
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
@@ -48,7 +48,10 @@ pub struct SamuraiConfig {
     pub ack_timeout_secs: u64,
     /// Transcript-staleness window for the silent-death watchdog (issue #44).
     pub staleness_window_secs: u64,
-    /// How long handoff files are kept after an epic completes (PRD §8).
+    /// How long handoff files are kept after an epic completes — i.e. after
+    /// its run config is ARCHIVED (PRD §8 row 1). Consumed by
+    /// `core::samurai_files::sweep_handoff_retention`, run once per app
+    /// start.
     pub handoff_retention_days: u32,
     /// Circuit breaker (issue #57, PRD §5.7): this many consecutive samurai
     /// audit events for one epic with repo HEAD unchanged trip the breaker —
@@ -71,7 +74,9 @@ impl Default for SamuraiConfig {
             park_hard_5h_pct: 90.0,
             park_hard_7d_pct: 95.0,
             ack_timeout_secs: 180,
-            staleness_window_secs: 300,
+            // Matches `samurai_watchdog::TRANSCRIPT_STALE_AFTER`, the window
+            // this field now drives — the shipped behaviour, unchanged.
+            staleness_window_secs: 120,
             handoff_retention_days: 14,
             breaker_events: 5,
             size_warn_bytes: 5 * 1024 * 1024,
@@ -94,18 +99,35 @@ impl SamuraiConfig {
             ("park_hard_7d_pct", self.park_hard_7d_pct),
         ];
         for (name, value) in pcts {
-            if !value.is_finite() || !(0.0..=100.0).contains(&value) {
-                return Err(format!("{name} must be a percentage between 0 and 100"));
+            // 0 is not a threshold: every predicate here is `percent >=
+            // threshold`, so a 0 handoff trigger hands off on EVERY tick
+            // (unbounded generation churn) and a 0 park threshold parks on
+            // every tick. Same floor reasoning as `size_warn_bytes` below.
+            // `value > 0.0` is already false for NaN and -inf.
+            if !(value > 0.0 && value <= 100.0) {
+                return Err(format!(
+                    "{name} must be a percentage above 0 and at most 100"
+                ));
             }
         }
-        if self.ack_timeout_secs == 0 {
-            return Err("ack_timeout_secs must be at least 1".to_string());
+        // Upper bound, not just a floor: the injector computes
+        // `ack_timeout * 3` as a `Duration`, and `Duration * u32` panics on
+        // overflow — an unbounded value would kill the injector loop (a bare
+        // `loop { tick }` with no catch) for the rest of the process.
+        if !(1..=86_400).contains(&self.ack_timeout_secs) {
+            return Err("ack_timeout_secs must be between 1 and 86400".to_string());
         }
         if self.staleness_window_secs == 0 {
             return Err("staleness_window_secs must be at least 1".to_string());
         }
         if self.breaker_events == 0 {
             return Err("breaker_events must be at least 1".to_string());
+        }
+        // Floor, because this one DELETES: 0 would mean "sweep every
+        // archived epic's handoffs on the next app start", and the settings
+        // field yields 0 for an emptied box (`Number("") === 0`).
+        if self.handoff_retention_days == 0 {
+            return Err("handoff_retention_days must be at least 1".to_string());
         }
         // 1 byte is the legitimate floor: it warns on every non-empty file,
         // which is exactly the live test mode (PRD decision #7). 0 would
@@ -133,7 +155,9 @@ mod tests {
         assert_eq!(cfg.size_warn_bytes, 5 * 1024 * 1024);
         // PRD gives "few minutes" / no number — but they must be non-zero.
         assert!(cfg.ack_timeout_secs > 0);
-        assert!(cfg.staleness_window_secs > 0);
+        // Pinned: this is the window the watchdog actually runs on, and it
+        // must keep matching `samurai_watchdog::TRANSCRIPT_STALE_AFTER`.
+        assert_eq!(cfg.staleness_window_secs, 120);
         assert!(cfg.validate().is_ok());
     }
 
@@ -217,6 +241,17 @@ mod tests {
         cfg.ack_timeout_secs = 0;
         assert!(cfg.validate().is_err());
 
+        // Upper bound: the injector multiplies this Duration by 3, and
+        // `Duration * u32` panics on overflow — an unbounded value would
+        // kill the injector task permanently.
+        let mut cfg = SamuraiConfig::default();
+        cfg.ack_timeout_secs = u64::MAX;
+        assert!(cfg.validate().is_err());
+        cfg.ack_timeout_secs = 86_401;
+        assert!(cfg.validate().is_err());
+        cfg.ack_timeout_secs = 86_400;
+        assert!(cfg.validate().is_ok());
+
         let mut cfg = SamuraiConfig::default();
         cfg.staleness_window_secs = 0;
         assert!(cfg.validate().is_err());
@@ -225,9 +260,49 @@ mod tests {
         cfg.breaker_events = 0;
         assert!(cfg.validate().is_err());
 
+        // 0 now means "delete every archived epic's handoffs on the next
+        // start" — the retention sweep consumes this field.
+        let mut cfg = SamuraiConfig::default();
+        cfg.handoff_retention_days = 0;
+        assert!(cfg.validate().is_err());
+
         let mut cfg = SamuraiConfig::default();
         cfg.size_warn_bytes = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_percentages() {
+        // 0 is not a threshold: `percent >= 0.0` holds for every reading, so
+        // a 0 handoff trigger hands off on every tick (unbounded generation
+        // churn) and a 0 park threshold parks on every tick. Reachable from
+        // the settings modal — clearing the field yields `Number("") === 0`.
+        for zero in [
+            SamuraiConfig {
+                handoff_context_pct: 0.0,
+                ..SamuraiConfig::default()
+            },
+            SamuraiConfig {
+                park_soft_5h_pct: 0.0,
+                ..SamuraiConfig::default()
+            },
+            SamuraiConfig {
+                park_hard_5h_pct: 0.0,
+                ..SamuraiConfig::default()
+            },
+            SamuraiConfig {
+                park_hard_7d_pct: 0.0,
+                ..SamuraiConfig::default()
+            },
+        ] {
+            assert!(zero.validate().is_err(), "{zero:?} must be rejected");
+        }
+        // The smallest legitimate test-mode threshold still passes.
+        let cfg = SamuraiConfig {
+            handoff_context_pct: 0.1,
+            ..SamuraiConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

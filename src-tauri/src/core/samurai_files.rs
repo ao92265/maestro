@@ -27,6 +27,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -130,6 +131,59 @@ pub fn handoff_dir(worktree_path: &str) -> PathBuf {
     PathBuf::from(strip_prefix_str(worktree_path))
         .join(".maestro")
         .join("handoffs")
+}
+
+/// PRD §8 row 1: handoff files auto-clean `retention_days` after the epic
+/// completes — "completes" meaning its run config reached
+/// [`RunConfigStatus::Archived`] (an ACTIVE epic's history is kept while it
+/// is live). Returns the removed paths for the caller's log.
+///
+/// The age signal is the file's mtime: a handoff file is written once per
+/// generation and never touched again, so its mtime IS that generation's
+/// end. Missing evidence never deletes — an unreadable mtime, a non-`.md`
+/// entry or an unreadable directory is skipped, matching the inventory's
+/// "no handoff dir is the normal case" reading above.
+pub fn sweep_handoff_retention(
+    configs: &[(PathBuf, SamuraiRunConfig)],
+    retention_days: u32,
+) -> Vec<PathBuf> {
+    let max_age = Duration::from_secs(u64::from(retention_days) * 24 * 60 * 60);
+    let mut removed: Vec<PathBuf> = Vec::new();
+    let mut seen_dirs: HashSet<PathBuf> = HashSet::new();
+    for (_, config) in configs {
+        if config.status != RunConfigStatus::Archived {
+            continue;
+        }
+        let dir = handoff_dir(&config.worktree_path);
+        if !seen_dirs.insert(dir.clone()) {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let expired = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age >= max_age);
+            if !expired {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed.push(path),
+                Err(e) => log::warn!(
+                    "samurai retention: failed to delete expired handoff {}: {e}",
+                    path.display()
+                ),
+            }
+        }
+    }
+    removed
 }
 
 /// Every Samurai-managed file as one flat list (issue #65). Inputs are
@@ -483,9 +537,16 @@ fn stat(path: &Path) -> Option<(u64, Option<String>)> {
 fn canonical_stripped(path: &Path) -> Option<PathBuf> {
     let canonical = std::fs::canonicalize(path).ok()?;
     let s = canonical.to_string_lossy();
-    Some(PathBuf::from(
-        s.strip_prefix(r"\\?\").unwrap_or(&s).to_string(),
-    ))
+    // `\\?\UNC\server\share\…` is a NETWORK path: it must strip back to
+    // `\\server\share\…`. Dropping only `\\?\` would leave a RELATIVE
+    // `UNC\…` path, which resolves against the process cwd and fails every
+    // `is_file()` — the case that hits any redirected AppData or
+    // share-hosted worktree.
+    let stripped = match s.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => s.strip_prefix(r"\\?\").unwrap_or(&s).to_string(),
+    };
+    Some(PathBuf::from(stripped))
 }
 
 /// Lossless `\\?\`-strip of a path for display/wire use (no canonicalize —
@@ -931,6 +992,82 @@ mod tests {
             PathBuf::from("C:/wt/epic-9")
                 .join(".maestro")
                 .join("handoffs")
+        );
+    }
+
+    #[test]
+    fn test_retention_sweep_only_touches_archived_epics() {
+        // PRD §8 row 1. The fixture has an ACTIVE epic (#9, two handoffs)
+        // and an ARCHIVED one (#7, one handoff).
+        let f = fixture();
+        let wt7 = f.base.path().join("wt-7").join(".maestro").join("handoffs");
+        let wt9 = f.base.path().join("wt-9").join(".maestro").join("handoffs");
+        std::fs::write(wt7.join("notes.txt"), "not a handoff").unwrap();
+        let configs = f.store.list_with_paths();
+
+        // Fresh files under the shipped 14-day window: nothing is swept.
+        assert!(sweep_handoff_retention(&configs, 14).is_empty());
+        assert!(wt7.join("7-gen1.md").exists());
+
+        // Expired. `0` is the age boundary this test can reach without a
+        // fake clock; `validate()` forbids 0 in a real config, so the sweep
+        // only ever sees >= 1 in production.
+        let removed = sweep_handoff_retention(&configs, 0);
+        assert_eq!(removed.len(), 1, "removed: {removed:?}");
+        assert!(!wt7.join("7-gen1.md").exists());
+        assert!(
+            wt7.join("notes.txt").exists(),
+            "only .md handoffs are swept"
+        );
+        assert!(
+            wt9.join("9-gen1.md").exists() && wt9.join("9-gen2.md").exists(),
+            "an ACTIVE epic keeps its history while it is live"
+        );
+
+        // Idempotent; an already-empty (or missing) handoff dir is not an
+        // error.
+        assert!(sweep_handoff_retention(&configs, 0).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_canonical_stripped_keeps_unc_paths_absolute() {
+        // `fs::canonicalize` returns `\\?\UNC\server\share\…` for anything
+        // whose target is a network location (redirected AppData, a
+        // share-hosted worktree). Stripping only `\\?\` leaves a RELATIVE
+        // `UNC\…` path: the roots compare still passes (both sides mangled
+        // alike) but `target.is_file()` resolves against the process cwd and
+        // fails, so every managed delete died with "not a regular file".
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("handoff-gen1.md");
+        std::fs::write(&file, "# handoff\n").unwrap();
+
+        let local = file.to_string_lossy().replace('/', "\\");
+        // `C:\x\y` → `\\localhost\C$\x\y` (the admin share). Hosts with it
+        // disabled simply skip — the test never asserts reachability.
+        let Some((drive, rest)) = local.split_once(":\\") else {
+            return;
+        };
+        let unc = format!(r"\\localhost\{drive}$\{rest}");
+        if std::fs::metadata(&unc).is_err() {
+            return;
+        }
+
+        let resolved = canonical_stripped(Path::new(&unc)).expect("a UNC path must resolve");
+        assert!(
+            resolved.is_absolute(),
+            "{} must stay absolute",
+            resolved.display()
+        );
+        assert!(
+            resolved.is_file(),
+            "{} must still resolve to the file",
+            resolved.display()
+        );
+        assert!(
+            !resolved.to_string_lossy().starts_with("UNC\\"),
+            "{} must not keep the bare UNC\\ marker",
+            resolved.display()
         );
     }
 }

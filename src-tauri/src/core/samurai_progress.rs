@@ -306,16 +306,29 @@ impl SamuraiProgress {
                 // The epic worktree is stable across generations (PRD §5.9);
                 // a successor refreshes the dir but keeps the counter — zero
                 // progress across a handoff stays visible.
-                state
+                let entry = state
                     .epics
                     .entry((project.clone(), epic.clone()))
-                    .and_modify(|e| e.working_dir = dir.clone())
                     .or_insert_with(|| EpicBreaker {
-                        working_dir: dir,
+                        working_dir: dir.clone(),
                         observed_head: None,
                         count: 0,
                         latched: false,
                     });
+                entry.working_dir = dir;
+                // gen-1 is a LAUNCH, never a successor: `spawn_first_
+                // generation` hardcodes 1, successors are `generation + 1`
+                // and a resume's `next_generation` is `prior + 1` — both
+                // always >= 2. A terminal transition deliberately KEEPS the
+                // epic entry and `handle_removed` bails out once the
+                // baseline is already gone, so without this reset the
+                // previous run's count/latch would park a freshly launched
+                // orchestrator on sight (`evaluate_trip` below).
+                if generation == 1 {
+                    entry.observed_head = None;
+                    entry.count = 0;
+                    entry.latched = false;
+                }
             }
         }
         self.evaluate_trip(&project, &epic);
@@ -1120,6 +1133,104 @@ mod tests {
         // Idempotent for unknown sessions.
         h.progress.remove_session(99);
         h.progress.flush().await;
+    }
+
+    #[tokio::test]
+    async fn test_relaunched_epic_gen_1_starts_from_a_clean_breaker() {
+        // A latched breaker must not survive into a RELAUNCH. `Job::Terminal`
+        // deliberately keeps the epic entry, and `handle_removed` bails out
+        // once the baseline is already gone — so after a normal
+        // KILLED/PARKED/DEAD lifecycle nothing prunes it. gen-1 is only ever
+        // a launch (successors and resumes are >= 2), so it resets.
+        let base = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        let project = repo.path().to_string_lossy().into_owned();
+        let h = harness(base.path(), 3);
+
+        h.dirs.lock().unwrap().insert(1, project.clone());
+        h.supervisor
+            .register_session(1, project.clone(), "epic-r".into(), 1)
+            .unwrap();
+        settle(&h, &project).await;
+
+        // Go mid-handoff so the due trip cannot park anybody → latched.
+        h.supervisor.transition(1, HandoffRequested).unwrap();
+        for _ in 0..2 {
+            h.audit.append(&project, countable("epic-r", 1));
+        }
+        settle(&h, &project).await;
+        let (_, _, latched) = h.progress.breaker_view(&project, "epic-r").unwrap();
+        assert!(latched, "a due-but-unparkable trip must latch");
+
+        // Normal end of life: terminal transition, then teardown. The
+        // baseline is already gone, so the removal cannot prune the entry.
+        h.supervisor.transition(1, Dead).unwrap();
+        settle(&h, &project).await;
+        h.progress.remove_session(1);
+        h.progress.flush().await;
+        assert!(
+            h.progress.breaker_view(&project, "epic-r").is_some(),
+            "the epic entry survives a normal lifecycle — this is the leak"
+        );
+
+        // Relaunch: a fresh gen-1 for the same (project, epic).
+        h.dirs.lock().unwrap().insert(2, project.clone());
+        h.supervisor
+            .register_session(2, project.clone(), "epic-r".into(), 1)
+            .unwrap();
+        let all = rows(&h, &project).await;
+
+        assert_eq!(
+            state_of(&h, 2),
+            Working,
+            "a freshly launched orchestrator must not be parked on sight"
+        );
+        let (_, count, latched) = h.progress.breaker_view(&project, "epic-r").unwrap();
+        assert_eq!((count, latched), (0, false), "gen-1 resets the breaker");
+        assert!(
+            alerts_of_kind(&all, "circuit_breaker").is_empty(),
+            "no trip belongs to the relaunched run"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_successor_generation_keeps_the_breaker_counter() {
+        // The other side of the gen-1 reset: a gen-2 successor registering
+        // after its predecessor was killed must KEEP the counter — zero
+        // progress across a handoff has to stay visible (module doc).
+        let base = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        let project = repo.path().to_string_lossy().into_owned();
+        let h = harness(base.path(), 100);
+
+        h.dirs.lock().unwrap().insert(1, project.clone());
+        h.supervisor
+            .register_session(1, project.clone(), "epic-s".into(), 1)
+            .unwrap();
+        settle(&h, &project).await;
+        for _ in 0..2 {
+            h.audit.append(&project, countable("epic-s", 1));
+        }
+        settle(&h, &project).await;
+        let (_, before, _) = h.progress.breaker_view(&project, "epic-s").unwrap();
+        assert_eq!(before, 2);
+
+        h.supervisor.transition(1, HandoffRequested).unwrap();
+        h.supervisor.transition(1, HandoffWritten).unwrap();
+        h.supervisor.transition(1, Killed).unwrap();
+        h.dirs.lock().unwrap().insert(2, project.clone());
+        h.supervisor
+            .register_session(2, project.clone(), "epic-s".into(), 2)
+            .unwrap();
+        settle(&h, &project).await;
+
+        let (_, after, _) = h.progress.breaker_view(&project, "epic-s").unwrap();
+        assert!(
+            after >= before,
+            "a successor must not reset the counter (before={before}, after={after})"
+        );
     }
 
     #[tokio::test]

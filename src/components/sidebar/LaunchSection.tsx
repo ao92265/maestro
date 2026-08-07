@@ -1,6 +1,6 @@
 import { ask } from "@tauri-apps/plugin-dialog";
 import { CheckCircle2, Loader2, RefreshCw, Rocket, Trash2, XCircle } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   samuraiCleanupEpic,
   samuraiLaunchRun,
@@ -93,6 +93,9 @@ export function LaunchSection() {
   const [triaged, setTriaged] = useState(false);
   const [preflight, setPreflight] = useState<SamuraiPreflight | null>(null);
   const [preflightLoading, setPreflightLoading] = useState(false);
+  // The project a running probe belongs to — a result that outlives a switch
+  // is dropped rather than applied to the newly active project.
+  const currentProjectRef = useRef(projectPath);
   const [launching, setLaunching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -116,18 +119,25 @@ export function LaunchSection() {
   // Preflight probes are project-scoped — a stale pass must not leak onto
   // another project.
   useEffect(() => {
+    currentProjectRef.current = projectPath;
     setPreflight(null);
     setError(null);
     setNotice(null);
   }, [projectPath]);
 
   const handlePreflight = async () => {
+    const target = projectPath;
     setPreflightLoading(true);
     setError(null);
     setNotice(null);
     try {
-      setPreflight(await samuraiPreflight(projectPath));
+      const result = await samuraiPreflight(target);
+      // Switched project while the probe was in flight — the answer belongs
+      // to the old project, so it must not re-green this one's gate.
+      if (currentProjectRef.current !== target) return;
+      setPreflight(result);
     } catch (err) {
+      if (currentProjectRef.current !== target) return;
       setError(String(err));
       setPreflight(null);
     } finally {
@@ -145,6 +155,13 @@ export function LaunchSection() {
     const pct = pctText === "" ? null : Number(pctText);
     if (pct !== null && !Number.isFinite(pct)) {
       setError("Handoff context % must be a number (or empty for the global default)");
+      return;
+    }
+    // Mirror the backend's SamuraiConfig::validate range: 0 would make every
+    // `percent >= threshold` test true and arm a permanent handoff loop, so
+    // it is rejected here rather than surfacing as a launch failure.
+    if (pct !== null && (pct <= 0 || pct > 100)) {
+      setError("Handoff context % must be between 1 and 100 (or empty for the global default)");
       return;
     }
     setLaunching(true);
@@ -264,7 +281,7 @@ export function LaunchSection() {
             <input
               id="samurai-launch-handoff-pct"
               type="number"
-              min={0}
+              min={1}
               max={100}
               value={handoffPct}
               onChange={(e) => setHandoffPct(e.target.value)}

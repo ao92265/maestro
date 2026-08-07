@@ -650,16 +650,24 @@ fn parse_assistant_message(session_id: u32, entry: &Entry) -> Vec<ClaudeEvent> {
         // percentage and the latest one wins downstream (issue #41).
         let context_tokens =
             tu.input_tokens + tu.cache_read_input_tokens + tu.cache_creation_input_tokens;
-        let context_window = context_window_for_model(&model);
-        let percent = (context_tokens as f64 / context_window as f64 * 1000.0).round() / 10.0;
-        events.push(ClaudeEvent::ContextUsageUpdate {
-            session_id,
-            model,
-            context_tokens,
-            context_window,
-            percent,
-            timestamp: timestamp.clone(),
-        });
+        // An API-error entry (model "<synthetic>", isApiErrorMessage — e.g. a
+        // 429 or a spend limit) carries an all-zero usage block, while a real
+        // assistant call always has a non-zero prompt. Emitting its 0% would
+        // wipe the session's live reading in SamuraiContextStore and disarm
+        // the 45% handoff trigger (PRD §5.4) and the highest-context-first
+        // park order (§5.5).
+        if context_tokens > 0 {
+            let context_window = context_window_for_model(&model);
+            let percent = (context_tokens as f64 / context_window as f64 * 1000.0).round() / 10.0;
+            events.push(ClaudeEvent::ContextUsageUpdate {
+                session_id,
+                model,
+                context_tokens,
+                context_window,
+                percent,
+                timestamp: timestamp.clone(),
+            });
+        }
     }
 
     events
@@ -1117,6 +1125,29 @@ mod tests {
             assert_eq!(*percent, 10.1, "100631 / 1M, rounded to one decimal");
             assert_eq!(timestamp, "2026-08-06T01:27:52.399Z");
         }
+    }
+
+    /// An API-error entry (`"<synthetic>"` + an all-zero usage block, the shape
+    /// Claude Code writes on a 429 / spend limit) must NOT emit a 0% context
+    /// reading — that would wipe the session's real percentage downstream and
+    /// disarm the handoff trigger. Its token counters still flow.
+    #[test]
+    fn test_synthetic_api_error_usage_emits_no_context_update() {
+        let line = r#"{"type":"assistant","isApiErrorMessage":true,"message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error: 429"}],"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}},"uuid":"a-synthetic","timestamp":"2026-08-07T10:00:00Z"}"#;
+        let events = parse_transcript_line(3, line);
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ClaudeEvent::ContextUsageUpdate { .. })),
+            "an all-zero usage block must not reset the session's context: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClaudeEvent::TokenUsageUpdate { .. })),
+            "token counters still flow: {events:?}"
+        );
     }
 
     /// Window resolution: the `[1m]` marker and the 1M-default families map to

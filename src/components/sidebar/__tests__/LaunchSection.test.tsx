@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
 
@@ -221,6 +221,44 @@ describe("LaunchSection (issue #63)", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Clean up epic #38" }));
     await waitFor(() => expect(askMock).toHaveBeenCalledTimes(1));
     expect(callsOf("samurai_cleanup_epic")).toHaveLength(0);
+  });
+
+  it("drops a preflight result that lands after a project switch", async () => {
+    let resolvePreflight: (result: SamuraiPreflight) => void = () => {};
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "samurai_preflight":
+          return new Promise<SamuraiPreflight>((resolve) => {
+            resolvePreflight = resolve;
+          });
+        case "samurai_list_runs":
+          return [];
+        default:
+          return undefined;
+      }
+    });
+    render(<LaunchSection />);
+    fireEvent.change(screen.getByLabelText("Epic ref"), { target: { value: "#38" } });
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Run preflight" }));
+
+    // Switch projects while the probe (gh auth status subprocess) is still out.
+    act(() => {
+      useWorkspaceStore.setState({
+        tabs: [buildTab({ id: "tab-2", name: "other", projectPath: "C:\\git\\other" })],
+      });
+    });
+    expect(await screen.findByText("C:\\git\\other")).toBeInTheDocument();
+
+    // The old project's answer lands — it must not green the new project's gate.
+    await act(async () => {
+      resolvePreflight(passPreflight());
+    });
+
+    expect(screen.queryByText("gh authenticated as nachogl1")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Launch" })).toBeDisabled();
+    // The early return still runs `finally`, so the spinner clears.
+    expect(screen.getByRole("button", { name: "Run preflight" })).toBeEnabled();
   });
 
   it("shows a backend launch refusal as an error", async () => {

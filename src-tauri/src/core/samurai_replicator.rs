@@ -295,11 +295,15 @@ fn parse_owner_repo(url: &str) -> Option<String> {
     if parts.next().is_some() {
         return None; // deeper than owner/repo — not a pin gh would accept
     }
-    if [owner, repo]
-        .iter()
-        .any(|s| s.chars().any(char::is_whitespace))
-    {
-        return None; // never let a pathological remote smuggle whitespace
+    if [owner, repo].iter().any(|s| {
+        !s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    }) {
+        // GitHub owner/repo names are [A-Za-z0-9._-]. Anything else — shell
+        // metacharacters above all — must never reach the `--repo` pin the
+        // prompts embed, because the orchestrator that runs those `gh`
+        // commands runs with `--dangerously-skip-permissions` (PRD §10).
+        return None;
     }
     Some(format!("{owner}/{repo}"))
 }
@@ -1037,14 +1041,25 @@ impl SamuraiReplicator {
         // double-stage — same discipline as on_dead.
         {
             let mut pending = self.lock_pending();
-            if pending
+            if let Some(i) = pending
                 .iter()
-                .any(|p| p.generation == generation && p.epic == epic && p.project == project)
+                .position(|p| p.generation == generation && p.epic == epic && p.project == project)
             {
-                log::warn!(
-                    "samurai replicator: gen-{generation} for epic {epic} is already staged — ignoring repeated spawn_generation"
-                );
-                return;
+                // An entry that already GAVE UP (spawn_dropped ALERT, still
+                // unregistered) is kept only for a late registration — it
+                // must not block a later attempt at the same generation, or
+                // the epic can never be resumed short of an app restart.
+                if pending[i].alerted && pending[i].registered.is_none() {
+                    log::warn!(
+                        "samurai replicator: replacing the dropped gen-{generation} entry for epic {epic} — re-staging"
+                    );
+                    pending.remove(i);
+                } else {
+                    log::warn!(
+                        "samurai replicator: gen-{generation} for epic {epic} is already staged — ignoring repeated spawn_generation"
+                    );
+                    return;
+                }
             }
             log::info!(
                 "samurai replicator: staging fresh gen-{generation} for epic {epic} in {working_dir} (prior gen-{prior})"
@@ -1205,14 +1220,26 @@ impl SamuraiReplicator {
         };
         {
             let mut pending = self.lock_pending();
-            if pending
+            if let Some(i) = pending
                 .iter()
-                .any(|p| p.generation == generation && p.epic == epic && p.project == project)
+                .position(|p| p.generation == generation && p.epic == epic && p.project == project)
             {
-                log::warn!(
-                    "samurai replicator: gen-1 for epic {epic} is already staged — ignoring repeated spawn_first_generation"
-                );
-                return;
+                // Same rule as spawn_generation: a dropped, never-registered
+                // entry is latched for a late registration only, and a fresh
+                // staging supersedes it — otherwise a launch whose spawn
+                // event nobody consumed (no project tab open) would silently
+                // no-op for the rest of the app's lifetime.
+                if pending[i].alerted && pending[i].registered.is_none() {
+                    log::warn!(
+                        "samurai replicator: replacing the dropped gen-1 entry for epic {epic} — re-staging"
+                    );
+                    pending.remove(i);
+                } else {
+                    log::warn!(
+                        "samurai replicator: gen-1 for epic {epic} is already staged — ignoring repeated spawn_first_generation"
+                    );
+                    return;
+                }
             }
             log::info!(
                 "samurai replicator: staging gen-1 LAUNCH for epic {epic} in {}",
@@ -1819,7 +1846,7 @@ mod tests {
     #[test]
     fn test_parse_owner_repo_https_and_ssh_forms() {
         // (url, expected) — tolerant of the common spellings, None otherwise.
-        let table: [(&str, Option<&str>); 14] = [
+        let table: [(&str, Option<&str>); 18] = [
             (
                 "https://github.com/nachogl1/maestro.git",
                 Some("nachogl1/maestro"),
@@ -1844,6 +1871,12 @@ mod tests {
             ("https://gitlab.com/group/sub/repo.git", None),
             ("https://github.com/only-owner", None),
             ("", None),
+            // Shell metacharacters in a pathological remote must never reach
+            // the `--repo` pin an autonomous orchestrator runs `gh` with.
+            ("https://github.com/o/r;$(id)", None),
+            ("https://github.com/o/r`id`", None),
+            ("git@github.com:o/r|sh", None),
+            ("https://github.com/o$(id)/r", None),
         ];
         for (url, expected) in table {
             assert_eq!(parse_owner_repo(url).as_deref(), expected, "url {url:?}");
@@ -3140,6 +3173,45 @@ mod tests {
             .backdate(1, SHA_TIMEOUT + Duration::from_secs(1));
         h.replicator.tick();
         assert_eq!(h.spawns.lock().unwrap().len(), 2, "dropped launch re-emits");
+    }
+
+    #[tokio::test]
+    async fn test_dropped_spawn_entry_does_not_block_a_later_relaunch() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-launch-dropped";
+        let brief = samurai_prompts::launch_instruction("#38", None);
+
+        h.replicator
+            .spawn_first_generation(project, "#38", "C:/tmp/wt", brief.clone());
+        assert_eq!(h.spawns.lock().unwrap().len(), 1);
+
+        // Nobody consumes the spawn event (no project tab open): one re-emit
+        // per expired window, then the entry gives up (spawn_dropped) and
+        // latches for a late registration that will never come.
+        for _ in 0..MAX_SPAWN_EMITS {
+            h.replicator
+                .backdate(1, SHA_TIMEOUT + Duration::from_secs(1));
+            h.replicator.tick();
+        }
+        assert_eq!(h.spawns.lock().unwrap().len(), MAX_SPAWN_EMITS as usize);
+        assert!(
+            h.replicator.pending_view(1).is_some(),
+            "latched, not pruned"
+        );
+
+        // The user re-opens the tab and launches again. The dropped entry is
+        // replaced instead of blocking the staging guard, so the spawn event
+        // fires — it used to no-op for the rest of the app's lifetime while
+        // the UI still reported a successful launch.
+        h.replicator
+            .spawn_first_generation(project, "#38", "C:/tmp/wt", brief);
+        assert_eq!(
+            h.spawns.lock().unwrap().len(),
+            MAX_SPAWN_EMITS as usize + 1,
+            "the relaunch emits a spawn event"
+        );
+        assert_eq!(h.replicator.pending_count(1), 1, "replaced, not duplicated");
     }
 
     #[tokio::test]

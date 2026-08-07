@@ -1721,15 +1721,13 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   }, [slots, launchSlot]);
 
   // Samurai kills (issue #55) and parks (issue #60): after a validated
-  // handoff — or a validated allowance park — the BACKEND tears the session
-  // down itself (PTY tree-kill, status server, transcript watcher, context
-  // store) and announces it by transitioning the session to KILLED/PARKED on
-  // the samurai-supervisor-event channel. No PTY-exit event exists and
-  // terminal teardown is otherwise always frontend-initiated, so without
-  // this the dead tile would linger as a zombie. Reuse handleKill — the
-  // exact cleanup the manual close runs, minus the kill IPC (already done)
-  // and minus the working-dir artifacts the successor (or the resume's
-  // fresh spawn) is about to reuse.
+  // handoff — or a validated allowance park — the session is announced by
+  // transitioning to KILLED/PARKED on the samurai-supervisor-event channel.
+  // No PTY-exit event exists and terminal teardown is otherwise always
+  // frontend-initiated, so without this the dead tile would linger as a
+  // zombie. Reuse the manual close path (kill IPC + handleKill), minus the
+  // working-dir artifacts the successor (or the resume's fresh spawn) is
+  // about to reuse.
   //
   // Deliberately placed AFTER the pending-launch consume/launch effects
   // (fresh-eyes finding A): effects run in definition order, so when the
@@ -1745,8 +1743,16 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       if (slot.sessionId === null) continue;
       const info = samuraiBySessionId[slot.sessionId];
       if (info && SAMURAI_TILE_CLOSE_STATES.has(info.state)) {
+        // The replicator/parker paths already tore the PTY down, but the
+        // Phase-2 circuit breaker (samurai_progress.rs) only transitions to
+        // PARKED — kill here so no path can orphan a live agent running with
+        // --dangerously-skip-permissions. A second kill is a harmless
+        // SessionNotFound (process_manager.rs removes from the map before
+        // signalling).
+        //
         // handleKill → removeSession drops the supervision entry, so this
         // effect cannot re-fire for the same session.
+        killSession(slot.sessionId).catch(console.error);
         handleKill(slot.sessionId, { keepDirArtifacts: true });
       }
     }

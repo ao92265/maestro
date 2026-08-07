@@ -5,8 +5,9 @@
 //! forever. One periodic tick combines two signals per supervised session:
 //!
 //! 1. **Transcript staleness** — the transcript file's mtime is older than
-//!    [`TRANSCRIPT_STALE_AFTER`] (the watcher already knows each session's
-//!    transcript path).
+//!    the configured `staleness_window_secs` (issue #45; default
+//!    [`TRANSCRIPT_STALE_AFTER`]). The watcher already knows each session's
+//!    transcript path.
 //! 2. **Process liveness** — is any `claude` process still alive under the
 //!    session's shell?
 //!
@@ -30,19 +31,20 @@ use std::time::Duration;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use super::process_manager::ProcessManager;
+use super::samurai_config::SharedSamuraiConfig;
 use super::supervisor::{Supervisor, SupervisorState};
 use super::transcript_watcher::TranscriptWatcher;
-
-// TODO(#45): both windows below move into the Samurai run config once the
-// config module lands (issue #45, built in parallel — not on this branch).
 
 /// How often the watchdog looks at supervised sessions. With no live
 /// supervised session a tick returns immediately without scanning processes.
 pub const TICK_INTERVAL: Duration = Duration::from_secs(30);
 
-/// A transcript untouched for this long counts as stale. Staleness alone
-/// never kills anything — it only arms the process-liveness check — so this
-/// can stay well under "multi-minute idle" territory without false positives.
+/// Default staleness window: a transcript untouched for this long counts as
+/// stale. Staleness alone never kills anything — it only arms the
+/// process-liveness check — so this can stay well under "multi-minute idle"
+/// territory without false positives. The watchdog itself reads
+/// `SamuraiConfig::staleness_window_secs` (issue #45) and only falls back
+/// here; the cold-start reconciler still uses this fixed window.
 pub const TRANSCRIPT_STALE_AFTER: Duration = Duration::from_secs(120);
 
 /// Upper bound when walking parent chains; also breaks PID-reuse cycles.
@@ -163,11 +165,30 @@ pub(crate) fn transcript_age(path: &Path) -> Option<Duration> {
         .ok()
 }
 
+/// The configured staleness window, read fresh each tick so a settings
+/// change applies on the next tick without a restart (same discipline as the
+/// injector's per-tick config read). 0 is rejected by
+/// `SamuraiConfig::validate`, but a hand-edited store could still carry it —
+/// fall back to the shipped default rather than treating every transcript as
+/// stale.
+fn stale_after(config: &SharedSamuraiConfig) -> Duration {
+    let secs = config
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .staleness_window_secs;
+    if secs == 0 {
+        TRANSCRIPT_STALE_AFTER
+    } else {
+        Duration::from_secs(secs)
+    }
+}
+
 /// One watchdog pass over every supervised session.
 async fn run_tick(
     supervisor: &Supervisor,
     transcripts: &TranscriptWatcher,
     processes: &ProcessManager,
+    stale_after: Duration,
 ) {
     let live: Vec<_> = supervisor
         .list_sessions()
@@ -193,7 +214,7 @@ async fn run_tick(
             .transcript_path(session.session_id)
             .and_then(|p| transcript_age(&p));
 
-        if decide(session.state, age, claude_alive, TRANSCRIPT_STALE_AFTER) == Verdict::Dead {
+        if decide(session.state, age, claude_alive, stale_after) == Verdict::Dead {
             log::warn!(
                 "samurai watchdog: session {} ({}) has a stale transcript ({:?} old) and no live claude process — declaring DEAD",
                 session.session_id,
@@ -220,6 +241,7 @@ pub fn spawn_watchdog(
     supervisor: Arc<Supervisor>,
     transcripts: Arc<TranscriptWatcher>,
     processes: ProcessManager,
+    config: SharedSamuraiConfig,
 ) {
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(TICK_INTERVAL);
@@ -229,7 +251,7 @@ pub fn spawn_watchdog(
         // at startup run_tick returns without scanning.
         loop {
             interval.tick().await;
-            run_tick(&supervisor, &transcripts, &processes).await;
+            run_tick(&supervisor, &transcripts, &processes, stale_after(&config)).await;
         }
     });
 }
@@ -317,6 +339,30 @@ mod tests {
                 "{state:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_stale_after_comes_from_config_not_the_constant() {
+        use crate::core::samurai_config::SamuraiConfig;
+        use std::sync::RwLock;
+
+        // Issue #45: the settings knob drives the window. A user who raises
+        // it to 10 minutes must get 10 minutes, not the shipped 120s.
+        let config: SharedSamuraiConfig = Arc::new(RwLock::new(SamuraiConfig {
+            staleness_window_secs: 600,
+            ..SamuraiConfig::default()
+        }));
+        assert_eq!(stale_after(&config), Duration::from_secs(600));
+        // And a live edit applies without a restart (read fresh per tick).
+        config.write().unwrap().staleness_window_secs = 45;
+        assert_eq!(stale_after(&config), Duration::from_secs(45));
+        // The default keeps the shipped window.
+        let default: SharedSamuraiConfig = Arc::new(RwLock::new(SamuraiConfig::default()));
+        assert_eq!(stale_after(&default), TRANSCRIPT_STALE_AFTER);
+        // 0 (validate() rejects it; a hand-edited store could not) must not
+        // make every transcript instantly stale.
+        config.write().unwrap().staleness_window_secs = 0;
+        assert_eq!(stale_after(&config), TRANSCRIPT_STALE_AFTER);
     }
 
     #[test]

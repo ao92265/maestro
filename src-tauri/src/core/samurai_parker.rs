@@ -255,10 +255,15 @@ impl SamuraiParker {
     /// suppressed retroactively.
     pub fn engage_external_park(&self, reason: &str) {
         log::error!("samurai parker: external park engaged ({reason}) — parking every supervised session, no resume timers");
-        let was_engaged = self.engaged.swap(true, Ordering::SeqCst);
         {
+            // Engagement decision and flag write in ONE critical section: a
+            // concurrent `engage_hard` landing between the two would leave
+            // the "was engaged" answer stale here and re-suppress the timers
+            // that crossing just un-suppressed — every epic it parks would
+            // then get no resume timer at all. The guard still drops before
+            // `advance()`, exactly as before.
             let mut state = self.lock_state();
-            if !was_engaged {
+            if !self.engaged.swap(true, Ordering::SeqCst) {
                 state.suppress_timers = true;
             }
         }
@@ -367,15 +372,18 @@ impl SamuraiParker {
     /// Hard crossing: engage (idempotent — a second event mid-sweep only
     /// merges its reset time) and advance.
     fn engage_hard(&self, resets_at: Option<&str>) {
-        let was_engaged = self.engaged.swap(true, Ordering::SeqCst);
-        {
+        // One critical section (see `engage_external_park`): the swap must
+        // not be observable before this sweep's reset story is written.
+        let was_engaged = {
             let mut state = self.lock_state();
+            let was = self.engaged.swap(true, Ordering::SeqCst);
             state.resets_at = merge_resets_at(state.resets_at, resets_at);
             // A real allowance crossing brings a reset story — even when it
             // joins an externally engaged sweep (issue #63), its timers must
             // arm normally.
             state.suppress_timers = false;
-        }
+            was
+        };
         if was_engaged {
             log::info!(
                 "samurai parker: hard crossing while a sweep is engaged — reset time merged"
@@ -1304,6 +1312,46 @@ mod tests {
         let timers = h.schedule.list();
         assert_eq!(timers.len(), 1, "the allowance crossing's timer arms");
         assert_eq!(timers[0].epic, "#1");
+    }
+
+    #[tokio::test]
+    async fn test_external_park_joining_a_hard_sweep_keeps_its_timers() {
+        // The mirror of the test above, and the invariant the engage/lock
+        // atomicity protects: an external park that arrives while an
+        // allowance sweep is already engaged must NOT re-suppress that
+        // sweep's timers (a stale "was engaged" answer used to be able to).
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-hard-then-ext";
+        let repo = tempdir().unwrap();
+        init_parkable_repo(repo.path(), "#1", 1);
+        h.dirs
+            .lock()
+            .unwrap()
+            .insert(1, repo.path().to_string_lossy().into_owned());
+        h.supervisor
+            .register_session(1, project.into(), "#1".into(), 1)
+            .unwrap();
+
+        h.parker.on_allowance_event(&hard_event(Some(RESETS_AT)));
+        h.parker.engage_external_park("gh_auth_lost");
+
+        complete_park(&h, 1, 1);
+        wait_until(|| !h.parker.parking_engaged()).await;
+        let timers = h.schedule.list();
+        assert_eq!(
+            timers.len(),
+            1,
+            "the allowance sweep's timer survives a joining external park"
+        );
+        assert_eq!(timers[0].epic, "#1");
+        let resets = DateTime::parse_from_rfc3339(RESETS_AT)
+            .unwrap()
+            .with_timezone(&Utc);
+        let fire = DateTime::parse_from_rfc3339(&timers[0].fire_at)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(fire, fire_at_for(resets, "#1"));
     }
 
     #[tokio::test]

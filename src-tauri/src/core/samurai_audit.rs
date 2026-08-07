@@ -16,6 +16,7 @@
 //! (PRD decision #15). The file size is reported on every read so later
 //! phases can warn when it grows.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -301,24 +302,44 @@ async fn read_events(
         .map_err(|e| format!("failed to read audit file: {}", e))?;
 
     let mut events: Vec<AuditEvent> = Vec::new();
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<AuditEvent>(line) {
-            Ok(event) => events.push(event),
-            // A malformed line should never exist (single writer, whole-line
-            // appends) — skip it rather than failing the whole read.
+    // A malformed line should never exist (single writer, whole-line appends)
+    // — skip it rather than failing the whole read.
+    let parse =
+        |line: &str, out: &mut Vec<AuditEvent>| match serde_json::from_str::<AuditEvent>(line) {
+            Ok(event) => out.push(event),
             Err(e) => log::warn!("skipping malformed audit line in {:?}: {}", path, e),
+        };
+    let lines = content.lines().filter(|l| !l.trim().is_empty());
+    match (tail, &since_ts) {
+        // The panel's default read (a plain tail): parse only the last n
+        // lines. The log is never auto-trimmed (see the module docs), and
+        // this runs inside the single writer task, so parsing every row would
+        // hold up appends by an amount that grows with the run's lifetime.
+        (Some(n), None) => {
+            let mut last: VecDeque<&str> = VecDeque::with_capacity(n);
+            for line in lines {
+                last.push_back(line);
+                if last.len() > n {
+                    last.pop_front();
+                }
+            }
+            for line in last {
+                parse(line, &mut events);
+            }
         }
-    }
-
-    if let Some(since) = &since_ts {
-        events.retain(|e| e.ts.as_str() > since.as_str());
-    }
-    if let Some(n) = tail {
-        if events.len() > n {
-            events.drain(..events.len() - n);
+        // since_ts filters on a parsed field, so it must parse everything.
+        _ => {
+            for line in lines {
+                parse(line, &mut events);
+            }
+            if let Some(since) = &since_ts {
+                events.retain(|e| e.ts.as_str() > since.as_str());
+            }
+            if let Some(n) = tail {
+                if events.len() > n {
+                    events.drain(..events.len() - n);
+                }
+            }
         }
     }
 
@@ -409,6 +430,33 @@ mod tests {
             .unwrap();
         assert_eq!(both.events.len(), 1);
         assert_eq!(both.events[0].details["seq"], 9);
+    }
+
+    /// The panel's default read is a plain tail, and it parses only the last
+    /// n lines (the log is never auto-trimmed and the read runs inside the
+    /// writer task). It must still return exactly what a full parse returns.
+    #[tokio::test]
+    async fn test_tail_only_read_matches_full_read_tail() {
+        let dir = tempdir().unwrap();
+        let log = spawn_log(dir.path().to_path_buf());
+        let project = "C:/git/tail-fast-path".to_string();
+
+        for i in 0..25u32 {
+            log.append(&project, event(AuditEventKind::Alert, i, json!({"seq": i})));
+        }
+
+        let all = log.read(&project, None, None).await.unwrap();
+        assert_eq!(all.events.len(), 25);
+
+        let tail = log.read(&project, Some(5), None).await.unwrap();
+        assert_eq!(tail.events, all.events[all.events.len() - 5..].to_vec());
+        assert_eq!(tail.file_size_bytes, all.file_size_bytes);
+
+        // A tail longer than the log keeps everything; a zero tail keeps none.
+        let over = log.read(&project, Some(100), None).await.unwrap();
+        assert_eq!(over.events, all.events);
+        let none = log.read(&project, Some(0), None).await.unwrap();
+        assert!(none.events.is_empty());
     }
 
     #[tokio::test]

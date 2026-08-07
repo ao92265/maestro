@@ -9,7 +9,12 @@
 //! tick. A threshold re-arms when the value falls back below it, so the next
 //! crossing fires again. Threshold changes take effect on the next tick
 //! (lowering a threshold below current usage IS the live test — PRD
-//! decision #7).
+//! decision #7). The one exception the LOOP adds on top: while a hard
+//! threshold stays latched ([`AllowanceWatcher::hard_latched`]) and the
+//! sweep it caused already completed, the remembered crossing is re-handed
+//! to the parker as soon as a session is working again — sessions that
+//! register after the crossing (cold-start reconciliation, resumes) must
+//! not run unparked for the rest of an exhausted window.
 //!
 //! **No governing window** (enterprise-style accounts return the 5h/7d
 //! windows as null): a distinct event fires once — Phase 3's preflight will
@@ -30,7 +35,7 @@ use tauri::{AppHandle, Emitter};
 use super::samurai_audit::{AuditEvent, AuditEventKind, AuditLog};
 use super::samurai_config::{SamuraiConfig, SharedSamuraiConfig};
 use super::samurai_parker::SamuraiParker;
-use super::supervisor::Supervisor;
+use super::supervisor::{Supervisor, SupervisorState};
 
 /// Frontend channel for allowance events (same payload as the audit row's
 /// `details`, plus it also arrives via `samurai-audit-event` when the row
@@ -176,6 +181,14 @@ impl AllowanceWatcher {
         }
         events
     }
+
+    /// Whether a hard threshold is STILL above its line — the latched state
+    /// behind the edge, which no event reports after the crossing tick. The
+    /// loop needs it to re-hand a session that registered after the crossing
+    /// (the latch alone would keep it unparked for the whole window).
+    pub fn hard_latched(&self) -> bool {
+        self.above_hard_5h || self.above_hard_7d
+    }
 }
 
 /// One latch: fire on the rising edge (`value >= threshold`, PRD says
@@ -223,6 +236,12 @@ pub fn spawn_allowance_loop(
 ) {
     tauri::async_runtime::spawn(async move {
         let mut watcher = AllowanceWatcher::default();
+        // The last hard crossing, kept while its threshold stays latched: the
+        // edge fires once, but sessions keep registering after it (cold-start
+        // reconciliation respawns orchestrators seconds after launch, and the
+        // very first tick is immediate — so the crossing routinely lands on an
+        // EMPTY supervisor registry).
+        let mut last_hard: Option<AllowanceEvent> = None;
         let mut interval = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -258,6 +277,31 @@ pub fn spawn_allowance_loop(
             };
             let events = watcher.evaluate(&reading, &snapshot);
             if events.is_empty() {
+                if !watcher.hard_latched() {
+                    // Below the line again (window reset): the edge is
+                    // re-armed, so the remembered crossing is spent.
+                    last_hard = None;
+                } else if !parker.parking_engaged() {
+                    // Still above the hard line with the sweep already
+                    // finished: anything WORKING now registered AFTER the
+                    // crossing and would otherwise never be parked. Re-hand
+                    // the same event — `engage_hard` is idempotent, the
+                    // crossing was already audited (no new ALERT rows), and
+                    // the completed sweep took its `parked_epics` with it, so
+                    // no timer can be armed twice.
+                    if let Some(event) = last_hard.as_ref() {
+                        if supervisor
+                            .list_sessions()
+                            .iter()
+                            .any(|s| s.state == SupervisorState::Working)
+                        {
+                            log::info!(
+                                "samurai allowance: still above the hard threshold and a session is working — re-engaging the park sweep"
+                            );
+                            parker.on_allowance_event(event);
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -294,6 +338,15 @@ pub fn spawn_allowance_loop(
                 // rows are durable, so the trail always shows the crossing
                 // before the PARK rows it causes.
                 parker.on_allowance_event(event);
+                if matches!(
+                    event,
+                    AllowanceEvent::ThresholdCrossed {
+                        threshold_kind: ThresholdKind::Hard,
+                        ..
+                    }
+                ) {
+                    last_hard = Some(event.clone());
+                }
             }
         }
     });
@@ -473,6 +526,29 @@ mod tests {
             vec![(AllowanceWindow::SevenDay, ThresholdKind::Hard)]
         );
         assert!(!events.contains(&AllowanceEvent::NoGoverningWindow));
+    }
+
+    #[test]
+    fn hard_latched_reports_the_state_the_edge_hides() {
+        // The loop re-hands the remembered hard crossing while this is true
+        // (a session registering after the crossing would never be parked
+        // otherwise) and forgets it once the window resets.
+        let mut w = AllowanceWatcher::default();
+        assert!(!w.hard_latched(), "nothing crossed yet");
+        // Soft alone never counts as "hard still above the line".
+        assert_eq!(w.evaluate(&reading(Some(80.0), None), &cfg()).len(), 1);
+        assert!(!w.hard_latched());
+        // 5h hard crosses → latched, and it STAYS latched on silent ticks.
+        assert_eq!(w.evaluate(&reading(Some(91.0), None), &cfg()).len(), 1);
+        assert!(w.hard_latched());
+        assert!(w.evaluate(&reading(Some(92.0), None), &cfg()).is_empty());
+        assert!(w.hard_latched());
+        // 5h window resets below every threshold → re-armed, not latched.
+        assert!(w.evaluate(&reading(Some(3.0), None), &cfg()).is_empty());
+        assert!(!w.hard_latched());
+        // The 7d window latches it just as well.
+        assert_eq!(w.evaluate(&reading(Some(3.0), Some(96.0)), &cfg()).len(), 1);
+        assert!(w.hard_latched());
     }
 
     #[test]
