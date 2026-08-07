@@ -56,6 +56,13 @@ interface AgentState {
   dismiss: (agentId: string) => void;
   /** Remove every finished agent of one session, leaving the running ones. */
   clearFinished: (sessionId: number) => void;
+  /**
+   * Remove every finished agent everywhere, plus the dead ones: agents still
+   * marked running whose session is not in `liveSessionIds` — its terminal
+   * ended or is gone, so the agent can never complete and would otherwise
+   * show as "running" forever.
+   */
+  clearFinishedAndDead: (liveSessionIds: ReadonlySet<number>) => void;
 }
 
 /**
@@ -65,8 +72,8 @@ interface AgentState {
  * graph with its final status, its brief and its report, so a whole
  * orchestration run can be read back after every agent has stopped. Nothing
  * expires them on a timer and a dead session does not drop them — the only
- * removals are [`dismiss`] and [`clearFinished`], plus quitting the app, since
- * this store is in memory only.
+ * removals are [`dismiss`], [`clearFinished`] and [`clearFinishedAndDead`],
+ * plus quitting the app, since this store is in memory only.
  */
 /**
  * Apply one event to the agent list, returning the SAME array reference when
@@ -195,6 +202,14 @@ export const useAgentStore = create<AgentState>((set) => ({
     set((state) => {
       const kept = state.agents.filter(
         (a) => a.sessionId !== sessionId || a.completedAt === null
+      );
+      return kept.length === state.agents.length ? state : { agents: kept };
+    }),
+
+  clearFinishedAndDead: (liveSessionIds: ReadonlySet<number>) =>
+    set((state) => {
+      const kept = state.agents.filter(
+        (a) => a.completedAt === null && liveSessionIds.has(a.sessionId)
       );
       return kept.length === state.agents.length ? state : { agents: kept };
     }),

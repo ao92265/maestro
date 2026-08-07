@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   AGENT_H,
   agentNodeId,
-  CLUSTER_W,
   layoutLandscape,
   PROJECT_W,
   projectNodeId,
@@ -65,7 +64,7 @@ describe("layoutLandscape", () => {
     expect(idleTerminal.y).toBeGreaterThan(lastAgent.y);
   });
 
-  it("tiles several projects into a grid rather than one endless column", () => {
+  it("stacks every project in one column, top to bottom", () => {
     const projects: LayoutProject[] = ["a", "b", "c", "d"].map((tabId) => ({
       tabId,
       terminals: [{ sessionId: Number(tabId.charCodeAt(0)), agentIds: [] }],
@@ -73,12 +72,13 @@ describe("layoutLandscape", () => {
     const positions = layoutLandscape(projects);
     const xs = projects.map((p) => positions.get(projectNodeId(p.tabId))!.x);
     const ys = projects.map((p) => positions.get(projectNodeId(p.tabId))!.y);
-    // 4 projects -> 2 columns, so two distinct x values and two distinct y values.
-    expect(new Set(xs).size).toBe(2);
-    expect(new Set(ys).size).toBe(2);
-    // Neighbouring clusters never overlap horizontally.
-    const [left, right] = [...new Set(xs)].sort((m, n) => m - n);
-    expect(right - left).toBeGreaterThanOrEqual(CLUSTER_W);
+    // Every project node shares the same x; rows descend without overlapping.
+    expect(new Set(xs).size).toBe(1);
+    expect(new Set(ys).size).toBe(4);
+    const sorted = [...ys].sort((m, n) => m - n);
+    for (let i = 1; i < sorted.length; i += 1) {
+      expect(sorted[i] - sorted[i - 1]).toBeGreaterThan(0);
+    }
   });
 
   it("handles a project with no terminals", () => {
