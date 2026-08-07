@@ -199,7 +199,7 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
   const sessions = useSessionStore((s) => s.sessions);
   const agents = useAgentStore((s) => s.agents);
   const dismissAgent = useAgentStore((s) => s.dismiss);
-  const clearFinished = useAgentStore((s) => s.clearFinished);
+  const clearFinishedAndDead = useAgentStore((s) => s.clearFinishedAndDead);
   const projectColors = useProjectColors();
   const manualPositions = useLandscapeLayoutStore((s) => s.positions);
   const setManualPosition = useLandscapeLayoutStore((s) => s.setPosition);
@@ -554,16 +554,35 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
     requestAnimationFrame(fitAll);
   }, [resetManualPositions, fitAll]);
 
-  const finishedCount = useMemo(
-    () => agents.filter((a) => a.completedAt !== null).length,
-    [agents],
+  // A session whose Claude process is still alive. An agent of any other
+  // session (ended, errored, or closed entirely) can never complete — it is
+  // "dead" and clearable even though it still reads as running.
+  const liveSessionIds = useMemo(
+    () =>
+      new Set(
+        sessions
+          .filter(
+            (s) =>
+              s.status === "Working" ||
+              s.status === "NeedsInput" ||
+              s.status === "Starting" ||
+              s.status === "Idle",
+          )
+          .map((s) => s.id),
+      ),
+    [sessions],
+  );
+
+  const clearableCount = useMemo(
+    () =>
+      agents.filter((a) => a.completedAt !== null || !liveSessionIds.has(a.sessionId)).length,
+    [agents, liveSessionIds],
   );
 
   const handleClearFinished = useCallback(() => {
-    const sessionIds = new Set(agents.map((a) => a.sessionId));
-    for (const sessionId of sessionIds) clearFinished(sessionId);
+    clearFinishedAndDead(liveSessionIds);
     setOpenAgentKey(null);
-  }, [agents, clearFinished]);
+  }, [clearFinishedAndDead, liveSessionIds]);
 
   const handleExport = useCallback(async () => {
     setExportError(null);
@@ -587,7 +606,10 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
     "flex shrink-0 items-center gap-1 whitespace-nowrap rounded border border-maestro-border bg-maestro-card px-1.5 py-1 text-[11px] text-maestro-muted transition-colors hover:text-maestro-text disabled:opacity-40";
 
   return (
-    <div className="absolute inset-0 z-30 flex flex-col bg-maestro-bg">
+    /* z-50: the eagle view's zoomed pane sits at z-40 in the same stacking
+       context (App's <main>), so anything lower leaves the landscape invisible
+       whenever a terminal is zoomed. */
+    <div className="absolute inset-0 z-50 flex flex-col bg-maestro-bg">
       {/* Toolbar */}
       <div className="flex h-10 shrink-0 items-center gap-1.5 overflow-x-auto border-b border-maestro-border px-2">
         <span className="mr-1 shrink-0 whitespace-nowrap text-[11px] text-maestro-muted">
@@ -657,12 +679,12 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
         <button
           type="button"
           onClick={handleClearFinished}
-          disabled={finishedCount === 0}
-          title="Remove every finished agent, in every terminal"
+          disabled={clearableCount === 0}
+          title="Remove every done agent, plus dead ones whose terminal ended"
           className={toolbarButton}
         >
           <Trash2 size={11} />
-          Clear finished{finishedCount > 0 ? ` (${finishedCount})` : ""}
+          Clear done{clearableCount > 0 ? ` (${clearableCount})` : ""}
         </button>
         <button type="button" onClick={handleExport} title="Export every brief, report and counter to markdown" className={toolbarButton}>
           <Download size={11} />
