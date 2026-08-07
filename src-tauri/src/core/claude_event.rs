@@ -236,21 +236,27 @@ impl ClaudeEvent {
             ClaudeEvent::FileCreated { session_id, file_path, timestamp } => {
                 format!("FileCreated:{session_id}:{file_path}:{timestamp}")
             }
-            ClaudeEvent::SubagentSpawned { agent_id, .. } => {
-                format!("SubagentSpawned:{agent_id}")
+            // Session-scoped: the frontend keys agents by (session, agent),
+            // because resuming the same conversation in a second terminal
+            // replays identical tool_use ids under a new session id. Keying on
+            // the agent id alone let the first terminal's replay swallow the
+            // second's inside the dedup window, so its agents never appeared.
+            ClaudeEvent::SubagentSpawned { session_id, agent_id, .. } => {
+                format!("SubagentSpawned:{session_id}:{agent_id}")
             }
-            ClaudeEvent::SubagentLaunched { agent_id, .. } => {
-                format!("SubagentLaunched:{agent_id}")
+            ClaudeEvent::SubagentLaunched { session_id, agent_id, .. } => {
+                format!("SubagentLaunched:{session_id}:{agent_id}")
             }
             // Timestamped: a background agent can be resumed and notify again
             // under the same id, and each notification carries a fresh report.
             // Keying on the id alone would drop every completion after the first.
             ClaudeEvent::SubagentCompleted {
+                session_id,
                 agent_id,
                 timestamp,
                 ..
             } => {
-                format!("SubagentCompleted:{agent_id}:{timestamp}")
+                format!("SubagentCompleted:{session_id}:{agent_id}:{timestamp}")
             }
             ClaudeEvent::StatusUpdate { session_id, state, message, .. } => {
                 format!("StatusUpdate:{session_id}:{state}:{message}")
@@ -300,6 +306,52 @@ mod tests {
             timestamp: "2026-02-24T00:00:00Z".into(),
         };
         assert_eq!(a.dedup_key(), b.dedup_key());
+    }
+
+    /// Resuming a conversation in a second terminal replays the same tool_use
+    /// ids under a new session id. The store keys agents by (session, agent),
+    /// so the dedup keys must too — otherwise the second terminal's replayed
+    /// spawns land inside the first's 5s window and are silently swallowed.
+    #[test]
+    fn test_subagent_dedup_keys_are_scoped_by_session() {
+        let spawned = |session_id| ClaudeEvent::SubagentSpawned {
+            session_id,
+            agent_type: "Explore".into(),
+            agent_id: "toolu_x".into(),
+            description: "d".into(),
+            prompt: "p".into(),
+            run_in_background: false,
+            timestamp: "t".into(),
+        };
+        assert_ne!(spawned(1).dedup_key(), spawned(2).dedup_key());
+
+        let launched = |session_id| ClaudeEvent::SubagentLaunched {
+            session_id,
+            agent_id: "toolu_x".into(),
+            agent_run_id: "run".into(),
+            model: "claude-fable-5".into(),
+            timestamp: "t".into(),
+        };
+        assert_ne!(launched(1).dedup_key(), launched(2).dedup_key());
+
+        let completed = |session_id| ClaudeEvent::SubagentCompleted {
+            session_id,
+            agent_id: "toolu_x".into(),
+            success: true,
+            report: "r".into(),
+            status: None,
+            agent_type: None,
+            model: None,
+            duration_ms: None,
+            total_tokens: None,
+            tool_use_count: None,
+            tool_stats: None,
+            agent_run_id: None,
+            timestamp: "t".into(),
+        };
+        assert_ne!(completed(1).dedup_key(), completed(2).dedup_key());
+        // Same session, same timestamp: still one logical occurrence.
+        assert_eq!(completed(1).dedup_key(), completed(1).dedup_key());
     }
 
     #[test]
