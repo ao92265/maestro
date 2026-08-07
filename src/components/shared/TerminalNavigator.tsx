@@ -83,20 +83,33 @@ export function TerminalNavigator({ onNavigate }: TerminalNavigatorProps) {
               No terminals running.
             </p>
           )}
-          {groups.map(({ tab, terminals }) => {
+          {groups.map(({ tab, terminals }, index) => {
             const color = projectColorFor(tab.name);
             return (
-              <div key={tab.id} className="mb-1 last:mb-0">
-                <div className="flex items-center gap-1.5 px-2 py-1">
+              // Projects are separated on purpose: a rule above every group but
+              // the first, plus a filled header banded in the project's color.
+              // A flat list of names ran together once more than one project
+              // was open.
+              <div
+                key={tab.id}
+                className={
+                  index > 0
+                    ? "mt-1.5 border-t border-maestro-border pt-1.5"
+                    : undefined
+                }
+              >
+                <div
+                  className="mb-0.5 flex items-center gap-1.5 rounded bg-maestro-surface px-2 py-1"
+                  style={{ borderLeft: `2px solid ${color}` }}
+                >
                   <span
-                    className="h-2 w-2 shrink-0 rounded-full"
-                    style={{ backgroundColor: color }}
-                  />
-                  <span
-                    className="min-w-0 truncate text-[10px] font-bold uppercase tracking-wider"
+                    className="min-w-0 flex-1 truncate text-[10px] font-bold uppercase tracking-wider"
                     style={{ color }}
                   >
                     {tab.name}
+                  </span>
+                  <span className="shrink-0 text-[10px] tabular-nums text-maestro-muted">
+                    {terminals.length}
                   </span>
                 </div>
                 {terminals.map((sess) => {
@@ -124,9 +137,12 @@ export function TerminalNavigator({ onNavigate }: TerminalNavigatorProps) {
                         {sess.name?.trim() || `Session #${sess.id}`}
                       </span>
                       {isParked && (
+                        // Neon red + glow: parked is the one state in this list
+                        // the user scans for, so it must not read as another
+                        // muted glyph.
                         <ParkingSquare
-                          size={11}
-                          className="shrink-0 text-maestro-muted"
+                          size={12}
+                          className="shrink-0 text-maestro-accent drop-shadow-[0_0_5px_rgb(var(--maestro-accent)/0.8)]"
                           aria-label="Parked"
                         />
                       )}
