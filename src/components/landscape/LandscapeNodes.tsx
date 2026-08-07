@@ -31,6 +31,8 @@ export type ProjectNodeData = {
   status: BackendSessionStatus;
   terminalCount: number;
   runningAgentCount: number;
+  /** All agents, running or kept-until-dismissed — the basis of the count. */
+  agentCount: number;
   /** Filtered out: shown faded rather than hidden, so the map keeps its shape. */
   dimmed: boolean;
 };
@@ -44,6 +46,7 @@ export type TerminalNodeData = {
   status: BackendSessionStatus;
   color: string;
   agentCount: number;
+  runningAgentCount: number;
   dimmed: boolean;
 };
 
@@ -149,9 +152,9 @@ export function ProjectNode({ data, selected }: NodeProps) {
       </div>
       <p className="mt-1 truncate text-[11px] text-maestro-muted">
         {d.terminalCount} terminal{d.terminalCount === 1 ? "" : "s"}
-        {d.runningAgentCount > 0 ? ` · ${d.runningAgentCount} agent${
-          d.runningAgentCount === 1 ? "" : "s"
-        } running` : ""}
+        {/* Both bases shown: the graph keeps finished agents until dismissed,
+            so "running" alone would contradict the nodes still on screen. */}
+        {d.agentCount > 0 ? ` · ${d.runningAgentCount}/${d.agentCount} agents running` : ""}
       </p>
       <p className="truncate text-[10px] text-maestro-muted/70">{d.path}</p>
       <EdgeHandles source />
@@ -196,7 +199,9 @@ export function TerminalNode({ data, selected }: NodeProps) {
       <p className="truncate text-[10px] text-maestro-muted/70">
         {d.agentCount === 0
           ? "no subagents"
-          : `${d.agentCount} subagent${d.agentCount === 1 ? "" : "s"}`}
+          : `${d.agentCount} subagent${d.agentCount === 1 ? "" : "s"} · ${
+              d.runningAgentCount
+            } running`}
       </p>
       <EdgeHandles target source />
     </div>
@@ -257,7 +262,8 @@ export function AgentNode({ data, selected }: NodeProps) {
       </p>
       {stats && <p className="mt-1 w-full truncate text-[10px] text-maestro-muted">{stats}</p>}
       <ToolStatsRow agent={agent} />
-      <EdgeHandles target />
+      {/* Source too: a nested agent's edge leaves the agent that spawned it. */}
+      <EdgeHandles target source />
     </div>
   );
 }

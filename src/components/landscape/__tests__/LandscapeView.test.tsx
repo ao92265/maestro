@@ -99,6 +99,7 @@ function buildAgent(agentId: string, overrides: Partial<SubagentInfo> = {}): Sub
     description: "search for auth code",
     prompt: "Find every call site of authenticate()",
     runInBackground: false,
+    parentAgentId: null,
     spawnedAt: "2026-08-04T10:00:00.000Z",
     completedAt: null,
     success: null,
@@ -136,9 +137,43 @@ describe("LandscapeView", () => {
     expect(screen.getByText("search for auth code")).toBeInTheDocument();
   });
 
-  it("counts the landscape in its header", () => {
+  it("counts the landscape in its header, naming both agent bases", () => {
+    useAgentStore.setState({
+      agents: [
+        buildAgent("a1"),
+        buildAgent("a2", { completedAt: Date.parse("2026-08-04T10:05:00Z"), success: true }),
+      ],
+    });
     renderLandscape();
-    expect(screen.getByText(/1 project · 1 terminal · 1 agent running/)).toBeInTheDocument();
+    // Finished agents stay on the canvas until dismissed, so the header names
+    // the basis instead of showing a bare running count.
+    expect(
+      screen.getByText(/1 project · 1 terminal · 1 running \/ 2 total agents/),
+    ).toBeInTheDocument();
+  });
+
+  it("lays a nested agent out one column right of its parent", () => {
+    useAgentStore.setState({
+      agents: [
+        buildAgent("a1"),
+        buildAgent("a2", {
+          agentType: "NestedExplore",
+          parentAgentId: "a1",
+          spawnedAt: "2026-08-04T10:01:00.000Z",
+        }),
+      ],
+    });
+    const { container } = renderLandscape();
+    expect(screen.getByText("NestedExplore")).toBeInTheDocument();
+    // happy-dom renders no edge DOM (React Flow needs measured handles), but
+    // the node transforms show the tree: a root sibling would share the
+    // parent's x and stack below it; a child moves a full column right.
+    const x = (id: string) => {
+      const node = container.querySelector(`[data-id="${id}"]`) as HTMLElement | null;
+      const match = node?.style.transform.match(/translate\((-?[\d.]+)px/);
+      return match ? Number.parseFloat(match[1]) : NaN;
+    };
+    expect(x("agent:1:a2")).toBeGreaterThan(x("agent:1:a1"));
   });
 
   it("opens the brief/report drawer when a subagent is clicked", () => {

@@ -23,6 +23,12 @@ export interface SubagentInfo {
   prompt: string;
   /** Launched in the background, so it keeps running past its tool_result. */
   runInBackground: boolean;
+  /**
+   * Tool_use id of the agent that spawned this one — a nested agent, read
+   * from the parent's own transcript in the subagents folder. Null for agents
+   * the session itself spawned (and for synthesized orphans).
+   */
+  parentAgentId: string | null;
   /** Transcript timestamp of the spawn. */
   spawnedAt: string;
   /** Epoch ms of completion; null while running. From the transcript timestamp. */
@@ -102,6 +108,7 @@ function applyEvent(agents: SubagentInfo[], event: ClaudeEvent): SubagentInfo[] 
           description: event.description,
           prompt: event.prompt,
           runInBackground: event.run_in_background,
+          parentAgentId: event.parent_agent_id ?? null,
           spawnedAt: event.timestamp,
           completedAt: null,
           success: null,
@@ -157,6 +164,7 @@ function applyEvent(agents: SubagentInfo[], event: ClaudeEvent): SubagentInfo[] 
             description: "",
             prompt: "",
             runInBackground: false,
+            parentAgentId: null,
             spawnedAt: event.timestamp,
             completedAt,
             success: event.success,

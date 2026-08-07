@@ -24,6 +24,7 @@ function spawned(
     description: "search for auth code",
     prompt: "Find every call site of authenticate()",
     run_in_background: false,
+    parent_agent_id: null,
     timestamp: "2026-07-13T10:00:00.000Z",
     ...overrides,
   };
@@ -73,6 +74,18 @@ describe("useAgentStore", () => {
       success: null,
       report: "",
     });
+  });
+
+  // A nested agent's spawn (read from the subagents folder) names the agent
+  // that spawned it, which is what the graphs hang the tree on.
+  it("SubagentSpawned keeps the parent agent id", () => {
+    useAgentStore.getState().handleEvent(spawned(1, "toolu_parent"));
+    useAgentStore
+      .getState()
+      .handleEvent(spawned(1, "toolu_child", { parent_agent_id: "toolu_parent" }));
+    const agents = useAgentStore.getState().agents;
+    expect(agents.find((a) => a.agentId === "toolu_parent")?.parentAgentId).toBeNull();
+    expect(agents.find((a) => a.agentId === "toolu_child")?.parentAgentId).toBe("toolu_parent");
   });
 
   it("duplicate SubagentSpawned is ignored", () => {

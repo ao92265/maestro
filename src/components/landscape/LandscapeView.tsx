@@ -35,6 +35,7 @@ import {
   agentMarkdownLines,
   edgeStroke,
 } from "@/components/session/agentPresentation";
+import { buildAgentTree, type AgentTreeNode } from "@/lib/agentTree";
 import { useAgentStore, type SubagentInfo } from "@/stores/useAgentStore";
 import { useLandscapeLayoutStore } from "@/stores/useLandscapeLayoutStore";
 import {
@@ -48,6 +49,7 @@ import {
   layoutLandscape,
   projectNodeId,
   terminalNodeId,
+  type LayoutAgent,
   type LayoutProject,
   type XY,
 } from "./layout";
@@ -69,7 +71,10 @@ interface LandscapeViewProps {
 /** One terminal with the subagents hanging off it. */
 interface TerminalModel {
   session: SessionConfig;
+  /** Every agent of the session, flat — counts, filtering, export. */
   agents: SubagentInfo[];
+  /** The same agents as their spawn tree — what the canvas draws. */
+  agentTree: AgentTreeNode[];
   title: string;
   description: string;
 }
@@ -81,6 +86,7 @@ interface ClusterModel {
   status: BackendSessionStatus;
   terminals: TerminalModel[];
   runningAgentCount: number;
+  agentCount: number;
 }
 
 /**
@@ -185,11 +191,11 @@ function buildLandscapeMarkdown(clusters: ClusterModel[]): string {
 
 /**
  * The whole development landscape on one canvas: every open project, every
- * terminal inside it, and every subagent those terminals spawned.
+ * terminal inside it, and the spawn tree of every agent those terminals ran.
  *
- * Three levels is all the data honestly supports — a subagent's own transcript
- * is never written into its parent's file, so Maestro cannot see agents spawned
- * by an agent. See the note in [`AgentGraph`].
+ * Agents spawned BY an agent are read from the conversation's subagents
+ * folder and carry `parentAgentId`, so the canvas nests project → terminal →
+ * agent → nested agent to any depth. See the note in [`AgentGraph`].
  *
  * Nodes can be dragged freely; "Reorganize" throws every manual position away
  * and restores the deterministic layout.
@@ -228,12 +234,16 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
       // Ascending session id = launch order, so a project's terminals keep the
       // same vertical order for as long as they live.
       const tabSessions = sessionsForTab(tab, sessions).sort((a, b) => a.id - b.id);
-      const terminals = tabSessions.map((session) => ({
-        session,
-        agents: bySession.get(session.id) ?? [],
-        title: session.name?.trim() || session.mode,
-        description: terminalDescription(session),
-      }));
+      const terminals = tabSessions.map((session) => {
+        const sessionAgents = bySession.get(session.id) ?? [];
+        return {
+          session,
+          agents: sessionAgents,
+          agentTree: buildAgentTree(sessionAgents),
+          title: session.name?.trim() || session.mode,
+          description: terminalDescription(session),
+        };
+      });
       return {
         tab,
         color: projectColors.get(tab.name) ?? projectColorFor(tab.name),
@@ -243,6 +253,7 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
           (n, t) => n + t.agents.filter((a) => a.completedAt === null).length,
           0,
         ),
+        agentCount: terminals.reduce((n, t) => n + t.agents.length, 0),
       };
     });
   }, [tabs, sessions, agents, projectColors]);
@@ -293,18 +304,26 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
   // Map, same position objects.
   const layoutCache = useRef<{ key: string; positions: Map<string, XY> } | null>(null);
   const layout = useMemo(() => {
+    const toLayoutAgent = (node: AgentTreeNode): LayoutAgent => ({
+      id: node.agent.agentId,
+      children: node.children.map(toLayoutAgent),
+    });
     const projects: LayoutProject[] = clusters.map((cluster) => ({
       tabId: cluster.tab.id,
       terminals: cluster.terminals.map((terminal) => ({
         sessionId: terminal.session.id,
-        agentIds: terminal.agents.map((a) => a.agentId),
+        agents: terminal.agentTree.map(toLayoutAgent),
       })),
     }));
+    // Nesting is part of the shape: an agent moving under a late-arriving
+    // parent must re-run the tiling even though the id set is unchanged.
+    const agentKey = (a: LayoutAgent): string =>
+      a.children.length === 0 ? a.id : `${a.id}(${a.children.map(agentKey).join(",")})`;
     const key = projects
       .map(
         (p) =>
           `${p.tabId}[${p.terminals
-            .map((t) => `${t.sessionId}:${t.agentIds.join(",")}`)
+            .map((t) => `${t.sessionId}:${t.agents.map(agentKey).join(",")}`)
             .join("|")}]`,
       )
       .join(";");
@@ -331,6 +350,7 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
         status: cluster.status,
         terminalCount: cluster.terminals.length,
         runningAgentCount: cluster.runningAgentCount,
+        agentCount: cluster.agentCount,
         dimmed: dimmed.has(pId),
       };
       nodes.push({ id: pId, type: "project", position: at(pId), data: projectData });
@@ -346,6 +366,7 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
           status: terminal.session.status,
           color: cluster.color,
           agentCount: terminal.agents.length,
+          runningAgentCount: terminal.agents.filter((a) => a.completedAt === null).length,
           dimmed: dimmed.has(tId),
         };
         nodes.push({ id: tId, type: "terminal", position: at(tId), data: terminalData });
@@ -357,13 +378,16 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
           style: { stroke: cluster.color, strokeWidth: 1.5, opacity: dimmed.has(tId) ? 0.15 : 0.65 },
         });
 
-        for (const agent of terminal.agents) {
+        // A root agent's edge leaves the terminal; a nested agent's edge
+        // leaves the agent that spawned it.
+        const walkAgents = (node: AgentTreeNode, sourceId: string) => {
+          const agent = node.agent;
           const aId = agentNodeId(terminal.session.id, agent.agentId);
           const agentData: AgentNodeData = { kind: "agent", agent, dimmed: dimmed.has(aId) };
           nodes.push({ id: aId, type: "agent", position: at(aId), data: agentData });
           edges.push({
-            id: `e:${tId}->${aId}`,
-            source: tId,
+            id: `e:${sourceId}->${aId}`,
+            source: sourceId,
             target: aId,
             animated: agent.completedAt === null,
             style: {
@@ -372,7 +396,9 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
               opacity: dimmed.has(aId) ? 0.15 : 1,
             },
           });
-        }
+          for (const child of node.children) walkAgents(child, aId);
+        };
+        for (const root of terminal.agentTree) walkAgents(root, tId);
       }
     }
     return { nodes, edges };
@@ -600,6 +626,7 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
 
   const terminalCount = clusters.reduce((n, c) => n + c.terminals.length, 0);
   const runningAgents = clusters.reduce((n, c) => n + c.runningAgentCount, 0);
+  const totalAgents = clusters.reduce((n, c) => n + c.agentCount, 0);
   // shrink-0 + nowrap: a narrow window must scroll the toolbar sideways, not
   // wrap the buttons into a second row the 40px-tall bar can't show.
   const toolbarButton =
@@ -612,10 +639,12 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
     <div className="absolute inset-0 z-50 flex flex-col bg-maestro-bg">
       {/* Toolbar */}
       <div className="flex h-10 shrink-0 items-center gap-1.5 overflow-x-auto border-b border-maestro-border px-2">
+        {/* Both agent bases named: finished agents stay on the canvas until
+            dismissed, so a bare "running" count would look contradictory. */}
         <span className="mr-1 shrink-0 whitespace-nowrap text-[11px] text-maestro-muted">
           {clusters.length} project{clusters.length === 1 ? "" : "s"} · {terminalCount} terminal
-          {terminalCount === 1 ? "" : "s"} · {runningAgents} agent{runningAgents === 1 ? "" : "s"}{" "}
-          running
+          {terminalCount === 1 ? "" : "s"} · {runningAgents} running / {totalAgents} total agent
+          {totalAgents === 1 ? "" : "s"}
         </span>
 
         <div className="relative shrink-0">
