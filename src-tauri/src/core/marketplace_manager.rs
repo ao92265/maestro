@@ -328,6 +328,25 @@ impl MarketplaceManager {
         Ok(name)
     }
 
+    /// True when a catalog-supplied plugin subdirectory is safe to `join` onto
+    /// the sparse-checkout temp directory.
+    ///
+    /// Only plain components are allowed, which is deliberately stricter than
+    /// pairing `..` with `is_absolute()`: on Windows `\Users\me` is NOT
+    /// absolute (it carries no drive prefix), yet `temp.join(r"\Users\me")`
+    /// yields `C:\Users\me` and discards the temp directory entirely — and the
+    /// caller then *renames* that directory into the install dir. Allowing
+    /// only `Component::Normal` subsumes `..`, roots, drive prefixes and
+    /// absolute paths at once; legitimate values such as
+    /// `plugins/frontend-design` are all `Normal`.
+    fn is_safe_source_subpath(subpath: &str) -> bool {
+        !subpath.is_empty()
+            && !subpath.contains('\0')
+            && Path::new(subpath)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+    }
+
     /// Validates a git clone URL fetched from a (network-sourced, untrusted)
     /// marketplace catalog.
     ///
@@ -431,9 +450,7 @@ impl MarketplaceManager {
     /// This is used for plugins that are subdirectories within a larger monorepo
     /// (e.g., anthropics/claude-code/plugins/frontend-design).
     async fn clone_sparse(repo_url: &str, target_dir: &Path, subpath: &str) -> MarketplaceResult<()> {
-        // The subdirectory comes from the untrusted catalog; reject anything
-        // that could escape the clone via `..` or an absolute path.
-        if subpath.contains("..") || Path::new(subpath).is_absolute() || subpath.contains('\0') {
+        if !Self::is_safe_source_subpath(subpath) {
             return Err(MarketplaceError::InvalidPath(format!(
                 "unsafe plugin source path: {subpath}"
             )));
@@ -864,6 +881,26 @@ mod tests {
             MarketplaceManager::sanitize_plugin_dir_name("my-plugin.v2").unwrap(),
             "my-plugin.v2"
         );
+    }
+
+    #[test]
+    fn is_safe_source_subpath_blocks_escapes() {
+        // The catalog-supplied subpath is joined onto the sparse-checkout temp
+        // dir and the result is then renamed into the install dir, so anything
+        // that escapes the join is a plugin-installs-arbitrary-directory bug.
+        assert!(!MarketplaceManager::is_safe_source_subpath("../../etc"));
+        assert!(!MarketplaceManager::is_safe_source_subpath("plugins/../../../etc"));
+        assert!(!MarketplaceManager::is_safe_source_subpath("C:\\Users\\v\\Documents"));
+        assert!(!MarketplaceManager::is_safe_source_subpath("/etc/passwd"));
+        assert!(!MarketplaceManager::is_safe_source_subpath(""));
+        // Root-relative: NOT `is_absolute()` on Windows, but `join` still
+        // discards the base and keeps the drive — the hole this guard closes.
+        assert!(!MarketplaceManager::is_safe_source_subpath("\\Users\\v\\Documents"));
+        assert!(!MarketplaceManager::is_safe_source_subpath("\\"));
+
+        // Real monorepo plugin paths keep working.
+        assert!(MarketplaceManager::is_safe_source_subpath("plugins/frontend-design"));
+        assert!(MarketplaceManager::is_safe_source_subpath("plugin"));
     }
 
     #[test]
