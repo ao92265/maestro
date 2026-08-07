@@ -339,9 +339,17 @@ impl MarketplaceManager {
     /// only `Component::Normal` subsumes `..`, roots, drive prefixes and
     /// absolute paths at once; legitimate values such as
     /// `plugins/frontend-design` are all `Normal`.
+    ///
+    /// Backslashes and colons are rejected explicitly, as in
+    /// [`sanitize_plugin_dir_name`], so the verdict does not depend on the host
+    /// OS: the catalog is cross-platform data, but only Windows treats `\` as a
+    /// separator and `C:` as a prefix — everywhere else they would parse as one
+    /// ordinary component and slip through.
     fn is_safe_source_subpath(subpath: &str) -> bool {
         !subpath.is_empty()
             && !subpath.contains('\0')
+            && !subpath.contains('\\')
+            && !subpath.contains(':')
             && Path::new(subpath)
                 .components()
                 .all(|c| matches!(c, std::path::Component::Normal(_)))
@@ -890,11 +898,14 @@ mod tests {
         // that escapes the join is a plugin-installs-arbitrary-directory bug.
         assert!(!MarketplaceManager::is_safe_source_subpath("../../etc"));
         assert!(!MarketplaceManager::is_safe_source_subpath("plugins/../../../etc"));
-        assert!(!MarketplaceManager::is_safe_source_subpath("C:\\Users\\v\\Documents"));
         assert!(!MarketplaceManager::is_safe_source_subpath("/etc/passwd"));
         assert!(!MarketplaceManager::is_safe_source_subpath(""));
-        // Root-relative: NOT `is_absolute()` on Windows, but `join` still
-        // discards the base and keeps the drive — the hole this guard closes.
+        // Windows-shaped escapes. The verdict must not depend on the host OS —
+        // off Windows these parse as one ordinary component, so the guard
+        // rejects `\` and `:` outright rather than relying on `components()`.
+        // Root-relative is the sharp case: NOT `is_absolute()` even on Windows,
+        // yet `join` still discards the base and keeps the drive.
+        assert!(!MarketplaceManager::is_safe_source_subpath("C:\\Users\\v\\Documents"));
         assert!(!MarketplaceManager::is_safe_source_subpath("\\Users\\v\\Documents"));
         assert!(!MarketplaceManager::is_safe_source_subpath("\\"));
 
