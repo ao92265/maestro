@@ -11,20 +11,8 @@ import {
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { SamuraiConfig } from "@/lib/samurai";
 import { useUpdateStore } from "@/stores/useUpdateStore";
-
-/** Samurai thresholds (PRD §7). Keys are the backend's snake_case wire
- *  names — must match `SamuraiConfig` in `src-tauri/src/core/samurai_config.rs`. */
-export interface SamuraiConfig {
-  handoff_context_pct: number;
-  park_soft_5h_pct: number;
-  park_hard_5h_pct: number;
-  park_hard_7d_pct: number;
-  ack_timeout_secs: number;
-  staleness_window_secs: number;
-  handoff_retention_days: number;
-  breaker_events: number;
-}
 
 const SAMURAI_FIELDS: { key: keyof SamuraiConfig; label: string }[] = [
   { key: "handoff_context_pct", label: "Handoff trigger (context %)" },
@@ -35,6 +23,7 @@ const SAMURAI_FIELDS: { key: keyof SamuraiConfig; label: string }[] = [
   { key: "staleness_window_secs", label: "Staleness window (seconds)" },
   { key: "handoff_retention_days", label: "Handoff retention (days)" },
   { key: "breaker_events", label: "Circuit breaker events (zero-progress trip)" },
+  { key: "size_warn_bytes", label: "File size warning (bytes)" },
 ];
 
 interface MaestroSettingsModalProps {

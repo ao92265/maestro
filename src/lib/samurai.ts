@@ -244,3 +244,114 @@ export function samuraiCleanupEpic(
 ): Promise<SamuraiCleanupReport> {
   return invoke("samurai_cleanup_epic", { projectPath, epic });
 }
+
+// ---------------------------------------------------------------------------
+// Issue #65: Second Brain file inventory + guarded delete
+// ---------------------------------------------------------------------------
+
+/** What a listed file is (PRD §8 rows 1–5) — mirrors `SamuraiFileKind`. */
+export type SamuraiFileKind =
+  | "HANDOFF"
+  | "RUN_CONFIG"
+  | "TIMER"
+  | "AUDIT_LOG"
+  | "JOURNAL"
+  | "HARVEST_REPORT";
+
+/**
+ * One inventory row — mirrors the Rust `SamuraiFileEntry`
+ * (`core/samurai_files.rs`). `TIMER` rows share `schedule.json` as their
+ * `path` (one row per pending timer) and carry `fire_at` so the UI can
+ * render "resumes at 14:32".
+ */
+export interface SamuraiFileEntry {
+  kind: SamuraiFileKind;
+  /** Absolute path, Windows `\\?\` prefix already stripped. */
+  path: string;
+  size_bytes: number;
+  /** RFC 3339 UTC modified time; null when the filesystem reports none. */
+  modified_at: string | null;
+  /** Owning project, when the association is known. */
+  project_path: string | null;
+  /** Owning epic, when the association is known. */
+  epic: string | null;
+  /**
+   * Referenced by an ACTIVE run config, a live supervised session, or a
+   * pending timer — deleting requires `force` (harder confirm, PRD §5.11).
+   */
+  in_use: boolean;
+  /**
+   * A live (non-terminal) supervised session exists for this entry's
+   * project + epic — the session slice of `in_use` on its own; false for
+   * kinds without an epic association. Gates "clean this epic": the backend
+   * refuses cleanup only while a live session exists.
+   */
+  has_live_session: boolean;
+  /** TIMER rows only: RFC 3339 fire time. */
+  fire_at: string | null;
+}
+
+/**
+ * Fixed prefix of the "file is in use, pass force" delete refusal — must
+ * match `IN_USE_ERROR_PREFIX` in `src-tauri/src/core/samurai_files.rs`.
+ */
+export const SAMURAI_IN_USE_ERROR_PREFIX = "IN_USE:";
+
+/** True when a `samuraiFileDelete` rejection means "in use — force needed". */
+export function isSamuraiInUseError(error: unknown): boolean {
+  return typeof error === "string" && error.startsWith(SAMURAI_IN_USE_ERROR_PREFIX);
+}
+
+/**
+ * Every Samurai-managed file (PRD §8) as one flat list: handoffs, run
+ * configs (active + archived), pending timers, per-project audit logs, and
+ * Phase 5 journal/harvest reports once they exist.
+ */
+export function samuraiFilesList(): Promise<SamuraiFileEntry[]> {
+  return invoke("samurai_files_list");
+}
+
+/**
+ * Deletes one Samurai-managed file (destructive — confirm before calling).
+ * Rejects paths outside the backend-computed managed roots; an in-use file
+ * rejects with a `SAMURAI_IN_USE_ERROR_PREFIX`-prefixed message unless
+ * `force` is true (use `isSamuraiInUseError` to route to a harder confirm).
+ * `schedule.json` always rejects, force or not — cancel its timers instead
+ * (`samuraiTimerCancel`, or the epic cleanup).
+ */
+export function samuraiFileDelete(path: string, force: boolean): Promise<void> {
+  return invoke("samurai_file_delete", { path, force });
+}
+
+/**
+ * Cancels one epic's pending resume timer (confirm before calling — the
+ * parked run will NOT resume on its own afterwards; relaunching is the only
+ * way back). Resolves `false` when no timer was pending — cancelling twice
+ * is not an error.
+ */
+export function samuraiTimerCancel(projectPath: string, epic: string): Promise<boolean> {
+  return invoke("samurai_timer_cancel", { projectPath, epic });
+}
+
+// ---------------------------------------------------------------------------
+// Issue #67: config read for the health checker's size-warning rule
+// ---------------------------------------------------------------------------
+
+/** Samurai thresholds (PRD §7). Keys are the backend's snake_case wire
+ *  names — must match `SamuraiConfig` in `src-tauri/src/core/samurai_config.rs`. */
+export interface SamuraiConfig {
+  handoff_context_pct: number;
+  park_soft_5h_pct: number;
+  park_hard_5h_pct: number;
+  park_hard_7d_pct: number;
+  ack_timeout_secs: number;
+  staleness_window_secs: number;
+  handoff_retention_days: number;
+  breaker_events: number;
+  size_warn_bytes: number;
+}
+
+/** The saved Samurai config. The health checker reads `size_warn_bytes`. */
+export function samuraiGetConfig(): Promise<SamuraiConfig> {
+  return invoke("samurai_get_config");
+}
