@@ -52,8 +52,13 @@ interface AgentState {
    * hundred-event batches instead of hundreds of individual messages.
    */
   handleEvents: (events: ClaudeEvent[]) => void;
-  /** Remove one agent from the graph. Nothing else ever removes them. */
-  dismiss: (agentId: string) => void;
+  /**
+   * Remove one agent from the graph. Nothing else ever removes them.
+   * Keyed on (session, agent) like every event handler: a resumed
+   * conversation replays the same tool_use ids, so the id alone would also
+   * take the other session's node.
+   */
+  dismiss: (sessionId: number, agentId: string) => void;
   /** Remove every finished agent of one session, leaving the running ones. */
   clearFinished: (sessionId: number) => void;
   /**
@@ -192,9 +197,11 @@ export const useAgentStore = create<AgentState>((set) => ({
     });
   },
 
-  dismiss: (agentId: string) =>
+  dismiss: (sessionId: number, agentId: string) =>
     set((state) => {
-      const kept = state.agents.filter((a) => a.agentId !== agentId);
+      const kept = state.agents.filter(
+        (a) => a.agentId !== agentId || a.sessionId !== sessionId
+      );
       return kept.length === state.agents.length ? state : { agents: kept };
     }),
 

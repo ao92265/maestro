@@ -131,6 +131,20 @@ interface GitState {
 const INITIAL_COMMIT_COUNT = 50;
 const LOAD_MORE_COUNT = 50;
 
+/**
+ * Per-fetch request counters for the settings-panel reads.
+ *
+ * These fire on every repo change (tab switch, eagle git carousel swipe) and
+ * run as real concurrent git subprocesses, so a slow response for the previous
+ * repo can land after the new repo's and stick — nothing refetches afterwards.
+ * They deliberately do NOT use `activeRepoPath`: that stamp belongs to the
+ * branch/commit display data, and writing it here would make these reads
+ * supersede an in-flight branch fetch for a different repo.
+ */
+let remotesSeq = 0;
+let userConfigSeq = 0;
+let defaultBranchSeq = 0;
+
 export const useGitStore = create<GitState>()((set, get) => ({
   // Initial state
   currentBranch: null,
@@ -299,10 +313,13 @@ export const useGitStore = create<GitState>()((set, get) => ({
   },
 
   fetchUserConfig: async (repoPath: string) => {
+    const seq = ++userConfigSeq;
     try {
       const userConfig = await invoke<GitUserConfig>("git_user_config", { repoPath });
+      if (seq !== userConfigSeq) return; // superseded by a later repo
       set({ userConfig });
     } catch (err) {
+      if (seq !== userConfigSeq) return;
       console.error("Failed to fetch user config:", err);
       set({ userConfig: null });
     }
@@ -330,10 +347,13 @@ export const useGitStore = create<GitState>()((set, get) => ({
   },
 
   fetchRemotes: async (repoPath: string) => {
+    const seq = ++remotesSeq;
     try {
       const remotes = await invoke<RemoteInfo[]>("git_list_remotes", { repoPath });
+      if (seq !== remotesSeq) return; // superseded by a later repo
       set({ remotes });
     } catch (err) {
+      if (seq !== remotesSeq) return;
       console.error("Failed to fetch remotes:", err);
       set({ remotes: [] });
     }
@@ -437,10 +457,13 @@ export const useGitStore = create<GitState>()((set, get) => ({
   },
 
   fetchDefaultBranch: async (repoPath: string) => {
+    const seq = ++defaultBranchSeq;
     try {
       const defaultBranch = await invoke<string | null>("git_get_default_branch", { repoPath });
+      if (seq !== defaultBranchSeq) return; // superseded by a later repo
       set({ defaultBranch });
     } catch (err) {
+      if (seq !== defaultBranchSeq) return;
       console.error("Failed to fetch default branch:", err);
       set({ defaultBranch: null });
     }

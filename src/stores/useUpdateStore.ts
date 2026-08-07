@@ -21,6 +21,16 @@ interface DownloadProgress {
   content_length: number | null;
 }
 
+/**
+ * Bytes accumulated for the download in progress.
+ *
+ * Module scope rather than a closure inside `initListeners`, which runs once at
+ * app mount: each `downloadAndInstall` has to zero it, or a retry after a
+ * failed or aborted download resumes the previous attempt's count and the bar
+ * jumps straight to the 100% clamp.
+ */
+let downloadBytesReceived = 0;
+
 /** Persisted settings. */
 type UpdateSettings = {
   autoCheckEnabled: boolean;
@@ -128,6 +138,7 @@ export const useUpdateStore = create<UpdateState & UpdateActions>()(
         const { status, customEndpoint } = get();
         if (status !== "available") return;
 
+        downloadBytesReceived = 0;
         set({ status: "downloading", downloadProgress: 0, error: null });
         try {
           await invoke("download_and_install_update", {
@@ -156,14 +167,14 @@ export const useUpdateStore = create<UpdateState & UpdateActions>()(
       setCustomEndpoint: (url) => set({ customEndpoint: url }),
 
       initListeners: async () => {
-        let bytesReceived = 0;
-
         const unlistenProgress = await listen<DownloadProgress>(
           "update-download-progress",
           (event) => {
-            bytesReceived += event.payload.chunk_length;
+            downloadBytesReceived += event.payload.chunk_length;
             const total = event.payload.content_length;
-            const progress = total ? Math.min(100, Math.round((bytesReceived / total) * 100)) : null;
+            const progress = total
+              ? Math.min(100, Math.round((downloadBytesReceived / total) * 100))
+              : null;
             set({ downloadProgress: progress });
           },
         );
