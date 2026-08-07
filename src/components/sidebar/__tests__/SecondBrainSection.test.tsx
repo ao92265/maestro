@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
@@ -23,6 +23,23 @@ vi.mock("@tauri-apps/api/event", () => ({
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   ask: vi.fn(),
 }));
+
+/**
+ * MarkdownBody defers its renderer behind `lazy()`, which dynamically imports
+ * react-markdown and the rehype/remark plugins. Whichever test renders markdown
+ * first otherwise pays that whole transform inside a `findByText`, and under
+ * full-suite parallel load that reliably overruns its 1s default — a flake that
+ * only ever hit the first of the two report tests, because the second reused
+ * the warm module cache. Warm it once here instead of widening the timeouts.
+ */
+beforeAll(async () => {
+  await Promise.all([
+    import("react-markdown"),
+    import("rehype-raw"),
+    import("remark-gfm"),
+    import("remark-gemoji"),
+  ]);
+});
 
 import { SecondBrainSection } from "../SecondBrainSection";
 import { SAMURAI_IN_USE_ERROR_PREFIX, type SamuraiFileEntry } from "@/lib/samurai";
