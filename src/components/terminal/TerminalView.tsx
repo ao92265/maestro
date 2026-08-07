@@ -779,6 +779,12 @@ export const TerminalView = memo(function TerminalView({
       // sending no-op resize IPC calls and avoids re-reflowing the xterm buffer
       // unnecessarily.
       const RESIZE_DEBOUNCE_MS = 120;
+      // `resize_pty` rejects anything above this (see commands/terminal.rs).
+      // Fitting past it would reflow xterm to a geometry the PTY never adopts
+      // — the classic mangled-output symptom — while the rejection is only
+      // logged. Zooming out on a wide pane reaches it: the 10px font floor
+      // gives a ~3px cell, so ~1500 CSS px is already over 500 columns.
+      const MAX_PTY_DIM = 500;
       let resizeRafId: number | null = null;
       let resizeTimerId: ReturnType<typeof setTimeout> | null = null;
       let lastFitCols = -1;
@@ -792,10 +798,14 @@ export const TerminalView = memo(function TerminalView({
           if (writeBuffer.length > 0) flushBuffer();
           const dims = fitAddon.proposeDimensions();
           if (!dims || dims.cols <= 0 || dims.rows <= 0) return;
-          if (dims.cols === lastFitCols && dims.rows === lastFitRows) return;
-          lastFitCols = dims.cols;
-          lastFitRows = dims.rows;
-          fitAddon.fit();
+          // Resize to the clamped size rather than calling fit(), so xterm and
+          // the PTY always agree on the geometry.
+          const cols = Math.min(dims.cols, MAX_PTY_DIM);
+          const rows = Math.min(dims.rows, MAX_PTY_DIM);
+          if (cols === lastFitCols && rows === lastFitRows) return;
+          lastFitCols = cols;
+          lastFitRows = rows;
+          term.resize(cols, rows);
         } catch {
           // Container may have zero dimensions during layout transitions
         }

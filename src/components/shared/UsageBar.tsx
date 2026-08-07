@@ -48,9 +48,9 @@ export function UsageBar() {
   }
 
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex min-w-0 items-center gap-2">
       <RefreshButton onClick={() => fetchUsage(true)} spinning={isLoading} />
-      <div className="flex items-center gap-3">
+      <div className="flex min-w-0 items-center gap-3">
         {bars.map((bar) => (
           <Bar key={bar.label} bar={bar} />
         ))}
@@ -79,10 +79,12 @@ function Bar({ bar }: { bar: UsageWindowBar }) {
   const pct = clampPercent(bar.percent);
   const reset = formatResetTime(bar.resetsAt);
   return (
-    <div className="flex w-28 flex-col gap-1">
-      <div className="flex items-baseline justify-between gap-1 text-[11px] leading-none">
-        <span className="whitespace-nowrap text-maestro-muted/70">{bar.label}</span>
-        <span className="whitespace-nowrap text-maestro-muted/60">
+    <div className="flex w-28 min-w-0 shrink flex-col gap-1">
+      <div className="flex min-w-0 items-baseline justify-between gap-1 text-[11px] leading-none">
+        <span className="shrink-0 whitespace-nowrap text-maestro-muted/70">{bar.label}</span>
+        {/* Truncates rather than nowraps: the budget window's detail
+            ("$857 / $1000") is wider than the bar's own box. */}
+        <span className="min-w-0 truncate text-maestro-muted/60">
           {Math.round(pct)}%{bar.detail ? ` · ${bar.detail}` : ""}
         </span>
       </div>
