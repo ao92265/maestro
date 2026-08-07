@@ -212,13 +212,25 @@ describe("LandscapeView", () => {
     expect(useAgentStore.getState().agents.map((a) => a.agentId)).toEqual(["a1"]);
   });
 
-  it("clears dead agents — still 'running' but their terminal ended", () => {
-    // Session 1 is Done: its running agent can never complete.
-    useSessionStore.setState({ sessions: [buildSession({ status: "Done" })] });
+  it("clears dead agents — still 'running' but their terminal is gone", () => {
+    // The terminal was closed, so session 1 is no longer in the store and its
+    // running agent can never complete.
+    useSessionStore.setState({ sessions: [] });
     useAgentStore.setState({ agents: [buildAgent("a1")] });
     renderLandscape();
     fireEvent.click(screen.getByText(/Clear done \(1\)/));
     expect(useAgentStore.getState().agents).toHaveLength(0);
+  });
+
+  it("keeps a running agent whose session merely self-reported Done", () => {
+    // "Done" comes from the agent's own MCP status, not from the process
+    // exiting — an orchestrator reports finished while its background
+    // subagents keep running. Clearing those would drop their reports for good.
+    useSessionStore.setState({ sessions: [buildSession({ status: "Done" })] });
+    useAgentStore.setState({ agents: [buildAgent("a1")] });
+    renderLandscape();
+    expect(screen.getByRole("button", { name: /Clear done/ })).toBeDisabled();
+    expect(useAgentStore.getState().agents).toHaveLength(1);
   });
 
   it("'Reorganize' throws away every manual position", () => {
