@@ -608,6 +608,10 @@ fn parse_assistant_message(session_id: u32, entry: &Entry) -> Vec<ClaudeEvent> {
                         description,
                         prompt,
                         run_in_background,
+                        // The parser sees one line at a time and cannot know
+                        // which file it came from; the watcher stamps the
+                        // parent when the line belongs to a subagent's file.
+                        parent_agent_id: None,
                         timestamp: timestamp.clone(),
                     });
                 }

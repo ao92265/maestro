@@ -7,6 +7,14 @@
 //! and emits the resulting [`ClaudeEvent`]s. The [`notify`] filesystem watch
 //! that wakes those tasks is shared: one per transcript *directory*, however
 //! many sessions tail files inside it.
+//!
+//! A session's transcript `<dir>/<uuid>.jsonl` is not the whole story: every
+//! agent the session spawns writes its own transcript to
+//! `<dir>/<uuid>/subagents/agent-<id>.jsonl` (flat, whatever the spawn depth),
+//! next to an `agent-<id>.meta.json` naming the Task tool_use id that spawned
+//! it. Agents spawned *by an agent* appear only there — so each reader also
+//! tails its session's subagents folder, forwarding the nested agents'
+//! lifecycle events with a `parent_agent_id` linking child to parent.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -68,12 +76,34 @@ struct WatcherState {
 }
 
 /// The directory whose watch covers `transcript_path`. The parent is watched
-/// rather than the file itself so file *creation* is caught too.
+/// rather than the file itself so file *creation* is caught too. Watched
+/// recursively, because each conversation's subagent transcripts live two
+/// levels below it (see [`subagents_dir_of`]).
 fn watch_dir_of(transcript_path: &Path) -> PathBuf {
     transcript_path
         .parent()
         .unwrap_or(transcript_path)
         .to_path_buf()
+}
+
+/// The folder holding a transcript's per-agent transcripts:
+/// `<dir>/<uuid>.jsonl` -> `<dir>/<uuid>/subagents`.
+fn subagents_dir_of(transcript_path: &Path) -> PathBuf {
+    transcript_path.with_extension("").join("subagents")
+}
+
+/// Map a notify event path to the transcript whose sessions it should wake: a
+/// write anywhere under `<dir>/<uuid>/subagents/` belongs to the sessions
+/// tailing `<dir>/<uuid>.jsonl`; any other path already is the transcript.
+fn wake_path_of(event_path: &Path) -> PathBuf {
+    for ancestor in event_path.ancestors() {
+        if ancestor.file_name().is_some_and(|n| n == "subagents") {
+            if let Some(convo_dir) = ancestor.parent() {
+                return convo_dir.with_extension("jsonl");
+            }
+        }
+    }
+    event_path.to_path_buf()
 }
 
 impl TranscriptWatcher {
@@ -134,7 +164,9 @@ impl TranscriptWatcher {
                             event
                                 .paths
                                 .iter()
-                                .filter_map(|p| subs.get(p))
+                                // A write to a subagent transcript wakes the
+                                // sessions tailing the owning conversation.
+                                .filter_map(|p| subs.get(&wake_path_of(p)))
                                 .flat_map(|sessions| sessions.values().cloned())
                                 .collect()
                         };
@@ -171,7 +203,10 @@ impl TranscriptWatcher {
         // contains the failure to this attempt, so the next session in this
         // directory creates a fresh watcher rather than inheriting a dead one.
         // This session is not itself retried until the next SessionStarted.
-        if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+        // Recursive: the conversations' subagent folders
+        // (`<dir>/<uuid>/subagents/`) live below the transcript directory, and
+        // nested agents are only visible through the files written there.
+        if let Err(e) = watcher.watch(dir, RecursiveMode::Recursive) {
             log::error!(
                 "TranscriptWatcher: failed to watch directory {}: {e}",
                 dir.display()
@@ -319,21 +354,44 @@ impl Drop for TranscriptWatcher {
 // Internal: reader task
 // ---------------------------------------------------------------------------
 
-/// Long-running task that drains filesystem notifications and reads new lines.
+/// Incremental read state for one JSONL transcript file.
+#[derive(Default)]
+struct FileTail {
+    byte_offset: u64,
+    /// tool_use ids of Task invocations whose result hasn't been seen yet;
+    /// lets us turn a generic tool_result into a SubagentCompleted event.
+    pending_task_ids: HashSet<String>,
+    /// Subset of the above that Claude launched in the background: their
+    /// tool_result already came back with "async_launched", so the generic
+    /// completion must not be mistaken for the agent finishing.
+    async_task_ids: HashSet<String>,
+}
+
+/// One subagent transcript tailed alongside the session's own.
+struct SubagentTail {
+    /// This agent's own Task tool_use id, from its `.meta.json` — the parent
+    /// stamped onto every spawn parsed out of its file, which is what links a
+    /// nested agent to the agent that spawned it.
+    own_agent_id: String,
+    tail: FileTail,
+}
+
+/// Everything one reader task carries between read passes.
+#[derive(Default)]
+struct ReaderState {
+    main: FileTail,
+    subagents: HashMap<PathBuf, SubagentTail>,
+}
+
+/// Long-running task that drains filesystem notifications and reads new lines
+/// from the session transcript and every subagent transcript beside it.
 async fn reader_task(
     session_id: u32,
     path: PathBuf,
     mut rx: mpsc::Receiver<()>,
     event_bus: Arc<EventBus>,
 ) {
-    let mut byte_offset: u64 = 0;
-    // tool_use ids of Task invocations whose result hasn't been seen yet;
-    // lets us turn a generic tool_result into a SubagentCompleted event.
-    let mut pending_task_ids: HashSet<String> = HashSet::new();
-    // Subset of the above that Claude launched in the background: their
-    // tool_result already came back with "async_launched", so the generic
-    // completion must not be mistaken for the agent finishing.
-    let mut async_task_ids: HashSet<String> = HashSet::new();
+    let mut state = ReaderState::default();
 
     while rx.recv().await.is_some() {
         // Coalesce rapid notifications: drain any buffered signals so we
@@ -347,26 +405,23 @@ async fn reader_task(
         // can take effect between passes.
         let path_for_read = path.clone();
         let bus = event_bus.clone();
-        let mut pending = std::mem::take(&mut pending_task_ids);
-        let mut asyncs = std::mem::take(&mut async_task_ids);
+        let mut moved = std::mem::take(&mut state);
         let read_result = tokio::task::spawn_blocking(move || {
-            let offset = read_new_lines(
+            moved.main.byte_offset = read_new_lines(
                 session_id,
                 &path_for_read,
-                byte_offset,
+                moved.main.byte_offset,
                 &bus,
-                &mut pending,
-                &mut asyncs,
+                &mut moved.main.pending_task_ids,
+                &mut moved.main.async_task_ids,
+                None,
             );
-            (offset, pending, asyncs)
+            read_subagent_files(session_id, &path_for_read, &bus, &mut moved.subagents);
+            moved
         })
         .await;
         match read_result {
-            Ok((offset, pending, asyncs)) => {
-                byte_offset = offset;
-                pending_task_ids = pending;
-                async_task_ids = asyncs;
-            }
+            Ok(returned) => state = returned,
             Err(e) => {
                 log::error!("TranscriptWatcher: read pass for session {session_id} failed: {e}");
             }
@@ -374,6 +429,95 @@ async fn reader_task(
     }
 
     log::debug!("TranscriptWatcher: reader task for session {session_id} exiting");
+}
+
+// ---------------------------------------------------------------------------
+// Internal: subagent transcripts
+// ---------------------------------------------------------------------------
+
+/// Cap on subagent transcripts tailed per session; bounds the per-file read
+/// state the same way [`MAX_WATCHED_SESSIONS`] bounds sessions. Big
+/// orchestration runs spawn tens of agents; hundreds is out of scope.
+const MAX_SUBAGENT_FILES: usize = 512;
+
+/// The slice of a subagent's `.meta.json` this watcher reads.
+#[derive(serde::Deserialize)]
+struct SubagentMeta {
+    #[serde(rename = "toolUseId")]
+    tool_use_id: String,
+}
+
+/// Read every `agent-*.jsonl` in the transcript's subagents folder, forwarding
+/// nested-agent lifecycle events. Files are tailed incrementally exactly like
+/// the main transcript; newly appeared files start from byte 0.
+fn read_subagent_files(
+    session_id: u32,
+    transcript_path: &Path,
+    event_bus: &EventBus,
+    tails: &mut HashMap<PathBuf, SubagentTail>,
+) {
+    let dir = subagents_dir_of(transcript_path);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        // No subagents folder (yet) — the common case for most sessions.
+        Err(_) => return,
+    };
+    // Sorted, so a multi-file catch-up replays in one deterministic order.
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|p| {
+            p.extension().is_some_and(|ext| ext == "jsonl")
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("agent-"))
+        })
+        .collect();
+    files.sort();
+
+    for file in files {
+        if !tails.contains_key(&file) {
+            if tails.len() >= MAX_SUBAGENT_FILES {
+                log::warn!(
+                    "TranscriptWatcher: session {session_id} has more than \
+                     {MAX_SUBAGENT_FILES} subagent transcripts; ignoring {}",
+                    file.display()
+                );
+                continue;
+            }
+            // The meta names this agent's own tool_use id — the identity its
+            // nested spawns are parented to. If it isn't readable yet (the
+            // writer creates both files together, but we can win the race),
+            // skip the file and retry next pass rather than mis-parent a
+            // whole subtree.
+            let meta_path = file.with_extension("meta.json");
+            let own_agent_id = match std::fs::read_to_string(&meta_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<SubagentMeta>(&s).ok())
+            {
+                Some(meta) => meta.tool_use_id,
+                None => continue,
+            };
+            tails.insert(
+                file.clone(),
+                SubagentTail {
+                    own_agent_id,
+                    tail: FileTail::default(),
+                },
+            );
+        }
+        let SubagentTail { own_agent_id, tail } =
+            tails.get_mut(&file).expect("inserted or existing above");
+        tail.byte_offset = read_new_lines(
+            session_id,
+            &file,
+            tail.byte_offset,
+            event_bus,
+            &mut tail.pending_task_ids,
+            &mut tail.async_task_ids,
+            Some(own_agent_id.as_str()),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +536,13 @@ async fn reader_task(
 /// says only "launched", so their generic completion is skipped and the real one
 /// comes from the task notification the parser turns into `SubagentCompleted`.
 ///
+/// `parent_agent` distinguishes what is being read. `None`: the session's own
+/// transcript, every event goes to the bus. `Some(id)`: a subagent's
+/// transcript — only agent lifecycle events are forwarded, spawns stamped
+/// with `parent_agent_id = id`, and everything else (the agent's internal
+/// messages, tool calls, file edits, token usage) stays off the bus so it
+/// cannot flood the session's activity feed.
+///
 /// Returns the updated byte offset (pointing just past the last byte read).
 /// If the file does not exist, returns the same `byte_offset` without error.
 fn read_new_lines(
@@ -401,6 +552,7 @@ fn read_new_lines(
     event_bus: &EventBus,
     pending_task_ids: &mut HashSet<String>,
     async_task_ids: &mut HashSet<String>,
+    parent_agent: Option<&str>,
 ) -> u64 {
     let file = match File::open(path) {
         Ok(f) => f,
@@ -445,10 +597,20 @@ fn read_new_lines(
                 let trimmed = line_buf.trim();
                 if !trimmed.is_empty() {
                     let events = parse_transcript_line(session_id, trimmed);
-                    for event in events {
+                    for mut event in events {
                         match event {
-                            ClaudeEvent::SubagentSpawned { ref agent_id, .. } => {
+                            ClaudeEvent::SubagentSpawned {
+                                ref agent_id,
+                                ref mut parent_agent_id,
+                                ..
+                            } => {
                                 pending_task_ids.insert(agent_id.clone());
+                                // A spawn parsed out of a subagent's own file
+                                // is a nested agent: link it to the agent
+                                // whose transcript it appeared in.
+                                if let Some(parent) = parent_agent {
+                                    *parent_agent_id = Some(parent.to_string());
+                                }
                                 event_bus.emit(event);
                             }
                             // A background agent's tool_result comes back at
@@ -505,7 +667,13 @@ fn read_new_lines(
                                     });
                                 }
                             }
-                            other => event_bus.emit(other),
+                            // A subagent's internal activity never reaches the
+                            // bus — only its nested agents' lifecycle does.
+                            other => {
+                                if parent_agent.is_none() {
+                                    event_bus.emit(other);
+                                }
+                            }
                         }
                     }
                 }
@@ -549,7 +717,7 @@ mod tests {
         let path = file.path().to_path_buf();
         let (bus, collected) = test_event_bus();
 
-        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new());
+        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new(), None);
 
         assert_eq!(new_offset, 0, "empty file should keep offset at 0");
         assert!(
@@ -567,7 +735,7 @@ mod tests {
         let path = file.path().to_path_buf();
         let (bus, collected) = test_event_bus();
 
-        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new());
+        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new(), None);
 
         assert!(new_offset > 0, "offset should advance past the written line");
 
@@ -602,7 +770,7 @@ mod tests {
         let mut task_ids = HashSet::new();
 
         // First read picks up the first line.
-        let offset1 = read_new_lines(1, &path, 0, &bus, &mut task_ids, &mut HashSet::new());
+        let offset1 = read_new_lines(1, &path, 0, &bus, &mut task_ids, &mut HashSet::new(), None);
         assert_eq!(
             collected.lock().unwrap().len(),
             1,
@@ -615,7 +783,7 @@ mod tests {
         file.flush().expect("flush");
 
         // Second read starts from offset1 and should only pick up the new line.
-        let offset2 = read_new_lines(1, &path, offset1, &bus, &mut task_ids, &mut HashSet::new());
+        let offset2 = read_new_lines(1, &path, offset1, &bus, &mut task_ids, &mut HashSet::new(), None);
         assert!(
             offset2 > offset1,
             "offset should advance after reading second line"
@@ -651,7 +819,7 @@ mod tests {
         file.flush().unwrap();
 
         let (bus, collected) = test_event_bus();
-        read_new_lines(7, &file.path().to_path_buf(), 0, &bus, &mut HashSet::new(), &mut HashSet::new());
+        read_new_lines(7, &file.path().to_path_buf(), 0, &bus, &mut HashSet::new(), &mut HashSet::new(), None);
 
         let events = collected.lock().unwrap();
         // The Task's result surfaces as SubagentCompleted…
@@ -698,6 +866,7 @@ mod tests {
             &bus,
             &mut pending,
             &mut async_ids,
+            None,
         );
 
         {
@@ -734,6 +903,7 @@ mod tests {
             &bus,
             &mut pending,
             &mut async_ids,
+            None,
         );
 
         let events = collected.lock().unwrap();
@@ -776,6 +946,7 @@ mod tests {
             &bus,
             &mut HashSet::new(),
             &mut HashSet::new(),
+            None,
         );
 
         let events = collected.lock().unwrap();
@@ -815,7 +986,7 @@ mod tests {
         file.flush().unwrap();
 
         let (bus, collected) = test_event_bus();
-        read_new_lines(9, &file.path().to_path_buf(), 0, &bus, &mut HashSet::new(), &mut HashSet::new());
+        read_new_lines(9, &file.path().to_path_buf(), 0, &bus, &mut HashSet::new(), &mut HashSet::new(), None);
 
         let events = collected.lock().unwrap();
         let completions: Vec<_> = events
@@ -847,7 +1018,7 @@ mod tests {
         file.flush().unwrap();
 
         let (bus, collected) = test_event_bus();
-        read_new_lines(9, &file.path().to_path_buf(), 0, &bus, &mut HashSet::new(), &mut HashSet::new());
+        read_new_lines(9, &file.path().to_path_buf(), 0, &bus, &mut HashSet::new(), &mut HashSet::new(), None);
 
         let events = collected.lock().unwrap();
         assert!(
@@ -876,7 +1047,7 @@ mod tests {
         write!(file, "{first_half}").unwrap();
         file.flush().unwrap();
 
-        let offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new());
+        let offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new(), None);
         assert_eq!(offset, 0, "offset must stay at the unfinished line's start");
         assert!(collected.lock().unwrap().is_empty(), "no events from a fragment");
 
@@ -884,11 +1055,183 @@ mod tests {
         writeln!(file, "{second_half}").unwrap();
         file.flush().unwrap();
 
-        let offset = read_new_lines(1, &path, offset, &bus, &mut HashSet::new(), &mut HashSet::new());
+        let offset = read_new_lines(1, &path, offset, &bus, &mut HashSet::new(), &mut HashSet::new(), None);
         assert!(offset > 0, "offset advances once the line is complete");
         let events = collected.lock().unwrap();
         assert_eq!(events.len(), 1, "the completed line parses exactly once");
         assert!(matches!(&events[0], ClaudeEvent::UserMessage { text, .. } if text == "hello"));
+    }
+
+    /// Write the three files Claude Code produces for one nested spawn: the
+    /// session transcript spawning agent A, and A's own transcript (in the
+    /// subagents folder, with its meta) spawning agent B and completing it.
+    fn write_nested_fixture(dir: &Path) -> PathBuf {
+        let main_path = dir.join("t.jsonl");
+        let spawn_a = r#"{"type":"assistant","message":{"model":"claude-fable-5","content":[{"type":"tool_use","id":"toolu_A","name":"Agent","input":{"description":"parent agent","subagent_type":"general-purpose","prompt":"do the thing"}}]},"uuid":"m1","timestamp":"2026-08-07T10:00:00Z"}"#;
+        std::fs::write(&main_path, format!("{spawn_a}\n")).unwrap();
+
+        let sub_dir = dir.join("t").join("subagents");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::write(
+            sub_dir.join("agent-a1.meta.json"),
+            r#"{"agentType":"general-purpose","description":"parent agent","toolUseId":"toolu_A","spawnDepth":1}"#,
+        )
+        .unwrap();
+        // A's transcript: an internal user line (must stay off the bus), the
+        // spawn of nested agent B, and B's rich completion.
+        let internal = r#"{"parentUuid":null,"isSidechain":true,"agentId":"a1","type":"user","message":{"role":"user","content":"internal brief"},"uuid":"s1","timestamp":"2026-08-07T10:00:01Z"}"#;
+        let spawn_b = r#"{"isSidechain":true,"agentId":"a1","type":"assistant","message":{"model":"claude-fable-5","content":[{"type":"tool_use","id":"toolu_B","name":"Agent","input":{"description":"nested child","subagent_type":"Explore","prompt":"look around"}}]},"uuid":"s2","timestamp":"2026-08-07T10:00:02Z"}"#;
+        let done_b = r#"{"isSidechain":true,"agentId":"a1","type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_B","content":[{"type":"text","text":"found it"}]}]},"toolUseResult":{"status":"completed","agentId":"b2","agentType":"Explore","content":[{"type":"text","text":"found it"}]},"uuid":"s3","timestamp":"2026-08-07T10:00:03Z"}"#;
+        std::fs::write(
+            sub_dir.join("agent-a1.jsonl"),
+            format!("{internal}\n{spawn_b}\n{done_b}\n"),
+        )
+        .unwrap();
+        main_path
+    }
+
+    /// Agents spawned BY an agent live only in the subagents folder; reading
+    /// it must surface them with parent linkage, without leaking the agent's
+    /// internal chatter onto the session's feed.
+    #[test]
+    fn test_subagent_folder_yields_parented_spawns_and_completions() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = write_nested_fixture(dir.path());
+
+        let (bus, collected) = test_event_bus();
+        let mut main = FileTail::default();
+        main.byte_offset = read_new_lines(
+            5,
+            &main_path,
+            0,
+            &bus,
+            &mut main.pending_task_ids,
+            &mut main.async_task_ids,
+            None,
+        );
+        let mut tails = HashMap::new();
+        read_subagent_files(5, &main_path, &bus, &mut tails);
+
+        let events = collected.lock().unwrap();
+        // The session's own spawn of A: no parent.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ClaudeEvent::SubagentSpawned { agent_id, parent_agent_id: None, .. }
+                    if agent_id == "toolu_A"
+            )),
+            "expected unparented spawn of toolu_A, got {:?}",
+            *events
+        );
+        // The nested spawn of B: parented to A by its tool_use id.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ClaudeEvent::SubagentSpawned { agent_id, parent_agent_id: Some(parent), .. }
+                    if agent_id == "toolu_B" && parent == "toolu_A"
+            )),
+            "expected spawn of toolu_B parented to toolu_A, got {:?}",
+            *events
+        );
+        // B's completion, with its report.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ClaudeEvent::SubagentCompleted { agent_id, report, .. }
+                    if agent_id == "toolu_B" && report == "found it"
+            )),
+            "expected completion of toolu_B, got {:?}",
+            *events
+        );
+        // A's internal chatter must not reach the bus: no user/assistant
+        // messages beyond the ones the events above imply.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ClaudeEvent::UserMessage { .. })),
+            "a subagent's internal messages must stay off the bus: {:?}",
+            *events
+        );
+        // Re-reading moves nothing: offsets advanced past everything.
+        let before = events.len();
+        drop(events);
+        read_subagent_files(5, &main_path, &bus, &mut tails);
+        assert_eq!(collected.lock().unwrap().len(), before, "no re-emission on a second pass");
+    }
+
+    /// A subagent transcript whose meta hasn't been written yet is skipped —
+    /// and picked up on a later pass once the meta appears, not mis-parented.
+    #[test]
+    fn test_subagent_file_without_meta_is_retried_next_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = write_nested_fixture(dir.path());
+        let meta_path = dir.path().join("t").join("subagents").join("agent-a1.meta.json");
+        let meta = std::fs::read_to_string(&meta_path).unwrap();
+        std::fs::remove_file(&meta_path).unwrap();
+
+        let (bus, collected) = test_event_bus();
+        let mut tails = HashMap::new();
+        read_subagent_files(5, &main_path, &bus, &mut tails);
+        assert!(
+            collected.lock().unwrap().is_empty(),
+            "without its meta the file's owner is unknown; nothing may be emitted"
+        );
+        assert!(tails.is_empty(), "the file is not tracked until its meta is readable");
+
+        std::fs::write(&meta_path, meta).unwrap();
+        read_subagent_files(5, &main_path, &bus, &mut tails);
+        assert!(
+            collected.lock().unwrap().iter().any(|e| matches!(
+                e,
+                ClaudeEvent::SubagentSpawned { agent_id, parent_agent_id: Some(parent), .. }
+                    if agent_id == "toolu_B" && parent == "toolu_A"
+            )),
+            "once the meta exists the nested spawn must surface"
+        );
+    }
+
+    /// End-to-end: a subagent transcript written AFTER the watch started must
+    /// wake the session (recursive watch + wake mapping) and surface the
+    /// nested agent live.
+    #[tokio::test]
+    async fn test_watcher_picks_up_nested_agents_live() {
+        use std::time::Duration;
+
+        let (event_bus, captured) = test_event_bus();
+        let watcher = TranscriptWatcher::new(event_bus);
+
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("t.jsonl");
+        std::fs::write(&main_path, "").unwrap();
+        let main_path = main_path.canonicalize().unwrap();
+        watcher.start_watching(1, main_path.clone());
+
+        // Give the initial catch-up a moment, then write the nested layout.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        write_nested_fixture(main_path.parent().unwrap());
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            {
+                let events = captured.lock().unwrap();
+                if events.iter().any(|e| matches!(
+                    e,
+                    ClaudeEvent::SubagentSpawned { agent_id, parent_agent_id: Some(parent), .. }
+                        if agent_id == "toolu_B" && parent == "toolu_A"
+                )) {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "nested agent never surfaced from the subagents folder. Got {:?}",
+                        *events
+                    );
+                }
+            }
+        }
+
+        watcher.stop_watching(1);
     }
 
     #[test]
@@ -896,7 +1239,7 @@ mod tests {
         let path = PathBuf::from("/tmp/nonexistent_transcript_test_file_12345.jsonl");
         let (bus, collected) = test_event_bus();
 
-        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new());
+        let new_offset = read_new_lines(1, &path, 0, &bus, &mut HashSet::new(), &mut HashSet::new(), None);
 
         assert_eq!(
             new_offset, 0,
