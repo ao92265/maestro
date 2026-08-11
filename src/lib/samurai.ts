@@ -148,9 +148,9 @@ export interface SamuraiGhAuthCheck {
 }
 
 /**
- * Preflight results (PRD §5.8). The third launch gate — issues declared
- * triaged/agent-ready — is a user declaration (checkbox in the form), so it
- * never appears here.
+ * Preflight results (PRD §5.8). Agent-readiness of the epic's issues is no
+ * longer a gate here: gen-1 judges it itself as step 2 of its opening brief,
+ * so there is nothing for the form to declare or for this to report.
  */
 export interface SamuraiPreflight {
   gh_auth: SamuraiGhAuthCheck;
@@ -208,21 +208,22 @@ export function samuraiPreflight(projectPath: string): Promise<SamuraiPreflight>
 /**
  * Launches an epic run: server-side preflight re-check, epic worktree at the
  * stable path, ACTIVE run config, gen-1 spawn with the opening brief.
- * Refusals (untriaged, gh auth, no governing window, live session) arrive as
- * rejected promises with the reason.
+ * Refusals (gh auth, no governing window, live session) arrive as rejected
+ * promises with the reason.
+ *
+ * `epic` accepts an epic ref, one issue, or a comma-separated list — the
+ * backend normalizes the spelling so `#77,78` and `#77 , 78` are one run.
  */
 export function samuraiLaunchRun(
   projectPath: string,
   epic: string,
   model: string | null,
-  issuesTriaged: boolean,
   handoffContextPct: number | null,
 ): Promise<SamuraiLaunchResult> {
   return invoke("samurai_launch_run", {
     projectPath,
     epic,
     model,
-    issuesTriaged,
     handoffContextPct,
   });
 }
@@ -235,7 +236,7 @@ export function samuraiListRuns(): Promise<SamuraiRunConfig[]> {
 /**
  * One-click epic cleanup (destructive — confirm before calling): cancels the
  * resume timer, archives the run config, removes the epic worktree, deletes
- * the `samurai/<slug>` branch. Idempotent; refuses while a live supervised
+ * the `samurai-<slug>` branch. Idempotent; refuses while a live supervised
  * session exists.
  */
 export function samuraiCleanupEpic(

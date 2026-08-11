@@ -442,12 +442,17 @@ pub fn launch_instruction(epic: &str, repo_pin: Option<&str>) -> String {
          {epic_text}. This directory is the epic's dedicated worktree on its own branch. \
          Do the following: \
          (1) {gh_read}. \
-         (2) Plan the work across the epic's issues before touching code. \
-         (3) Work the issues via SMALL idempotent subagent tasks, each committing its \
+         (2) Assess whether each issue is AGENT-READY — scope clear enough to implement, \
+         acceptance criteria stated, no open product or design decision that needs a human. \
+         Work only the ready ones. For each issue that is NOT ready, comment on it saying \
+         exactly what is missing, and say so in your progress comment on the epic instead of \
+         guessing at the intent. \
+         (3) Plan the work across the agent-ready issues before touching code. \
+         (4) Work them via SMALL idempotent subagent tasks, each committing its \
          completed step to THIS branch (stage named paths only, never `git add .` or \
          `git add -A`; Conventional Commit messages `type(scope): summary`). \
-         (4) {gh_progress}. \
-         (5) NEVER switch to, commit to, or push any other branch, and NEVER touch any \
+         (5) {gh_progress}. \
+         (6) NEVER switch to, commit to, or push any other branch, and NEVER touch any \
          repository other than this one.{caution}"
     )
 }
@@ -1014,6 +1019,11 @@ mod tests {
         assert!(text.contains("`gh` CLI"));
         assert!(text.contains("ALL of its comments"));
         assert!(text.contains("EVERY child issue"));
+        // Agent-readiness is the MODEL's call, not a human checkbox: gen-1
+        // judges each issue, works the ready ones, and reports the rest.
+        assert!(text.contains("AGENT-READY"));
+        assert!(text.contains("Work only the ready ones"));
+        assert!(text.contains("exactly what is missing"));
         assert!(text.contains("Plan the work"));
         // Small idempotent subagent tasks with per-step commits (PRD §10).
         assert!(text.contains("SMALL idempotent subagent tasks"));

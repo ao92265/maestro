@@ -242,8 +242,9 @@ describe("UtilityPanel", () => {
   it("renders the Launch panel with the run form and active runs", async () => {
     render(<UtilityPanel panel="launch" width={320} onResize={() => {}} onClose={() => {}} />);
     expect(screen.getByText("Launch Run")).toBeInTheDocument();
-    expect(screen.getByLabelText("Epic ref")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Run preflight" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Issues")).toBeInTheDocument();
+    // One button: it runs preflight itself, so there is no separate step.
+    expect(screen.queryByRole("button", { name: "Run preflight" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Launch" })).toBeDisabled();
     expect(await screen.findByText("No active runs. Launch one above.")).toBeInTheDocument();
   });

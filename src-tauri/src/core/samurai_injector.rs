@@ -2046,7 +2046,8 @@ mod tests {
         supervisor
             .register_session(2, "C:/git/proj-inj-low".into(), "epic".into(), 1)
             .unwrap();
-        context.observe(&context_event(1, 44.9));
+        // Just under the PRD §7 default handoff trigger (40%).
+        context.observe(&context_event(1, 39.9));
 
         injector.tick();
 

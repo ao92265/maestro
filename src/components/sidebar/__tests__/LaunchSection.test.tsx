@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
 
@@ -21,6 +21,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 
 import { LaunchSection } from "../LaunchSection";
 import type { SamuraiPreflight, SamuraiRunConfig } from "@/lib/samurai";
+import type { UsageData } from "@/lib/usageParser";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 
 const invokeMock = vi.mocked(invoke);
@@ -50,6 +51,30 @@ function passPreflight(overrides: Partial<SamuraiPreflight> = {}): SamuraiPrefli
   };
 }
 
+/** Opus 38% used → 62% left; Fable rides the `limits`-derived list. */
+function buildUsage(overrides: Partial<UsageData> = {}): UsageData {
+  return {
+    sessionPercent: 10,
+    sessionResetsAt: null,
+    weeklyPercent: 20,
+    weeklyResetsAt: null,
+    weeklyOpusPercent: 38,
+    weeklyOpusResetsAt: null,
+    weeklySonnetPercent: 5,
+    weeklySonnetResetsAt: null,
+    weeklyOauthAppsPercent: null,
+    weeklyOauthAppsResetsAt: null,
+    spendPercent: null,
+    spendResetsAt: null,
+    spendUsedDollars: null,
+    spendLimitDollars: null,
+    modelWindows: [{ label: "Fable", percent: 91, resetsAt: null }],
+    errorMessage: null,
+    needsAuth: false,
+    ...overrides,
+  };
+}
+
 function run(overrides: Partial<SamuraiRunConfig> = {}): SamuraiRunConfig {
   return {
     project_path: "C:\\git\\maestro",
@@ -68,6 +93,7 @@ function run(overrides: Partial<SamuraiRunConfig> = {}): SamuraiRunConfig {
 function mockInvoke({
   preflight = passPreflight(),
   runs = [] as SamuraiRunConfig[],
+  usage = buildUsage(),
 } = {}) {
   invokeMock.mockImplementation(async (cmd: string) => {
     switch (cmd) {
@@ -75,10 +101,12 @@ function mockInvoke({
         return preflight;
       case "samurai_list_runs":
         return runs;
+      case "get_claude_usage":
+        return usage;
       case "samurai_launch_run":
         return {
           epic: "#38",
-          branch: "samurai/38",
+          branch: "samurai-38",
           worktree_path: "C:\\data\\worktrees\\maestro-abc\\samurai-38",
           repo_pin: "nachogl1/maestro",
           stale_timer_cancelled: false,
@@ -86,7 +114,7 @@ function mockInvoke({
       case "samurai_cleanup_epic":
         return {
           epic: "#38",
-          branch: "samurai/38",
+          branch: "samurai-38",
           timer_cancelled: true,
           config_archived: true,
           worktree_removed: true,
@@ -115,51 +143,82 @@ describe("LaunchSection (issue #63)", () => {
   it("renders the form with the active project and a disabled Launch button", async () => {
     render(<LaunchSection />);
     expect(screen.getByText("Launch Run")).toBeInTheDocument();
-    expect(screen.getByText("C:\\git\\maestro")).toBeInTheDocument();
-    expect(screen.getByLabelText("Epic ref")).toBeInTheDocument();
-    expect(screen.getByLabelText("Model (optional)")).toBeInTheDocument();
-    expect(
-      screen.getByText("Issues are triaged/agent-ready — planned with Claude"),
-    ).toBeInTheDocument();
-    // No preflight yet → Launch stays disabled.
+    // The project is read-only context, shown by name — not an input.
+    expect(screen.getByText("maestro")).toBeInTheDocument();
+    expect(screen.getByLabelText("Issues")).toBeInTheDocument();
+    expect(screen.getByLabelText("Model")).toBeInTheDocument();
+    expect(screen.getByLabelText("Handoff at context %")).toBeInTheDocument();
+    // The agent-readiness declaration is gone — it is the model's call now,
+    // and all that is left is the warning.
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    expect(screen.getByText(/Make sure the issues are agent-ready/)).toBeInTheDocument();
+    // Nothing to work yet → Launch stays disabled.
     expect(screen.getByRole("button", { name: "Launch" })).toBeDisabled();
     expect(await screen.findByText("No active runs. Launch one above.")).toBeInTheDocument();
   });
 
-  it("enables Launch only after epic + declaration + passing preflight", async () => {
+  it("runs preflight then launches from the one button, no declaration needed", async () => {
     render(<LaunchSection />);
-    fireEvent.change(screen.getByLabelText("Epic ref"), { target: { value: "#38" } });
-    fireEvent.click(screen.getByRole("checkbox"));
     expect(screen.getByRole("button", { name: "Launch" })).toBeDisabled();
-
-    fireEvent.click(screen.getByRole("button", { name: "Run preflight" }));
-    // Pass rows render with the gh username; the declaration row passes too.
-    expect(await screen.findByText("gh authenticated as nachogl1")).toBeInTheDocument();
-    expect(screen.getByText("Allowance windows reported")).toBeInTheDocument();
-    expect(screen.getByText("Issues declared triaged/agent-ready")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Issues"), { target: { value: "#38" } });
     expect(screen.getByRole("button", { name: "Launch" })).toBeEnabled();
 
     fireEvent.click(screen.getByRole("button", { name: "Launch" }));
+
+    // Preflight runs as phase 1 of the launch, not as a separate click, and
+    // strictly before it — the launch must never start on an unchecked env.
     await waitFor(() => expect(callsOf("samurai_launch_run")).toHaveLength(1));
+    expect(callsOf("samurai_preflight")).toHaveLength(1);
+    const order = invokeMock.mock.calls.map(([name]) => name);
+    expect(order.indexOf("samurai_preflight")).toBeLessThan(order.indexOf("samurai_launch_run"));
     expect(callsOf("samurai_launch_run")[0][1]).toEqual({
       projectPath: "C:\\git\\maestro",
       epic: "#38",
       model: null,
-      issuesTriaged: true,
       handoffContextPct: null,
     });
-    expect(await screen.findByText(/Run launched: epic #38 on samurai\/38/)).toBeInTheDocument();
+    expect(await screen.findByText(/Run launched: #38 on samurai-38/)).toBeInTheDocument();
+  });
+
+  it("accepts a comma-separated issue list as one run", async () => {
+    render(<LaunchSection />);
+    fireEvent.change(screen.getByLabelText("Issues"), { target: { value: "77, 78" } });
+    expect(screen.getByText(/2 issues in one run/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Launch" }));
+    await waitFor(() => expect(callsOf("samurai_launch_run")).toHaveLength(1));
+    expect(callsOf("samurai_launch_run")[0][1]).toMatchObject({ epic: "77, 78" });
+  });
+
+  it("shows remaining allowance per model and pins the chosen one", async () => {
+    render(<LaunchSection />);
+    fireEvent.change(screen.getByLabelText("Issues"), { target: { value: "#38" } });
+
+    // Wait for the usage poll to land before opening the picker.
+    await waitFor(() => expect(callsOf("get_claude_usage").length).toBeGreaterThan(0));
+    fireEvent.click(screen.getByLabelText("Model"));
+
+    const listbox = await screen.findByRole("listbox", { name: "Model" });
+    // 38% used → 62% left; Fable 91% used → 9% left; Haiku has no window.
+    expect(within(listbox).getByText("62% left")).toBeInTheDocument();
+    expect(within(listbox).getByText("9% left")).toBeInTheDocument();
+    // Default (no model pinned) and Haiku (no window reported) both show the
+    // unknown dash — "no data" must never render as 0% left.
+    expect(within(listbox).getAllByText("—")).toHaveLength(2);
+
+    fireEvent.click(within(listbox).getByRole("option", { name: /Opus 5/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Launch/ }));
+
+    await waitFor(() => expect(callsOf("samurai_launch_run")).toHaveLength(1));
+    expect(callsOf("samurai_launch_run")[0][1]).toMatchObject({ model: "claude-opus-5" });
   });
 
   it("passes the per-run handoff % override to the launch (review F4)", async () => {
     render(<LaunchSection />);
-    fireEvent.change(screen.getByLabelText("Epic ref"), { target: { value: "#38" } });
-    fireEvent.change(screen.getByLabelText("Handoff context % (this run)"), {
+    fireEvent.change(screen.getByLabelText("Issues"), { target: { value: "#38" } });
+    fireEvent.change(screen.getByLabelText("Handoff at context %"), {
       target: { value: "30" },
     });
-    fireEvent.click(screen.getByRole("checkbox"));
-    fireEvent.click(screen.getByRole("button", { name: "Run preflight" }));
-    expect(await screen.findByText("gh authenticated as nachogl1")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Launch" }));
 
     await waitFor(() => expect(callsOf("samurai_launch_run")).toHaveLength(1));
@@ -167,15 +226,14 @@ describe("LaunchSection (issue #63)", () => {
       projectPath: "C:\\git\\maestro",
       epic: "#38",
       model: null,
-      issuesTriaged: true,
       handoffContextPct: 30,
     });
     // The field clears with the rest of the form after a launch.
-    await screen.findByText(/Run launched: epic #38/);
-    expect(screen.getByLabelText("Handoff context % (this run)")).toHaveValue(null);
+    await screen.findByText(/Run launched: #38/);
+    expect(screen.getByLabelText("Handoff at context %")).toHaveValue(null);
   });
 
-  it("renders failing preflight rows and keeps Launch disabled", async () => {
+  it("stops at failing preflight rows and never reaches the launch", async () => {
     mockInvoke({
       preflight: {
         gh_auth: { ok: false, username: null, error: "gh is not authenticated" },
@@ -183,14 +241,16 @@ describe("LaunchSection (issue #63)", () => {
       },
     });
     render(<LaunchSection />);
-    fireEvent.change(screen.getByLabelText("Epic ref"), { target: { value: "#38" } });
-    fireEvent.click(screen.getByRole("checkbox"));
-    fireEvent.click(screen.getByRole("button", { name: "Run preflight" }));
+    fireEvent.change(screen.getByLabelText("Issues"), { target: { value: "#38" } });
+    fireEvent.click(screen.getByRole("button", { name: "Launch" }));
 
     expect(await screen.findByText(/gh auth failed/)).toBeInTheDocument();
     expect(screen.getByText(/gh is not authenticated/)).toBeInTheDocument();
     expect(screen.getByText(/No governing allowance window/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Launch" })).toBeDisabled();
+    expect(screen.getByText(/Preflight failed/)).toBeInTheDocument();
+    expect(callsOf("samurai_launch_run")).toHaveLength(0);
+    // Still launchable once the user fixes the environment.
+    expect(screen.getByRole("button", { name: "Launch" })).toBeEnabled();
   });
 
   it("lists active runs and cleans one up after the ask() confirm", async () => {
@@ -209,7 +269,7 @@ describe("LaunchSection (issue #63)", () => {
       epic: "#38",
     });
     expect(
-      await screen.findByText(/Cleaned up epic #38: removed worktree, branch samurai\/38/),
+      await screen.findByText(/Cleaned up epic #38: removed worktree, branch samurai-38/),
     ).toBeInTheDocument();
   });
 
@@ -233,14 +293,15 @@ describe("LaunchSection (issue #63)", () => {
           });
         case "samurai_list_runs":
           return [];
+        case "get_claude_usage":
+          return buildUsage();
         default:
           return undefined;
       }
     });
     render(<LaunchSection />);
-    fireEvent.change(screen.getByLabelText("Epic ref"), { target: { value: "#38" } });
-    fireEvent.click(screen.getByRole("checkbox"));
-    fireEvent.click(screen.getByRole("button", { name: "Run preflight" }));
+    fireEvent.change(screen.getByLabelText("Issues"), { target: { value: "#38" } });
+    fireEvent.click(screen.getByRole("button", { name: "Launch" }));
 
     // Switch projects while the probe (gh auth status subprocess) is still out.
     act(() => {
@@ -248,39 +309,40 @@ describe("LaunchSection (issue #63)", () => {
         tabs: [buildTab({ id: "tab-2", name: "other", projectPath: "C:\\git\\other" })],
       });
     });
-    expect(await screen.findByText("C:\\git\\other")).toBeInTheDocument();
+    expect(await screen.findByText("other")).toBeInTheDocument();
 
-    // The old project's answer lands — it must not green the new project's gate.
+    // The old project's answer lands — it must not launch into the new one.
     await act(async () => {
       resolvePreflight(passPreflight());
     });
 
     expect(screen.queryByText("gh authenticated as nachogl1")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Launch" })).toBeDisabled();
-    // The early return still runs `finally`, so the spinner clears.
-    expect(screen.getByRole("button", { name: "Run preflight" })).toBeEnabled();
+    expect(callsOf("samurai_launch_run")).toHaveLength(0);
+    // The phase cleared, so the button is usable again for the new project.
+    expect(screen.getByRole("button", { name: "Launch" })).toBeEnabled();
   });
 
   it("shows a backend launch refusal as an error", async () => {
-    mockInvoke();
     invokeMock.mockImplementation(async (cmd: string) => {
       switch (cmd) {
         case "samurai_preflight":
           return passPreflight();
         case "samurai_list_runs":
           return [];
+        case "get_claude_usage":
+          return buildUsage();
         case "samurai_launch_run":
-          throw "launch refused: declare the epic's issues triaged/agent-ready (planned with Claude) first";
+          throw "launch refused: this epic already has a live supervised session";
         default:
           return undefined;
       }
     });
     render(<LaunchSection />);
-    fireEvent.change(screen.getByLabelText("Epic ref"), { target: { value: "#38" } });
-    fireEvent.click(screen.getByRole("checkbox"));
-    fireEvent.click(screen.getByRole("button", { name: "Run preflight" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Launch" }));
+    fireEvent.change(screen.getByLabelText("Issues"), { target: { value: "#38" } });
+    fireEvent.click(screen.getByRole("button", { name: "Launch" }));
 
-    expect(await screen.findByText(/launch refused: declare the epic's issues/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/launch refused: this epic already has a live supervised session/),
+    ).toBeInTheDocument();
   });
 });

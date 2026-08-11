@@ -69,7 +69,7 @@ pub struct SamuraiConfig {
 impl Default for SamuraiConfig {
     fn default() -> Self {
         Self {
-            handoff_context_pct: 45.0,
+            handoff_context_pct: 40.0,
             park_soft_5h_pct: 78.0,
             park_hard_5h_pct: 90.0,
             park_hard_7d_pct: 95.0,
@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn defaults_match_prd_section_7() {
         let cfg = SamuraiConfig::default();
-        assert_eq!(cfg.handoff_context_pct, 45.0);
+        assert_eq!(cfg.handoff_context_pct, 40.0);
         assert_eq!(cfg.park_soft_5h_pct, 78.0);
         assert_eq!(cfg.park_hard_5h_pct, 90.0);
         assert_eq!(cfg.park_hard_7d_pct, 95.0);
@@ -175,7 +175,7 @@ mod tests {
         // filling the gaps — this is what makes the #44 merge trivial.
         let cfg: SamuraiConfig = serde_json::from_str(r#"{"park_hard_5h_pct": 2.0}"#).unwrap();
         assert_eq!(cfg.park_hard_5h_pct, 2.0);
-        assert_eq!(cfg.handoff_context_pct, 45.0);
+        assert_eq!(cfg.handoff_context_pct, 40.0);
         assert_eq!(
             cfg.staleness_window_secs,
             SamuraiConfig::default().staleness_window_secs
