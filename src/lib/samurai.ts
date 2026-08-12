@@ -476,3 +476,22 @@ export function samuraiHarvestRun(): Promise<SamuraiHarvestReport> {
 export function samuraiHarvestRead(path: string): Promise<string> {
   return invoke("samurai_harvest_read", { path });
 }
+
+// ---------------------------------------------------------------------------
+// Issue #82: guarded read of ANY listed Samurai file — the Second Brain viewer
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads one Samurai-managed file by absolute path, read-only (Rust
+ * `samurai_file_read`) — the Second Brain's file viewer serves every row's
+ * content from here, not just harvest reports.
+ *
+ * Containment is the backend's: the path is accepted ONLY if the inventory it
+ * recomputes on every call — the same snapshot `samuraiFilesList` returns —
+ * currently holds it. Anything else, anything over the 2 MB cap, and any read
+ * failure rejects with a plain readable string; render it as-is rather than
+ * parsing it.
+ */
+export function samuraiFileRead(path: string): Promise<string> {
+  return invoke("samurai_file_read", { path });
+}
