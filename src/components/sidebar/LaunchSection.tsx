@@ -401,6 +401,7 @@ export function LaunchSection() {
         report.branch_deleted ? `branch ${report.branch}` : null,
         report.config_archived ? "run config" : null,
         report.timer_cancelled ? "resume timer" : null,
+        report.spawn_cancelled ? "staged gen-1 spawn" : null,
       ].filter(Boolean);
       setNotice(
         removed.length > 0

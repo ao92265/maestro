@@ -555,6 +555,9 @@ pub struct SamuraiCleanupReport {
     /// when one existed).
     pub epic: String,
     pub branch: String,
+    /// A gen-N spawn was staged but never registered — cancelled here, or it
+    /// would have fired into the worktree this cleanup deletes.
+    pub spawn_cancelled: bool,
     pub timer_cancelled: bool,
     pub config_archived: bool,
     pub worktree_removed: bool,
@@ -566,11 +569,13 @@ pub struct SamuraiCleanupReport {
 /// The cleanup sequence, extracted from the Tauri command for testability
 /// (the `prepare_worktree_inner` precedent; `worktree_base` override exists
 /// only so tests never touch the real app-data worktree base).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn cleanup_epic_inner(
     supervisor: &Supervisor,
     schedule: &SamuraiSchedule,
     run_configs: &RunConfigStore,
     worktrees: &WorktreeManager,
+    replicator: &SamuraiReplicator,
     project: &str,
     epic: &str,
     worktree_base: Option<&Path>,
@@ -597,6 +602,15 @@ pub(crate) async fn cleanup_epic_inner(
             live.state.as_str(),
         ));
     }
+
+    // 0. Cancel a staged-but-unregistered spawn. The live-session refusal
+    //    above only sees SUPERVISED sessions, and a launch the frontend has
+    //    not registered yet is invisible to the supervisor while its spawn
+    //    event is still being re-emitted (~15 min). Left staged it fires into
+    //    the worktree step 3 deletes, and it blocks a relaunch of the epic
+    //    until it gives up. Before any deletion, so no re-emit can be armed
+    //    once the directory is gone.
+    let spawn_cancelled = replicator.cancel_pending_for_epic(project, &epic);
 
     // 1. Cancel the resume timer — left armed it would respawn the epic
     //    into a deleted worktree. Cancelling twice is not an error (P3.1).
@@ -660,11 +674,12 @@ pub(crate) async fn cleanup_epic_inner(
     };
 
     log::info!(
-        "samurai cleanup: epic {epic} in {project} — timer_cancelled={timer_cancelled} config_archived={config_archived} worktree_removed={worktree_removed} branch_deleted={branch_deleted}"
+        "samurai cleanup: epic {epic} in {project} — spawn_cancelled={spawn_cancelled} timer_cancelled={timer_cancelled} config_archived={config_archived} worktree_removed={worktree_removed} branch_deleted={branch_deleted}"
     );
     Ok(SamuraiCleanupReport {
         epic,
         branch,
+        spawn_cancelled,
         timer_cancelled,
         config_archived,
         worktree_removed,
@@ -684,6 +699,7 @@ pub async fn samurai_cleanup_epic(
     schedule: State<'_, Arc<SamuraiSchedule>>,
     run_configs: State<'_, Arc<RunConfigStore>>,
     worktrees: State<'_, WorktreeManager>,
+    replicator: State<'_, Arc<SamuraiReplicator>>,
     project_path: String,
     epic: String,
 ) -> Result<SamuraiCleanupReport, String> {
@@ -693,6 +709,7 @@ pub async fn samurai_cleanup_epic(
         &schedule,
         &run_configs,
         &worktrees,
+        &replicator,
         &project,
         &epic,
         None,
@@ -1015,14 +1032,54 @@ mod tests {
 
     /// Everything cleanup needs, rooted in tempdirs.
     struct CleanupHarness {
-        supervisor: Supervisor,
+        supervisor: Arc<Supervisor>,
         schedule: Arc<SamuraiSchedule>,
+        replicator: Arc<SamuraiReplicator>,
+        spawns: Arc<std::sync::Mutex<Vec<crate::core::samurai_replicator::SuccessorSpawn>>>,
         run_configs: RunConfigStore,
         worktrees: WorktreeManager,
         project: String,
         _dirs: (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir),
         base: tempfile::TempDir,
         repo: tempfile::TempDir,
+    }
+
+    /// A replicator wired to inert collaborators — enough for the staging /
+    /// cancellation paths the launch and cleanup suites exercise. Returns the
+    /// spawn-event sink so a test can assert on what was (not) emitted.
+    fn test_replicator(
+        supervisor: Arc<Supervisor>,
+        audit: AuditLog,
+    ) -> (
+        Arc<SamuraiReplicator>,
+        Arc<std::sync::Mutex<Vec<crate::core::samurai_replicator::SuccessorSpawn>>>,
+    ) {
+        use crate::core::samurai_injector::SessionDirResolver;
+        use crate::core::samurai_replicator::{
+            SessionTeardown, StdinWriter, SuccessorEmitter, SuccessorSpawn, TranscriptPathResolver,
+        };
+        use std::sync::{Mutex, RwLock};
+
+        let spawns: Arc<Mutex<Vec<SuccessorSpawn>>> = Arc::new(Mutex::new(Vec::new()));
+        let spawns_rec = spawns.clone();
+        let emit_spawn: SuccessorEmitter =
+            Arc::new(move |s| spawns_rec.lock().unwrap().push(s.clone()));
+        let session_dirs: SessionDirResolver = Arc::new(|_| None);
+        let transcript_paths: TranscriptPathResolver = Arc::new(|_| None);
+        let teardown: SessionTeardown = Arc::new(|_| Box::pin(async {}));
+        let write_stdin: StdinWriter = Arc::new(|_, _| {});
+        let shared: SharedSamuraiConfig = Arc::new(RwLock::new(SamuraiConfig::default()));
+        let replicator = Arc::new(SamuraiReplicator::new(
+            supervisor,
+            audit,
+            shared,
+            session_dirs,
+            transcript_paths,
+            teardown,
+            emit_spawn,
+            write_stdin,
+        ));
+        (replicator, spawns)
     }
 
     fn cleanup_harness() -> CleanupHarness {
@@ -1036,9 +1093,13 @@ mod tests {
         let (schedule, _task) =
             SamuraiSchedule::new(schedule_dir.path().to_path_buf(), Arc::new(|_| {}), None);
         let project = repo.path().to_string_lossy().into_owned();
+        let supervisor = Arc::new(Supervisor::new(audit.clone(), None));
+        let (replicator, spawns) = test_replicator(supervisor.clone(), audit);
         CleanupHarness {
-            supervisor: Supervisor::new(audit, None),
+            supervisor,
             schedule,
+            replicator,
+            spawns,
             run_configs: RunConfigStore::new(runs_dir.path().to_path_buf()),
             worktrees: WorktreeManager::new(),
             project,
@@ -1054,6 +1115,7 @@ mod tests {
             &h.schedule,
             &h.run_configs,
             &h.worktrees,
+            &h.replicator,
             &h.project,
             epic,
             Some(h.base.path()),
@@ -1296,6 +1358,52 @@ mod tests {
 
         // Cancelling twice is not an error — it just reports nothing armed.
         assert!(!timer_cancel_inner(&schedule, "C:/git/alpha", "#38").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_cancels_a_staged_but_unregistered_spawn() {
+        // The live-session refusal only sees SUPERVISED sessions. A launch
+        // the frontend never registered is invisible to it, but the
+        // replicator keeps re-emitting its spawn event for ~15 min — into a
+        // worktree this cleanup is about to delete. Cleanup must cancel it.
+        let h = cleanup_harness();
+        let worktree =
+            ensure_epic_worktree(&h.worktrees, &h.project, "samurai-38", Some(h.base.path()))
+                .await
+                .unwrap();
+        h.run_configs
+            .save(&SamuraiRunConfig::new(
+                h.project.clone(),
+                "#38",
+                worktree.to_string_lossy().into_owned(),
+            ))
+            .unwrap();
+        h.replicator.spawn_first_generation(
+            &h.project,
+            "#38",
+            &worktree.to_string_lossy(),
+            "opening brief".to_string(),
+        );
+        assert_eq!(h.spawns.lock().unwrap().len(), 1, "gen-1 staged and emitted");
+
+        // Cleaned up under a DIFFERENT spelling than it was staged with: the
+        // cancel matches by slug, like every other surface.
+        let report = run_cleanup(&h, "38").await.unwrap();
+        assert!(report.spawn_cancelled, "the staged gen-1 was cancelled");
+        assert!(report.worktree_removed);
+
+        // …and the re-emit ladder is really gone: no further spawn events for
+        // an epic whose worktree no longer exists.
+        h.replicator.tick();
+        assert_eq!(
+            h.spawns.lock().unwrap().len(),
+            1,
+            "no re-emit into the deleted worktree"
+        );
+
+        // Idempotent: a second pass has nothing left to cancel.
+        let again = run_cleanup(&h, "#38").await.unwrap();
+        assert!(!again.spawn_cancelled);
     }
 
     #[tokio::test]

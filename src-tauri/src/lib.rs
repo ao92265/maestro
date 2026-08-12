@@ -551,22 +551,15 @@ pub fn run() {
             let ritual_pm = app.state::<ProcessManager>().inner().clone();
             let ritual_writer: core::samurai_replicator::StdinWriter =
                 Arc::new(move |session_id, data| {
-                    // write_stdin is fully blocking (same policy as the
-                    // injector's spawn_write) — blocking pool, never inline.
-                    let pm = ritual_pm.clone();
-                    tauri::async_runtime::spawn(async move {
-                        match tokio::task::spawn_blocking(move || pm.write_stdin(session_id, &data))
-                            .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => log::warn!(
-                                "samurai replicator: writing ritual to session {session_id} failed: {e}"
-                            ),
-                            Err(e) => log::warn!(
-                                "samurai replicator: ritual write task for session {session_id} failed: {e}"
-                            ),
-                        }
-                    });
+                    // Text, then a separate Enter (samurai_pty) — one
+                    // text-plus-CR write is read as a paste and never
+                    // submits. Both frames go to the blocking pool.
+                    core::samurai_pty::submit_instruction(
+                        ritual_pm.clone(),
+                        session_id,
+                        data,
+                        "replicator",
+                    );
                 });
             // The parker (issue #60) tears parked sessions down with this
             // same closure — a PARKED terminal serves no purpose, every

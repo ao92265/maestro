@@ -46,6 +46,14 @@ pub struct SamuraiConfig {
     /// How long to wait for an injected instruction's ACK before the single
     /// retry → ALERT (PRD §5.3 "few minutes").
     pub ack_timeout_secs: u64,
+    /// How long an instruction may wait for the agent's turn to END before it
+    /// is alerted as stuck. Sized for the gap between Stop hooks, NOT for a
+    /// reply: an orchestrator running a subagent wave plus a full build+test
+    /// legitimately goes far longer than `ack_timeout_secs` without a single
+    /// idle signal, and the ACK window used to double as this cap — so a
+    /// long turn raised a false `never_idled` ALERT. The instruction is now
+    /// KEPT past this alert and still delivered on the eventual Stop.
+    pub max_turn_wait_secs: u64,
     /// Transcript-staleness window for the silent-death watchdog (issue #44).
     pub staleness_window_secs: u64,
     /// How long handoff files are kept after an epic completes — i.e. after
@@ -74,6 +82,10 @@ impl Default for SamuraiConfig {
             park_hard_5h_pct: 90.0,
             park_hard_7d_pct: 95.0,
             ack_timeout_secs: 180,
+            // 30 min: longer than a subagent wave plus a full build+test
+            // turn on a workspace this size, short enough that a genuinely
+            // wedged turn still surfaces within one working session.
+            max_turn_wait_secs: 1800,
             // Matches `samurai_watchdog::TRANSCRIPT_STALE_AFTER`, the window
             // this field now drives — the shipped behaviour, unchanged.
             staleness_window_secs: 120,
@@ -116,6 +128,11 @@ impl SamuraiConfig {
         // `loop { tick }` with no catch) for the rest of the process.
         if !(1..=86_400).contains(&self.ack_timeout_secs) {
             return Err("ack_timeout_secs must be between 1 and 86400".to_string());
+        }
+        // Same bounds and the same reason: it becomes a `Duration` the
+        // injector compares against on every tick.
+        if !(1..=86_400).contains(&self.max_turn_wait_secs) {
+            return Err("max_turn_wait_secs must be between 1 and 86400".to_string());
         }
         if self.staleness_window_secs == 0 {
             return Err("staleness_window_secs must be at least 1".to_string());
@@ -195,6 +212,7 @@ mod tests {
             park_hard_5h_pct: 2.0,
             park_hard_7d_pct: 3.0,
             ack_timeout_secs: 60,
+            max_turn_wait_secs: 900,
             staleness_window_secs: 120,
             handoff_retention_days: 7,
             breaker_events: 3,

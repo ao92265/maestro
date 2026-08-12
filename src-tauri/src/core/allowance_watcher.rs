@@ -10,11 +10,14 @@
 //! crossing fires again. Threshold changes take effect on the next tick
 //! (lowering a threshold below current usage IS the live test — PRD
 //! decision #7). The one exception the LOOP adds on top: while a hard
-//! threshold stays latched ([`AllowanceWatcher::hard_latched`]) and the
-//! sweep it caused already completed, the remembered crossing is re-handed
-//! to the parker as soon as a session is working again — sessions that
-//! register after the crossing (cold-start reconciliation, resumes) must
-//! not run unparked for the rest of an exhausted window.
+//! threshold stays latched and the sweep it caused already completed, a
+//! crossing REBUILT FROM THE CURRENT READING
+//! ([`AllowanceWatcher::latched_hard_event`]) is re-handed to the parker as
+//! soon as a session is working again — sessions that register after the
+//! crossing (cold-start reconciliation, resumes) must not run unparked for
+//! the rest of an exhausted window. Rebuilt, not remembered: the parker arms
+//! resume timers from `resets_at`, and the original event's copy goes stale
+//! as soon as its window resets while another latch holds the sweep open.
 //!
 //! **No governing window** (enterprise-style accounts return the 5h/7d
 //! windows as null): a distinct event fires once — Phase 3's preflight will
@@ -183,11 +186,60 @@ impl AllowanceWatcher {
     }
 
     /// Whether a hard threshold is STILL above its line — the latched state
-    /// behind the edge, which no event reports after the crossing tick. The
-    /// loop needs it to re-hand a session that registered after the crossing
-    /// (the latch alone would keep it unparked for the whole window).
-    pub fn hard_latched(&self) -> bool {
+    /// behind the edge, which no event reports after the crossing tick.
+    #[cfg(test)]
+    fn hard_latched(&self) -> bool {
         self.above_hard_5h || self.above_hard_7d
+    }
+
+    /// The hard crossing still in force, rebuilt from THIS tick's reading.
+    ///
+    /// Deliberately not a remembered snapshot of the original crossing event:
+    /// the parker arms resume timers from the event's `resets_at`, and a
+    /// remembered 5h `resets_at` goes stale the moment that window resets
+    /// while the 7d latch keeps the sweep engaged — re-handing it then arms a
+    /// timer in the PAST, which fires immediately and thrashes the epic
+    /// between park and resume for the rest of the weekly window.
+    ///
+    /// When both hard windows are latched the LATER reset wins, matching what
+    /// the parker does when both cross in one sweep. A latched window with no
+    /// percent this tick is skipped: no current data, so nothing to re-hand.
+    pub fn latched_hard_event(
+        &self,
+        reading: &AllowanceReading,
+        config: &SamuraiConfig,
+    ) -> Option<AllowanceEvent> {
+        let mut candidates: Vec<AllowanceEvent> = Vec::new();
+        if self.above_hard_5h {
+            if let Some(value) = reading.session_percent {
+                candidates.push(AllowanceEvent::ThresholdCrossed {
+                    window: AllowanceWindow::FiveHour,
+                    threshold_kind: ThresholdKind::Hard,
+                    value,
+                    threshold: config.park_hard_5h_pct,
+                    resets_at: reading.session_resets_at.clone(),
+                });
+            }
+        }
+        if self.above_hard_7d {
+            if let Some(value) = reading.weekly_percent {
+                candidates.push(AllowanceEvent::ThresholdCrossed {
+                    window: AllowanceWindow::SevenDay,
+                    threshold_kind: ThresholdKind::Hard,
+                    value,
+                    threshold: config.park_hard_7d_pct,
+                    resets_at: reading.weekly_resets_at.clone(),
+                });
+            }
+        }
+        // Later known reset wins; a known reset beats an unknown one.
+        candidates.into_iter().max_by_key(|e| match e {
+            AllowanceEvent::ThresholdCrossed { resets_at, .. } => resets_at
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&chrono::Utc)),
+            AllowanceEvent::NoGoverningWindow => None,
+        })
     }
 }
 
@@ -236,12 +288,6 @@ pub fn spawn_allowance_loop(
 ) {
     tauri::async_runtime::spawn(async move {
         let mut watcher = AllowanceWatcher::default();
-        // The last hard crossing, kept while its threshold stays latched: the
-        // edge fires once, but sessions keep registering after it (cold-start
-        // reconciliation respawns orchestrators seconds after launch, and the
-        // very first tick is immediate — so the crossing routinely lands on an
-        // EMPTY supervisor registry).
-        let mut last_hard: Option<AllowanceEvent> = None;
         let mut interval = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -277,19 +323,18 @@ pub fn spawn_allowance_loop(
             };
             let events = watcher.evaluate(&reading, &snapshot);
             if events.is_empty() {
-                if !watcher.hard_latched() {
-                    // Below the line again (window reset): the edge is
-                    // re-armed, so the remembered crossing is spent.
-                    last_hard = None;
-                } else if !parker.parking_engaged() {
-                    // Still above the hard line with the sweep already
+                if !parker.parking_engaged() {
+                    // Still above a hard line with the sweep already
                     // finished: anything WORKING now registered AFTER the
-                    // crossing and would otherwise never be parked. Re-hand
-                    // the same event — `engage_hard` is idempotent, the
-                    // crossing was already audited (no new ALERT rows), and
-                    // the completed sweep took its `parked_epics` with it, so
-                    // no timer can be armed twice.
-                    if let Some(event) = last_hard.as_ref() {
+                    // crossing and would otherwise never be parked. Re-hand a
+                    // crossing rebuilt from THIS tick's reading — never the
+                    // original event, whose `resets_at` may belong to a window
+                    // that has since reset (that arms a resume timer in the
+                    // past). `engage_hard` is idempotent, the crossing was
+                    // already audited (no new ALERT rows), and the completed
+                    // sweep took its `parked_epics` with it, so no timer can
+                    // be armed twice.
+                    if let Some(event) = watcher.latched_hard_event(&reading, &snapshot) {
                         if supervisor
                             .list_sessions()
                             .iter()
@@ -298,7 +343,7 @@ pub fn spawn_allowance_loop(
                             log::info!(
                                 "samurai allowance: still above the hard threshold and a session is working — re-engaging the park sweep"
                             );
-                            parker.on_allowance_event(event);
+                            parker.on_allowance_event(&event);
                         }
                     }
                 }
@@ -338,15 +383,6 @@ pub fn spawn_allowance_loop(
                 // rows are durable, so the trail always shows the crossing
                 // before the PARK rows it causes.
                 parker.on_allowance_event(event);
-                if matches!(
-                    event,
-                    AllowanceEvent::ThresholdCrossed {
-                        threshold_kind: ThresholdKind::Hard,
-                        ..
-                    }
-                ) {
-                    last_hard = Some(event.clone());
-                }
             }
         }
     });
@@ -530,9 +566,9 @@ mod tests {
 
     #[test]
     fn hard_latched_reports_the_state_the_edge_hides() {
-        // The loop re-hands the remembered hard crossing while this is true
-        // (a session registering after the crossing would never be parked
-        // otherwise) and forgets it once the window resets.
+        // The loop re-hands a rebuilt hard crossing while this is true (a
+        // session registering after the crossing would never be parked
+        // otherwise) and stops once the window resets.
         let mut w = AllowanceWatcher::default();
         assert!(!w.hard_latched(), "nothing crossed yet");
         // Soft alone never counts as "hard still above the line".
@@ -549,6 +585,70 @@ mod tests {
         // The 7d window latches it just as well.
         assert_eq!(w.evaluate(&reading(Some(3.0), Some(96.0)), &cfg()).len(), 1);
         assert!(w.hard_latched());
+    }
+
+    #[test]
+    fn latched_hard_event_is_rebuilt_from_the_current_reading() {
+        // The re-hand must never carry a `resets_at` from a window that has
+        // since reset: the parker arms resume timers from it, and a spent 5h
+        // reset time is in the PAST — the timer fires instantly and the epic
+        // thrashes between park and resume for the rest of the weekly window.
+        let mut w = AllowanceWatcher::default();
+        let with_resets = |session: Option<f64>, weekly: Option<f64>| AllowanceReading {
+            session_percent: session,
+            session_resets_at: Some("2026-08-06T20:00:00Z".to_string()),
+            weekly_percent: weekly,
+            weekly_resets_at: Some("2026-08-10T09:00:00Z".to_string()),
+        };
+
+        // Nothing crossed: nothing to re-hand.
+        assert_eq!(w.latched_hard_event(&with_resets(Some(10.0), None), &cfg()), None);
+
+        // Both hard windows cross (5h also passes its soft line on the way).
+        // The LATER reset (7d) wins — resuming at the 5h reset would land
+        // straight back in an exhausted weekly.
+        assert_eq!(w.evaluate(&with_resets(Some(91.0), Some(96.0)), &cfg()).len(), 3);
+        let event = w
+            .latched_hard_event(&with_resets(Some(91.0), Some(96.0)), &cfg())
+            .expect("both latched");
+        assert!(matches!(
+            &event,
+            AllowanceEvent::ThresholdCrossed { window: AllowanceWindow::SevenDay, resets_at, .. }
+                if resets_at.as_deref() == Some("2026-08-10T09:00:00Z")
+        ));
+
+        // The 5h window resets while the 7d latch still holds the sweep open.
+        // The re-hand must now be the 7d event with the WEEKLY reset time —
+        // the bug was re-handing the remembered 5h event, whose `resets_at`
+        // is now in the past.
+        assert!(w.evaluate(&with_resets(Some(2.0), Some(96.0)), &cfg()).is_empty());
+        let event = w
+            .latched_hard_event(&with_resets(Some(2.0), Some(96.0)), &cfg())
+            .expect("7d still latched");
+        assert!(matches!(
+            &event,
+            AllowanceEvent::ThresholdCrossed { window: AllowanceWindow::SevenDay, resets_at, .. }
+                if resets_at.as_deref() == Some("2026-08-10T09:00:00Z")
+        ));
+
+        // A latched window with no percent this tick is skipped — no current
+        // data, so nothing is re-handed until the next reading.
+        assert_eq!(
+            w.latched_hard_event(
+                &AllowanceReading {
+                    session_percent: None,
+                    session_resets_at: None,
+                    weekly_percent: None,
+                    weekly_resets_at: None,
+                },
+                &cfg()
+            ),
+            None
+        );
+
+        // Weekly resets too: nothing latched, nothing to re-hand.
+        assert!(w.evaluate(&with_resets(Some(2.0), Some(4.0)), &cfg()).is_empty());
+        assert_eq!(w.latched_hard_event(&with_resets(Some(2.0), Some(4.0)), &cfg()), None);
     }
 
     #[test]

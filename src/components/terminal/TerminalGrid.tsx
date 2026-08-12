@@ -351,6 +351,15 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   // landing-view guard in handleKill (finding A) — a claimed-but-unlaunched
   // successor must keep this grid mounted.
   const autoLaunchSlotIdsRef = useRef<string[]>([]);
+  // Slots whose deferred launch HAS fired but has not yet written a
+  // sessionId. `launchSlotInner` only sets sessionId after ~8 awaited IPC
+  // round-trips, and the id leaves autoLaunchSlotIdsRef the moment the launch
+  // starts — so without this second marker a slot mid-launch looks pristine
+  // to the reuse guard below, and a claim arriving in that window would
+  // overwrite it and have its own launch silently dropped (the launch
+  // early-returns once sessionId is set). Also counts toward the landing-view
+  // guard in handleKill: unmounting the grid mid-launch destroys it.
+  const launchingSlotIdsRef = useRef<Set<string>>(new Set());
 
   // Clear a pane's yellow attention highlight (set when it was auto-unparked
   // because its agent asked for input). Called only from USER-driven selection
@@ -1132,9 +1141,12 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     // project's only session would never spawn. In that case fall through to
     // the normal in-place removal and let the pending-launch effects (below)
     // spawn the successor into the surviving grid.
+    // Both markers count: a claim that has already STARTED launching left
+    // autoLaunchSlotIdsRef, and unmounting the grid under an in-flight launch
+    // destroys it just as thoroughly as unmounting under a queued one.
     const launchImminent = successorLaunchImminent(
       usePendingLaunchStore.getState().pending,
-      autoLaunchSlotIdsRef.current.length,
+      autoLaunchSlotIdsRef.current.length + launchingSlotIdsRef.current.size,
       tabId,
     );
     if (slotsRef.current.length <= 1 && !launchImminent && onAllSessionsClosedRef.current) {
@@ -1669,7 +1681,8 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     const reusable =
       current.length === 1 &&
       current[0].sessionId === null &&
-      !autoLaunchSlotIdsRef.current.includes(current[0].id)
+      !autoLaunchSlotIdsRef.current.includes(current[0].id) &&
+      !launchingSlotIdsRef.current.has(current[0].id)
         ? current[0]
         : null;
     if (!reusable && current.length >= MAX_SESSIONS) {
@@ -1694,6 +1707,23 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       worktreeMode: "project",
     };
     autoLaunchSlotIdsRef.current = [...autoLaunchSlotIdsRef.current, slot.id];
+    // Advance slotsRef EAGERLY, before the setSlots below (bug: a samurai
+    // launch opened an unsupervised terminal in the main checkout, and the
+    // backend re-emitted 180s later). On the grid's MOUNT commit this effect
+    // and the auto-launch effect below run in the SAME passive-effect flush:
+    // React cannot re-render between them, so the ref sync at line 574 has
+    // not run and launchSlot would read the PRISTINE slot — project dir, no
+    // samurai payload, no registration. The next commit's sync re-derives
+    // the ref from state, so an eager advance is self-healing.
+    //
+    // The setSlots calls stay FUNCTIONAL updaters on purpose: replacing them
+    // with this ref-derived array would clobber a concurrent functional
+    // update (launchSlotInner writes sessionId into another in-flight slot).
+    slotsRef.current = reusable
+      ? slotsRef.current.map((s) => (s.id === reusable.id ? slot : s))
+      : slotsRef.current.some((s) => s.id === slot.id)
+        ? slotsRef.current
+        : [...slotsRef.current, slot];
     if (reusable) {
       setSlots((prev) => prev.map((s) => (s.id === reusable.id ? slot : s)));
     } else {
@@ -1717,7 +1747,15 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     const ready = ids.filter((id) => slots.some((s) => s.id === id));
     if (ready.length === 0) return;
     autoLaunchSlotIdsRef.current = ids.filter((id) => !ready.includes(id));
-    for (const id of ready) void launchSlot(id);
+    // Hand the claim from the queued marker to the in-flight one in the same
+    // statement — a slot must never be unmarked while its launch is running,
+    // or the reuse guard treats it as pristine. `launchSlot` always settles
+    // (withProjectLock releases in a finally, launchSlotInner swallows its
+    // own errors), so the marker cannot latch.
+    for (const id of ready) {
+      launchingSlotIdsRef.current.add(id);
+      void launchSlot(id).finally(() => launchingSlotIdsRef.current.delete(id));
+    }
   }, [slots, launchSlot]);
 
   // Samurai kills (issue #55) and parks (issue #60): after a validated

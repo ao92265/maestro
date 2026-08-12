@@ -193,6 +193,8 @@ export interface SamuraiLaunchResult {
 export interface SamuraiCleanupReport {
   epic: string;
   branch: string;
+  /** A staged-but-unregistered gen-N spawn was cancelled before the delete. */
+  spawn_cancelled: boolean;
   timer_cancelled: boolean;
   config_archived: boolean;
   worktree_removed: boolean;

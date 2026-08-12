@@ -264,7 +264,7 @@ async fn reconcile_gated(
     auth: Option<AuthProbe>,
     retry_after: Duration,
 ) {
-    let orphaned = reconcile_pass(
+    let (orphaned, spawned) = reconcile_pass(
         &run_configs,
         &timers,
         &supervisor,
@@ -273,6 +273,7 @@ async fn reconcile_gated(
         &transcript_ages,
         &claude_alive,
         auth.as_ref(),
+        &HashSet::new(),
     )
     .await;
     if !orphaned {
@@ -283,6 +284,13 @@ async fn reconcile_gated(
         retry_after.as_secs()
     );
     tokio::time::sleep(retry_after).await;
+    // `spawned` is what makes the retry idempotent for the epics pass 1
+    // already acted on. The live-session guard alone cannot: registration
+    // only happens when the frontend consumes the spawn event, and a spawn
+    // event that nobody consumed is only re-emitted after `ack_timeout_secs`
+    // (180s) — longer than `retry_after` (120s). Without this the retry
+    // re-reads pass 1's OWN `RESUME` row as the prior generation and stages a
+    // SECOND orchestrator, generation+1, into the same worktree.
     reconcile_pass(
         &run_configs,
         &timers,
@@ -292,13 +300,21 @@ async fn reconcile_gated(
         &transcript_ages,
         &claude_alive,
         auth.as_ref(),
+        &spawned,
     )
     .await;
 }
 
 /// One reconciliation pass over every ACTIVE run config. Returns whether any
 /// epic ended in [`ReconcileAction::AlertOrphan`] — the only verdict worth
-/// retrying (see [`reconcile_gated`]).
+/// retrying (see [`reconcile_gated`]) — plus the (project, epic) pairs this
+/// pass actually spawned.
+///
+/// `already_spawned` are pairs an EARLIER pass staged a generation for. They
+/// are treated exactly like a live session: this pass must not re-decide
+/// them, because the audit row the earlier pass wrote would be read back as
+/// their prior generation and produce a second, higher-numbered orchestrator
+/// in the same worktree.
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_pass(
     run_configs: &Arc<RunConfigStore>,
@@ -309,13 +325,15 @@ async fn reconcile_pass(
     transcript_ages: &TranscriptAgeProbe,
     claude_alive: &ClaudeAliveProbe,
     auth: Option<&AuthProbe>,
-) -> bool {
+    already_spawned: &HashSet<(String, String)>,
+) -> (bool, HashSet<(String, String)>) {
+    let mut spawned: HashSet<(String, String)> = HashSet::new();
     let configs = run_configs.load_active();
     if configs.is_empty() {
         // The normal state until the P3.5 launcher exists, and afterwards
         // whenever no epic is live. No process scan, no audit noise.
         log::info!("samurai reconciler: no active run configs — nothing to reconcile");
-        return false;
+        return (false, spawned);
     }
     log::info!(
         "samurai reconciler: reconciling {} active run config(s)",
@@ -329,9 +347,13 @@ async fn reconcile_pass(
     let sessions = supervisor.list_sessions();
     let guards = |config: &SamuraiRunConfig| -> (bool, bool) {
         let timer_pending = timered.contains(&(config.project_path.clone(), config.epic.clone()));
-        let live_session = sessions.iter().any(|s| {
-            s.project == config.project_path && s.epic == config.epic && !s.state.is_terminal()
-        });
+        // An epic an earlier pass already spawned counts as live even though
+        // nothing has registered yet — see `already_spawned`.
+        let live_session = already_spawned
+            .contains(&(config.project_path.clone(), config.epic.clone()))
+            || sessions.iter().any(|s| {
+                s.project == config.project_path && s.epic == config.epic && !s.state.is_terminal()
+            });
         (timer_pending, live_session)
     };
 
@@ -421,9 +443,12 @@ async fn reconcile_pass(
                 action = ReconcileAction::AlertNoGhAuth;
             }
         }
+        if matches!(action, ReconcileAction::Spawn { .. }) {
+            spawned.insert((config.project_path.clone(), config.epic.clone()));
+        }
         apply(replicator, audit, config, action);
     }
-    orphaned
+    (orphaned, spawned)
 }
 
 /// Highest generation either persisted source knows: the epic's handoff
@@ -1104,6 +1129,74 @@ mod tests {
                 .filter(|r| r.event == AuditEventKind::Resume)
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_pass_does_not_respawn_an_epic_pass_one_already_spawned() {
+        // Two ACTIVE configs: epic A looks like a probable orphan (which is
+        // what arms the retry pass at all), epic B is stale and spawns on
+        // pass 1. The retry pass must NOT re-decide B — its only guard used
+        // to be a live supervised session, and registration cannot arrive in
+        // time (the frontend registers on consuming the spawn event, and an
+        // unconsumed event is only re-emitted after ack_timeout_secs = 180s,
+        // longer than the 120s retry delay). Left unguarded, the retry reads
+        // pass 1's OWN Resume row back as B's prior generation and stages a
+        // SECOND orchestrator, one generation higher, into the same worktree.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-recon-double";
+        let repo_a = tempdir().unwrap();
+        let repo_b = tempdir().unwrap();
+        init_repo(repo_a.path());
+        init_repo(repo_b.path());
+        write_handoff(repo_b.path(), "#78", 3);
+        for (epic, repo) in [("#77", repo_a.path()), ("#78", repo_b.path())] {
+            h.run_configs
+                .save(&SamuraiRunConfig::new(
+                    project,
+                    epic,
+                    repo.to_string_lossy().into_owned(),
+                ))
+                .unwrap();
+        }
+
+        // Epic A's transcript stays fresh (with a live claude machine-wide it
+        // reads as a probable orphan → AlertOrphan → the retry is armed);
+        // epic B's is always stale.
+        let a_path = repo_a.path().to_string_lossy().into_owned();
+        let probe: TranscriptAgeProbe = Arc::new(move |path: &str| {
+            Some(Duration::from_secs(if path == a_path { 5 } else { 600 }))
+        });
+
+        reconcile_gated(
+            h.run_configs.clone(),
+            Vec::new(),
+            h.supervisor.clone(),
+            h.replicator.clone(),
+            h.audit.clone(),
+            probe,
+            alive(true),
+            None,
+            TEST_RETRY,
+        )
+        .await;
+
+        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
+        let spawns = h.spawns.lock().unwrap().clone();
+        assert_eq!(spawns.len(), 1, "epic #78 spawns exactly once, not twice");
+        assert_eq!(spawns[0].epic, "#78");
+        assert_eq!(spawns[0].generation, 4, "handoff gen 3 + 1");
+
+        // …and exactly one RESUME row, so a later pass cannot inflate the
+        // generation off its own audit trail either.
+        let rows = rows(&h.audit, project).await;
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.event == AuditEventKind::Resume)
+                .count(),
+            1,
+            "one RESUME row for the one spawn"
         );
     }
 

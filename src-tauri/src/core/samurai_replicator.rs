@@ -101,9 +101,14 @@ pub type SessionTeardown =
 /// Emits the `samurai-spawn-successor` event to the frontend.
 pub type SuccessorEmitter = Arc<dyn Fn(&SuccessorSpawn) + Send + Sync>;
 
-/// Types one line + `\r` into a session's PTY (the ritual delivery). The
-/// production closure routes through `spawn_blocking` + `write_stdin`, the
-/// same policy as the injector's writes.
+/// Delivers one instruction into a session's PTY (the ritual delivery).
+///
+/// The writer OWNS submission: it receives the instruction text alone and is
+/// responsible for sending the Enter itself. The production closure routes
+/// through `samurai_pty::submit_instruction`, which writes the text and then
+/// a lone `\r` a moment later — a single text-plus-CR write is read by the
+/// CLI as a paste and leaves the instruction sitting in the input box,
+/// unsubmitted.
 pub type StdinWriter = Arc<dyn Fn(u32, String) + Send + Sync>;
 
 /// Resolves a session's transcript file for the recovery digest (issue #56).
@@ -1064,6 +1069,24 @@ impl SamuraiReplicator {
                     return;
                 }
             }
+            // Backstop against a second orchestrator in one worktree: the
+            // guard above is keyed on the GENERATION, so two callers that
+            // disagree about the prior generation (the reconciler's retry
+            // pass reading back its own RESUME row, or a resumer/reconciler
+            // race) would each stage their own entry and BOTH spawn. An epic
+            // that already has a live, not-yet-given-up entry is not
+            // respawnable at any other generation either. `alerted` entries
+            // are exempt for the same reason as above — an epic must never
+            // become permanently unresumable.
+            if let Some(other) = pending.iter().find(|p| {
+                p.epic == epic && p.project == project && p.registered.is_none() && !p.alerted
+            }) {
+                log::warn!(
+                    "samurai replicator: epic {epic} already has an unregistered gen-{} staged — refusing to also stage gen-{generation}",
+                    other.generation
+                );
+                return;
+            }
             log::info!(
                 "samurai replicator: staging fresh gen-{generation} for epic {epic} in {working_dir} (prior gen-{prior})"
             );
@@ -1364,6 +1387,40 @@ impl SamuraiReplicator {
             })
     }
 
+    /// Drops every staged-but-unregistered entry for an epic. Returns whether
+    /// anything was removed.
+    ///
+    /// Called by the epic cleanup: the cleanup's own guard only sees
+    /// SUPERVISED sessions, and a launch that the frontend has not registered
+    /// yet is invisible to the supervisor while its spawn event is still
+    /// being re-emitted (up to five windows, ~15 min). Left staged, that spawn
+    /// fires into a directory cleanup has just deleted, and it blocks a
+    /// relaunch of the same epic until it gives up.
+    ///
+    /// Matched by SLUG, not exact string: staging keys on the exact epic
+    /// spelling while cleanup, run configs and worktrees all unify by slug —
+    /// a cleanup typed as "38" must still cancel a spawn staged under "#38".
+    /// Registered entries are left alone; cleanup refuses on those already.
+    pub fn cancel_pending_for_epic(&self, project: &str, epic: &str) -> bool {
+        let slug = samurai_prompts::epic_slug(epic);
+        let mut pending = self.lock_pending();
+        let before = pending.len();
+        pending.retain(|p| {
+            let cancel = p.project == project
+                && samurai_prompts::epic_slug(&p.epic) == slug
+                && p.registered.is_none();
+            if cancel {
+                log::info!(
+                    "samurai replicator: cancelling staged gen-{} for epic {} in {project} — the epic is being cleaned up",
+                    p.generation,
+                    p.epic,
+                );
+            }
+            !cancel
+        });
+        pending.len() != before
+    }
+
     /// Called after every `samurai_register_session`. A registration that
     /// matches a staged (project, epic, generation) arms the ritual delivery
     /// for that session id and starts the no-start clock; everything else is
@@ -1418,7 +1475,8 @@ impl SamuraiReplicator {
                 "samurai replicator: successor session {session_id} started — delivering the gen-{} verify ritual",
                 p.generation
             );
-            (self.write_stdin)(*session_id, format!("{}\r", p.instruction));
+            // Text only — the writer submits it (see [`StdinWriter`]).
+            (self.write_stdin)(*session_id, p.instruction.clone());
         }
     }
 
@@ -2107,13 +2165,14 @@ mod tests {
         h.replicator.observe_hook(&session_started(99));
         assert!(h.writes.lock().unwrap().is_empty());
 
-        // The armed session's first SessionStarted delivers ritual + \r.
+        // The armed session's first SessionStarted delivers the ritual. The
+        // payload carries NO submit key — the writer sends Enter separately
+        // (samurai_pty), because text+CR in one write is read as a paste.
         h.replicator.observe_hook(&session_started(2));
         let writes = h.writes.lock().unwrap().clone();
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].0, 2);
-        assert!(writes[0].1.ends_with('\r'));
-        assert_eq!(writes[0].1.matches('\r').count(), 1, "exactly the final CR");
+        assert!(!writes[0].1.contains('\r'), "no submit key in the payload");
         assert!(!writes[0].1.contains('\n'));
         assert!(writes[0].1.contains("generation 3"));
         assert!(writes[0].1.contains(".maestro/handoffs/epic-9-gen2.md"));
@@ -2271,7 +2330,7 @@ mod tests {
         let writes = h.writes.lock().unwrap().clone();
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].0, 2);
-        assert!(writes[0].1.ends_with('\r'));
+        assert!(!writes[0].1.contains('\r'), "no submit key in the payload");
         assert!(h.replicator.pending_view(3).is_none());
 
         // Exactly one successor_no_start ALERT in the whole flow.
@@ -2661,8 +2720,7 @@ mod tests {
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].0, 2);
         assert!(writes[0].1.contains("RECOVERY MODE"));
-        assert!(writes[0].1.ends_with('\r'));
-        assert_eq!(writes[0].1.matches('\r').count(), 1, "exactly the final CR");
+        assert!(!writes[0].1.contains('\r'), "no submit key in the payload");
 
         // The successor's SPAWN audit row carries the recovery mark.
         let mut spawn_rows = Vec::new();
@@ -3153,7 +3211,9 @@ mod tests {
         h.replicator.observe_hook(&session_started(5));
         let writes = h.writes.lock().unwrap().clone();
         assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0], (5, format!("{brief}\r")));
+        // Verbatim, and WITHOUT a submit key — samurai_pty sends the Enter
+        // as its own write so the CLI does not read the pair as a paste.
+        assert_eq!(writes[0], (5, brief.clone()));
         assert!(h.replicator.pending_view(1).is_none(), "claimed = pruned");
     }
 

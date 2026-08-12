@@ -64,6 +64,7 @@ use super::samurai_config::SharedSamuraiConfig;
 use super::samurai_context::SamuraiContextStore;
 use super::samurai_parker::SamuraiParker;
 use super::samurai_prompts;
+use super::samurai_pty;
 use super::samurai_replicator::SamuraiReplicator;
 use super::supervisor::{SessionSnapshot, Supervisor, SupervisorState};
 use super::windows_process::StdCommandExt;
@@ -203,7 +204,8 @@ struct PendingInstruction {
     project: String,
     epic: String,
     generation: u32,
-    /// The instruction text (no trailing `\r`; added at write time).
+    /// The instruction text. No submit key, ever — `samurai_pty` sends the
+    /// Enter as a separate PTY write at delivery time.
     instruction: String,
     /// Injection attempts so far: 0 (waiting for first idle), 1, or 2 (max).
     attempts: u8,
@@ -228,6 +230,11 @@ struct PendingInstruction {
     /// What the first round's validation/timeout found wrong (rides into the
     /// final `handoff_invalid` ALERT details).
     failure: Option<String>,
+    /// The stuck-wait ALERT already fired for this entry. It stays tracked
+    /// (a long turn ends eventually and the instruction is still owed), but
+    /// the ALERT is one-shot and the parker must stop counting it as pending
+    /// — see [`TimeoutVerdict::AlertStuck`] and `has_pending`.
+    stuck_alerted: bool,
 }
 
 impl PendingInstruction {
@@ -248,6 +255,7 @@ impl PendingInstruction {
             validating: false,
             corrective: false,
             failure: None,
+            stuck_alerted: false,
         }
     }
 }
@@ -340,8 +348,15 @@ enum TimeoutVerdict {
     Alert,
     /// Finding E: a waiting state aged out — the trigger fired but the Stop
     /// hook never came (wedged turn), or the retry was armed and idle never
-    /// came. ALERT once (`never_idled` / `retry_never_injected`) and stop
-    /// tracking: the session cannot be instructed.
+    /// came. ALERT once (`never_idled` / `retry_never_injected`).
+    ///
+    /// Unlike [`Alert`](Self::Alert) the entry is KEPT: "no idle yet" is not
+    /// "cannot be instructed". A long turn — a subagent wave, a full
+    /// build+test — ends eventually, and dropping the entry at the cap left
+    /// the epic stranded for good: the trigger only fires for WORKING
+    /// sessions, the parker skips a mid-handoff session, and the watchdog
+    /// will not call a live `claude` DEAD. The next Stop hook now still
+    /// delivers the instruction it was waiting to deliver.
     AlertStuck,
 }
 
@@ -350,6 +365,14 @@ enum TimeoutVerdict {
 /// `waiting_elapsed` is time since the entry started waiting for an idle
 /// signal (creation / retry armed). Both boundaries are strict (`>`),
 /// matching "no ACK within N seconds".
+///
+/// Two different waits, two different caps. An ARMED RETRY waits for the
+/// Stop of a turn the agent is already known to have finished once, so
+/// `timeout * STUCK_WAIT_MULTIPLIER` fits. A NEVER-INJECTED entry waits for
+/// the end of whatever turn was in flight when the trigger fired — a
+/// subagent wave plus a full build+test — and gets `max_turn_wait`, which is
+/// sized for that. Reusing the ACK window for both is what made a normal
+/// long turn look wedged.
 fn timeout_verdict(
     acked: bool,
     attempts: u8,
@@ -357,22 +380,22 @@ fn timeout_verdict(
     elapsed: Option<Duration>,
     waiting_elapsed: Duration,
     timeout: Duration,
+    max_turn_wait: Duration,
 ) -> TimeoutVerdict {
     if acked {
         return TimeoutVerdict::Keep; // resolved — the written phase owns it
     }
-    let wait_cap = timeout * STUCK_WAIT_MULTIPLIER;
     if awaiting_retry {
         // Retry armed; idle never came (finding E: age-capped, not forever).
-        return if waiting_elapsed > wait_cap {
+        return if waiting_elapsed > timeout * STUCK_WAIT_MULTIPLIER {
             TimeoutVerdict::AlertStuck
         } else {
             TimeoutVerdict::Keep
         };
     }
     let Some(elapsed) = elapsed else {
-        // Trigger fired, Stop never came — same age cap (finding E).
-        return if waiting_elapsed > wait_cap {
+        // Trigger fired, Stop never came — the long-turn cap.
+        return if waiting_elapsed > max_turn_wait {
             TimeoutVerdict::AlertStuck
         } else {
             TimeoutVerdict::Keep
@@ -858,7 +881,7 @@ impl SamuraiInjector {
     /// One trigger + timeout pass. Called from the spawned loop; fully
     /// synchronous (validation I/O is spawned, never run inline).
     pub fn tick(&self) {
-        let (threshold_pct, timeout) = {
+        let (threshold_pct, timeout, max_turn_wait) = {
             let cfg = self
                 .config
                 .read()
@@ -866,6 +889,7 @@ impl SamuraiInjector {
             (
                 cfg.handoff_context_pct,
                 Duration::from_secs(cfg.ack_timeout_secs),
+                Duration::from_secs(cfg.max_turn_wait_secs),
             )
         };
         let written_window = timeout * WRITTEN_WINDOW_MULTIPLIER;
@@ -941,6 +965,9 @@ impl SamuraiInjector {
             });
 
             let mut alerts: Vec<(u32, PendingKind, String, AuditEvent)> = Vec::new();
+            // Stuck-wait alerts are reported like the rest but their entries
+            // are NOT removed below — the instruction is still owed.
+            let mut stuck: Vec<(u32, PendingKind, String, AuditEvent)> = Vec::new();
             for (id, p) in pending.iter_mut() {
                 if !p.acked {
                     // ACK phase — P2.2 plumbing, shared by the corrective
@@ -952,6 +979,7 @@ impl SamuraiInjector {
                         p.injected_at.map(|t| t.elapsed()),
                         p.waiting_since.elapsed(),
                         timeout,
+                        max_turn_wait,
                     ) {
                         TimeoutVerdict::Keep => {}
                         TimeoutVerdict::ArmRetry => {
@@ -964,10 +992,17 @@ impl SamuraiInjector {
                             p.waiting_since = Instant::now();
                         }
                         TimeoutVerdict::AlertStuck => {
-                            // Finding E: no injection was ever possible —
-                            // either the trigger's Stop never came (wedged
-                            // turn) or the armed retry's idle never came.
-                            // One ack_timeout ALERT with the exact flavor.
+                            // Finding E: no injection was possible yet —
+                            // either the trigger's Stop never came (a very
+                            // long turn) or the armed retry's idle never
+                            // came. One ack_timeout ALERT with the exact
+                            // flavor, then KEEP TRACKING: the turn ends
+                            // eventually and the instruction is still owed.
+                            // Latched so the ALERT stays one-shot.
+                            if p.stuck_alerted {
+                                continue;
+                            }
+                            p.stuck_alerted = true;
                             let flag = if p.awaiting_retry {
                                 "retry_never_injected"
                             } else {
@@ -977,6 +1012,10 @@ impl SamuraiInjector {
                                 "kind": "ack_timeout",
                                 "attempts": p.attempts,
                                 "instruction": p.kind.as_str(),
+                                // The entry survives this alert; nothing is
+                                // abandoned. Explicit so an audit reader is
+                                // not left assuming the epic was dropped.
+                                "still_tracked": true,
                             });
                             details[flag] = json!(true);
                             let event = AuditEvent::now(
@@ -986,7 +1025,7 @@ impl SamuraiInjector {
                                 *id,
                                 details,
                             );
-                            alerts.push((*id, p.kind, p.project.clone(), event));
+                            stuck.push((*id, p.kind, p.project.clone(), event));
                         }
                         TimeoutVerdict::Alert => {
                             let event = if p.corrective {
@@ -1041,10 +1080,12 @@ impl SamuraiInjector {
             }
             // Alerted sessions stop being tracked (the removal is what makes
             // the ALERT fire exactly once); they stay in their `*_REQUESTED`
-            // state for human attention.
+            // state for human attention. `stuck` entries are deliberately
+            // NOT removed — their one-shot guard is the `stuck_alerted` flag.
             for (id, _, _, _) in &alerts {
                 pending.remove(id);
             }
+            alerts.extend(stuck);
             alerts
         };
 
@@ -1147,7 +1188,13 @@ impl SamuraiInjector {
     /// Whether a pending instruction (any kind) is being shepherded for the
     /// session. The parker's eligibility/blocking decisions read this.
     pub fn has_pending(&self, session_id: u32) -> bool {
-        self.lock_pending().contains_key(&session_id)
+        // A stuck-alerted entry is still tracked (it delivers on the eventual
+        // Stop) but must NOT read as pending: the parker's `blocks_completion`
+        // would otherwise hold a hard park sweep open for the whole length of
+        // the long turn that got it stuck.
+        self.lock_pending()
+            .get(&session_id)
+            .is_some_and(|p| !p.stuck_alerted)
     }
 
     /// A session that is idle RIGHT NOW (its last signal was a Stop) never
@@ -1178,8 +1225,10 @@ impl SamuraiInjector {
         }
     }
 
-    /// Decision + bookkeeping for an idle signal, no I/O. Returns the exact
-    /// bytes to write (instruction + `\r`) when an injection is due.
+    /// Decision + bookkeeping for an idle signal, no I/O. Returns the
+    /// instruction text when an injection is due — WITHOUT a submit key:
+    /// `samurai_pty::submit_instruction` sends the Enter as its own write, or
+    /// the CLI reads text+CR as one paste and never submits it.
     fn arm_injection_on_idle(&self, session_id: u32) -> Option<String> {
         let state = self.session_state(session_id)?;
         let mut pending = self.lock_pending();
@@ -1196,32 +1245,24 @@ impl SamuraiInjector {
         p.attempts += 1;
         p.injected_at = Some(Instant::now());
         p.awaiting_retry = false;
+        // The long turn finally ended and the instruction went in: the entry
+        // is live again, so it counts as pending once more and a later
+        // genuine stall can raise its own stuck ALERT.
+        p.stuck_alerted = false;
         log::info!(
             "samurai injector: session {session_id} idle — injecting {}{} instruction (attempt {})",
             if p.corrective { "corrective " } else { "" },
             p.kind.as_str(),
             p.attempts
         );
-        Some(format!("{}\r", p.instruction))
+        Some(p.instruction.clone())
     }
 
-    /// Write the instruction into the session's PTY. `write_stdin` is fully
-    /// blocking (std mutex + pipe write with no bounded completion time), so
-    /// it runs on the blocking pool — same pattern as
-    /// `commands::terminal::write_stdin`.
+    /// Write the instruction into the session's PTY, then submit it with a
+    /// separate Enter (`samurai_pty::submit_instruction` — a single
+    /// text-plus-CR write is read as a paste and never submits).
     fn spawn_write(&self, session_id: u32, data: String) {
-        let pm = self.processes.clone();
-        tauri::async_runtime::spawn(async move {
-            match tokio::task::spawn_blocking(move || pm.write_stdin(session_id, &data)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => log::warn!(
-                    "samurai injector: writing instruction to session {session_id} failed: {e}"
-                ),
-                Err(e) => {
-                    log::warn!("samurai injector: write task for session {session_id} failed: {e}")
-                }
-            }
-        });
+        samurai_pty::submit_instruction(self.processes.clone(), session_id, data, "injector");
     }
 
     /// ACK scan for one assistant reply. Only the session's own expected
@@ -1519,6 +1560,12 @@ mod tests {
     const OVER_WINDOW: Option<Duration> = Some(Duration::from_secs(541));
     const UNDER_WINDOW: Option<Duration> = Some(Duration::from_secs(300));
     /// A waiting age safely inside the stuck cap (180s * 3 = 540s).
+    /// The long-turn cap (`max_turn_wait_secs`) and one second past it. A
+    /// never-injected entry waits for the END OF A TURN, so it is governed by
+    /// this, not by the ACK window — a subagent wave plus a build+test run
+    /// legitimately exceeds `TIMEOUT * 3`.
+    const MAX_TURN_WAIT: Duration = Duration::from_secs(1800);
+    const TURN_WAIT_OVER: Duration = Duration::from_secs(1801);
     const WAIT_OK: Duration = Duration::from_secs(60);
     /// A waiting age past the stuck cap (finding E).
     const WAIT_OVER: Duration = Duration::from_secs(541);
@@ -1695,9 +1742,15 @@ mod tests {
             (false, 2, false, OVER, WAIT_OK, Alert), // attempt 2 expired → ALERT once
             (true, 1, false, OVER, WAIT_OK, Keep),  // ACKed: the ACK clock stops
             (true, 2, false, OVER, WAIT_OK, Keep),
-            // Finding E: the waiting states are age-capped, never forever.
-            (false, 0, false, None, WAIT_OVER, AlertStuck), // Stop never came
-            (false, 1, true, OVER, WAIT_OVER, AlertStuck),  // idle never came
+            // Finding E: the waiting states are age-capped, never forever —
+            // but the two waits have DIFFERENT caps.
+            // Never injected: a long turn (past the ACK cap, inside the
+            // turn cap) is normal for an orchestrator running subagents.
+            (false, 0, false, None, WAIT_OVER, Keep),
+            (false, 0, false, None, TURN_WAIT_OVER, AlertStuck), // Stop never came
+            // Armed retry: the agent already finished a turn once, so the
+            // shorter ACK-derived cap still applies.
+            (false, 1, true, OVER, WAIT_OVER, AlertStuck), // idle never came
             (false, 1, true, UNDER, WAIT_OVER, AlertStuck), // cap ignores the injection clock
             // The cap only governs waiting states — an injected, non-retry
             // entry keeps the normal ACK clock even when it is old.
@@ -1708,7 +1761,15 @@ mod tests {
         ];
         for (acked, attempts, awaiting_retry, elapsed, waiting, expected) in table {
             assert_eq!(
-                timeout_verdict(acked, attempts, awaiting_retry, elapsed, waiting, TIMEOUT),
+                timeout_verdict(
+                    acked,
+                    attempts,
+                    awaiting_retry,
+                    elapsed,
+                    waiting,
+                    TIMEOUT,
+                    MAX_TURN_WAIT
+                ),
                 expected,
                 "acked={acked} attempts={attempts} awaiting_retry={awaiting_retry} elapsed={elapsed:?} waiting={waiting:?}"
             );
@@ -1719,7 +1780,7 @@ mod tests {
     fn test_timeout_boundary_is_strict() {
         // "no ACK within N seconds": exactly N is still within.
         assert_eq!(
-            timeout_verdict(false, 1, false, Some(TIMEOUT), WAIT_OK, TIMEOUT),
+            timeout_verdict(false, 1, false, Some(TIMEOUT), WAIT_OK, TIMEOUT, MAX_TURN_WAIT),
             TimeoutVerdict::Keep
         );
         assert_eq!(
@@ -1729,13 +1790,15 @@ mod tests {
                 false,
                 Some(TIMEOUT + Duration::from_millis(1)),
                 WAIT_OK,
-                TIMEOUT
+                TIMEOUT,
+                MAX_TURN_WAIT
             ),
             TimeoutVerdict::ArmRetry
         );
-        // The stuck cap is equally strict: exactly timeout*3 is still within.
+        // The never-injected cap is equally strict: exactly max_turn_wait is
+        // still within.
         assert_eq!(
-            timeout_verdict(false, 0, false, None, TIMEOUT * 3, TIMEOUT),
+            timeout_verdict(false, 0, false, None, MAX_TURN_WAIT, TIMEOUT, MAX_TURN_WAIT),
             TimeoutVerdict::Keep
         );
         assert_eq!(
@@ -1744,8 +1807,26 @@ mod tests {
                 0,
                 false,
                 None,
+                MAX_TURN_WAIT + Duration::from_millis(1),
+                TIMEOUT,
+                MAX_TURN_WAIT
+            ),
+            TimeoutVerdict::AlertStuck
+        );
+        // …and the armed-retry cap keeps its own strict timeout*3 boundary.
+        assert_eq!(
+            timeout_verdict(false, 1, true, OVER, TIMEOUT * 3, TIMEOUT, MAX_TURN_WAIT),
+            TimeoutVerdict::Keep
+        );
+        assert_eq!(
+            timeout_verdict(
+                false,
+                1,
+                true,
+                OVER,
                 TIMEOUT * 3 + Duration::from_millis(1),
-                TIMEOUT
+                TIMEOUT,
+                MAX_TURN_WAIT
             ),
             TimeoutVerdict::AlertStuck
         );
@@ -2125,10 +2206,11 @@ mod tests {
         context.observe(&context_event(1, 50.0));
         injector.tick();
 
-        // First idle → attempt 1, instruction + \r, single pasteable block.
+        // First idle → attempt 1, a single pasteable block with NO submit
+        // key: samurai_pty writes the Enter separately, or the CLI reads
+        // text+CR as one paste and never submits it.
         let data = injector.arm_injection_on_idle(1).expect("must inject");
-        assert!(data.ends_with('\r'));
-        assert_eq!(data.matches('\r').count(), 1, "exactly the final CR");
+        assert!(!data.contains('\r'), "no submit key in the payload");
         assert!(!data.contains('\n'));
         assert!(data.contains("<samurai-ack>handoff gen-3</samurai-ack>"));
         // Issue #54: the full brief rides along — file path + written marker.
@@ -2406,7 +2488,7 @@ mod tests {
         assert!(data.contains("WIP is not committed"));
         assert!(data.contains("<samurai-ack>handoff gen-2 retry</samurai-ack>"));
         assert!(data.contains("<samurai-handoff-written>gen-2 retry</samurai-handoff-written>"));
-        assert!(!data[..data.len() - 1].contains('\r') && !data.contains('\n'));
+        assert!(!data.contains('\r') && !data.contains('\n'));
 
         // A replay of ROUND 1's markers (claude --resume rewrites history
         // into a new transcript, read from byte 0) must not touch the
@@ -2706,15 +2788,29 @@ mod tests {
         injector.tick(); // trigger; the session never goes idle (wedged turn)
         assert_eq!(injector.pending_view(1), Some((0, false, false)));
 
-        // Inside the cap: kept, still waiting.
+        // Inside the cap: kept, still waiting. A turn long enough to blow the
+        // ACK window is normal for an orchestrator running subagents, so the
+        // never-injected wait is governed by max_turn_wait, not ack_timeout*3.
         injector.tick();
         assert!(injector.pending_view(1).is_some());
-
-        // Past ack_timeout*3 with no injection possible: single ALERT with
-        // the never_idled flavor, tracking stops.
         injector.backdate_waiting(1, WAIT_OVER);
         injector.tick();
-        assert!(injector.pending_view(1).is_none(), "tracking stopped");
+        assert!(
+            injector.pending_view(1).is_some(),
+            "a long turn is not a stall"
+        );
+
+        // Past max_turn_wait with no injection possible: single ALERT with
+        // the never_idled flavor — but tracking CONTINUES. The turn ends
+        // eventually and the instruction is still owed; dropping the entry
+        // here used to strand the epic with no handoff, no park and no
+        // recovery for the rest of the app's lifetime.
+        injector.backdate_waiting(1, TURN_WAIT_OVER);
+        injector.tick();
+        assert!(
+            injector.pending_view(1).is_some(),
+            "still tracked after the stuck ALERT"
+        );
         assert_eq!(injector.session_state(1), Some(HandoffRequested));
 
         let mut alerts: Vec<AuditEvent> = Vec::new();
@@ -2732,8 +2828,12 @@ mod tests {
         assert_eq!(alerts.len(), 1, "the ALERT fires exactly once");
         assert_eq!(alerts[0].details["never_idled"], true);
         assert_eq!(alerts[0].details["attempts"], 0);
+        assert_eq!(
+            alerts[0].details["still_tracked"], true,
+            "the audit row says the instruction is still owed"
+        );
 
-        // Further ticks stay quiet.
+        // Further ticks stay quiet — the ALERT is latched, not re-fired.
         injector.tick();
         let rows = audit.read(project, None, None).await.unwrap().events;
         assert_eq!(
@@ -2742,6 +2842,16 @@ mod tests {
                 .count(),
             1
         );
+
+        // The parker must not count a stuck entry as pending, or a hard park
+        // sweep would stay open for the whole length of the long turn.
+        assert!(!injector.has_pending(1), "stuck entry does not block a sweep");
+
+        // The long turn finally ends: the instruction goes in after all, and
+        // the entry counts as live again.
+        assert!(injector.arm_injection_on_idle(1).is_some(), "late idle delivers");
+        assert_eq!(injector.pending_view(1), Some((1, false, false)));
+        assert!(injector.has_pending(1), "live again once injected");
     }
 
     #[tokio::test]
@@ -2761,9 +2871,14 @@ mod tests {
         injector.tick();
         assert_eq!(injector.pending_view(1), Some((1, false, true)));
 
+        // An ARMED RETRY keeps the shorter ack_timeout*3 cap: the agent has
+        // already finished one turn, so its next Stop is not far off.
         injector.backdate_waiting(1, WAIT_OVER);
         injector.tick();
-        assert!(injector.pending_view(1).is_none(), "tracking stopped");
+        assert!(
+            injector.pending_view(1).is_some(),
+            "still tracked after the stuck ALERT"
+        );
 
         let mut alerts: Vec<AuditEvent> = Vec::new();
         for _ in 0..200 {
@@ -2780,6 +2895,12 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].details["retry_never_injected"], true);
         assert_eq!(alerts[0].details["attempts"], 1);
+        assert_eq!(alerts[0].details["still_tracked"], true);
+
+        // The retry still lands when the idle finally arrives.
+        assert!(!injector.has_pending(1), "stuck entry does not block a sweep");
+        assert!(injector.arm_injection_on_idle(1).is_some(), "late idle delivers");
+        assert_eq!(injector.pending_view(1), Some((2, false, false)));
     }
 
     // --- fresh-eyes finding H: teardown propagation ---
@@ -2846,7 +2967,7 @@ mod tests {
         assert!(data.contains("<samurai-ack>park gen-2</samurai-ack>"));
         assert!(data.contains(".maestro/handoffs/epic-9-gen2.md"));
         assert!(data.contains("<samurai-handoff-written>gen-2 park</samurai-handoff-written>"));
-        assert!(!data[..data.len() - 1].contains('\r') && !data.contains('\n'));
+        assert!(!data.contains('\r') && !data.contains('\n'));
 
         // A replayed HANDOFF ACK for the same generation must not ACK the
         // park (kind-scoped values), and a replayed handoff written marker
