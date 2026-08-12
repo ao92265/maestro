@@ -9,7 +9,11 @@ import {
   RotateCcw,
 } from "lucide-react";
 
-import { listClaudeSessions, type ClaudeSessionInfo } from "@/lib/terminal";
+import {
+  EMPTY_CLAUDE_SESSION_LISTING,
+  listClaudeSessions,
+  type ClaudeSessionInfo,
+} from "@/lib/terminal";
 import { listWorktrees, type WorktreeInfo } from "@/lib/worktreeManager";
 import { projectColorFor } from "@/lib/projectColor";
 import { useActivityStore } from "@/stores/useActivityStore";
@@ -103,13 +107,15 @@ export function HistorySection({ onLaunch }: HistorySectionProps) {
         .map((w) => w.path),
     ];
     const perPath = await Promise.all(
-      searchPaths.map((path) => listClaudeSessions(path).catch(() => [] as ClaudeSessionInfo[]))
+      searchPaths.map((path) =>
+        listClaudeSessions(path).catch(() => EMPTY_CLAUDE_SESSION_LISTING)
+      )
     );
 
     // A session resumed in a different directory is written to both, so dedupe
     // on id (keeping the most recent) to avoid duplicate rows and React keys.
     const byId = new Map<string, ClaudeSessionInfo>();
-    for (const conv of perPath.flat()) {
+    for (const conv of perPath.flatMap((listing) => listing.sessions)) {
       const seen = byId.get(conv.session_id);
       if (!seen || conv.last_active > seen.last_active) byId.set(conv.session_id, conv);
     }
@@ -208,13 +214,20 @@ export function HistorySection({ onLaunch }: HistorySectionProps) {
                             type="button"
                             // Resume in the conversation's own directory —
                             // `claude --resume` cannot find the session from
-                            // anywhere else. Null means the directory is gone,
-                            // so fall back to the project path.
+                            // anywhere else. The backend now reports a gone
+                            // directory instead of blanking it, so the shell
+                            // must not be pointed at it: fall back to the
+                            // project path when cwd_exists is false.
                             onClick={() =>
-                              queueLaunch(tab, conv.session_id, conv.cwd, conv.git_branch)
+                              queueLaunch(
+                                tab,
+                                conv.session_id,
+                                conv.cwd_exists ? conv.cwd : null,
+                                conv.git_branch
+                              )
                             }
                             title={
-                              conv.cwd
+                              conv.cwd_exists
                                 ? `Resume this conversation in ${conv.cwd}`
                                 : "Original directory is gone — this conversation may not resume"
                             }

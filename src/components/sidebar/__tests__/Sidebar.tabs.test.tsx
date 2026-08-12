@@ -109,17 +109,27 @@ function mockInvoke() {
       // History tab reads. Claude files transcripts per working directory, so
       // this conversation only shows up if the worktree is scanned too.
       case "list_claude_sessions":
-        if (args?.projectPath !== WORKTREE_PATH) return [];
-        return [
-          {
-            session_id: "11111111-2222-3333-4444-555555555555",
-            first_prompt: "Fix the login bug",
-            started_at: "2026-07-29T08:00:00Z",
-            last_active: "2026-07-29T09:00:00Z",
-            git_branch: "feat/login",
-            cwd: WORKTREE_PATH,
-          },
-        ];
+        if (args?.projectPath !== WORKTREE_PATH) {
+          return { sessions: [], total_found: 0, truncated: false, unreadable: 0 };
+        }
+        return {
+          sessions: [
+            {
+              session_id: "11111111-2222-3333-4444-555555555555",
+              first_prompt: "Fix the login bug",
+              last_activity: "Opened the PR",
+              started_at: "2026-07-29T08:00:00Z",
+              last_active: "2026-07-29T09:00:00Z",
+              message_count: 42,
+              git_branch: "feat/login",
+              cwd: WORKTREE_PATH,
+              cwd_exists: true,
+            },
+          ],
+          total_found: 1,
+          truncated: false,
+          unreadable: 0,
+        };
       case "git_worktree_list":
         return [
           {
@@ -232,22 +242,32 @@ describe("Sidebar tab bar", () => {
 
   it("History tab falls back to the project path when the directory is gone", async () => {
     usePendingLaunchStore.setState({ pending: [] });
-    // A deleted worktree: the backend nulls out cwd so the shell can still spawn.
+    // A deleted worktree: the backend still reports the directory it recorded
+    // (so the UI can name it) but flags it as gone, and the launch must not be
+    // pointed there or the shell cannot spawn.
     // Override only the History reads — other sections feed shared stores that
     // outlive the test, so they must keep their well-formed shapes.
     const base = invokeMock.getMockImplementation()!;
     invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
       if (cmd === "list_claude_sessions") {
-        return [
-          {
-            session_id: "99999999-8888-7777-6666-555555555555",
-            first_prompt: "Work in a deleted worktree",
-            started_at: "2026-07-29T08:00:00Z",
-            last_active: "2026-07-29T09:00:00Z",
-            git_branch: "feat/gone",
-            cwd: null,
-          },
-        ];
+        return {
+          sessions: [
+            {
+              session_id: "99999999-8888-7777-6666-555555555555",
+              first_prompt: "Work in a deleted worktree",
+              last_activity: null,
+              started_at: "2026-07-29T08:00:00Z",
+              last_active: "2026-07-29T09:00:00Z",
+              message_count: 7,
+              git_branch: "feat/gone",
+              cwd: "C:\\worktrees\\deleted",
+              cwd_exists: false,
+            },
+          ],
+          total_found: 1,
+          truncated: false,
+          unreadable: 0,
+        };
       }
       if (cmd === "git_worktree_list") return [];
       return base(cmd, args);

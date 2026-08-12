@@ -134,8 +134,13 @@ describe("TerminalGrid samurai tile close", () => {
     invokeMock.mockReset();
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "generate_project_hash") return "hash";
-      // Everything else the card/grid probes (resume sessions, mcp projects)
-      // is a list — an undefined default crashes PreLaunchCard.
+      // The session listing reports what it could not return, so it is an
+      // object, not a bare list.
+      if (cmd === "list_claude_sessions") {
+        return { sessions: [], total_found: 0, truncated: false, unreadable: 0 };
+      }
+      // Everything else the card/grid probes (mcp projects, plugins) is a
+      // list — an undefined default crashes PreLaunchCard.
       return [];
     });
     killSessionMock.mockClear();
