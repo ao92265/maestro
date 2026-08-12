@@ -7,7 +7,7 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
-import { ThinkingIndicator } from "../ThinkingIndicator";
+import { SessionStatusDot, ThinkingIndicator } from "../ThinkingIndicator";
 import { useSessionStore, type BackendSessionStatus, type SessionConfig } from "@/stores/useSessionStore";
 
 function session(status: BackendSessionStatus): SessionConfig {
@@ -62,6 +62,52 @@ describe("ThinkingIndicator", () => {
       expect(dot).not.toHaveClass("animate-thinking-dot");
       expect(dot).toHaveClass("opacity-60");
     }
+  });
+
+  /**
+   * Issue #77 cause 6: every state that is not Working/NeedsInput used to be
+   * labelled "Idle", so a crashed, finished or still-starting agent read
+   * exactly like one with nothing to do.
+   */
+  it("names every state instead of calling them all idle", () => {
+    const cases: Array<[BackendSessionStatus, string]> = [
+      ["Starting", "Starting up"],
+      ["Idle", "Idle"],
+      ["Done", "Finished"],
+      ["Error", "Errored"],
+      ["Timeout", "Startup timed out"],
+    ];
+    for (const [status, label] of cases) {
+      useSessionStore.setState({ sessions: [session(status)] });
+      const { unmount } = render(<ThinkingIndicator sessionId={1} />);
+      expect(screen.getByRole("status")).toHaveAttribute("aria-label", label);
+      unmount();
+    }
+  });
+
+  it("still says something when no status has been reported at all", () => {
+    useSessionStore.setState({ sessions: [] });
+    render(<ThinkingIndicator sessionId={1} />);
+
+    expect(screen.getByRole("status")).toHaveAttribute("aria-label", "No status reported");
+  });
+
+  it("never animates a session that has stopped", () => {
+    for (const status of ["Done", "Error", "Timeout", "Idle"] as BackendSessionStatus[]) {
+      useSessionStore.setState({ sessions: [session(status)] });
+      const { unmount } = render(<ThinkingIndicator sessionId={1} />);
+      for (const dot of dots()) {
+        expect(dot).not.toHaveClass("animate-thinking-dot");
+      }
+      unmount();
+    }
+  });
+
+  it("labels the bare status dot as well", () => {
+    useSessionStore.setState({ sessions: [session("NeedsInput")] });
+    render(<SessionStatusDot sessionId={1} />);
+
+    expect(screen.getByRole("img")).toHaveAttribute("aria-label", "Awaiting user input");
   });
 
   it("staggers the three dots so they ripple rather than blink together", () => {
