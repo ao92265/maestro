@@ -19,9 +19,16 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   ask: vi.fn(),
 }));
 
+// useSessionStore binds Tauri event listeners at call time; nothing in these
+// tests listens, but the import must not reach a real event bridge.
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn().mockResolvedValue(() => {}),
+}));
+
 import { LaunchSection } from "../LaunchSection";
 import type { SamuraiPreflight, SamuraiRunConfig } from "@/lib/samurai";
 import type { UsageData } from "@/lib/usageParser";
+import { useSessionStore, type SamuraiSessionInfo } from "@/stores/useSessionStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 
 const invokeMock = vi.mocked(invoke);
@@ -137,12 +144,29 @@ function callsOf(cmd: string) {
   return invokeMock.mock.calls.filter(([name]) => name === cmd);
 }
 
+/** One supervised session, exactly as the supervisor registers it (issue #84). */
+function supervised(overrides: Partial<SamuraiSessionInfo> = {}): SamuraiSessionInfo {
+  return {
+    project: "C:\\git\\maestro",
+    // The supervisor registers under the run's identity string, so this is
+    // the same field the run config carries.
+    epic: "#38",
+    generation: 1,
+    state: "WORKING",
+    ...overrides,
+  };
+}
+
+/** The per-run "open the agent" button of a run labelled `epic`. */
+const OPEN_LABEL = (epic: string) => `Open the agent for run ${epic}`;
+
 describe("LaunchSection (issue #63)", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     askMock.mockReset();
     mockInvoke();
     useWorkspaceStore.setState({ tabs: [buildTab()] });
+    useSessionStore.setState({ samuraiBySessionId: {} });
   });
 
   it("renders the form with the active project and a disabled Launch button", async () => {
@@ -463,5 +487,78 @@ describe("LaunchSection (issue #63)", () => {
     expect(
       await screen.findByText(/launch refused: this epic already has a live supervised session/),
     ).toBeInTheDocument();
+  });
+
+  it("opens the newest live generation of a run's agent (issue #84)", async () => {
+    mockInvoke({ runs: [run()] });
+    useSessionStore.setState({
+      samuraiBySessionId: {
+        // gen-1, killed when gen-2 replaced it (issue #55 replication).
+        4: supervised({ generation: 1, state: "KILLED" }),
+        // gen-2, the one actually working — and registered under the
+        // backend's canonical `\\?\` spelling of the same directory.
+        7: supervised({ project: "\\\\?\\C:\\git\\maestro", generation: 2 }),
+        // A higher generation of the same ref in ANOTHER project: never it.
+        9: supervised({ project: "C:\\git\\other", generation: 3 }),
+      },
+    });
+    const onNavigate = vi.fn();
+    render(<LaunchSection onNavigate={onNavigate} />);
+
+    const button = await screen.findByRole("button", { name: OPEN_LABEL("#38") });
+    expect(button).toBeEnabled();
+    fireEvent.click(button);
+
+    expect(onNavigate).toHaveBeenCalledTimes(1);
+    expect(onNavigate).toHaveBeenCalledWith("tab-1", 7);
+  });
+
+  it("disables the open button and says why when no agent is registered", async () => {
+    mockInvoke({ runs: [run()] });
+    const onNavigate = vi.fn();
+    render(<LaunchSection onNavigate={onNavigate} />);
+
+    const button = await screen.findByRole("button", { name: OPEN_LABEL("#38") });
+    expect(button).toBeDisabled();
+    // The reason hangs off the wrapper — a disabled button never gets hovered.
+    expect(screen.getByTitle(/not running in this Maestro session/)).toBeInTheDocument();
+    fireEvent.click(button);
+    expect(onNavigate).not.toHaveBeenCalled();
+  });
+
+  it("names parking as the reason when the run's tile was closed", async () => {
+    mockInvoke({ runs: [run()] });
+    useSessionStore.setState({
+      samuraiBySessionId: { 3: supervised({ generation: 2, state: "PARKED" }) },
+    });
+    render(<LaunchSection onNavigate={vi.fn()} />);
+
+    expect(await screen.findByRole("button", { name: OPEN_LABEL("#38") })).toBeDisabled();
+    expect(screen.getByTitle(/it was parked/)).toBeInTheDocument();
+  });
+
+  it("never cross-focuses two projects running the same epic ref", async () => {
+    mockInvoke({ runs: [run(), run({ project_path: "C:\\git\\other" })] });
+    // Only the second project has a live agent under `#38`.
+    useSessionStore.setState({
+      samuraiBySessionId: { 12: supervised({ project: "C:\\git\\other" }) },
+    });
+    useWorkspaceStore.setState({
+      tabs: [
+        buildTab(),
+        buildTab({ id: "tab-2", name: "other", projectPath: "C:\\git\\other", active: false }),
+      ],
+    });
+    const onNavigate = vi.fn();
+    render(<LaunchSection onNavigate={onNavigate} />);
+
+    // Rows keep samurai_list_runs order: [0] is maestro, [1] is other.
+    const buttons = await screen.findAllByRole("button", { name: OPEN_LABEL("#38") });
+    expect(buttons).toHaveLength(2);
+    expect(buttons[0]).toBeDisabled();
+    expect(buttons[1]).toBeEnabled();
+
+    fireEvent.click(buttons[1]);
+    expect(onNavigate).toHaveBeenCalledWith("tab-2", 12);
   });
 });

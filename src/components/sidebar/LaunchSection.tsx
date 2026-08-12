@@ -7,10 +7,12 @@ import {
   Loader2,
   RefreshCw,
   Rocket,
+  TerminalSquare,
   Trash2,
   XCircle,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { samePath } from "@/lib/path";
 import {
   samuraiCleanupEpic,
   samuraiLaunchRun,
@@ -18,10 +20,16 @@ import {
   samuraiPreflight,
   type SamuraiPreflight,
   type SamuraiRunConfig,
+  type SamuraiSupervisorState,
 } from "@/lib/samurai";
 import type { UsageData } from "@/lib/usageParser";
+import {
+  SAMURAI_TILE_CLOSE_STATES,
+  useSessionStore,
+  type SamuraiSessionInfo,
+} from "@/stores/useSessionStore";
 import { useUsageStore } from "@/stores/useUsageStore";
-import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
+import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 import { cardClass, SectionHeader } from "./sectionChrome";
 
 /** Last path segment, for compact project display. */
@@ -204,16 +212,88 @@ function ModelPicker({
   );
 }
 
-/** One active run with its cleanup action. */
+/** Where a run's live agent sits, or why it cannot be opened (issue #84). */
+type OpenTarget =
+  | { kind: "open"; tabId: string; sessionId: number }
+  | { kind: "blocked"; reason: string };
+
+/** Hover text of an openable run's button. */
+const OPEN_HINT = "Switch to this run's project and focus its live agent's terminal";
+
+/** Nothing is registered under this run at all. */
+const NO_SESSION_REASON = "No live agent for this run — it is not running in this Maestro session";
+
+/**
+ * Why a run that IS registered still has no tile to focus. Only the states
+ * whose tile the frontend closes (`SAMURAI_TILE_CLOSE_STATES`) land here —
+ * DEAD deliberately keeps its tile, so a dead agent stays openable.
+ */
+const CLOSED_TILE_REASON: Partial<Record<SamuraiSupervisorState, string>> = {
+  PARKED: "No live agent for this run — it was parked, and resuming starts a fresh agent",
+  KILLED: "No live agent for this run — its agent was killed",
+};
+
+/**
+ * Finds the terminal to open for one run.
+ *
+ * The run's `epic` is its identity AND the string the supervisor registers its
+ * session under (issue #83), so the two compare directly — trimmed, because a
+ * legacy config and a live registration can differ by padding. Project paths
+ * go through `samePath`, never `===`: the same directory has several spellings
+ * on Windows, and matching on the ref alone would cross-focus two projects
+ * running the same epic number.
+ */
+function findOpenTarget(
+  run: SamuraiRunConfig,
+  samuraiBySessionId: Record<number, SamuraiSessionInfo>,
+  tabs: WorkspaceTab[],
+): OpenTarget {
+  const matches = Object.entries(samuraiBySessionId)
+    .map(([id, info]) => ({ sessionId: Number(id), info }))
+    .filter(
+      ({ info }) =>
+        info.epic.trim() === run.epic.trim() && samePath(info.project, run.project_path),
+    )
+    // Newest generation first: with several alive, that is the one working.
+    .sort((a, b) => b.info.generation - a.info.generation);
+  if (matches.length === 0) return { kind: "blocked", reason: NO_SESSION_REASON };
+
+  const live = matches.find(({ info }) => !SAMURAI_TILE_CLOSE_STATES.has(info.state));
+  if (!live) {
+    // The newest generation's state is the honest reason — an older gen being
+    // KILLED says nothing about why the run has no terminal now.
+    return {
+      kind: "blocked",
+      reason: CLOSED_TILE_REASON[matches[0].info.state] ?? NO_SESSION_REASON,
+    };
+  }
+
+  const tab = tabs.find((t) => samePath(t.projectPath, run.project_path));
+  if (!tab) {
+    return {
+      kind: "blocked",
+      reason: "No live agent for this run — its project is not open in a tab",
+    };
+  }
+  return { kind: "open", tabId: tab.id, sessionId: live.sessionId };
+}
+
+/** One active run with its open-the-agent and cleanup actions. */
 function RunRow({
   run,
+  target,
+  onOpen,
   onCleanup,
   busy,
 }: {
   run: SamuraiRunConfig;
+  target: OpenTarget;
+  onOpen: (tabId: string, sessionId: number) => void;
   onCleanup: (run: SamuraiRunConfig) => void;
   busy: boolean;
 }) {
+  const open = target.kind === "open" ? target : null;
+  const openHint = target.kind === "open" ? OPEN_HINT : target.reason;
   return (
     <div
       className="flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] hover:bg-maestro-surface"
@@ -229,6 +309,20 @@ function RunRow({
         {run.epic}
         <span className="text-maestro-muted"> · {baseName(run.project_path)}</span>
         {run.model ? <span className="text-maestro-muted"> · {run.model}</span> : null}
+      </span>
+      {/* The reason rides the wrapper, not the button: a disabled button takes
+          no pointer events, so its own `title` would never surface — and the
+          row's worktree tooltip would answer the hover instead. */}
+      <span className="flex shrink-0" title={openHint}>
+        <button
+          type="button"
+          onClick={() => open && onOpen(open.tabId, open.sessionId)}
+          disabled={open === null}
+          className="rounded p-1 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-accent disabled:opacity-40"
+          aria-label={`Open the agent for run ${run.epic}`}
+        >
+          <TerminalSquare size={12} />
+        </button>
       </span>
       <button
         type="button"
@@ -282,12 +376,21 @@ const PHASE_LABEL: Record<LaunchPhase, string> = {
  * override — behind ONE Launch button that runs preflight itself and reports
  * the phase it is in. Below it, the active runs (`samurai_list_runs`) with
  * per-run destructive cleanup behind the same ask()-confirm pattern as the
- * audit clear.
+ * audit clear, and (issue #84) a per-run jump to the agent working it.
+ *
+ * `onNavigate` is the same sidebar→terminal route the Agents section takes
+ * (App's `handleAgentNavigate`): select the project tab, then zoom its pane —
+ * which unparks the session on the way in.
  */
-export function LaunchSection() {
+export function LaunchSection({
+  onNavigate,
+}: {
+  onNavigate?: (tabId: string, sessionId: number) => void;
+}) {
   const tabs = useWorkspaceStore((s) => s.tabs);
   const activeTab = tabs.find((t) => t.active);
   const projectPath = activeTab?.projectPath ?? "";
+  const samuraiBySessionId = useSessionStore((s) => s.samuraiBySessionId);
 
   const usage = useUsageStore((s) => s.usage);
   const startPolling = useUsageStore((s) => s.startPolling);
@@ -657,6 +760,8 @@ export function LaunchSection() {
               <RunRow
                 key={`${run.project_path}-${run.epic}`}
                 run={run}
+                target={findOpenTarget(run, samuraiBySessionId, tabs)}
+                onOpen={(tabId, sessionId) => onNavigate?.(tabId, sessionId)}
                 onCleanup={handleCleanup}
                 busy={cleaningEpic !== null}
               />
