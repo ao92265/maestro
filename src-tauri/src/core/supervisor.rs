@@ -399,11 +399,12 @@ fn validate_transition(
     // One in-flight instruction max. DEAD is exempt: the watchdog declaring a
     // session dead is an observation, not an instruction.
     let starts_instruction = matches!(to, HandoffRequested | ParkRequested);
-    if starts_instruction && in_flight.is_some() {
-        return Err(format!(
-            "an instruction is already in flight ({:?}); one in-flight instruction max",
-            in_flight.unwrap()
-        ));
+    if starts_instruction {
+        if let Some(pending) = in_flight {
+            return Err(format!(
+                "an instruction is already in flight ({pending:?}); one in-flight instruction max"
+            ));
+        }
     }
 
     // HANDOFF and PARK are mutually exclusive. If the allowance crosses

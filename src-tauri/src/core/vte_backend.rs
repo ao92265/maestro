@@ -24,8 +24,8 @@ use vte::{Parser, Perform};
 use libc;
 
 use super::terminal_backend::{
-    BackendCapabilities, BackendType, CursorShape, SubscriptionHandle, TerminalBackend,
-    TerminalConfig, TerminalError, TerminalState,
+    BackendCapabilities, BackendType, CursorShape, OutputCallback, SubscriptionHandle,
+    TerminalBackend, TerminalConfig, TerminalError, TerminalState,
 };
 
 /// Stateful UTF-8 decoder that handles split multi-byte sequences.
@@ -541,7 +541,7 @@ impl TerminalBackend for VteBackend {
             .map(|h| h.get_state())
     }
 
-    fn subscribe_output(&self, _callback: Box<dyn Fn(&[u8]) + Send + Sync>) -> SubscriptionHandle {
+    fn subscribe_output(&self, _callback: OutputCallback) -> SubscriptionHandle {
         SubscriptionHandle::new(())
     }
 

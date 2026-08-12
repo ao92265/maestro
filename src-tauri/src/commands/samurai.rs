@@ -195,10 +195,11 @@ pub struct GhAuthCheck {
     pub error: Option<String>,
 }
 
-/// Preflight results (PRD §5.8). Two probed checks; the third launch gate —
-/// "issues declared triaged/agent-ready" — is a USER DECLARATION (a checkbox
-/// in the launcher form, PRD decision #11), not something Maestro analyzes,
-/// so it never appears here.
+/// Preflight results (PRD §5.8). Two probed checks. Agent-readiness of the
+/// epic's issues used to be a third gate — a user checkbox (PRD decision
+/// #11) — but a human ticking a box proved no more reliable than not asking:
+/// gen-1 now assesses readiness itself as step 1 of its brief
+/// (`launch_instruction`), so nothing about it appears here either.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SamuraiPreflight {
     pub gh_auth: GhAuthCheck,
@@ -264,30 +265,42 @@ pub async fn samurai_preflight(project_path: String) -> Result<SamuraiPreflight,
     Ok(run_preflight(&project).await)
 }
 
-/// The epic's dedicated branch: `samurai/<epic_slug>` (PRD §5.9 — one
-/// stable worktree per epic; the slug is the same identity the handoff
-/// files and run configs use).
+/// The epic's dedicated branch: `samurai-<epic_slug>` (PRD §5.9 — one stable
+/// worktree per epic; the slug is the same identity the handoff files and run
+/// configs use).
+///
+/// A HYPHEN, not a slash, on purpose. Git stores each branch as a file under
+/// `refs/heads/`, so `samurai/38` needs `samurai` to be a DIRECTORY — which
+/// is impossible while the repo also has a branch literally named `samurai`.
+/// The PRD mandates that staging branch (§9), so the run branches are the
+/// side that has to move out of the namespace.
 fn epic_branch(epic: &str) -> String {
-    format!("samurai/{}", epic_slug(epic))
+    format!("samurai-{}", epic_slug(epic))
+}
+
+/// Canonical spelling of what the user typed in the launcher's "Issues" field.
+///
+/// The field accepts an epic ref, ONE issue, or a comma-separated list
+/// (`77, 78`) — a run is scoped to a set of issues, and an epic is just the
+/// common case where that set is named by one parent. Splitting on commas
+/// lets `#77,78` and `#77 , 78` land on the same identity, which matters:
+/// this string is the run's key everywhere (branch slug, worktree, handoff
+/// filenames, resume timers), so two spellings of one run must not produce
+/// two runs. Whitespace inside a single ref is collapsed for the same reason.
+fn normalize_epic_ref(epic: &str) -> String {
+    epic.split(',')
+        .map(|part| part.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The launch refusal matrix, in check order. `None` = clear to launch.
-fn launch_refusal(
-    preflight: &SamuraiPreflight,
-    issues_triaged: bool,
-    live_session: bool,
-) -> Option<String> {
+fn launch_refusal(preflight: &SamuraiPreflight, live_session: bool) -> Option<String> {
     if live_session {
         return Some(
             "launch refused: this epic already has a live supervised session — let it finish \
              or clean the epic up first"
-                .to_string(),
-        );
-    }
-    if !issues_triaged {
-        return Some(
-            "launch refused: declare the epic's issues triaged/agent-ready (planned with \
-             Claude) first"
                 .to_string(),
         );
     }
@@ -392,11 +405,10 @@ pub(crate) async fn launch_run_inner(
     project: &str,
     epic: &str,
     model: Option<String>,
-    issues_triaged: bool,
     handoff_context_pct: Option<f64>,
     worktree_base: Option<&Path>,
 ) -> Result<SamuraiLaunchResult, String> {
-    let epic = epic.trim().to_string();
+    let epic = normalize_epic_ref(epic);
     if epic.is_empty() {
         return Err("an epic reference is required".to_string());
     }
@@ -408,7 +420,7 @@ pub(crate) async fn launch_run_inner(
     let live_session = supervisor.list_sessions().iter().any(|s| {
         s.project == project && epic_slug(&s.epic) == epic_slug(&epic) && !s.state.is_terminal()
     });
-    if let Some(refusal) = launch_refusal(preflight, issues_triaged, live_session) {
+    if let Some(refusal) = launch_refusal(preflight, live_session) {
         return Err(refusal);
     }
 
@@ -488,6 +500,9 @@ pub(crate) async fn launch_run_inner(
 /// ACTIVE run config → spawn gen-1 with its opening brief. The SPAWN audit
 /// row lands via the existing registration path with
 /// `details.trigger: "launch"`.
+// Every `State` parameter is Tauri's dependency injection: the macro resolves
+// them by type, so they cannot be bundled into one struct without losing it.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn samurai_launch_run(
     supervisor: State<'_, Arc<Supervisor>>,
@@ -499,7 +514,6 @@ pub async fn samurai_launch_run(
     project_path: String,
     epic: String,
     model: Option<String>,
-    issues_triaged: bool,
     handoff_context_pct: Option<f64>,
 ) -> Result<SamuraiLaunchResult, String> {
     let project = canonical_project_path(&project_path);
@@ -519,7 +533,6 @@ pub async fn samurai_launch_run(
         &project,
         &epic,
         model,
-        issues_triaged,
         handoff_context_pct,
         None,
     )
@@ -630,7 +643,7 @@ pub(crate) async fn cleanup_epic_inner(
         (false, None)
     };
 
-    // 4. Delete the samurai/<slug> branch. `-D` on purpose: by the time a
+    // 4. Delete the samurai-<slug> branch. `-D` on purpose: by the time a
     //    human confirms this destructive cleanup, completed work lives in
     //    PRs on the fork (PRD §5.9/§12). Already gone → reported.
     let branches = git
@@ -661,7 +674,7 @@ pub(crate) async fn cleanup_epic_inner(
 }
 
 /// One-click epic cleanup (PRD §5.9): cancel the resume timer, archive the
-/// run config, remove the epic worktree, delete the `samurai/<slug>` branch.
+/// run config, remove the epic worktree, delete the `samurai-<slug>` branch.
 /// Refuses while a live supervised session exists; idempotent otherwise —
 /// already-gone pieces are reported in the [`SamuraiCleanupReport`], never
 /// errors. The UI confirms before calling (destructive, never silent).
@@ -891,28 +904,42 @@ mod tests {
     #[test]
     fn test_launch_refusal_matrix() {
         // All gates pass → clear to launch.
-        assert_eq!(launch_refusal(&preflight(true, true), true, false), None);
+        assert_eq!(launch_refusal(&preflight(true, true), false), None);
         // Each failing gate refuses with its own reason, in check order.
-        let live = launch_refusal(&preflight(true, true), true, true).unwrap();
+        let live = launch_refusal(&preflight(true, true), true).unwrap();
         assert!(live.contains("live supervised session"));
-        let untriaged = launch_refusal(&preflight(true, true), false, false).unwrap();
-        assert!(untriaged.contains("triaged"));
-        let no_auth = launch_refusal(&preflight(false, true), true, false).unwrap();
+        let no_auth = launch_refusal(&preflight(false, true), false).unwrap();
         assert!(no_auth.contains("gh auth"));
         assert!(no_auth.contains("not authenticated"));
-        let no_window = launch_refusal(&preflight(true, false), true, false).unwrap();
+        let no_window = launch_refusal(&preflight(true, false), false).unwrap();
         assert!(no_window.contains("no governing allowance window"));
         // A live session outranks everything (destructive-adjacent first).
-        let both = launch_refusal(&preflight(false, false), false, true).unwrap();
+        let both = launch_refusal(&preflight(false, false), true).unwrap();
         assert!(both.contains("live supervised session"));
     }
 
     #[test]
     fn test_epic_branch_shape() {
-        assert_eq!(epic_branch("#38"), "samurai/38");
-        assert_eq!(epic_branch("Epic 12: Auth"), "samurai/epic-12-auth");
+        assert_eq!(epic_branch("#38"), "samurai-38");
+        assert_eq!(epic_branch("Epic 12: Auth"), "samurai-epic-12-auth");
         // The empty-ref fallback still yields a legal branch name.
-        assert_eq!(epic_branch(""), "samurai/epic");
+        assert_eq!(epic_branch(""), "samurai-epic");
+        // A comma-separated list is one run, so it is one branch.
+        assert_eq!(epic_branch("77, 78"), "samurai-77-78");
+    }
+
+    #[test]
+    fn test_normalize_epic_ref_collapses_spellings_of_one_run() {
+        // A single ref is just trimmed and internally collapsed.
+        assert_eq!(normalize_epic_ref("  #38  "), "#38");
+        assert_eq!(normalize_epic_ref("Epic  12:\tAuth"), "Epic 12: Auth");
+        // Every spelling of the same list lands on one identity — otherwise
+        // the same two issues could be launched twice as two separate runs.
+        for spelling in ["77,78", "77, 78", " 77 ,  78 ", "77,,78", "77, 78,"] {
+            assert_eq!(normalize_epic_ref(spelling), "77, 78", "spelling: {spelling}");
+        }
+        // Empty stays empty so the caller's "epic required" check still fires.
+        assert_eq!(normalize_epic_ref("   ,  , "), "");
     }
 
     #[test]
@@ -972,7 +999,7 @@ mod tests {
 
         // First launch: the branch is created from HEAD and the worktree
         // lands at the stable deterministic path under the base.
-        let first = ensure_epic_worktree(&worktrees, &project, "samurai/38", Some(base.path()))
+        let first = ensure_epic_worktree(&worktrees, &project, "samurai-38", Some(base.path()))
             .await
             .unwrap();
         assert!(first.exists());
@@ -980,7 +1007,7 @@ mod tests {
 
         // Relaunch: REUSE — same path, no error (reconciliation depends on
         // path stability, PRD §5.9).
-        let second = ensure_epic_worktree(&worktrees, &project, "samurai/38", Some(base.path()))
+        let second = ensure_epic_worktree(&worktrees, &project, "samurai-38", Some(base.path()))
             .await
             .unwrap();
         assert_eq!(first, second);
@@ -1040,7 +1067,7 @@ mod tests {
         // A launched epic: worktree at the stable path, ACTIVE config with
         // that path, an armed resume timer.
         let worktree =
-            ensure_epic_worktree(&h.worktrees, &h.project, "samurai/38", Some(h.base.path()))
+            ensure_epic_worktree(&h.worktrees, &h.project, "samurai-38", Some(h.base.path()))
                 .await
                 .unwrap();
         h.run_configs
@@ -1071,7 +1098,7 @@ mod tests {
         // slug identity resolves it to the config's spelling.
         let report = run_cleanup(&h, "38").await.unwrap();
         assert_eq!(report.epic, "#38");
-        assert_eq!(report.branch, "samurai/38");
+        assert_eq!(report.branch, "samurai-38");
         assert!(report.timer_cancelled);
         assert!(report.config_archived);
         assert!(report.worktree_removed);
@@ -1091,7 +1118,7 @@ mod tests {
                 .await
                 .unwrap()
                 .iter()
-                .any(|b| b.name == "samurai/38"),
+                .any(|b| b.name == "samurai-38"),
             "branch deleted"
         );
 
@@ -1177,7 +1204,6 @@ mod tests {
             &project,
             "38",
             Some("opus".to_string()),
-            true,
             Some(30.0),
             Some(base.path()),
         )
@@ -1220,7 +1246,6 @@ mod tests {
             &project,
             "#38",
             None,
-            true,
             None,
             Some(base.path()),
         )
@@ -1299,7 +1324,7 @@ mod tests {
         // launcher's worktree and branch exist at the deterministic path.
         let h = cleanup_harness();
         let worktree =
-            ensure_epic_worktree(&h.worktrees, &h.project, "samurai/38", Some(h.base.path()))
+            ensure_epic_worktree(&h.worktrees, &h.project, "samurai-38", Some(h.base.path()))
                 .await
                 .unwrap();
 

@@ -587,7 +587,7 @@ mod tests {
 
     #[test]
     fn test_candidate_order_highest_context_first_unknown_last() {
-        let mut candidates = vec![
+        let mut candidates = [
             (4, None),
             (2, Some(80.0)),
             (3, Some(80.0)),

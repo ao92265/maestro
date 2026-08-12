@@ -69,7 +69,7 @@ pub struct SamuraiConfig {
 impl Default for SamuraiConfig {
     fn default() -> Self {
         Self {
-            handoff_context_pct: 45.0,
+            handoff_context_pct: 40.0,
             park_soft_5h_pct: 78.0,
             park_hard_5h_pct: 90.0,
             park_hard_7d_pct: 95.0,
@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn defaults_match_prd_section_7() {
         let cfg = SamuraiConfig::default();
-        assert_eq!(cfg.handoff_context_pct, 45.0);
+        assert_eq!(cfg.handoff_context_pct, 40.0);
         assert_eq!(cfg.park_soft_5h_pct, 78.0);
         assert_eq!(cfg.park_hard_5h_pct, 90.0);
         assert_eq!(cfg.park_hard_7d_pct, 95.0);
@@ -175,7 +175,7 @@ mod tests {
         // filling the gaps — this is what makes the #44 merge trivial.
         let cfg: SamuraiConfig = serde_json::from_str(r#"{"park_hard_5h_pct": 2.0}"#).unwrap();
         assert_eq!(cfg.park_hard_5h_pct, 2.0);
-        assert_eq!(cfg.handoff_context_pct, 45.0);
+        assert_eq!(cfg.handoff_context_pct, 40.0);
         assert_eq!(
             cfg.staleness_window_secs,
             SamuraiConfig::default().staleness_window_secs
@@ -225,50 +225,59 @@ mod tests {
 
     #[test]
     fn validate_rejects_out_of_range_values() {
-        let mut cfg = SamuraiConfig::default();
-        cfg.park_hard_5h_pct = 101.0;
-        assert!(cfg.validate().is_err());
-
-        let mut cfg = SamuraiConfig::default();
-        cfg.handoff_context_pct = -1.0;
-        assert!(cfg.validate().is_err());
-
-        let mut cfg = SamuraiConfig::default();
-        cfg.park_soft_5h_pct = f64::NAN;
-        assert!(cfg.validate().is_err());
-
-        let mut cfg = SamuraiConfig::default();
-        cfg.ack_timeout_secs = 0;
-        assert!(cfg.validate().is_err());
+        // One out-of-range field at a time, every other field left at its
+        // PRD §7 default, so each assertion names exactly one rejection.
+        for cfg in [
+            SamuraiConfig {
+                park_hard_5h_pct: 101.0,
+                ..Default::default()
+            },
+            SamuraiConfig {
+                handoff_context_pct: -1.0,
+                ..Default::default()
+            },
+            SamuraiConfig {
+                park_soft_5h_pct: f64::NAN,
+                ..Default::default()
+            },
+            SamuraiConfig {
+                ack_timeout_secs: 0,
+                ..Default::default()
+            },
+            SamuraiConfig {
+                staleness_window_secs: 0,
+                ..Default::default()
+            },
+            SamuraiConfig {
+                breaker_events: 0,
+                ..Default::default()
+            },
+            // 0 now means "delete every archived epic's handoffs on the next
+            // start" — the retention sweep consumes this field.
+            SamuraiConfig {
+                handoff_retention_days: 0,
+                ..Default::default()
+            },
+            SamuraiConfig {
+                size_warn_bytes: 0,
+                ..Default::default()
+            },
+        ] {
+            assert!(cfg.validate().is_err(), "should reject: {cfg:?}");
+        }
 
         // Upper bound: the injector multiplies this Duration by 3, and
         // `Duration * u32` panics on overflow — an unbounded value would
         // kill the injector task permanently.
-        let mut cfg = SamuraiConfig::default();
-        cfg.ack_timeout_secs = u64::MAX;
+        let mut cfg = SamuraiConfig {
+            ack_timeout_secs: u64::MAX,
+            ..Default::default()
+        };
         assert!(cfg.validate().is_err());
         cfg.ack_timeout_secs = 86_401;
         assert!(cfg.validate().is_err());
         cfg.ack_timeout_secs = 86_400;
         assert!(cfg.validate().is_ok());
-
-        let mut cfg = SamuraiConfig::default();
-        cfg.staleness_window_secs = 0;
-        assert!(cfg.validate().is_err());
-
-        let mut cfg = SamuraiConfig::default();
-        cfg.breaker_events = 0;
-        assert!(cfg.validate().is_err());
-
-        // 0 now means "delete every archived epic's handoffs on the next
-        // start" — the retention sweep consumes this field.
-        let mut cfg = SamuraiConfig::default();
-        cfg.handoff_retention_days = 0;
-        assert!(cfg.validate().is_err());
-
-        let mut cfg = SamuraiConfig::default();
-        cfg.size_warn_bytes = 0;
-        assert!(cfg.validate().is_err());
     }
 
     #[test]

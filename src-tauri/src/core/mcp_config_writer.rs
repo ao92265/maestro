@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use super::config_recovery::read_json_or_recover;
-use super::mcp_manager::{McpServerConfig, McpServerSource, McpServerType};
+use super::mcp_manager::{McpServerConfig, McpServerType};
 use crate::commands::mcp::McpCustomServer;
 
 /// Per-directory lock map to serialize concurrent .mcp.json read-modify-write operations.
@@ -654,6 +654,9 @@ pub async fn remove_session_mcp_config(working_dir: &Path, session_id: u32) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests build a full `McpServerConfig`, so the variant they
+    // need is imported here rather than at module scope.
+    use super::super::mcp_manager::McpServerSource;
     use std::collections::HashMap;
     use tempfile::tempdir;
 

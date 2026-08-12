@@ -77,6 +77,9 @@ impl SessionManager {
 
     /// Inserts a new session with `Idle` status and no branch assigned.
     /// Returns `Err` with the existing config if a session with this ID already exists.
+    // `Err` is the session that already occupies this id, so both variants are
+    // a `SessionConfig` — boxing the error would not shrink the `Result`.
+    #[allow(clippy::result_large_err)]
     pub fn create_session(
         &self,
         id: u32,

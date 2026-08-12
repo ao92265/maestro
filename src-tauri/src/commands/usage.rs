@@ -231,7 +231,7 @@ async fn read_keychain_credentials() -> Result<CredentialsData, String> {
 /// Read credentials from file (fallback for non-macOS or if keychain fails).
 async fn read_file_credentials() -> Result<CredentialsData, String> {
     let home = directories::UserDirs::new()
-        .and_then(|dirs| Some(dirs.home_dir().to_path_buf()))
+        .map(|dirs| dirs.home_dir().to_path_buf())
         .ok_or("Could not get home directory")?;
 
     let creds_path = home.join(".claude").join(".credentials.json");

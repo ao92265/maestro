@@ -14,7 +14,7 @@
 
 Maestro becomes the **supervisor brain** of development work. You hand it a GitHub epic (e.g. 15 issues) and it runs unattended for days: per-project **orchestrator** agents spawn subagents to do the work, and Maestro keeps the whole thing alive —
 
-- **Self-healing:** when an orchestrator's context fills to ~45%, Maestro triggers a *handoff* — the agent writes its state to a file and a fresh agent ("next generation") continues with a clean context. We call this **agent replication**; it prevents context pollution and quality decay.
+- **Self-healing:** when an orchestrator's context fills to ~40%, Maestro triggers a *handoff* — the agent writes its state to a file and a fresh agent ("next generation") continues with a clean context. We call this **agent replication**; it prevents context pollution and quality decay.
 - **Park & resume:** when the token allowance (5-hour window ≥ 90% or 7-day window ≥ 95%) is nearly spent, Maestro *parks* all work and auto-resumes at the exact reset time. No human involved.
 - **Audit:** every spawn, handoff, park, resume, completion and alert is recorded and visible in the app, so you oversee everything without digging through internal files.
 - **Second Brain:** a frontend panel that shows and manages every file the system creates, plus (Phase 5) an ops journal and periodic "harvest" reports for continuous process improvement.
@@ -94,7 +94,7 @@ Maestro types into terminals blindly, so:
 
 ### 5.4 Self-healing (agent replication)
 
-- **Trigger:** context ≥ **45%** (configurable; see Decisions log — tuned later with audit data, not beliefs).
+- **Trigger:** context ≥ **40%** (configurable; see Decisions log — tuned later with audit data, not beliefs).
 - Orchestrator lets in-flight subagents finish their current step, writes the handoff file (§6), **commits WIP to the epic branch**.
 - Maestro checks only: *file exists + WIP committed* (no template-section validation — a model can emit empty sections; the successor's verify step is the real check).
 - Maestro kills gen-N (tree-kill — subagent processes die with it, which is why subagent tasks must be small and idempotent with per-step commits: a kill loses at most one step).
@@ -180,7 +180,7 @@ Kept lean: pointers (issue numbers, SHAs, paths), never content dumps. GitHub ho
 
 | Setting | Default | Note |
 |---|---|---|
-| Handoff trigger (context %) | **45%** | User-observed decay past 50%; critique argued ~70%. Start at 45%, tune with audit data (progress-per-generation). |
+| Handoff trigger (context %) | **40%** | User-observed decay past 50%; critique argued ~70%. Started at 45%, lowered to 40% after live runs still showed decay; tune with audit data (progress-per-generation). |
 | Park soft threshold (5h) | **~75–80%** | Stop new subagent spawns; wind down. |
 | Park hard threshold | **5h ≥ 90%**, **7d ≥ 95%** | Sequential parking, highest-context first. |
 | Resume time | `resets_at` + 5 min + per-epic jitter | Anti-thundering-herd. |
@@ -249,7 +249,7 @@ On disk but not re-rendered in-app (existing tools own them): Claude Code transc
 1. Park thresholds: **5h → 90%, 7d → 95%** (from 92/96).
 2. **No auto-update suppression** (work laptop, security policy) → recovery-first: hardened audit/ledger + cold-start reconciliation.
 3. **Not on enterprise** — 5h/7d parking stands; spend-budget parking deferred until relevant ("when that happens we will talk").
-4. Handoff threshold **45% configurable**, tuned later with audit data (vs critique's ~70%).
+4. Handoff threshold **40% configurable**, tuned later with audit data (vs critique's ~70%).
 5. **Template validation gate dropped** — keep only "file exists + WIP committed".
 6. **`--resume` same-session path dropped** — every wake-up is a fresh spawn; one recovery path.
 7. **Dedicated test-mode machinery dropped** — configurable thresholds are the test mode; user tests live via audit.
@@ -269,7 +269,7 @@ On disk but not re-rendered in-app (existing tools own them): Claude Code transc
 Epic: 15 issues. You write the run config in the launcher, hit start, walk away.
 
 - **T+0** — Preflight passes (gh auth, windows reported). Maestro creates the epic worktree, spawns **gen-1**, audit: `SPAWN`. Gen-1 reads the GitHub epic, plans, spawns `dev-issue-101`, `dev-issue-102`.
-- **T+3h** — context crosses 45%. Watchdog waits for idle, injects "prepare handoff", gets ACK. Gen-1 lets `dev-issue-103` finish its step, writes `epic12-gen1.md`, commits WIP. Audit: `HANDOFF`. Maestro tree-kills gen-1, spawns **gen-2** at 0% context; gen-2 runs verify (HEAD matches → skipped), continues.
+- **T+3h** — context crosses 40%. Watchdog waits for idle, injects "prepare handoff", gets ACK. Gen-1 lets `dev-issue-103` finish its step, writes `epic12-gen1.md`, commits WIP. Audit: `HANDOFF`. Maestro tree-kills gen-1, spawns **gen-2** at 0% context; gen-2 runs verify (HEAD matches → skipped), continues.
 - **T+4.5h** — 5h window hits 78%: soft threshold — no new subagents. At 90%: park. Gen-2 finishes its atomic step, updates the handoff, commits. Audit: `PARK`. Timer armed for reset+5min (persisted to disk).
 - **T+5h** — Windows applies an update and reboots. On next Maestro launch, cold-start reconciliation finds the live epic and the pending timer.
 - **T+6.5h** — Timer fires. Maestro spawns **gen-3** from the handoff. Audit: `RESUME`. Work continues through the night.

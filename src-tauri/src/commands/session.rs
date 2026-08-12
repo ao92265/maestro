@@ -125,6 +125,10 @@ pub async fn get_sessions_for_project(
 
 /// Removes all sessions for a project (used when closing a project tab).
 /// Also kills the associated PTY sessions and cleans up MCP/plugin state.
+// Tauri resolves each `State` by type — closing a project has to tear down
+// every subsystem that holds per-session state, and they arrive as injected
+// parameters or not at all.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn remove_sessions_for_project(
     state: State<'_, SessionManager>,

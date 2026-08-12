@@ -208,6 +208,10 @@ pub enum ClaudeEvent {
 
 impl ClaudeEvent {
     /// Returns the `session_id` carried by every event variant.
+    // Every consumer so far destructures the variant it cares about and reads
+    // the field directly; kept because the invariant it encodes (every variant
+    // has one) is worth stating in code.
+    #[allow(dead_code)]
     pub fn session_id(&self) -> u32 {
         match self {
             ClaudeEvent::SessionStarted { session_id, .. }

@@ -461,7 +461,11 @@ pub async fn load_project_catalog(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::{IssueInfo, PrAuthor, PrLabel};
+    // `PrAuthor`/`PrLabel` come from the defining module: only these tests
+    // build PR fixtures by hand, so re-exporting them on the `github` façade
+    // would add a name the shipped code never uses.
+    use crate::github::ops::{PrAuthor, PrLabel};
+    use crate::github::IssueInfo;
 
     fn issue(number: u64, title: &str, labels: &[&str]) -> IssueInfo {
         IssueInfo {
