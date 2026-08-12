@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { create } from "zustand";
-import { samePath } from "@/lib/path";
+import { normalizePath, samePath } from "@/lib/path";
 import {
   samuraiListSessions,
   samuraiScheduleList,
@@ -32,6 +32,20 @@ export type BackendSessionStatus =
 
 /** Timeout in milliseconds for sessions stuck in Starting state (Bug #74) */
 const SESSION_STARTUP_TIMEOUT_MS = 30000;
+
+/**
+ * How long a subagent may sit un-completed before the Stop-hook heuristic
+ * stops believing it is still running (issue #77).
+ *
+ * The heuristic below holds a session at `Working` while any subagent it
+ * spawned has no completion recorded. A completion event that never arrives
+ * (missed notification, transcript gap) used to pin the session — and its
+ * animated dots — at `Working` forever. Subagents are always spawned within
+ * the turn the Stop hook is closing, i.e. seconds to minutes old, so half an
+ * hour is far more than any legitimate hand-off needs while still bounding
+ * the stale state instead of leaving it permanent.
+ */
+const SUBAGENT_STALE_MS = 30 * 60 * 1000;
 
 /**
  * Statuses that mean the terminal is done running and the next move is the
@@ -231,9 +245,118 @@ function withContextUsage(session: SessionConfig): SessionConfig {
   };
 }
 
-/** Generate a unique key for buffering status updates */
+/**
+ * Generate a unique key for buffering status updates.
+ *
+ * The path is normalized (issue #77): the session and the status event can
+ * spell the same directory differently (Windows `\\?\` prefix, drive-letter
+ * case, trailing separator), and a raw-string key would park the update under
+ * a name the session lookup never asks for — losing it permanently.
+ */
 function statusBufferKey(sessionId: number, projectPath: string): string {
-  return `${sessionId}:${projectPath}`;
+  return `${sessionId}:${normalizePath(projectPath)}`;
+}
+
+/**
+ * Sessions whose agent reported a terminal state (`Done`/`Error`) over MCP
+ * during the turn that is currently ending.
+ *
+ * The Stop hook fires at every turn end. Honouring the session's *current*
+ * status instead used to drop every stop for a session that had ever reported
+ * `Done` — it stayed "done" through all later work and never flagged that it
+ * was waiting on the user (issue #77 cause 1). The entry is consumed by the
+ * Stop hook that closes the same turn, so the next turn starts clean.
+ */
+const terminalReportedThisTurn: Set<number> = new Set();
+
+/**
+ * Pending re-checks for sessions held at `Working` by subagents that never
+ * reported completion. Key is session ID (see `SUBAGENT_STALE_MS`).
+ */
+const subagentWatchdogs: Map<number, ReturnType<typeof setTimeout>> = new Map();
+
+/** Subagents of a session that are still plausibly running (see SUBAGENT_STALE_MS). */
+function countRunningSubagents(sessionId: number): number {
+  const now = Date.now();
+  return useAgentStore
+    .getState()
+    .agents.filter((a) => {
+      if (a.sessionId !== sessionId || a.completedAt !== null) return false;
+      const spawned = Date.parse(a.spawnedAt);
+      // An unreadable spawn timestamp cannot be aged out, so it is not
+      // trusted to keep a session pinned at Working.
+      if (Number.isNaN(spawned)) return false;
+      return now - spawned < SUBAGENT_STALE_MS;
+    }).length;
+}
+
+/**
+ * Milliseconds until the last of this session's running subagents goes stale,
+ * or null when none of them counts as running right now.
+ */
+function msUntilSubagentsGoStale(sessionId: number): number | null {
+  const now = Date.now();
+  let longest: number | null = null;
+  for (const a of useAgentStore.getState().agents) {
+    if (a.sessionId !== sessionId || a.completedAt !== null) continue;
+    const spawned = Date.parse(a.spawnedAt);
+    if (Number.isNaN(spawned)) continue;
+    const remaining = SUBAGENT_STALE_MS - (now - spawned);
+    if (remaining <= 0) continue;
+    if (longest === null || remaining > longest) longest = remaining;
+  }
+  return longest;
+}
+
+/** Cancels a pending subagent re-check (fresher news arrived, or the session went away). */
+function clearSubagentWatchdog(sessionId: number): void {
+  const timer = subagentWatchdogs.get(sessionId);
+  if (timer) {
+    clearTimeout(timer);
+    subagentWatchdogs.delete(sessionId);
+  }
+}
+
+/**
+ * Schedules the re-check that bounds a subagent-driven `Working` state.
+ *
+ * When it fires, subagents still without a completion have aged past
+ * `SUBAGENT_STALE_MS`: either newer ones are genuinely running (re-arm), or
+ * the session has actually stopped and its dots must stop with it, so it lands
+ * on the `NeedsInput` the Stop hook would have produced.
+ */
+function armSubagentWatchdog(sessionId: number, projectPath: string): void {
+  clearSubagentWatchdog(sessionId);
+  const delay = msUntilSubagentsGoStale(sessionId);
+  if (delay === null) return;
+
+  const timer = setTimeout(() => {
+    subagentWatchdogs.delete(sessionId);
+    if (countRunningSubagents(sessionId) > 0) {
+      armSubagentWatchdog(sessionId, projectPath);
+      return;
+    }
+    useSessionStore.setState((state) => {
+      const target = state.sessions.find(
+        (s) => s.id === sessionId && samePath(s.project_path, projectPath)
+      );
+      // Anything else that moved the session on already knows better.
+      if (target?.status !== "Working") return state;
+      return {
+        sessions: state.sessions.map((s) =>
+          s === target
+            ? {
+                ...s,
+                status: "NeedsInput" as BackendSessionStatus,
+                statusMessage: "Subagents stopped reporting - waiting for your input",
+              }
+            : s
+        ),
+      };
+    });
+  }, delay);
+
+  subagentWatchdogs.set(sessionId, timer);
 }
 
 /**
@@ -359,6 +482,13 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
   },
 
   addSession: (session: SessionConfig) => {
+    // Take this session's own buffered status FIRST: the purge below matches
+    // every key for the id, so reading afterwards always found nothing and the
+    // whole buffer was dead weight — a status that beat its session into the
+    // store (a turn end during startup, say) was silently dropped (issue #77).
+    const bufferKey = statusBufferKey(session.id, session.project_path);
+    const bufferedStatus = pendingStatusUpdates.get(bufferKey);
+
     // Clear any stale buffered status for this session ID across ALL projects
     // This prevents pollution from old sessions with the same ID
     for (const key of pendingStatusUpdates.keys()) {
@@ -367,10 +497,6 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
         pendingStatusUpdates.delete(key);
       }
     }
-
-    // Check if we have a buffered status update for this session
-    const bufferKey = statusBufferKey(session.id, session.project_path);
-    const bufferedStatus = pendingStatusUpdates.get(bufferKey);
 
     console.log(`[SessionStore] addSession id=${session.id} project_path='${session.project_path}'`);
     console.log(`[SessionStore] Buffer key: '${bufferKey}', has buffered status: ${!!bufferedStatus}`);
@@ -459,6 +585,11 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     // Clear any startup timeout for this session
     clearStartupTimeout(sessionId);
 
+    // Same stale-id hygiene for the turn bookkeeping: a future session reusing
+    // this id must not inherit a pending re-check or a "reported done" mark.
+    clearSubagentWatchdog(sessionId);
+    terminalReportedThisTurn.delete(sessionId);
+
     // Forget the context usage so a future session reusing this id doesn't
     // inherit a stale percentage.
     lastContextUsage.delete(sessionId);
@@ -493,6 +624,8 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       // Same stale-id hygiene as removeSession.
       for (const session of removed) {
         lastContextUsage.delete(session.id);
+        clearSubagentWatchdog(session.id);
+        terminalReportedThisTurn.delete(session.id);
       }
       // Remove the sessions from local state
       set((state) => {
@@ -519,6 +652,36 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       return removed;
     } catch (err) {
       console.error("Failed to remove sessions for project:", err);
+      // The backend rejects whenever `canonicalize` fails on the project path
+      // — a directory that was moved, deleted, or sits on a drive that went
+      // away — and `closeTab` drops the tab either way. Returning early left
+      // that project's sessions in the store with no tab left to reach them:
+      // stale parked chips in the eagle shelf and inflated session/agent
+      // counts, forever (issue #76). Prune them locally instead; their PTYs
+      // were already killed alongside this call.
+      const orphaned = get().sessions.filter((s) => samePath(s.project_path, projectPath));
+      if (orphaned.length === 0) return [];
+      const isOrphan = (id: number) => orphaned.some((s) => s.id === id);
+      // Same stale-id hygiene as the success path.
+      for (const session of orphaned) {
+        lastContextUsage.delete(session.id);
+        clearSubagentWatchdog(session.id);
+        terminalReportedThisTurn.delete(session.id);
+      }
+      set((state) => {
+        const samuraiBySessionId = { ...state.samuraiBySessionId };
+        for (const session of orphaned) {
+          delete samuraiBySessionId[session.id];
+        }
+        return {
+          sessions: state.sessions.filter((s) => !isOrphan(s.id)),
+          parkedSessionIds: state.parkedSessionIds.filter((id) => !isOrphan(id)),
+          flaggedSessionIds: state.flaggedSessionIds.filter((id) => !isOrphan(id)),
+          attentionSessionIds: state.attentionSessionIds.filter((id) => !isOrphan(id)),
+          samuraiBySessionId,
+        };
+      });
+      // The backend still holds them: nothing was removed there.
       return [];
     }
   },
@@ -536,25 +699,26 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
             const { session_id, project_path, message, needs_input_prompt } = event.payload;
 
             // Normalize the Stop-hook signal: treat "AwaitingInput" as
-            // NeedsInput, but never downgrade an explicit terminal state
-            // (Done/Error) or a startup Timeout the agent/frontend already set.
+            // NeedsInput, keeping a terminal state (Done/Error) only when the
+            // agent reported it during this very turn.
             let status: BackendSessionStatus;
             let statusMessage = message;
             if (event.payload.status === "AwaitingInput") {
-              const existing = get().sessions.find(
-                (s) => s.id === session_id && s.project_path === project_path
-              );
-              if (existing && ["Done", "Error", "Timeout"].includes(existing.status)) {
+              // The agent finished this turn by reporting done/error, and the
+              // Stop hook is the tail of that same turn — keep what it said.
+              // Consuming the mark here is what stops a stale `Done` from
+              // swallowing every future turn end (issue #77 cause 1).
+              if (terminalReportedThisTurn.has(session_id)) {
+                terminalReportedThisTurn.delete(session_id);
                 return;
               }
               // The Stop hook fires whenever the agent ends its turn — including
               // when it ends the turn precisely because it handed work off to
               // background subagents. Those are still running, so the session is
-              // working, not waiting on the user. Self-correcting: the next turn
-              // end, once no subagent is running, reports NeedsInput as normal.
-              const runningSubagents = useAgentStore
-                .getState()
-                .agents.filter((a) => a.sessionId === session_id && a.completedAt === null).length;
+              // working, not waiting on the user. Bounded by SUBAGENT_STALE_MS
+              // and the watchdog armed below, so a completion event that never
+              // arrives cannot pin the session at Working.
+              const runningSubagents = countRunningSubagents(session_id);
               if (runningSubagents > 0) {
                 status = "Working";
                 statusMessage = `${runningSubagents} subagent${
@@ -565,11 +729,19 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
               }
             } else {
               status = event.payload.status;
+              // Remember an agent-reported terminal state so the Stop hook that
+              // closes this same turn does not overwrite it; anything else the
+              // agent reports means the turn moved on.
+              if (status === "Done" || status === "Error") {
+                terminalReportedThisTurn.add(session_id);
+              } else {
+                terminalReportedThisTurn.delete(session_id);
+              }
             }
 
             // Check if session exists in store
             const sessionExists = get().sessions.some(
-              (s) => s.id === session_id && s.project_path === project_path
+              (s) => s.id === session_id && samePath(s.project_path, project_path)
             );
 
             if (!sessionExists) {
@@ -589,6 +761,12 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
               clearStartupTimeout(session_id);
             }
 
+            // This event is fresher than any pending subagent re-check.
+            clearSubagentWatchdog(session_id);
+            if (status === "Working" && event.payload.status === "AwaitingInput") {
+              armSubagentWatchdog(session_id, project_path);
+            }
+
             set((state) => {
               // Auto-unpark on the TRANSITION into a ready-for-the-user state:
               // a parked agent that stops — because it needs an answer, or
@@ -598,7 +776,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
               // still-stopped session, repeated events for the same status are
               // not a new transition and must not undo that manual choice.
               const existing = state.sessions.find(
-                (s) => s.id === session_id && s.project_path === project_path
+                (s) => s.id === session_id && samePath(s.project_path, project_path)
               );
               const autoUnpark =
                 existing !== undefined &&
@@ -608,7 +786,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
 
               return {
                 sessions: state.sessions.map((s) =>
-                  s.id === session_id && s.project_path === project_path
+                  s.id === session_id && samePath(s.project_path, project_path)
                     ? {
                         ...s,
                         status,

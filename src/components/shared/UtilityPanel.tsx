@@ -43,12 +43,15 @@ export function UtilityPanel({
   width,
   onResize,
   onClose,
+  onNavigateToSession,
 }: {
   panel: UtilityPanelKind;
   /** Width shared with the other right-docked panels (see App). */
   width: number;
   onResize: (width: number) => void;
   onClose: () => void;
+  /** Jump to a session's terminal — the Launch panel's per-run open button. */
+  onNavigateToSession?: (tabId: string, sessionId: number) => void;
 }) {
   const { title, icon: Icon } = PANEL_META[panel];
   return (
@@ -91,7 +94,7 @@ export function UtilityPanel({
           ) : panel === "secondbrain" ? (
             <SecondBrainSection />
           ) : panel === "launch" ? (
-            <LaunchSection />
+            <LaunchSection onNavigate={onNavigateToSession} />
           ) : (
             <AiPanel />
           )}

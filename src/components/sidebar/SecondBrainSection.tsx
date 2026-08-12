@@ -1,11 +1,12 @@
 import { ask } from "@tauri-apps/plugin-dialog";
-import { Eraser, Eye, Files, Loader2, RefreshCw, Sparkles, TimerOff, Trash2, X } from "lucide-react";
+import { Eraser, Eye, FileText, Files, Loader2, RefreshCw, TimerOff, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { HealthFlag } from "@/lib/healthRules";
 import {
   isSamuraiInUseError,
   samuraiCleanupEpic,
   samuraiFileDelete,
+  samuraiFileRead,
   samuraiFilesList,
   samuraiHarvestRead,
   samuraiTimerCancel,
@@ -68,6 +69,31 @@ function formatAge(modifiedAt: string | null): string {
   return `${Math.round(hours / 24)}d ago`;
 }
 
+/**
+ * How the viewer renders a file, picked from its extension alone (issue #82).
+ * `.jsonl` deliberately falls through to `text`: it is one JSON object per
+ * line, so parsing the file as a whole would always fail and pretty-printing
+ * it line by line would destroy the append-order reading that makes an audit
+ * log or the journal legible.
+ */
+type ViewerFormat = "markdown" | "json" | "text";
+
+function viewerFormat(path: string): ViewerFormat {
+  const name = baseName(path).toLowerCase();
+  if (name.endsWith(".md")) return "markdown";
+  if (name.endsWith(".json")) return "json";
+  return "text";
+}
+
+/** Pretty-prints JSON; hands back the raw text untouched when it does not parse. */
+function prettyJson(text: string): string {
+  try {
+    return JSON.stringify(JSON.parse(text), null, 2);
+  } catch {
+    return text;
+  }
+}
+
 /** TIMER rows: "resumes at 14:32" (date prefixed when not today). */
 function formatFireAt(fireAt: string): string {
   const d = new Date(fireAt);
@@ -88,8 +114,8 @@ function FileRow({
   healthFlags,
 }: {
   entry: SamuraiFileEntry;
-  /** HARVEST_REPORT rows only: view the report markdown (issue #71). */
-  onOpen: ((entry: SamuraiFileEntry) => void) | null;
+  /** Every row: open this file in the read-only viewer (issue #82). */
+  onOpen: (entry: SamuraiFileEntry) => void;
   /** Absent on TIMER rows — a timer is cancelled, never file-deleted. */
   onDelete: ((entry: SamuraiFileEntry) => void) | null;
   /** TIMER rows only: cancel this epic's pending resume. */
@@ -123,26 +149,24 @@ function FileRow({
           ) : null}
         </span>
         <span className="shrink-0 text-[10px] text-maestro-muted/70">{meta}</span>
-        {onOpen && (
-          <button
-            type="button"
-            onClick={() => onOpen(entry)}
-            disabled={busy}
-            className="rounded p-1 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-text disabled:opacity-40"
-            aria-label={`Open ${label}`}
-            title="View this harvest report"
-          >
-            <Eye size={12} />
-          </button>
-        )}
+        <button
+          type="button"
+          onClick={() => onOpen(entry)}
+          disabled={busy}
+          className="rounded p-1 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-text disabled:opacity-40"
+          aria-label={`Open ${label}`}
+          title="View this file (read-only)"
+        >
+          <Eye size={12} />
+        </button>
         {onCleanEpic && (
           <button
             type="button"
             onClick={() => onCleanEpic(entry)}
             disabled={busy}
             className="rounded p-1 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-red disabled:opacity-40"
-            aria-label={`Clean up epic ${entry.epic}`}
-            title="Delete this epic's worktree and branch, cancel its timer, archive its run config (asks first)"
+            aria-label={`Clean up run ${entry.epic}`}
+            title="Delete this run's worktree and branch, cancel its timer, archive its run config (asks first)"
           >
             <Eraser size={12} />
           </button>
@@ -182,34 +206,41 @@ function FileRow({
 }
 
 /**
- * Fixed overlay showing one harvest report's markdown (issue #71). Same
- * overlay chrome as FileDiffModal, minus the outside-click machinery — close
- * button and Escape only.
+ * Fixed overlay showing one Samurai file, read-only — generalised from the
+ * #71 harvest-report viewer to every kind the Files card lists (issue #82).
+ * Same overlay chrome as FileDiffModal, minus the outside-click machinery —
+ * close button and Escape only.
+ *
+ * Strictly a viewer: no edit, no save, no open-in-external-app. Removing a
+ * file stays the row's delete/cancel action, with its own confirms.
  */
-function HarvestReportModal({
-  entry,
-  onClose,
-}: {
-  entry: SamuraiFileEntry;
-  onClose: () => void;
-}) {
+function FileViewerModal({ entry, onClose }: { entry: SamuraiFileEntry; onClose: () => void }) {
   // null = loading.
-  const [markdown, setMarkdown] = useState<string | null>(null);
+  const [content, setContent] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const format = viewerFormat(entry.path);
 
   useEffect(() => {
     let cancelled = false;
-    samuraiHarvestRead(entry.path)
-      .then((md) => {
-        if (!cancelled) setMarkdown(md);
+    // Harvest reports keep their own dedicated command (issue #71): its
+    // containment is the narrower of the two — the harvest directory alone,
+    // with no dependence on the inventory snapshot — so there is nothing to
+    // gain by widening them onto the general read.
+    const read = entry.kind === "HARVEST_REPORT" ? samuraiHarvestRead : samuraiFileRead;
+    read(entry.path)
+      .then((text) => {
+        if (!cancelled) setContent(text);
       })
       .catch((err) => {
+        // Every backend refusal — vanished since the listing, not a managed
+        // file, over the 2 MB cap, OS read failure — is already a readable
+        // sentence. Show it in place, verbatim; never crash the panel.
         if (!cancelled) setError(String(err));
       });
     return () => {
       cancelled = true;
     };
-  }, [entry.path]);
+  }, [entry.path, entry.kind]);
 
   // Close on Escape — same listener shape as FileDiffModal.
   useEffect(() => {
@@ -225,7 +256,7 @@ function HarvestReportModal({
       <div className="flex max-h-[85vh] w-[36rem] max-w-[90vw] flex-col overflow-hidden rounded-lg border border-maestro-border bg-maestro-bg shadow-2xl">
         <div className="flex items-center justify-between gap-2 border-b border-maestro-border px-4 py-3">
           <div className="flex min-w-0 items-center gap-2">
-            <Sparkles size={14} className="shrink-0 text-maestro-muted" />
+            <FileText size={14} className="shrink-0 text-maestro-muted" />
             <span className="truncate text-sm font-medium text-maestro-text">
               {baseName(entry.path)}
             </span>
@@ -233,7 +264,7 @@ function HarvestReportModal({
           <button
             type="button"
             onClick={onClose}
-            aria-label="Close report"
+            aria-label="Close file viewer"
             className="shrink-0 rounded p-1 text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
           >
             <X size={16} />
@@ -242,15 +273,21 @@ function HarvestReportModal({
         <div className="min-h-0 overflow-y-auto p-4">
           {error ? (
             <p className="text-[11px] text-maestro-red">{error}</p>
-          ) : markdown === null ? (
+          ) : content === null ? (
             <div className="flex items-center gap-2 text-[11px] text-maestro-muted">
               <Loader2 size={12} className="animate-spin" /> Loading…
             </div>
+          ) : format === "markdown" ? (
+            // allowRawHtml={false}: this is model output (harvest reports) or
+            // text ANY local process can write (handoffs) — raw HTML in it
+            // must never become live elements in this invoke-capable webview.
+            <MarkdownBody content={content} allowRawHtml={false} />
           ) : (
-            // allowRawHtml={false}: the report is model output derived from
-            // journal text ANY local process can write — raw HTML in it must
-            // never become live elements in this invoke-capable webview.
-            <MarkdownBody content={markdown} allowRawHtml={false} />
+            // Wrapped at whitespace, with a horizontal scroll left for the
+            // unbreakable long lines JSONL rows are made of.
+            <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-[10px] leading-relaxed text-maestro-text">
+              {format === "json" ? prettyJson(content) : content}
+            </pre>
           )}
         </div>
       </div>
@@ -263,11 +300,13 @@ function HarvestReportModal({
  * top (the Phase 1 AuditSection absorbed as-is), the ops journal card
  * (issue #71, PRD §5.12) and below them the Files
  * section — every managed resource from `samurai_files_list` grouped by kind
- * with size + age, delete-with-confirm per row (in-use files get a second,
+ * with size + age, a read-only view per row (issue #82),
+ * delete-with-confirm per row (in-use files get a second,
  * harder confirm before force-deleting; TIMER rows get a cancel-timer action
  * instead of delete), and one-click "clean this epic" on run configs without
- * a live supervised session. Deliberately minimal per the PRD: list, delete,
- * warn — no file-manager ambitions.
+ * a live supervised session. Deliberately minimal per the PRD: list, read,
+ * delete, warn — no file-manager ambitions, and nothing here ever writes to a
+ * managed file.
  */
 export function SecondBrainSection() {
   // null = loading.
@@ -275,8 +314,8 @@ export function SecondBrainSection() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  // The harvest report shown in the overlay; null = closed (issue #71).
-  const [openReport, setOpenReport] = useState<SamuraiFileEntry | null>(null);
+  // The file shown in the read-only viewer overlay; null = closed (issue #82).
+  const [openFile, setOpenFile] = useState<SamuraiFileEntry | null>(null);
 
   /* ── Health checker flags (rule-based, read-only) — issue #67 ── */
   const allHealthFlags = useHealthStore((s) => s.flags);
@@ -369,8 +408,8 @@ export function SecondBrainSection() {
     if (!entry.epic || !entry.project_path) return;
     // Same confirm + report wording as LaunchSection's active-run cleanup.
     const confirmed = await ask(
-      `Clean up epic ${entry.epic}? This deletes its worktree and samurai branch, cancels its resume timer, and archives its run config. It cannot be undone.`,
-      { title: "Clean Up Epic", kind: "warning" },
+      `Clean up run ${entry.epic}? This deletes its worktree and samurai branch, cancels its resume timer, and archives its run config. It cannot be undone.`,
+      { title: "Clean Up Run", kind: "warning" },
     ).catch(() => false);
     if (!confirmed) return;
     setBusy(true);
@@ -386,8 +425,8 @@ export function SecondBrainSection() {
       ].filter(Boolean);
       setNotice(
         removed.length > 0
-          ? `Cleaned up epic ${report.epic}: removed ${removed.join(", ")}.`
-          : `Epic ${report.epic} was already clean.`,
+          ? `Cleaned up run ${report.epic}: removed ${removed.join(", ")}.`
+          : `Run ${report.epic} was already clean.`,
       );
       await refresh();
     } catch (err) {
@@ -433,7 +472,8 @@ export function SecondBrainSection() {
           }
         />
         <p className="mb-2 text-[11px] text-maestro-muted">
-          Every Samurai-managed file, all projects. Deleting always asks; in-use files ask twice.
+          Every Samurai-managed file, all projects. Viewing is read-only; deleting always asks and
+          in-use files ask twice.
         </p>
         {error && <p className="mb-2 text-[11px] text-maestro-red">{error}</p>}
         {notice && <p className="mb-2 text-[11px] text-maestro-green">{notice}</p>}
@@ -467,9 +507,9 @@ export function SecondBrainSection() {
                                 ? healthRows.get(`${entry.path}|${baseName(entry.path)}`)
                                 : undefined
                             }
-                            // Harvest reports are the one readable kind —
-                            // everything else is machine state (issue #71).
-                            onOpen={kind === "HARVEST_REPORT" ? setOpenReport : null}
+                            // Every kind is readable in place (issue #82) —
+                            // the viewer picks its renderer per extension.
+                            onOpen={setOpenFile}
                             // TIMER rows are cancelled, never file-deleted —
                             // schedule.json self-cleans and the backend
                             // refuses deleting it (review F1).
@@ -507,9 +547,7 @@ export function SecondBrainSection() {
         )}
       </div>
 
-      {openReport && (
-        <HarvestReportModal entry={openReport} onClose={() => setOpenReport(null)} />
-      )}
+      {openFile && <FileViewerModal entry={openFile} onClose={() => setOpenFile(null)} />}
     </div>
   );
 }

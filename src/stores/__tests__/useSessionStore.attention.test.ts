@@ -56,6 +56,9 @@ beforeAll(async () => {
 
 describe("useSessionStore auto-unpark attention", () => {
   beforeEach(() => {
+    // Drops the per-session turn bookkeeping kept outside the store state
+    // (see removeSession), so a terminal report cannot leak between tests.
+    for (const id of [1, 2, 3]) useSessionStore.getState().removeSession(id);
     useSessionStore.setState({
       sessions: [],
       parkedSessionIds: [],
@@ -210,12 +213,14 @@ describe("useSessionStore auto-unpark attention", () => {
     expect(useSessionStore.getState().attentionSessionIds).toEqual([2]);
   });
 
-  it("does not auto-unpark a parked Done/Error session on the Stop-hook AwaitingInput signal", () => {
-    // The listener never downgrades an explicit terminal state — the guarded
-    // early-return must also mean: no unpark, no attention.
+  it("does not auto-unpark when the agent reported Done/Error in the turn that just ended", () => {
+    // The turn end that follows the agent's own terminal report changes
+    // nothing — so no unpark and no attention either.
     useSessionStore.setState({
-      sessions: [session(1, "Done"), session(2, "Error")],
+      sessions: [session(1, "Working"), session(2, "Working")],
     });
+    emitStatus(1, "Done");
+    emitStatus(2, "Error");
     useSessionStore.getState().parkSession(1);
     useSessionStore.getState().parkSession(2);
 
@@ -226,6 +231,23 @@ describe("useSessionStore auto-unpark attention", () => {
     expect(state.parkedSessionIds).toEqual([1, 2]);
     expect(state.attentionSessionIds).toEqual([]);
     expect(state.sessions.map((s) => s.status)).toEqual(["Done", "Error"]);
+  });
+
+  /**
+   * Issue #77: a session left at Done by an *earlier* turn is not evidence
+   * about this one. The stop means the agent is waiting, so a parked session
+   * must come back into view like any other NeedsInput transition.
+   */
+  it("auto-unparks a parked session whose Done is left over from an earlier turn", () => {
+    useSessionStore.setState({ sessions: [session(1, "Done")] });
+    useSessionStore.getState().parkSession(1);
+
+    emitStatus(1, "AwaitingInput");
+
+    const state = useSessionStore.getState();
+    expect(state.parkedSessionIds).toEqual([]);
+    expect(state.attentionSessionIds).toEqual([1]);
+    expect(state.sessions[0].status).toBe("NeedsInput");
   });
 
   it("fetchSessions prunes attention ids absent from the fetched list", async () => {

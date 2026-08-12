@@ -204,20 +204,57 @@ export async function checkCliAvailable(command: string): Promise<boolean> {
 export interface ClaudeSessionInfo {
   session_id: string;
   first_prompt: string | null;
+  /** Preview of the most recent message — the opening line alone rarely identifies a long run. */
+  last_activity: string | null;
   started_at: string;
+  /** Last message timestamp (RFC3339 UTC), falling back to the file mtime. */
   last_active: string;
+  /** JSONL entries in the transcript — a proxy for how long the conversation was. */
+  message_count: number;
   git_branch: string | null;
   /**
-   * Directory the conversation ran in, or null when it no longer exists.
+   * Directory the conversation ran in, as recorded in the transcript.
    * `claude --resume` only finds a session from this directory, so a resume
-   * launch must use it as the working directory.
+   * launch must use it as the working directory — but only when it still
+   * exists (see `cwd_exists`), otherwise the shell cannot spawn there.
    */
   cwd: string | null;
+  /** Whether `cwd` still exists on disk. False means warn before resuming. */
+  cwd_exists: boolean;
 }
 
-/** Lists previous Claude Code sessions for a project from Claude's native storage. */
-export async function listClaudeSessions(projectPath: string): Promise<ClaudeSessionInfo[]> {
-  return invoke<ClaudeSessionInfo[]>("list_claude_sessions", { projectPath });
+/** A session listing plus what it could not return, so nothing vanishes silently. */
+export interface ClaudeSessionListing {
+  sessions: ClaudeSessionInfo[];
+  /** Unique conversations found before the backend cap was applied. */
+  total_found: number;
+  /** True when `sessions` is shorter than `total_found`. */
+  truncated: boolean;
+  /** Transcripts that could not be parsed (also logged backend-side). */
+  unreadable: number;
+}
+
+/** An empty listing, for callers that swallow load errors. */
+export const EMPTY_CLAUDE_SESSION_LISTING: ClaudeSessionListing = {
+  sessions: [],
+  total_found: 0,
+  truncated: false,
+  unreadable: 0,
+};
+
+/**
+ * Lists previous Claude Code sessions for a project from Claude's native storage.
+ *
+ * The backend also sweeps `~/.claude/projects` for directories encoded from a
+ * path under `projectPath` (repo subdirectories, worktrees that lived inside
+ * the repo — including deleted ones). Worktrees kept *outside* the repo cannot
+ * be derived from the path, so pass them as `extraRoots`.
+ */
+export async function listClaudeSessions(
+  projectPath: string,
+  extraRoots?: string[]
+): Promise<ClaudeSessionListing> {
+  return invoke<ClaudeSessionListing>("list_claude_sessions", { projectPath, extraRoots });
 }
 
 /** Deletes a Claude Code session's transcript and snapshot data. */

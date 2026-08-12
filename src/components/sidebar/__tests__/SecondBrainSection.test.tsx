@@ -84,12 +84,16 @@ function fileEntry(overrides: Partial<SamuraiFileEntry> = {}): SamuraiFileEntry 
  * Routes the global invoke mock. `deleteRejections` maps a path to the error
  * its non-forced `samurai_file_delete` calls reject with (the in-use
  * refusal); forced calls always succeed. `harvestMarkdown` overrides what
- * `samurai_harvest_read` returns.
+ * `samurai_harvest_read` returns. `fileReads` maps a path to what
+ * `samurai_file_read` resolves with; an `{ error }` value makes it reject
+ * with that string instead — the backend's refusals are plain strings, not
+ * Error objects (issue #82).
  */
 function mockInvoke(
   files: SamuraiFileEntry[],
   deleteRejections: Record<string, string> = {},
   harvestMarkdown = "## Harvest 2026-08-06\n\nYesterday's bottleneck was CI.",
+  fileReads: Record<string, string | { error: string }> = {},
 ) {
   invokeMock.mockImplementation(async (cmd: string, args?: unknown) => {
     switch (cmd) {
@@ -101,6 +105,12 @@ function mockInvoke(
         return { entries: [], file_size_bytes: 0 };
       case "samurai_harvest_read":
         return harvestMarkdown;
+      case "samurai_file_read": {
+        const { path } = args as { path: string };
+        const result = fileReads[path];
+        if (typeof result === "object") throw result.error;
+        return result ?? "";
+      }
       case "samurai_file_delete": {
         const { path, force } = args as { path: string; force: boolean };
         if (!force && deleteRejections[path]) throw deleteRejections[path];
@@ -287,8 +297,8 @@ describe("SecondBrainSection (issue #66)", () => {
     render(<SecondBrainSection />);
     expect(await screen.findByText("#38")).toBeInTheDocument();
 
-    expect(screen.queryByRole("button", { name: "Clean up epic #40" })).toBeNull();
-    const cleanButton = screen.getByRole("button", { name: "Clean up epic #38" });
+    expect(screen.queryByRole("button", { name: "Clean up run #40" })).toBeNull();
+    const cleanButton = screen.getByRole("button", { name: "Clean up run #38" });
 
     // Declined — nothing cleaned.
     fireEvent.click(cleanButton);
@@ -305,7 +315,7 @@ describe("SecondBrainSection (issue #66)", () => {
     );
     expect(
       await screen.findByText(
-        "Cleaned up epic #38: removed worktree, branch samurai/38, run config.",
+        "Cleaned up run #38: removed worktree, branch samurai/38, run config.",
       ),
     ).toBeInTheDocument();
   });
@@ -399,9 +409,16 @@ describe("SecondBrainSection (issue #66)", () => {
     expect(screen.getAllByText("schedule 6.0 MB (warn at 5.0 MB)")).toHaveLength(1);
   });
 
-  it("offers the open action on HARVEST_REPORT rows only", async () => {
+  it("offers the open action on every row, not just harvest reports", async () => {
+    // Issue #82: the eye button used to be HARVEST_REPORT-only, so every
+    // other kind could be deleted but never read.
     mockInvoke([
-      fileEntry(), // HANDOFF — no open action
+      fileEntry(), // HANDOFF
+      fileEntry({
+        kind: "AUDIT_LOG",
+        path: "C:\\git\\maestro\\.maestro\\samurai-audit.jsonl",
+        epic: null,
+      }),
       fileEntry({
         kind: "HARVEST_REPORT",
         path: "C:\\appdata\\samurai\\harvest\\2026-08-06.md",
@@ -411,8 +428,85 @@ describe("SecondBrainSection (issue #66)", () => {
     render(<SecondBrainSection />);
     expect(await screen.findByText("2026-08-06.md")).toBeInTheDocument();
 
+    expect(screen.getByRole("button", { name: "Open 38-gen2.md" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open samurai-audit.jsonl" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Open 2026-08-06.md" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Open 38-gen2.md" })).toBeNull();
+  });
+
+  it("reads a non-harvest file through the guarded general read command", async () => {
+    const entry = fileEntry();
+    mockInvoke([entry], {}, undefined, {
+      [entry.path]: "## Handoff gen-2\n\nPick up the CI fix.",
+    });
+    render(<SecondBrainSection />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Open 38-gen2.md" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("samurai_file_read", { path: entry.path }),
+    );
+    // .md → markdown, same renderer the harvest report gets.
+    expect(await screen.findByText("Pick up the CI fix.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close file viewer" }));
+    expect(screen.queryByText("Pick up the CI fix.")).toBeNull();
+  });
+
+  it("pretty-prints a .json file", async () => {
+    const configPath = "C:\\appdata\\samurai\\runs\\maestro-38.json";
+    mockInvoke([fileEntry({ kind: "RUN_CONFIG", path: configPath })], {}, undefined, {
+      [configPath]: '{"epic":"#38","status":"ACTIVE"}',
+    });
+    const { container } = render(<SecondBrainSection />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Open #38" }));
+    await waitFor(() =>
+      expect(container.querySelector("pre")?.textContent).toBe(
+        '{\n  "epic": "#38",\n  "status": "ACTIVE"\n}',
+      ),
+    );
+  });
+
+  it("falls back to the raw text when a .json file does not parse", async () => {
+    const configPath = "C:\\appdata\\samurai\\runs\\maestro-38.json";
+    const truncated = '{"epic":"#38","status":';
+    mockInvoke([fileEntry({ kind: "RUN_CONFIG", path: configPath })], {}, undefined, {
+      [configPath]: truncated,
+    });
+    const { container } = render(<SecondBrainSection />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Open #38" }));
+    await waitFor(() => expect(container.querySelector("pre")?.textContent).toBe(truncated));
+  });
+
+  it("shows .jsonl as plain text rather than parsing it", async () => {
+    const journalPath = "C:\\appdata\\samurai\\journal.jsonl";
+    // A single-line JSONL file is itself valid JSON — if the viewer picked
+    // its renderer by content rather than extension this would come back
+    // pretty-printed and the append-order reading would be lost.
+    const raw = '{"ts":"2026-08-12T09:00:00Z","category":"ERROR","text":"CI flaked"}';
+    mockInvoke([fileEntry({ kind: "JOURNAL", path: journalPath, epic: null })], {}, undefined, {
+      [journalPath]: raw,
+    });
+    const { container } = render(<SecondBrainSection />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Open journal.jsonl" }));
+    await waitFor(() => expect(container.querySelector("pre")?.textContent).toBe(raw));
+  });
+
+  it("renders a read refusal inline in the viewer instead of crashing", async () => {
+    const entry = fileEntry();
+    // The backend's oversize refusal, verbatim — the viewer must not reword
+    // or parse it.
+    const refusal =
+      `refusing to read ${entry.path}: the file is 2.4 MB, over the 2 MB viewer ` +
+      "limit — open it in an external editor";
+    mockInvoke([entry], {}, undefined, { [entry.path]: { error: refusal } });
+    render(<SecondBrainSection />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Open 38-gen2.md" }));
+    expect(await screen.findByText(refusal)).toBeInTheDocument();
+    // Still a live panel, not a blown-up tree.
+    expect(screen.getByText("Files")).toBeInTheDocument();
   });
 
   it("opens a harvest report in the markdown overlay and closes it again", async () => {
@@ -427,7 +521,7 @@ describe("SecondBrainSection (issue #66)", () => {
     // The fetched markdown renders through MarkdownBody (lazy-loaded).
     expect(await screen.findByText("Yesterday's bottleneck was CI.")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Close report" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close file viewer" }));
     expect(screen.queryByText("Yesterday's bottleneck was CI.")).toBeNull();
   });
 

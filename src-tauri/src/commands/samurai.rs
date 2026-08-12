@@ -22,7 +22,7 @@ use crate::core::samurai_injector::strip_extended_prefix;
 use crate::core::samurai_journal::{
     default_journal_file, JournalCategory, JournalEntry, JournalListResult, JournalStore,
 };
-use crate::core::samurai_prompts::{self, epic_slug};
+use crate::core::samurai_prompts::{self, epic_slug, RunRefs};
 use crate::core::samurai_replicator::{derive_repo_pin, SamuraiReplicator};
 use crate::core::samurai_run_config::{RunConfigStatus, RunConfigStore, SamuraiRunConfig};
 use crate::core::samurai_schedule::{SamuraiSchedule, ScheduleEntry};
@@ -278,21 +278,22 @@ fn epic_branch(epic: &str) -> String {
     format!("samurai-{}", epic_slug(epic))
 }
 
-/// Canonical spelling of what the user typed in the launcher's "Issues" field.
+/// The run's refs, built from the launcher's two fields (issue #83): parent
+/// EPICS whose children the orchestrator discovers, and standalone ISSUES
+/// named directly.
 ///
-/// The field accepts an epic ref, ONE issue, or a comma-separated list
-/// (`77, 78`) — a run is scoped to a set of issues, and an epic is just the
-/// common case where that set is named by one parent. Splitting on commas
-/// lets `#77,78` and `#77 , 78` land on the same identity, which matters:
-/// this string is the run's key everywhere (branch slug, worktree, handoff
-/// filenames, resume timers), so two spellings of one run must not produce
-/// two runs. Whitespace inside a single ref is collapsed for the same reason.
-fn normalize_epic_ref(epic: &str) -> String {
-    epic.split(',')
-        .map(|part| part.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(", ")
+/// Every element is split on commas before [`RunRefs`] normalises it. The
+/// frontend splits its own comma-separated inputs, but the backend must not
+/// depend on that: `["7, 9"]` and `["7", "9"]` have to produce ONE identity,
+/// because [`RunRefs::label`] is the run's key everywhere (branch slug,
+/// worktree, handoff filenames, resume timers) and two spellings of one run
+/// must never produce two runs. `RunRefs` collapses whitespace and drops
+/// empties for the same reason.
+fn run_refs(epics: &[String], issues: &[String]) -> RunRefs {
+    RunRefs::new(
+        epics.iter().flat_map(|e| e.split(',')),
+        issues.iter().flat_map(|i| i.split(',')),
+    )
 }
 
 /// The launch refusal matrix, in check order. `None` = clear to launch.
@@ -381,10 +382,14 @@ pub struct SamuraiLaunchResult {
 /// site per the P5.1 contract (`default_journal_file`); a single space
 /// joins the two single-line instructions, keeping the brief one
 /// paste-able line.
-fn launch_brief(epic: &str, repo_pin: Option<&str>) -> String {
+///
+/// Issue #83: the refs arrive already split into epics and issues, so the
+/// gen-1 brief names each set for what it is instead of calling a pair of
+/// sibling issues an epic.
+fn launch_brief(refs: &RunRefs, repo_pin: Option<&str>) -> String {
     format!(
         "{} {}",
-        samurai_prompts::launch_instruction(epic, repo_pin),
+        samurai_prompts::launch_instruction(refs, repo_pin),
         samurai_prompts::journal_instruction(&default_journal_file()),
     )
 }
@@ -403,15 +408,20 @@ pub(crate) async fn launch_run_inner(
     preflight: &SamuraiPreflight,
     global_config: SamuraiConfig,
     project: &str,
-    epic: &str,
+    refs: &RunRefs,
     model: Option<String>,
     handoff_context_pct: Option<f64>,
     worktree_base: Option<&Path>,
 ) -> Result<SamuraiLaunchResult, String> {
-    let epic = normalize_epic_ref(epic);
-    if epic.is_empty() {
-        return Err("an epic reference is required".to_string());
+    // Issue #83: the refs are the launch input, and `label()` is the single
+    // identity string every downstream surface already keys off — branch,
+    // worktree, run config filename, handoff filenames, resume timers and the
+    // supervisor's session epic all flow through `epic_slug` on this value, so
+    // nothing below had to learn about the split.
+    if refs.is_empty() {
+        return Err("at least one epic or issue reference is required".to_string());
     }
+    let epic = refs.label();
     let model = model
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty());
@@ -474,13 +484,14 @@ pub(crate) async fn launch_run_inner(
     // reconciliation flags as reconcile_unstartable — the human relaunches
     // (accepted).
     let mut config =
-        SamuraiRunConfig::new(project.to_string(), epic.clone(), worktree_path.clone());
+        SamuraiRunConfig::new(project.to_string(), epic.clone(), worktree_path.clone())
+            .with_refs(refs);
     config.repo_pin = repo_pin.clone();
     config.model = model;
     config.thresholds = thresholds;
     run_configs.save(&config)?;
 
-    let instruction = launch_brief(&epic, repo_pin.as_deref());
+    let instruction = launch_brief(refs, repo_pin.as_deref());
     replicator.spawn_first_generation(project, &epic, &worktree_path, instruction);
 
     log::info!(
@@ -512,11 +523,16 @@ pub async fn samurai_launch_run(
     replicator: State<'_, Arc<SamuraiReplicator>>,
     config: State<'_, SharedSamuraiConfig>,
     project_path: String,
-    epic: String,
+    epics: Vec<String>,
+    issues: Vec<String>,
     model: Option<String>,
     handoff_context_pct: Option<f64>,
 ) -> Result<SamuraiLaunchResult, String> {
     let project = canonical_project_path(&project_path);
+    // The frontend validates its two fields, but the backend re-normalises
+    // them here and `launch_run_inner` refuses an empty set — the wire is not
+    // trusted to have done either.
+    let refs = run_refs(&epics, &issues);
     let preflight = run_preflight(&project).await;
     let global_config = config
         .read()
@@ -531,7 +547,7 @@ pub async fn samurai_launch_run(
         &preflight,
         global_config,
         &project,
-        &epic,
+        &refs,
         model,
         handoff_context_pct,
         None,
@@ -784,6 +800,91 @@ pub fn samurai_file_delete(
     samurai_files::delete_file(&roots, &configs, &entries, &path, force)
 }
 
+/// Biggest file [`samurai_file_read`] will hand to the webview: 2 MB. The
+/// audit logs and the ops journal are append-only JSONL that grow without
+/// bound (the health checker flags them for size), and a multi-MB string
+/// crossing the IPC boundary into a `<pre>` freezes the window. Over the
+/// cap the command says so instead of loading it.
+const FILE_READ_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// The guarded read behind [`samurai_file_read`], extracted from the Tauri
+/// command for testability (the `cleanup_epic_inner` / `harvest::read_report`
+/// precedent).
+///
+/// The containment rule is deliberately the NARROWEST one that serves the
+/// Second Brain: the requested path must canonicalize to a path the CURRENT
+/// inventory returned. Not "any file under the managed roots", not "any file
+/// in a project" — a listed file and nothing else, so this can never become
+/// a general-purpose file reader handed to a webview. Both sides go through
+/// [`samurai_files::canonical_stripped`], so `..` traversal, symlinks, 8.3
+/// short names and Windows `\\?\` / `\\?\UNC\` spellings all collapse to the
+/// same on-disk identity before the compare.
+///
+/// Every refusal is a plain readable string (the command convention here) —
+/// the viewer renders it inline.
+fn read_listed_file(entries: &[SamuraiFileEntry], path: &str) -> Result<String, String> {
+    // A path that cannot be resolved never reaches the compare — this is
+    // also the deleted-between-listing-and-click case, which must read as an
+    // explanation, not a panic.
+    let requested = samurai_files::canonical_stripped(Path::new(path)).ok_or_else(|| {
+        format!("cannot read {path}: the file does not exist or cannot be resolved")
+    })?;
+
+    let listed = entries.iter().any(|entry| {
+        samurai_files::canonical_stripped(Path::new(&entry.path)).is_some_and(|p| p == requested)
+    });
+    if !listed {
+        return Err(format!(
+            "refusing to read {}: the path is not a Samurai-managed file",
+            requested.display()
+        ));
+    }
+
+    let meta = std::fs::metadata(&requested)
+        .map_err(|e| format!("failed to read {}: {e}", requested.display()))?;
+    // The inventory only ever lists regular files, so this can only fire if
+    // the path was swapped for a directory after the listing.
+    if !meta.is_file() {
+        return Err(format!(
+            "refusing to read {}: not a regular file",
+            requested.display()
+        ));
+    }
+    if meta.len() > FILE_READ_MAX_BYTES {
+        return Err(format!(
+            "refusing to read {}: the file is {:.1} MB, over the 2 MB viewer limit — open it in an \
+             external editor",
+            requested.display(),
+            meta.len() as f64 / (1024.0 * 1024.0)
+        ));
+    }
+
+    std::fs::read_to_string(&requested)
+        .map_err(|e| format!("failed to read {}: {e}", requested.display()))
+}
+
+/// Reads one Samurai-managed file by absolute path, read-only — the Second
+/// Brain's file viewer (issue #82) serves every row's content from here, not
+/// just harvest reports. The path is accepted ONLY if it is one the
+/// inventory this command computes itself (the same
+/// [`samurai_files_list`] snapshot) currently returns; anything else, and
+/// anything over the 2 MB cap, is refused with a readable error.
+#[tauri::command]
+pub fn samurai_file_read(
+    supervisor: State<'_, Arc<Supervisor>>,
+    schedule: State<'_, Arc<SamuraiSchedule>>,
+    run_configs: State<'_, Arc<RunConfigStore>>,
+    path: String,
+) -> Result<String, String> {
+    let entries = samurai_files::list_files(
+        &samurai_files_roots(),
+        &run_configs.list_with_paths(),
+        &schedule.list(),
+        &supervisor.list_sessions(),
+    );
+    read_listed_file(&entries, &path)
+}
+
 /// The cancel itself, extracted from the Tauri command for testability (the
 /// `cleanup_epic_inner` precedent): the same `SamuraiSchedule::cancel` path
 /// cleanup step 1 uses, on its own. Like cleanup, the outcome is logged, not
@@ -851,6 +952,7 @@ pub fn samurai_journal_list(
 mod tests {
     use super::*;
     use crate::core::samurai_audit::AuditLog;
+    use crate::core::samurai_files::{strip_extended_length, SamuraiFileKind};
     use crate::core::windows_process::StdCommandExt;
     use tempfile::tempdir;
 
@@ -946,25 +1048,43 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_epic_ref_collapses_spellings_of_one_run() {
-        // A single ref is just trimmed and internally collapsed.
-        assert_eq!(normalize_epic_ref("  #38  "), "#38");
-        assert_eq!(normalize_epic_ref("Epic  12:\tAuth"), "Epic 12: Auth");
-        // Every spelling of the same list lands on one identity — otherwise
-        // the same two issues could be launched twice as two separate runs.
-        for spelling in ["77,78", "77, 78", " 77 ,  78 ", "77,,78", "77, 78,"] {
-            assert_eq!(normalize_epic_ref(spelling), "77, 78", "spelling: {spelling}");
+    fn test_run_refs_collapses_spellings_of_one_run() {
+        // Whatever shape the frontend sends — one comma-separated element or
+        // one element per ref — the same run must land on one identity, or
+        // the same work could be launched twice as two separate runs.
+        for spelling in [
+            vec!["77,78".to_string()],
+            vec!["77, 78".to_string()],
+            vec![" 77 ,  78 ".to_string()],
+            vec!["77,,78".to_string()],
+            vec!["77, 78,".to_string()],
+            vec!["#77".to_string(), " 78 ".to_string()],
+        ] {
+            let refs = run_refs(&spelling, &[]);
+            assert_eq!(refs.epics(), ["77", "78"], "spelling: {spelling:?}");
+            assert_eq!(refs.label(), "epics #77, #78", "spelling: {spelling:?}");
         }
-        // Empty stays empty so the caller's "epic required" check still fires.
-        assert_eq!(normalize_epic_ref("   ,  , "), "");
+
+        // The two fields stay apart, and each is normalised the same way.
+        let refs = run_refs(&["#5".to_string()], &["7, #9".to_string()]);
+        assert_eq!(refs.epics(), ["5"]);
+        assert_eq!(refs.issues(), ["7", "9"]);
+        assert_eq!(refs.label(), "epic #5 · issues #7, #9");
+
+        // Junk on both sides is empty, so the launch refusal still fires.
+        assert!(run_refs(&["   ,  , ".to_string()], &["#".to_string()]).is_empty());
+        assert!(run_refs(&[], &[]).is_empty());
     }
 
     #[test]
     fn test_launch_brief_is_launch_instruction_plus_journal_rider() {
         // Issue #72: the composed gen-1 brief = the unmodified launch
         // instruction, then the journaling rider, one paste-able line.
-        let brief = launch_brief("#38", Some("nachogl1/maestro"));
-        let launch = samurai_prompts::launch_instruction("#38", Some("nachogl1/maestro"));
+        let brief = launch_brief(&RunRefs::epics_only("#38"), Some("nachogl1/maestro"));
+        let launch = samurai_prompts::launch_instruction(
+            &RunRefs::epics_only("#38"),
+            Some("nachogl1/maestro"),
+        );
         assert!(
             brief.starts_with(&launch),
             "launch text must ride first, unmodified"
@@ -1109,6 +1229,32 @@ mod tests {
         }
     }
 
+    /// A launch through the harness — the same collaborators cleanup uses,
+    /// with preflight forced green and the worktree base kept in the tempdir.
+    async fn run_launch(
+        h: &CleanupHarness,
+        epics: &[&str],
+        issues: &[&str],
+    ) -> Result<SamuraiLaunchResult, String> {
+        let epics: Vec<String> = epics.iter().map(|s| s.to_string()).collect();
+        let issues: Vec<String> = issues.iter().map(|s| s.to_string()).collect();
+        launch_run_inner(
+            &h.supervisor,
+            &h.schedule,
+            &h.worktrees,
+            &h.run_configs,
+            &h.replicator,
+            &preflight(true, true),
+            SamuraiConfig::default(),
+            &h.project,
+            &run_refs(&epics, &issues),
+            None,
+            None,
+            Some(h.base.path()),
+        )
+        .await
+    }
+
     async fn run_cleanup(h: &CleanupHarness, epic: &str) -> Result<SamuraiCleanupReport, String> {
         cleanup_epic_inner(
             &h.supervisor,
@@ -1242,13 +1388,14 @@ mod tests {
         ));
         replicator.set_run_configs(run_configs.clone());
 
-        // A stale timer from the epic's previous run — armed under the "#38"
-        // spelling while the relaunch below types "38": the cancel must match
-        // by slug (re-review F5), not exact string.
+        // A stale timer from the run's previous generation — armed under the
+        // "epic 38" spelling of the identity label while the relaunch below
+        // produces "epic #38": the cancel must match by slug (re-review F5),
+        // not exact string.
         schedule
             .arm(ScheduleEntry {
                 project_path: project.clone(),
-                epic: "#38".to_string(),
+                epic: "epic 38".to_string(),
                 fire_at: "2030-01-01T00:00:00+00:00".to_string(),
                 reason: "park".to_string(),
             })
@@ -1264,7 +1411,7 @@ mod tests {
             &preflight(true, true),
             global.clone(),
             &project,
-            "38",
+            &run_refs(&["38".to_string()], &[]),
             Some("opus".to_string()),
             Some(30.0),
             Some(base.path()),
@@ -1272,13 +1419,14 @@ mod tests {
         .await
         .unwrap();
 
-        // F5: the "#38"-spelled timer is gone despite the "38" launch
-        // spelling, and the result reports it.
+        // F5: the "epic 38"-spelled timer is gone despite the launch's own
+        // "epic #38" spelling, and the result reports it.
+        assert_eq!(result.epic, "epic #38");
         assert!(result.stale_timer_cancelled);
         assert!(schedule.list().is_empty(), "stale timer cancelled");
 
         // F4: model + the one-field thresholds override are persisted.
-        let config = run_configs.get(&project, "#38").unwrap();
+        let config = run_configs.get(&project, &result.epic).unwrap();
         assert_eq!(config.model.as_deref(), Some("opus"));
         let thresholds = config.thresholds.expect("override stored");
         assert_eq!(thresholds.handoff_context_pct, 30.0);
@@ -1306,7 +1454,7 @@ mod tests {
             &preflight(true, true),
             global,
             &project,
-            "#38",
+            &run_refs(&["#38".to_string()], &[]),
             None,
             None,
             Some(base.path()),
@@ -1314,7 +1462,80 @@ mod tests {
         .await
         .unwrap();
         assert!(!again.stale_timer_cancelled);
-        assert_eq!(run_configs.get(&project, "#38").unwrap().thresholds, None);
+        assert_eq!(again.epic, "epic #38", "`38` and `#38` are one run");
+        assert_eq!(
+            run_configs.get(&project, "epic #38").unwrap().thresholds,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_launch_identity_per_ref_shape() {
+        // Issue #83 §3: one run carries ALL its numbers. The label is the
+        // run's identity, and branch, worktree folder and run-config filename
+        // are its slug — epics-only, issues-only and both.
+        let h = cleanup_harness();
+        for (epics, issues, label, slug) in [
+            (vec!["5"], vec![], "epic #5", "epic-5"),
+            (vec![], vec!["7", "9"], "issues #7, #9", "issues-7-9"),
+            (
+                vec!["5"],
+                vec!["7", "9"],
+                "epic #5 · issues #7, #9",
+                "epic-5-issues-7-9",
+            ),
+        ] {
+            let result = run_launch(&h, &epics, &issues).await.unwrap();
+            assert_eq!(result.epic, label, "label for {epics:?} + {issues:?}");
+            assert_eq!(result.branch, format!("samurai-{slug}"));
+            assert!(
+                Path::new(&result.worktree_path).ends_with(format!("samurai-{slug}")),
+                "worktree {} must use the combined slug",
+                result.worktree_path
+            );
+
+            // The config is keyed by the label and keeps the two lists that
+            // built it, so the prompt shape survives a resume.
+            let config = h
+                .run_configs
+                .get(&h.project, label)
+                .expect("config saved under the label");
+            assert_eq!(config.epics, epics);
+            assert_eq!(config.issues, issues);
+            assert_eq!(config.worktree_path, result.worktree_path);
+        }
+        assert_eq!(h.run_configs.load_active().len(), 3, "three distinct runs");
+    }
+
+    #[tokio::test]
+    async fn test_launch_refuses_empty_refs_and_a_live_duplicate_run() {
+        let h = cleanup_harness();
+
+        // Nothing usable on either side: refused before any side effect, no
+        // matter what the frontend thought it validated.
+        let err = run_launch(&h, &["  ", "#"], &[","]).await.unwrap_err();
+        assert!(
+            err.contains("at least one epic or issue reference"),
+            "{err}"
+        );
+        assert!(h.run_configs.load_active().is_empty());
+        assert!(h.spawns.lock().unwrap().is_empty());
+
+        // A real launch, then a live session registered for it the way the
+        // frontend does — under the run's label.
+        let result = run_launch(&h, &["5"], &["7", "9"]).await.unwrap();
+        h.supervisor
+            .register_session(1, h.project.clone(), result.epic.clone(), 1)
+            .unwrap();
+
+        // Relaunching the same run is refused, and the duplicate check
+        // matches by SLUG: a differently spelled but identical set of refs is
+        // the same run.
+        let dup = run_launch(&h, &["#5"], &["#7", "9"]).await.unwrap_err();
+        assert!(dup.contains("live supervised session"), "{dup}");
+
+        // A DIFFERENT set is a different run and still launches.
+        assert!(run_launch(&h, &["5"], &["7"]).await.is_ok());
     }
 
     #[test]
@@ -1441,5 +1662,175 @@ mod tests {
         assert!(report.worktree_removed);
         assert!(report.branch_deleted);
         assert!(!worktree.exists());
+    }
+
+    // --- issue #82: guarded read of any listed Samurai file ---
+
+    /// One inventory row for `path`, the shape `samurai_files_list` returns.
+    /// Only `path` participates in the guard; the rest is presentation.
+    fn listed_row(path: &Path) -> SamuraiFileEntry {
+        SamuraiFileEntry {
+            kind: SamuraiFileKind::Handoff,
+            path: path.to_string_lossy().into_owned(),
+            size_bytes: 0,
+            modified_at: None,
+            project_path: None,
+            epic: None,
+            in_use: false,
+            has_live_session: false,
+            fire_at: None,
+        }
+    }
+
+    #[test]
+    fn test_read_listed_file_reads_a_listed_file_and_refuses_the_rest() {
+        let base = tempdir().unwrap();
+        let dir = base.path().join("handoffs");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let listed = dir.join("handoff.md");
+        std::fs::write(&listed, "# handoff").unwrap();
+        // A real neighbour that is NOT listed, and a real file outside the
+        // directory entirely — both exist, so each is refused by the
+        // containment rule itself rather than by failing to resolve.
+        std::fs::write(dir.join("neighbour.md"), "neighbour").unwrap();
+        std::fs::write(base.path().join("outside.md"), "outside").unwrap();
+        let entries = vec![listed_row(&listed)];
+
+        // Happy path: a listed file reads back verbatim.
+        assert_eq!(
+            read_listed_file(&entries, &listed.to_string_lossy()).unwrap(),
+            "# handoff"
+        );
+
+        // The same file spelled through a `..` hop IS the same file: the
+        // canonicalization is symmetric, so a legitimate spelling still reads.
+        let round_trip = dir.join("sub").join("..").join("handoff.md");
+        assert_eq!(
+            read_listed_file(&entries, &round_trip.to_string_lossy()).unwrap(),
+            "# handoff"
+        );
+
+        // An unrelated absolute path is refused...
+        let err = read_listed_file(&entries, &base.path().join("outside.md").to_string_lossy())
+            .unwrap_err();
+        assert!(err.contains("not a Samurai-managed file"), "{err}");
+
+        // ...and so is the `..` traversal that lands on it: the `..` resolves
+        // BEFORE the compare, so the spelling buys nothing.
+        let sneaky = dir.join("..").join("outside.md");
+        let err = read_listed_file(&entries, &sneaky.to_string_lossy()).unwrap_err();
+        assert!(err.contains("not a Samurai-managed file"), "{err}");
+
+        // A sibling in the very same directory is refused too — the rule is
+        // "a path the listing returned", NOT "anything under a managed root".
+        let err =
+            read_listed_file(&entries, &dir.join("neighbour.md").to_string_lossy()).unwrap_err();
+        assert!(err.contains("not a Samurai-managed file"), "{err}");
+
+        // A LISTED path that is a directory (swapped after the listing) is
+        // refused as content instead of being read.
+        let dirs = vec![listed_row(&dir.join("sub"))];
+        let err = read_listed_file(&dirs, &dir.join("sub").to_string_lossy()).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    #[test]
+    fn test_read_listed_file_refuses_foreign_spellings_on_any_host() {
+        let base = tempdir().unwrap();
+        let listed = base.path().join("journal.jsonl");
+        std::fs::write(&listed, "{}\n").unwrap();
+        let entries = vec![listed_row(&listed)];
+
+        // Windows AND POSIX spellings, asserted on BOTH runners (CI is Linux,
+        // developers are on Windows). Whichever host runs this, one family
+        // resolves and is refused by containment while the other fails to
+        // resolve and is refused before the compare — both are refusals, and
+        // neither ever yields content.
+        for foreign in [
+            r"C:\Windows\win.ini",
+            r"\\?\C:\Windows\win.ini",
+            r"C:\Users\someone\.ssh\id_rsa",
+            r"\\?\UNC\server\share\secret.txt",
+            r"\\server\share\secret.txt",
+            r"..\..\..\..\Windows\win.ini",
+            "/etc/passwd",
+            "/etc/./passwd",
+            "../../../../etc/passwd",
+        ] {
+            match read_listed_file(&entries, foreign) {
+                Ok(content) => panic!("read a path outside the listing ({foreign}): {content:?}"),
+                Err(err) => assert!(
+                    err.contains("not a Samurai-managed file")
+                        || err.contains("does not exist or cannot be resolved"),
+                    "unexpected refusal for {foreign}: {err}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_strip_extended_length_maps_both_windows_prefixes() {
+        // The guard's Windows spelling rule as pure string logic, so it is
+        // asserted on a Linux runner too — `fs::canonicalize` only ever emits
+        // `\\?\` on Windows, so the canonicalizing path cannot exercise it
+        // there. `\\?\UNC\` is the twin trap flagged in harvest.rs: dropping
+        // only `\\?\` leaves a RELATIVE `UNC\server\share\…` that resolves
+        // against the process cwd.
+        let unc = strip_extended_length(r"\\?\UNC\server\share\journal.jsonl");
+        assert_eq!(unc, r"\\server\share\journal.jsonl");
+        assert!(!unc.starts_with("UNC"), "{unc}");
+        assert_eq!(
+            strip_extended_length(r"\\?\C:\data\journal.jsonl"),
+            r"C:\data\journal.jsonl"
+        );
+        // Already-plain spellings pass through untouched, both families.
+        assert_eq!(
+            strip_extended_length(r"C:\data\journal.jsonl"),
+            r"C:\data\journal.jsonl"
+        );
+        assert_eq!(
+            strip_extended_length("/var/data/journal.jsonl"),
+            "/var/data/journal.jsonl"
+        );
+    }
+
+    #[test]
+    fn test_read_listed_file_refuses_over_the_size_cap() {
+        let base = tempdir().unwrap();
+        let big = base.path().join("audit.jsonl");
+        std::fs::write(&big, vec![b'x'; FILE_READ_MAX_BYTES as usize + 1]).unwrap();
+        let entries = vec![listed_row(&big)];
+
+        // Over the cap: an explanation, and the bytes stay on disk.
+        let err = read_listed_file(&entries, &big.to_string_lossy()).unwrap_err();
+        assert!(err.contains("over the 2 MB viewer limit"), "{err}");
+        assert!(err.contains("2.0 MB"), "{err}");
+
+        // Exactly at the cap still reads — the refusal is strictly ">".
+        std::fs::write(&big, vec![b'x'; FILE_READ_MAX_BYTES as usize]).unwrap();
+        assert_eq!(
+            read_listed_file(&entries, &big.to_string_lossy())
+                .unwrap()
+                .len(),
+            FILE_READ_MAX_BYTES as usize
+        );
+    }
+
+    #[test]
+    fn test_read_listed_file_explains_a_file_deleted_after_the_listing() {
+        let base = tempdir().unwrap();
+        let gone = base.path().join("handoff.md");
+        std::fs::write(&gone, "# handoff").unwrap();
+        let entries = vec![listed_row(&gone)];
+        std::fs::remove_file(&gone).unwrap();
+
+        // Deleted between the listing and the click: a readable explanation
+        // the viewer can render inline, never a panic.
+        let err = read_listed_file(&entries, &gone.to_string_lossy()).unwrap_err();
+        assert!(
+            err.contains("does not exist or cannot be resolved"),
+            "{err}"
+        );
+        assert!(err.contains("handoff.md"), "{err}");
     }
 }

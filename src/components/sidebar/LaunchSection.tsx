@@ -7,10 +7,12 @@ import {
   Loader2,
   RefreshCw,
   Rocket,
+  TerminalSquare,
   Trash2,
   XCircle,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { samePath } from "@/lib/path";
 import {
   samuraiCleanupEpic,
   samuraiLaunchRun,
@@ -18,16 +20,38 @@ import {
   samuraiPreflight,
   type SamuraiPreflight,
   type SamuraiRunConfig,
+  type SamuraiSupervisorState,
 } from "@/lib/samurai";
 import type { UsageData } from "@/lib/usageParser";
+import {
+  SAMURAI_TILE_CLOSE_STATES,
+  useSessionStore,
+  type SamuraiSessionInfo,
+} from "@/stores/useSessionStore";
 import { useUsageStore } from "@/stores/useUsageStore";
-import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
+import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 import { cardClass, SectionHeader } from "./sectionChrome";
 
 /** Last path segment, for compact project display. */
 function baseName(path: string): string {
   const parts = path.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] ?? path;
+}
+
+/** One accepted ref (issue #83): a GitHub number, with or without its `#`. */
+const REF_PATTERN = /^#?\d+$/;
+
+/** The non-empty, trimmed comma-separated parts of a refs field. */
+function refParts(text: string): string[] {
+  return text
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+}
+
+/** `1 epic` / `2 epics` — a count with its noun agreeing. */
+function countPhrase(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
 }
 
 /**
@@ -188,16 +212,88 @@ function ModelPicker({
   );
 }
 
-/** One active run with its cleanup action. */
+/** Where a run's live agent sits, or why it cannot be opened (issue #84). */
+type OpenTarget =
+  | { kind: "open"; tabId: string; sessionId: number }
+  | { kind: "blocked"; reason: string };
+
+/** Hover text of an openable run's button. */
+const OPEN_HINT = "Switch to this run's project and focus its live agent's terminal";
+
+/** Nothing is registered under this run at all. */
+const NO_SESSION_REASON = "No live agent for this run — it is not running in this Maestro session";
+
+/**
+ * Why a run that IS registered still has no tile to focus. Only the states
+ * whose tile the frontend closes (`SAMURAI_TILE_CLOSE_STATES`) land here —
+ * DEAD deliberately keeps its tile, so a dead agent stays openable.
+ */
+const CLOSED_TILE_REASON: Partial<Record<SamuraiSupervisorState, string>> = {
+  PARKED: "No live agent for this run — it was parked, and resuming starts a fresh agent",
+  KILLED: "No live agent for this run — its agent was killed",
+};
+
+/**
+ * Finds the terminal to open for one run.
+ *
+ * The run's `epic` is its identity AND the string the supervisor registers its
+ * session under (issue #83), so the two compare directly — trimmed, because a
+ * legacy config and a live registration can differ by padding. Project paths
+ * go through `samePath`, never `===`: the same directory has several spellings
+ * on Windows, and matching on the ref alone would cross-focus two projects
+ * running the same epic number.
+ */
+function findOpenTarget(
+  run: SamuraiRunConfig,
+  samuraiBySessionId: Record<number, SamuraiSessionInfo>,
+  tabs: WorkspaceTab[],
+): OpenTarget {
+  const matches = Object.entries(samuraiBySessionId)
+    .map(([id, info]) => ({ sessionId: Number(id), info }))
+    .filter(
+      ({ info }) =>
+        info.epic.trim() === run.epic.trim() && samePath(info.project, run.project_path),
+    )
+    // Newest generation first: with several alive, that is the one working.
+    .sort((a, b) => b.info.generation - a.info.generation);
+  if (matches.length === 0) return { kind: "blocked", reason: NO_SESSION_REASON };
+
+  const live = matches.find(({ info }) => !SAMURAI_TILE_CLOSE_STATES.has(info.state));
+  if (!live) {
+    // The newest generation's state is the honest reason — an older gen being
+    // KILLED says nothing about why the run has no terminal now.
+    return {
+      kind: "blocked",
+      reason: CLOSED_TILE_REASON[matches[0].info.state] ?? NO_SESSION_REASON,
+    };
+  }
+
+  const tab = tabs.find((t) => samePath(t.projectPath, run.project_path));
+  if (!tab) {
+    return {
+      kind: "blocked",
+      reason: "No live agent for this run — its project is not open in a tab",
+    };
+  }
+  return { kind: "open", tabId: tab.id, sessionId: live.sessionId };
+}
+
+/** One active run with its open-the-agent and cleanup actions. */
 function RunRow({
   run,
+  target,
+  onOpen,
   onCleanup,
   busy,
 }: {
   run: SamuraiRunConfig;
+  target: OpenTarget;
+  onOpen: (tabId: string, sessionId: number) => void;
   onCleanup: (run: SamuraiRunConfig) => void;
   busy: boolean;
 }) {
+  const open = target.kind === "open" ? target : null;
+  const openHint = target.kind === "open" ? OPEN_HINT : target.reason;
   return (
     <div
       className="flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] hover:bg-maestro-surface"
@@ -207,17 +303,34 @@ function RunRow({
         ACTIVE
       </span>
       <span className="min-w-0 flex-1 truncate text-maestro-text">
+        {/* Already the readable label since issue #83 (`epic #5 · issues #7,
+            #9`), and a single raw ref (`#38`) for configs written before it —
+            rendering the stored string is what keeps both shapes right. */}
         {run.epic}
         <span className="text-maestro-muted"> · {baseName(run.project_path)}</span>
         {run.model ? <span className="text-maestro-muted"> · {run.model}</span> : null}
+      </span>
+      {/* The reason rides the wrapper, not the button: a disabled button takes
+          no pointer events, so its own `title` would never surface — and the
+          row's worktree tooltip would answer the hover instead. */}
+      <span className="flex shrink-0" title={openHint}>
+        <button
+          type="button"
+          onClick={() => open && onOpen(open.tabId, open.sessionId)}
+          disabled={open === null}
+          className="rounded p-1 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-accent disabled:opacity-40"
+          aria-label={`Open the agent for run ${run.epic}`}
+        >
+          <TerminalSquare size={12} />
+        </button>
       </span>
       <button
         type="button"
         onClick={() => onCleanup(run)}
         disabled={busy}
         className="rounded p-1 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-red disabled:opacity-40"
-        aria-label={`Clean up epic ${run.epic}`}
-        title="Delete this epic's worktree and branch, cancel its timer, archive its run config (asks first)"
+        aria-label={`Clean up run ${run.epic}`}
+        title="Delete this run's worktree and branch, cancel its timer, archive its run config (asks first)"
       >
         <Trash2 size={12} />
       </button>
@@ -256,23 +369,38 @@ const PHASE_LABEL: Record<LaunchPhase, string> = {
 
 /**
  * Samurai run launcher (issue #63, PRD §5.8 + §9): the form that starts an
- * autonomous run — project (the active tab, read-only), the issues to work,
- * an optional model pinned by remaining allowance, an optional handoff
+ * autonomous run — project (the active tab, read-only), the epics and the
+ * issues to work (issue #83: two fields, so the orchestrator prompt never
+ * calls a list of issues an epic), an optional model pinned by remaining
+ * allowance, an optional handoff
  * override — behind ONE Launch button that runs preflight itself and reports
  * the phase it is in. Below it, the active runs (`samurai_list_runs`) with
  * per-run destructive cleanup behind the same ask()-confirm pattern as the
- * audit clear.
+ * audit clear, and (issue #84) a per-run jump to the agent working it.
+ *
+ * `onNavigate` is the same sidebar→terminal route the Agents section takes
+ * (App's `handleAgentNavigate`): select the project tab, then zoom its pane —
+ * which unparks the session on the way in.
  */
-export function LaunchSection() {
+export function LaunchSection({
+  onNavigate,
+}: {
+  onNavigate?: (tabId: string, sessionId: number) => void;
+}) {
   const tabs = useWorkspaceStore((s) => s.tabs);
   const activeTab = tabs.find((t) => t.active);
   const projectPath = activeTab?.projectPath ?? "";
+  const samuraiBySessionId = useSessionStore((s) => s.samuraiBySessionId);
 
   const usage = useUsageStore((s) => s.usage);
   const startPolling = useUsageStore((s) => s.startPolling);
   useEffect(() => startPolling(), [startPolling]);
 
-  const [epic, setEpic] = useState("");
+  // Issue #83: the run's work, split so the orchestrator prompt can name each
+  // set for what it is — parent epics whose children it discovers, and issues
+  // named directly. Either may be empty; both may not.
+  const [epics, setEpics] = useState("");
+  const [issues, setIssues] = useState("");
   const [model, setModel] = useState("");
   // Review F4: optional per-run handoff trigger override. Empty = the
   // global config applies (backend stores thresholds: None).
@@ -310,14 +438,33 @@ export function LaunchSection() {
     setNotice(null);
   }, [projectPath]);
 
-  const issueCount = useMemo(
-    () => epic.split(",").filter((part) => part.trim().length > 0).length,
-    [epic],
-  );
+  const epicRefs = useMemo(() => refParts(epics), [epics]);
+  const issueRefs = useMemo(() => refParts(issues), [issues]);
 
-  const canLaunch = Boolean(projectPath) && epic.trim().length > 0 && phase === null;
+  /** `1 epic, 2 issues` — empty while both fields are. */
+  const refSummary = useMemo(() => {
+    const phrases: string[] = [];
+    if (epicRefs.length > 0) phrases.push(countPhrase(epicRefs.length, "epic"));
+    if (issueRefs.length > 0) phrases.push(countPhrase(issueRefs.length, "issue"));
+    return phrases.join(", ");
+  }, [epicRefs, issueRefs]);
+
+  // Enabled as soon as either field holds something, not once it parses: a
+  // disabled button cannot explain itself, so the click is what renders the
+  // "not an issue number" error below.
+  const canLaunch =
+    Boolean(projectPath) && epicRefs.length + issueRefs.length > 0 && phase === null;
 
   const handleLaunch = async () => {
+    // Issue #83: a ref is a number, `#` optional. Anything else is a form
+    // error — same treatment as the handoff override below — and never
+    // reaches the backend, which would otherwise slug it into a branch name.
+    const badRef = [...epicRefs, ...issueRefs].find((ref) => !REF_PATTERN.test(ref));
+    if (badRef) {
+      setError(`"${badRef}" is not an issue number — use numbers like 5 or #5, 12`);
+      return;
+    }
+
     // Review F4: an unparseable override is a form error, not a null.
     const pctText = handoffPct.trim();
     const pct = pctText === "" ? null : Number(pctText);
@@ -367,12 +514,13 @@ export function LaunchSection() {
     // Phase 2 — the launch proper.
     setPhase("spawning");
     try {
-      const result = await samuraiLaunchRun(target, epic.trim(), model.trim() || null, pct);
+      const result = await samuraiLaunchRun(target, epicRefs, issueRefs, model.trim() || null, pct);
       if (currentProjectRef.current !== target) return;
       setNotice(
         `Run launched: ${result.epic} on ${result.branch} (worktree ${result.worktree_path})${result.stale_timer_cancelled ? " — stale resume timer cancelled" : ""}`,
       );
-      setEpic("");
+      setEpics("");
+      setIssues("");
       setHandoffPct("");
       setPreflight(null);
       await refreshRuns();
@@ -387,8 +535,8 @@ export function LaunchSection() {
     // Destructive, never silent (PRD §5.9) — same ask() confirm pattern as
     // the audit clear.
     const confirmed = await ask(
-      `Clean up epic ${run.epic}? This deletes its worktree and samurai branch, cancels its resume timer, and archives its run config. It cannot be undone.`,
-      { title: "Clean Up Epic", kind: "warning" },
+      `Clean up run ${run.epic}? This deletes its worktree and samurai branch, cancels its resume timer, and archives its run config. It cannot be undone.`,
+      { title: "Clean Up Run", kind: "warning" },
     ).catch(() => false);
     if (!confirmed) return;
     setCleaningEpic(run.epic);
@@ -405,8 +553,8 @@ export function LaunchSection() {
       ].filter(Boolean);
       setNotice(
         removed.length > 0
-          ? `Cleaned up epic ${report.epic}: removed ${removed.join(", ")}.`
-          : `Epic ${report.epic} was already clean.`,
+          ? `Cleaned up run ${report.epic}: removed ${removed.join(", ")}.`
+          : `Run ${report.epic} was already clean.`,
       );
       await refreshRuns();
     } catch (err) {
@@ -443,22 +591,39 @@ export function LaunchSection() {
 
           <div>
             <FieldLabel
-              htmlFor="samurai-launch-epic"
-              hint="A GitHub epic reference, a single issue, or several issues separated by commas. All of them are worked by one run, in one worktree."
+              htmlFor="samurai-launch-epics"
+              hint="GitHub epic numbers. The run reads each epic's issue and every child issue it references, so you do not have to list the children."
+            >
+              Epics
+            </FieldLabel>
+            <input
+              id="samurai-launch-epics"
+              type="text"
+              value={epics}
+              onChange={(e) => setEpics(e.target.value)}
+              placeholder="5 or 5, 12"
+              className="w-full rounded border border-maestro-border/60 bg-maestro-surface px-2 py-1 text-[11px] text-maestro-text placeholder:text-maestro-muted/60 focus:border-maestro-accent focus:outline-none"
+            />
+          </div>
+
+          <div>
+            <FieldLabel
+              htmlFor="samurai-launch-issues"
+              hint="GitHub issue numbers the run works directly, with no parent epic. Fill either field, or both — everything named here is worked by one run, in one worktree."
             >
               Issues
             </FieldLabel>
             <input
-              id="samurai-launch-epic"
+              id="samurai-launch-issues"
               type="text"
-              value={epic}
-              onChange={(e) => setEpic(e.target.value)}
-              placeholder="#38, or 77, 78"
+              value={issues}
+              onChange={(e) => setIssues(e.target.value)}
+              placeholder="7, 9"
               className="w-full rounded border border-maestro-border/60 bg-maestro-surface px-2 py-1 text-[11px] text-maestro-text placeholder:text-maestro-muted/60 focus:border-maestro-accent focus:outline-none"
             />
             <p className="mt-0.5 text-[10px] leading-snug text-maestro-muted">
-              An epic ref, one issue, or a comma-separated list.
-              {issueCount > 1 ? ` ${issueCount} issues in one run.` : ""}
+              Numbers, with or without #, comma-separated. Fill either field or both.
+              {refSummary ? ` ${refSummary} in one run.` : ""}
             </p>
           </div>
 
@@ -595,6 +760,16 @@ export function LaunchSection() {
               <RunRow
                 key={`${run.project_path}-${run.epic}`}
                 run={run}
+                // No route out of the sidebar means the button cannot do what
+                // it offers, so it must not offer it — "no silent no-op"
+                // applies to a missing `onNavigate` exactly as it does to a
+                // missing session.
+                target={
+                  onNavigate
+                    ? findOpenTarget(run, samuraiBySessionId, tabs)
+                    : { kind: "blocked", reason: NO_SESSION_REASON }
+                }
+                onOpen={(tabId, sessionId) => onNavigate?.(tabId, sessionId)}
                 onCleanup={handleCleanup}
                 busy={cleaningEpic !== null}
               />

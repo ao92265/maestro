@@ -246,8 +246,15 @@ impl ClaudeEvent {
             ClaudeEvent::SessionStarted { session_id, claude_session_uuid, .. } => {
                 format!("SessionStarted:{session_id}:{claude_session_uuid}")
             }
-            ClaudeEvent::SessionEnded { session_id, .. } => {
-                format!("SessionEnded:{session_id}")
+            // The reason is part of the identity: the Stop hook reports every
+            // agent turn end as `reason = "stop"`, so keying on the session id
+            // alone let a genuine session end (`/clear`, `/exit`) landing
+            // inside the bus's 5s window share the key with the turn end that
+            // preceded it — and be dropped (issue #76).
+            ClaudeEvent::SessionEnded {
+                session_id, reason, ..
+            } => {
+                format!("SessionEnded:{session_id}:{reason}")
             }
             ClaudeEvent::UserMessage { uuid, .. } => {
                 format!("UserMessage:{uuid}")

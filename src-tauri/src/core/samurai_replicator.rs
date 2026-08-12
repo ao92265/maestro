@@ -3182,7 +3182,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         let project = "C:/git/proj-launch";
-        let brief = samurai_prompts::launch_instruction("#38", Some("nachogl1/maestro"));
+        let brief = samurai_prompts::launch_instruction(
+            &samurai_prompts::RunRefs::epics_only("#38"),
+            Some("nachogl1/maestro"),
+        );
 
         h.replicator
             .spawn_first_generation(project, "#38", "C:/tmp/wt-38", brief.clone());
@@ -3222,7 +3225,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         let project = "C:/git/proj-launch-retry";
-        let brief = samurai_prompts::launch_instruction("#38", None);
+        let brief =
+            samurai_prompts::launch_instruction(&samurai_prompts::RunRefs::epics_only("#38"), None);
 
         h.replicator
             .spawn_first_generation(project, "#38", "C:/tmp/wt", brief.clone());
@@ -3244,7 +3248,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         let project = "C:/git/proj-launch-dropped";
-        let brief = samurai_prompts::launch_instruction("#38", None);
+        let brief =
+            samurai_prompts::launch_instruction(&samurai_prompts::RunRefs::epics_only("#38"), None);
 
         h.replicator
             .spawn_first_generation(project, "#38", "C:/tmp/wt", brief.clone());

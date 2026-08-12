@@ -22,6 +22,30 @@ function deriveActivity(status: BackendSessionStatus | undefined): "thinking" | 
   return "idle";
 }
 
+/**
+ * Human label for every session state.
+ *
+ * The dots collapse most states into "idle" (only two of them animate), but the
+ * text must not: `Starting`, `Done`, `Error` and `Timeout` used to read
+ * identically to a genuinely idle agent, and a session with no status at all
+ * read as nothing (issue #77). Anything unrecognised — including a status the
+ * backend added and the frontend has not learned yet — falls back to "No status
+ * reported" rather than an empty label.
+ */
+const STATUS_LABELS: Record<BackendSessionStatus, string> = {
+  Starting: "Starting up",
+  Idle: "Idle",
+  Working: "Model is thinking",
+  NeedsInput: "Awaiting user input",
+  Done: "Finished",
+  Error: "Errored",
+  Timeout: "Startup timed out",
+};
+
+export function statusLabel(status: BackendSessionStatus | undefined): string {
+  return (status && STATUS_LABELS[status]) || "No status reported";
+}
+
 interface ThinkingIndicatorProps {
   sessionId: number;
   /** Approximate dot diameter in px. Defaults to 3.5px. */
@@ -54,6 +78,7 @@ export const SessionStatusDot = memo(function SessionStatusDot({
   className?: string;
 }) {
   const status = useSessionStore((s) => s.sessions.find((x) => x.id === sessionId)?.status);
+  const label = statusLabel(status);
   const color =
     status === "Working"
       ? "bg-maestro-blue"
@@ -66,7 +91,16 @@ export const SessionStatusDot = memo(function SessionStatusDot({
             : status === "Starting"
               ? "bg-maestro-orange"
               : "bg-maestro-muted/40";
-  return <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${color} ${className}`} />;
+  // Labelled: a bare coloured dot says nothing on hover and nothing at all to a
+  // screen reader, which is its own flavour of "blank status" (issue #77).
+  return (
+    <span
+      role="img"
+      aria-label={label}
+      title={label}
+      className={`h-1.5 w-1.5 shrink-0 rounded-full ${color} ${className}`}
+    />
+  );
 });
 
 export const ThinkingIndicator = memo(function ThinkingIndicator({
@@ -78,13 +112,7 @@ export const ThinkingIndicator = memo(function ThinkingIndicator({
   // don't re-render this component.
   const status = useSessionStore((s) => s.sessions.find((x) => x.id === sessionId)?.status);
   const activity = deriveActivity(status);
-
-  const label =
-    activity === "thinking"
-      ? "Model is thinking"
-      : activity === "needs-input"
-        ? "Awaiting user input"
-        : "Idle";
+  const label = statusLabel(status);
 
   const dotColor =
     activity === "thinking"

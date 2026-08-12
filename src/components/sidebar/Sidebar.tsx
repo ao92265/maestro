@@ -361,7 +361,10 @@ function ConfigTab({
         </>
       );
     case "history":
-      return <HistorySection onLaunch={onHistoryLaunch} />;
+      // onAgentNavigate is the same sidebar→terminal route the Agents section
+      // takes: History reuses it to reach a conversation that is already
+      // running, instead of dropping it from the list.
+      return <HistorySection onLaunch={onHistoryLaunch} onNavigate={onAgentNavigate} />;
     case "infra":
       return (
         <>

@@ -156,9 +156,10 @@ pub async fn generate_standup_report(
         .and_then(|d| d.and_hms_opt(0, 0, 0))
         .map(|naive| DateTime::from_naive_utc_and_offset(naive, Utc))
         .unwrap_or_else(|| Utc::now() - Duration::days(DEFAULT_SINCE_DAYS));
-    let sessions = claude_sessions::list_claude_sessions(canonical.clone())
+    let sessions = claude_sessions::list_claude_sessions(canonical.clone(), None)
         .await
         .unwrap_or_default()
+        .sessions
         .into_iter()
         .filter(|s| {
             DateTime::parse_from_rfc3339(&s.last_active)
