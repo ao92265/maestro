@@ -30,6 +30,22 @@ function baseName(path: string): string {
   return parts[parts.length - 1] ?? path;
 }
 
+/** One accepted ref (issue #83): a GitHub number, with or without its `#`. */
+const REF_PATTERN = /^#?\d+$/;
+
+/** The non-empty, trimmed comma-separated parts of a refs field. */
+function refParts(text: string): string[] {
+  return text
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+}
+
+/** `1 epic` / `2 epics` — a count with its noun agreeing. */
+function countPhrase(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
 /**
  * Models the run can be pinned to, plus the allowance window each one draws
  * from. `family` keys the usage lookup, not the CLI: the usage API reports
@@ -207,6 +223,9 @@ function RunRow({
         ACTIVE
       </span>
       <span className="min-w-0 flex-1 truncate text-maestro-text">
+        {/* Already the readable label since issue #83 (`epic #5 · issues #7,
+            #9`), and a single raw ref (`#38`) for configs written before it —
+            rendering the stored string is what keeps both shapes right. */}
         {run.epic}
         <span className="text-maestro-muted"> · {baseName(run.project_path)}</span>
         {run.model ? <span className="text-maestro-muted"> · {run.model}</span> : null}
@@ -256,8 +275,10 @@ const PHASE_LABEL: Record<LaunchPhase, string> = {
 
 /**
  * Samurai run launcher (issue #63, PRD §5.8 + §9): the form that starts an
- * autonomous run — project (the active tab, read-only), the issues to work,
- * an optional model pinned by remaining allowance, an optional handoff
+ * autonomous run — project (the active tab, read-only), the epics and the
+ * issues to work (issue #83: two fields, so the orchestrator prompt never
+ * calls a list of issues an epic), an optional model pinned by remaining
+ * allowance, an optional handoff
  * override — behind ONE Launch button that runs preflight itself and reports
  * the phase it is in. Below it, the active runs (`samurai_list_runs`) with
  * per-run destructive cleanup behind the same ask()-confirm pattern as the
@@ -272,7 +293,11 @@ export function LaunchSection() {
   const startPolling = useUsageStore((s) => s.startPolling);
   useEffect(() => startPolling(), [startPolling]);
 
-  const [epic, setEpic] = useState("");
+  // Issue #83: the run's work, split so the orchestrator prompt can name each
+  // set for what it is — parent epics whose children it discovers, and issues
+  // named directly. Either may be empty; both may not.
+  const [epics, setEpics] = useState("");
+  const [issues, setIssues] = useState("");
   const [model, setModel] = useState("");
   // Review F4: optional per-run handoff trigger override. Empty = the
   // global config applies (backend stores thresholds: None).
@@ -310,14 +335,33 @@ export function LaunchSection() {
     setNotice(null);
   }, [projectPath]);
 
-  const issueCount = useMemo(
-    () => epic.split(",").filter((part) => part.trim().length > 0).length,
-    [epic],
-  );
+  const epicRefs = useMemo(() => refParts(epics), [epics]);
+  const issueRefs = useMemo(() => refParts(issues), [issues]);
 
-  const canLaunch = Boolean(projectPath) && epic.trim().length > 0 && phase === null;
+  /** `1 epic, 2 issues` — empty while both fields are. */
+  const refSummary = useMemo(() => {
+    const phrases: string[] = [];
+    if (epicRefs.length > 0) phrases.push(countPhrase(epicRefs.length, "epic"));
+    if (issueRefs.length > 0) phrases.push(countPhrase(issueRefs.length, "issue"));
+    return phrases.join(", ");
+  }, [epicRefs, issueRefs]);
+
+  // Enabled as soon as either field holds something, not once it parses: a
+  // disabled button cannot explain itself, so the click is what renders the
+  // "not an issue number" error below.
+  const canLaunch =
+    Boolean(projectPath) && epicRefs.length + issueRefs.length > 0 && phase === null;
 
   const handleLaunch = async () => {
+    // Issue #83: a ref is a number, `#` optional. Anything else is a form
+    // error — same treatment as the handoff override below — and never
+    // reaches the backend, which would otherwise slug it into a branch name.
+    const badRef = [...epicRefs, ...issueRefs].find((ref) => !REF_PATTERN.test(ref));
+    if (badRef) {
+      setError(`"${badRef}" is not an issue number — use numbers like 5 or #5, 12`);
+      return;
+    }
+
     // Review F4: an unparseable override is a form error, not a null.
     const pctText = handoffPct.trim();
     const pct = pctText === "" ? null : Number(pctText);
@@ -367,12 +411,13 @@ export function LaunchSection() {
     // Phase 2 — the launch proper.
     setPhase("spawning");
     try {
-      const result = await samuraiLaunchRun(target, epic.trim(), model.trim() || null, pct);
+      const result = await samuraiLaunchRun(target, epicRefs, issueRefs, model.trim() || null, pct);
       if (currentProjectRef.current !== target) return;
       setNotice(
         `Run launched: ${result.epic} on ${result.branch} (worktree ${result.worktree_path})${result.stale_timer_cancelled ? " — stale resume timer cancelled" : ""}`,
       );
-      setEpic("");
+      setEpics("");
+      setIssues("");
       setHandoffPct("");
       setPreflight(null);
       await refreshRuns();
@@ -443,22 +488,39 @@ export function LaunchSection() {
 
           <div>
             <FieldLabel
-              htmlFor="samurai-launch-epic"
-              hint="A GitHub epic reference, a single issue, or several issues separated by commas. All of them are worked by one run, in one worktree."
+              htmlFor="samurai-launch-epics"
+              hint="GitHub epic numbers. The run reads each epic's issue and every child issue it references, so you do not have to list the children."
+            >
+              Epics
+            </FieldLabel>
+            <input
+              id="samurai-launch-epics"
+              type="text"
+              value={epics}
+              onChange={(e) => setEpics(e.target.value)}
+              placeholder="5 or 5, 12"
+              className="w-full rounded border border-maestro-border/60 bg-maestro-surface px-2 py-1 text-[11px] text-maestro-text placeholder:text-maestro-muted/60 focus:border-maestro-accent focus:outline-none"
+            />
+          </div>
+
+          <div>
+            <FieldLabel
+              htmlFor="samurai-launch-issues"
+              hint="GitHub issue numbers the run works directly, with no parent epic. Fill either field, or both — everything named here is worked by one run, in one worktree."
             >
               Issues
             </FieldLabel>
             <input
-              id="samurai-launch-epic"
+              id="samurai-launch-issues"
               type="text"
-              value={epic}
-              onChange={(e) => setEpic(e.target.value)}
-              placeholder="#38, or 77, 78"
+              value={issues}
+              onChange={(e) => setIssues(e.target.value)}
+              placeholder="7, 9"
               className="w-full rounded border border-maestro-border/60 bg-maestro-surface px-2 py-1 text-[11px] text-maestro-text placeholder:text-maestro-muted/60 focus:border-maestro-accent focus:outline-none"
             />
             <p className="mt-0.5 text-[10px] leading-snug text-maestro-muted">
-              An epic ref, one issue, or a comma-separated list.
-              {issueCount > 1 ? ` ${issueCount} issues in one run.` : ""}
+              Numbers, with or without #, comma-separated. Fill either field or both.
+              {refSummary ? ` ${refSummary} in one run.` : ""}
             </p>
           </div>
 
