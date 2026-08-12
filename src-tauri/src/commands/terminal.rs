@@ -175,6 +175,9 @@ pub async fn resize_pty(
 /// Also unregisters the session from the status server and stops the
 /// transcript watcher so its notify handle and tokio task are released
 /// (entries otherwise accumulate until the watcher cap refuses new sessions).
+// Same as `remove_sessions_for_project`: the `State` parameters are Tauri's
+// injection points, one per subsystem that must forget the dead session.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn kill_session(
     state: State<'_, ProcessManager>,

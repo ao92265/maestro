@@ -293,6 +293,9 @@ pub(crate) async fn cleanup_worktree_inner(
 ///
 /// Tries init.defaultBranch config, then looks for main/master.
 /// Returns None if no suitable fallback branch exists (e.g., single-branch repo).
+// Exercised by this module's tests; the removal paths currently resolve their
+// own target branch, so nothing in the shipped flow calls it.
+#[allow(dead_code)]
 pub(crate) async fn get_fallback_branch(git: &Git, avoid_branch: &str) -> Option<String> {
     // Try configured default branch
     if let Ok(Some(default)) = git.get_default_branch().await {

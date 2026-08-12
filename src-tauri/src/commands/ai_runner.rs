@@ -153,8 +153,8 @@ pub async fn latest_artifact_date(dir: &Path, before: Option<&str>) -> Option<St
         if let Some(date) = name.strip_suffix(".md") {
             if date.len() == 10
                 && NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()
-                && before.map_or(true, |b| date < b)
-                && best.as_deref().map_or(true, |b| date > b)
+                && before.is_none_or(|b| date < b)
+                && best.as_deref().is_none_or(|b| date > b)
             {
                 best = Some(date.to_string());
             }
@@ -183,7 +183,7 @@ pub fn interpolate(template: &str, vars: &[(&str, &str)]) -> String {
         let mut earliest: Option<(usize, &str, &str)> = None;
         for &(token, value) in vars {
             if let Some(pos) = rest.find(token) {
-                if earliest.map_or(true, |(p, _, _)| pos < p) {
+                if earliest.is_none_or(|(p, _, _)| pos < p) {
                     earliest = Some((pos, token, value));
                 }
             }

@@ -11,21 +11,16 @@ use serde::{Deserialize, Serialize};
 /// Installation scope for plugins.
 ///
 /// Determines where the plugin is installed and who has access to it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InstallScope {
     /// Installed to ~/.claude/plugins/ - available to all projects for this user.
+    #[default]
     User,
     /// Installed to <project>/.claude/plugins/ - available to this project only.
     Project,
     /// Installed to <project>/.claude.local/plugins/ - local to this machine/project.
     Local,
-}
-
-impl Default for InstallScope {
-    fn default() -> Self {
-        Self::User
-    }
 }
 
 /// Type of functionality a plugin provides.
@@ -45,7 +40,7 @@ pub enum PluginType {
 }
 
 /// Category of a plugin for filtering in the UI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PluginCategory {
     /// Development tools (linting, testing, building).
@@ -67,13 +62,8 @@ pub enum PluginCategory {
     /// Utilities and miscellaneous.
     Utility,
     /// Uncategorized plugins.
+    #[default]
     Other,
-}
-
-impl Default for PluginCategory {
-    fn default() -> Self {
-        Self::Other
-    }
 }
 
 /// A marketplace source - a GitHub repository hosting a plugin catalog.
@@ -206,6 +196,10 @@ pub struct SessionMarketplaceConfig {
 }
 
 /// Raw structure of a marketplace.json catalog file.
+// Deserialization target: every field mirrors the published catalog schema,
+// including the ones no caller reads yet. Dropping them would make the struct
+// a partial, misleading description of the file it parses.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct MarketplaceCatalog {
     /// Name of the marketplace.
@@ -222,6 +216,8 @@ pub struct MarketplaceCatalog {
 }
 
 /// Author info from a marketplace catalog (can be string or object).
+// As above: the object form's `email` is part of the catalog schema.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum CatalogAuthor {

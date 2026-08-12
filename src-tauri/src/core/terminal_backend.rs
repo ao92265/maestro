@@ -3,6 +3,14 @@
 //! Provides a common interface for different terminal backends (xterm.js passthrough,
 //! Ghostty VT, etc.) enabling platform-specific optimizations while maintaining
 //! cross-platform compatibility.
+//!
+//! Most of this module is the contract, not the shipped path: only
+//! `BackendType`/`BackendCapabilities` are read by `commands::terminal`, while
+//! the trait and its supporting types are implemented by `xterm_backend` and
+//! the `vte-backend`-gated `vte_backend`. That leaves them dead in a default
+//! build, so the allow below is scoped to this module rather than deleting an
+//! abstraction the feature builds depend on.
+#![allow(dead_code)]
 
 use std::sync::Arc;
 use tauri::AppHandle;
@@ -49,6 +57,10 @@ pub enum CursorShape {
     Underline,
     Bar,
 }
+
+/// A PTY output sink. Raw bytes for passthrough backends; VT-parsing
+/// backends may pass processed output with metadata behind `get_state()`.
+pub type OutputCallback = Box<dyn Fn(&[u8]) + Send + Sync>;
 
 /// Handle for managing output subscriptions.
 /// Dropping this handle unsubscribes the callback.
@@ -146,7 +158,7 @@ pub trait TerminalBackend: Send + Sync {
     /// processed output with additional metadata available via `get_state()`.
     ///
     /// Returns a handle that unsubscribes when dropped.
-    fn subscribe_output(&self, callback: Box<dyn Fn(&[u8]) + Send + Sync>) -> SubscriptionHandle;
+    fn subscribe_output(&self, callback: OutputCallback) -> SubscriptionHandle;
 
     /// Shuts down the backend, terminating the PTY session.
     ///

@@ -305,7 +305,7 @@ impl GitHub {
                     .lines()
                     .find(|line| line.contains("Logged in to"))
                     .and_then(|line| line.split("as ").nth(1))
-                    .map(|s| s.trim().trim_end_matches(|c| c == ')' || c == ' ').to_string());
+                    .map(|s| s.trim().trim_end_matches([')', ' ']).to_string());
 
                 Ok(AuthStatus {
                     logged_in: true,
@@ -532,7 +532,7 @@ impl GitHub {
         // Extract PR number from URL (e.g., https://github.com/owner/repo/pull/123)
         let number: u64 = url
             .split('/')
-            .last()
+            .next_back()
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| GitHubError::ParseError {
                 message: format!("Could not parse PR number from URL: {}", url),

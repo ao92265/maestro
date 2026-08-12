@@ -21,6 +21,9 @@ pub enum GitError {
     },
 
     /// A git command was terminated by a signal before completing.
+    // Signal termination is not observable on the Windows runner path, so this
+    // is constructed only on unix builds.
+    #[allow(dead_code)]
     #[error("git command was killed by signal")]
     Killed { command: String },
 
@@ -49,6 +52,7 @@ pub enum GitError {
 
     /// The specified worktree path does not exist in git's worktree list.
     #[error("worktree not found: {0}")]
+    #[allow(dead_code)]
     WorktreeNotFound(String),
 }
 

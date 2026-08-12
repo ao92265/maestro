@@ -561,12 +561,15 @@ fn invalid_alert(p: &PendingInstruction, session_id: u32, failure: String) -> Au
 /// the address of the pending map the call belongs to, so the one test that
 /// sets the hook can ignore calls from other tests' injectors (tests run in
 /// parallel in one process).
+/// Test hook signature: (pending-map address, session id).
 #[cfg(test)]
-static VALIDATION_GAP_HOOK: Mutex<Option<Arc<dyn Fn(usize, u32) + Send + Sync>>> =
-    Mutex::new(None);
+type ValidationGapHook = Arc<dyn Fn(usize, u32) + Send + Sync>;
 
 #[cfg(test)]
-fn validation_gap_hook() -> Option<Arc<dyn Fn(usize, u32) + Send + Sync>> {
+static VALIDATION_GAP_HOOK: Mutex<Option<ValidationGapHook>> = Mutex::new(None);
+
+#[cfg(test)]
+fn validation_gap_hook() -> Option<ValidationGapHook> {
     VALIDATION_GAP_HOOK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -18,6 +18,9 @@ pub struct GitHubOutput {
 
 impl GitHubOutput {
     /// Splits stdout into non-empty lines, filtering out blank lines.
+    // Callers parse `gh --json` output rather than lines; kept as the plain-text
+    // counterpart to `trimmed()`.
+    #[allow(dead_code)]
     pub fn lines(&self) -> Vec<&str> {
         self.stdout.lines().filter(|l| !l.is_empty()).collect()
     }
@@ -47,6 +50,7 @@ impl GitHub {
     }
 
     /// Returns the repository path.
+    #[allow(dead_code)]
     pub fn repo_path(&self) -> &Path {
         &self.repo_path
     }

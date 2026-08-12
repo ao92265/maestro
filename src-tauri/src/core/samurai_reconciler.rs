@@ -182,6 +182,9 @@ fn orphan_verdict(
 ///
 /// Without a `gh` probe the spawn decision is not auth-gated; prefer
 /// [`reconcile_with_auth`].
+// Startup calls `reconcile_with_auth`; this ungated entry point is what the
+// tests drive so they never shell out to `gh`.
+#[allow(dead_code)]
 pub async fn reconcile(
     run_configs: Arc<RunConfigStore>,
     timers: Vec<ScheduleEntry>,

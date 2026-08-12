@@ -112,6 +112,9 @@ fn resolve_ssh_auth_sock() -> Option<&'static str> {
 ///
 /// Provides convenience methods for common parsing patterns: `lines()` splits
 /// stdout into non-empty lines, and `trimmed()` returns whitespace-stripped stdout.
+// `stderr` is captured on every run so a failing command can be reported with
+// git's own words; callers that only need stdout leave it unread.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct GitOutput {
     pub stdout: String,

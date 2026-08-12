@@ -3,6 +3,12 @@
 //! This backend sends raw PTY output directly to xterm.js for rendering.
 //! It wraps the existing ProcessManager PTY logic and implements the
 //! TerminalBackend trait for cross-platform compatibility.
+//!
+//! Nothing constructs it in a default build — `commands::terminal` talks to
+//! `ProcessManager` directly and only reports the backend type. The impl is
+//! kept as the reference `TerminalBackend` implementation the `vte-backend`
+//! feature is written against, so the allow is scoped here.
+#![allow(dead_code)]
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,8 +23,8 @@ use tokio::sync::Notify;
 use libc;
 
 use super::terminal_backend::{
-    BackendCapabilities, BackendType, SubscriptionHandle, TerminalBackend, TerminalConfig,
-    TerminalError, TerminalState,
+    BackendCapabilities, BackendType, OutputCallback, SubscriptionHandle, TerminalBackend,
+    TerminalConfig, TerminalError, TerminalState,
 };
 
 /// Stateful UTF-8 decoder that handles split multi-byte sequences.
@@ -360,7 +366,7 @@ impl TerminalBackend for XtermPassthroughBackend {
         None
     }
 
-    fn subscribe_output(&self, _callback: Box<dyn Fn(&[u8]) + Send + Sync>) -> SubscriptionHandle {
+    fn subscribe_output(&self, _callback: OutputCallback) -> SubscriptionHandle {
         // For passthrough backend, output is emitted via Tauri events.
         // This subscription method is primarily for backends that need
         // programmatic access to output (e.g., for VT parsing).

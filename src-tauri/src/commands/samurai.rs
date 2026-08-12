@@ -500,6 +500,9 @@ pub(crate) async fn launch_run_inner(
 /// ACTIVE run config → spawn gen-1 with its opening brief. The SPAWN audit
 /// row lands via the existing registration path with
 /// `details.trigger: "launch"`.
+// Every `State` parameter is Tauri's dependency injection: the macro resolves
+// them by type, so they cannot be bundled into one struct without losing it.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn samurai_launch_run(
     supervisor: State<'_, Arc<Supervisor>>,
