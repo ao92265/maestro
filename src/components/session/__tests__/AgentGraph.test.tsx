@@ -37,6 +37,7 @@ function agent(
     description: "search for auth code",
     prompt: "Find every call site of authenticate()",
     runInBackground: false,
+    parentAgentId: null,
     spawnedAt: "2026-07-30T10:00:00.000Z",
     completedAt: null,
     success: null,
@@ -100,6 +101,36 @@ describe("AgentGraph", () => {
     expect(screen.getByText("FAILED")).toBeInTheDocument();
     // Scoped to the edge overlay: the toolbar's icons are <svg><path> too.
     expect(container.querySelectorAll("svg.absolute > path")).toHaveLength(3);
+  });
+
+  it("renders a nested agent one column right of its parent, with its own edge", () => {
+    useSessionStore.setState({ sessions: [session(1)] });
+    useAgentStore.setState({
+      agents: [
+        agent(1, "toolu_parent", { agentType: "Orchestrator" }),
+        agent(1, "toolu_child", {
+          agentType: "NestedExplore",
+          parentAgentId: "toolu_parent",
+          spawnedAt: "2026-07-30T10:01:00.000Z",
+        }),
+      ],
+    });
+    const { container } = render(<AgentGraph sessionId={1} />);
+    const parentNode = screen.getByText("Orchestrator").closest("button")!;
+    const childNode = screen.getByText("NestedExplore").closest("button")!;
+    const left = (el: HTMLElement) => Number.parseFloat(el.style.left);
+    expect(left(childNode)).toBeGreaterThan(left(parentNode));
+    // One edge per agent, nested or not.
+    expect(container.querySelectorAll("svg.absolute > path")).toHaveLength(2);
+  });
+
+  it("parks an agent whose parent is unknown at the root instead of hiding it", () => {
+    useSessionStore.setState({ sessions: [session(1)] });
+    useAgentStore.setState({
+      agents: [agent(1, "toolu_lost", { agentType: "Lost", parentAgentId: "toolu_gone" })],
+    });
+    render(<AgentGraph sessionId={1} />);
+    expect(screen.getByText("Lost")).toBeInTheDocument();
   });
 
   it("updates live when a new agent lands in the store", () => {

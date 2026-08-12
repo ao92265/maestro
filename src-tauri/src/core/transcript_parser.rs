@@ -358,7 +358,17 @@ fn parse_user_message(session_id: u32, entry: &Entry) -> Vec<ClaudeEvent> {
     // launch time only said "started". The notification carries the agent's full
     // report but none of the counters a foreground result has.
     if text.contains("<task-notification>") {
-        if let Some(agent_id) = tag_value(&text, "tool-use-id") {
+        // Task notifications are not agent-only: background Bash commands,
+        // workflows and monitors send the same blob (their summaries read
+        // `Background command "…"` / `Dynamic workflow "…"` / `Monitor
+        // event: …`). Only an agent's belongs on the agent graph — the
+        // completions this parser emits can now reach the store without a
+        // matching spawn, so this is the line that keeps a killed background
+        // shell from showing up as a phantom agent. A notification with no
+        // summary at all is the older, agent-only format and passes.
+        let is_agent_notification = tag_value(&text, "summary")
+            .is_none_or(|summary| summary.starts_with("Agent \""));
+        if let Some(agent_id) = tag_value(&text, "tool-use-id").filter(|_| is_agent_notification) {
             let status = tag_value(&text, "status");
             let failed = matches!(status.as_deref(), Some("failed") | Some("error") | Some("killed"));
             events.push(ClaudeEvent::SubagentCompleted {
@@ -598,6 +608,10 @@ fn parse_assistant_message(session_id: u32, entry: &Entry) -> Vec<ClaudeEvent> {
                         description,
                         prompt,
                         run_in_background,
+                        // The parser sees one line at a time and cannot know
+                        // which file it came from; the watcher stamps the
+                        // parent when the line belongs to a subagent's file.
+                        parent_agent_id: None,
                         timestamp: timestamp.clone(),
                     });
                 }
@@ -1018,6 +1032,49 @@ mod tests {
             e,
             ClaudeEvent::UserMessage { text, .. } if text.contains("<task-notification>")
         )));
+    }
+
+    /// Background Bash commands, workflows and monitors send task
+    /// notifications too, in the same blob format. Completions now reach the
+    /// store without a matching spawn, so a non-agent notification must not
+    /// become a phantom agent on the graph.
+    #[test]
+    fn test_non_agent_task_notification_is_not_a_subagent_completion() {
+        let bash = r#"{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>b9wqvjtm1</task-id>\n<tool-use-id>toolu_bash1</tool-use-id>\n<status>killed</status>\n<summary>Background command \"heartbeat watch\" was stopped</summary>\n</task-notification>"},"uuid":"u1","timestamp":"2026-08-07T10:00:00Z"}"#;
+        let workflow = r#"{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>wbjmf2mzu</task-id>\n<tool-use-id>toolu_wf1</tool-use-id>\n<status>completed</status>\n<summary>Dynamic workflow \"perf audit\" completed</summary>\n<result>{}</result>\n</task-notification>"},"uuid":"u2","timestamp":"2026-08-07T10:01:00Z"}"#;
+        for line in [bash, workflow] {
+            let events = parse_transcript_line(1, line);
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, ClaudeEvent::SubagentCompleted { .. })),
+                "only an agent's notification may complete an agent: {events:?}"
+            );
+            // The notification text itself still surfaces as the user message.
+            assert!(events
+                .iter()
+                .any(|e| matches!(e, ClaudeEvent::UserMessage { .. })));
+        }
+    }
+
+    /// An agent's notification carries a summary starting `Agent "…"` — it
+    /// must keep completing the agent now that non-agent summaries are
+    /// filtered out.
+    #[test]
+    fn test_agent_task_notification_with_summary_still_completes() {
+        let line = r#"{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>a6cd66348</task-id>\n<tool-use-id>toolu_agent1</tool-use-id>\n<status>failed</status>\n<summary>Agent \"fix-review-findings\" failed: API error</summary>\n</task-notification>"},"uuid":"u1","timestamp":"2026-08-07T10:00:00Z"}"#;
+        let events = parse_transcript_line(1, line);
+        let done = events
+            .iter()
+            .find(|e| matches!(e, ClaudeEvent::SubagentCompleted { .. }))
+            .expect("SubagentCompleted from the agent notification");
+        if let ClaudeEvent::SubagentCompleted {
+            agent_id, success, ..
+        } = done
+        {
+            assert_eq!(agent_id, "toolu_agent1");
+            assert!(!*success, "status 'failed' must not read as success");
+        }
     }
 
     /// Ordinary tools also write a `toolUseResult`; none of them is a sub-agent.

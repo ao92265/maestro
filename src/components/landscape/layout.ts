@@ -8,9 +8,11 @@
  * every run, so a second click would never reproduce the first.)
  *
  * Shape per project ("cluster"): the project node on the left, its terminals
- * stacked in the middle column, and each terminal's subagents stacked in the
- * right column beside it. Clusters are stacked in ONE column, so every project
- * node lines up on the left and everything branches out to the right.
+ * stacked in the middle column, and each terminal's subagent tree branching
+ * to the right beside it — one further column per nesting depth, since an
+ * agent can spawn agents of its own. Clusters are stacked in ONE column, so
+ * every project node lines up on the left and everything branches out to the
+ * right.
  */
 
 export interface XY {
@@ -18,10 +20,16 @@ export interface XY {
   y: number;
 }
 
-/** One terminal and the agents hanging off it, in render order. */
+/** One agent and the agents it spawned, in render order. */
+export interface LayoutAgent {
+  id: string;
+  children: LayoutAgent[];
+}
+
+/** One terminal and its root agents (the ones it spawned), in render order. */
 export interface LayoutTerminal {
   sessionId: number;
-  agentIds: string[];
+  agents: LayoutAgent[];
 }
 
 /** One project and its terminals, in render order. */
@@ -54,10 +62,23 @@ export const terminalNodeId = (sessionId: number) => `terminal:${sessionId}`;
 export const agentNodeId = (sessionId: number, agentId: string) =>
   `agent:${sessionId}:${agentId}`;
 
-/** Height of one terminal's row: the taller of the terminal and its agent stack. */
+/** Height of one agent's whole subtree: itself or its stacked children. */
+function agentSubtreeHeight(agent: LayoutAgent): number {
+  if (agent.children.length === 0) return AGENT_H;
+  const children =
+    agent.children.reduce((sum, child) => sum + agentSubtreeHeight(child), 0) +
+    (agent.children.length - 1) * AGENT_GAP;
+  return Math.max(AGENT_H, children);
+}
+
+/** Height of one terminal's row: the taller of the terminal and its agent trees. */
 function rowHeight(terminal: LayoutTerminal): number {
-  const n = terminal.agentIds.length;
-  const agentsH = n === 0 ? 0 : n * AGENT_H + (n - 1) * AGENT_GAP;
+  const n = terminal.agents.length;
+  const agentsH =
+    n === 0
+      ? 0
+      : terminal.agents.reduce((sum, agent) => sum + agentSubtreeHeight(agent), 0) +
+        (n - 1) * AGENT_GAP;
   return Math.max(TERMINAL_H, agentsH);
 }
 
@@ -112,12 +133,30 @@ export function layoutLandscape(projects: LayoutProject[]): Map<string, XY> {
         y: cursorY + (rowH - TERMINAL_H) / 2,
       });
 
-      const n = terminal.agentIds.length;
-      const agentsH = n === 0 ? 0 : n * AGENT_H + (n - 1) * AGENT_GAP;
+      const n = terminal.agents.length;
+      const agentsH =
+        n === 0
+          ? 0
+          : terminal.agents.reduce((sum, agent) => sum + agentSubtreeHeight(agent), 0) +
+            (n - 1) * AGENT_GAP;
+      // Nested agents go one column further right per depth, each node
+      // centered against its own subtree — same shape as the session graph.
+      const placeAgent = (agent: LayoutAgent, depth: number, top: number) => {
+        const height = agentSubtreeHeight(agent);
+        positions.set(agentNodeId(terminal.sessionId, agent.id), {
+          x: agentX + depth * (AGENT_W + COL_GAP),
+          y: top + (height - AGENT_H) / 2,
+        });
+        let childTop = top;
+        for (const child of agent.children) {
+          placeAgent(child, depth + 1, childTop);
+          childTop += agentSubtreeHeight(child) + AGENT_GAP;
+        }
+      };
       let agentY = cursorY + (rowH - agentsH) / 2;
-      for (const agentId of terminal.agentIds) {
-        positions.set(agentNodeId(terminal.sessionId, agentId), { x: agentX, y: agentY });
-        agentY += AGENT_H + AGENT_GAP;
+      for (const agent of terminal.agents) {
+        placeAgent(agent, 0, agentY);
+        agentY += agentSubtreeHeight(agent) + AGENT_GAP;
       }
 
       cursorY += rowH + TERMINAL_GAP;

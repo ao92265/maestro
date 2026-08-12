@@ -23,6 +23,12 @@ export interface SubagentInfo {
   prompt: string;
   /** Launched in the background, so it keeps running past its tool_result. */
   runInBackground: boolean;
+  /**
+   * Tool_use id of the agent that spawned this one — a nested agent, read
+   * from the parent's own transcript in the subagents folder. Null for agents
+   * the session itself spawned (and for synthesized orphans).
+   */
+  parentAgentId: string | null;
   /** Transcript timestamp of the spawn. */
   spawnedAt: string;
   /** Epoch ms of completion; null while running. From the transcript timestamp. */
@@ -103,6 +109,7 @@ function applyEvent(agents: SubagentInfo[], event: ClaudeEvent): SubagentInfo[] 
           description: event.description,
           prompt: event.prompt,
           runInBackground: event.run_in_background,
+          parentAgentId: event.parent_agent_id ?? null,
           spawnedAt: event.timestamp,
           completedAt: null,
           success: null,
@@ -136,20 +143,48 @@ function applyEvent(agents: SubagentInfo[], event: ClaudeEvent): SubagentInfo[] 
       );
     }
     case "SubagentCompleted": {
-      const target = agents.find(
-        (a) => a.agentId === event.agent_id && a.sessionId === event.session_id
-      );
-      if (!target) return agents;
-      // A detailed completion must not be clobbered by a bare one replayed
-      // on catch-up. A later notification carrying a fresh report does
-      // update it, because a background agent can be resumed and report
-      // again under the same id.
-      if (target.completedAt !== null && !event.report) return agents;
       // Use the transcript timestamp: catch-up reads replay old history, and
       // a wall-clock stamp would date every agent to the moment the session
       // was resumed.
       const parsed = Date.parse(event.timestamp);
       const completedAt = Number.isNaN(parsed) ? Date.now() : parsed;
+      const target = agents.find(
+        (a) => a.agentId === event.agent_id && a.sessionId === event.session_id
+      );
+      if (!target) {
+        // An orphan completion: the watcher never saw this agent's spawn
+        // (it lives in a transcript file the watcher never read). Synthesize
+        // the agent from what the completion carries — losing the prompt is
+        // better than losing the whole run.
+        return [
+          ...agents,
+          {
+            agentId: event.agent_id,
+            sessionId: event.session_id,
+            agentType: event.agent_type || "unknown",
+            description: "",
+            prompt: "",
+            runInBackground: false,
+            parentAgentId: null,
+            spawnedAt: event.timestamp,
+            completedAt,
+            success: event.success,
+            report: event.report,
+            status: event.status,
+            model: event.model,
+            durationMs: event.duration_ms,
+            totalTokens: event.total_tokens,
+            toolUseCount: event.tool_use_count,
+            toolStats: event.tool_stats,
+            agentRunId: event.agent_run_id,
+          },
+        ];
+      }
+      // A detailed completion must not be clobbered by a bare one replayed
+      // on catch-up. A later notification carrying a fresh report does
+      // update it, because a background agent can be resumed and report
+      // again under the same id.
+      if (target.completedAt !== null && !event.report) return agents;
       return agents.map((a) =>
         a.agentId === event.agent_id && a.sessionId === event.session_id
           ? {

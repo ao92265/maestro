@@ -1,21 +1,25 @@
 import { describe, expect, it } from "vitest";
 import {
   AGENT_H,
+  AGENT_W,
   agentNodeId,
   layoutLandscape,
   PROJECT_W,
   projectNodeId,
   TERMINAL_W,
   terminalNodeId,
+  type LayoutAgent,
   type LayoutProject,
 } from "../layout";
+
+const leaf = (id: string): LayoutAgent => ({ id, children: [] });
 
 const oneProject: LayoutProject[] = [
   {
     tabId: "tab-1",
     terminals: [
-      { sessionId: 1, agentIds: ["a1", "a2"] },
-      { sessionId: 2, agentIds: [] },
+      { sessionId: 1, agents: [leaf("a1"), leaf("a2")] },
+      { sessionId: 2, agents: [] },
     ],
   },
 ];
@@ -64,10 +68,39 @@ describe("layoutLandscape", () => {
     expect(idleTerminal.y).toBeGreaterThan(lastAgent.y);
   });
 
+  it("nests a child agent one column right of its parent, without overlap", () => {
+    const nested: LayoutProject[] = [
+      {
+        tabId: "tab-1",
+        terminals: [
+          {
+            sessionId: 1,
+            agents: [{ id: "parent", children: [leaf("kid1"), leaf("kid2")] }, leaf("solo")],
+          },
+        ],
+      },
+    ];
+    const positions = layoutLandscape(nested);
+    const parent = positions.get(agentNodeId(1, "parent"))!;
+    const kid1 = positions.get(agentNodeId(1, "kid1"))!;
+    const kid2 = positions.get(agentNodeId(1, "kid2"))!;
+    const solo = positions.get(agentNodeId(1, "solo"))!;
+    // Children sit one full column to the right of their parent.
+    expect(kid1.x).toBeGreaterThanOrEqual(parent.x + AGENT_W);
+    expect(kid2.x).toBe(kid1.x);
+    expect(kid2.y - kid1.y).toBeGreaterThanOrEqual(AGENT_H);
+    // The parent is centered against its two children.
+    expect(parent.y).toBeGreaterThan(kid1.y);
+    expect(parent.y).toBeLessThan(kid2.y);
+    // The next root clears the whole subtree above it.
+    expect(solo.x).toBe(parent.x);
+    expect(solo.y).toBeGreaterThanOrEqual(kid2.y + AGENT_H);
+  });
+
   it("stacks every project in one column, top to bottom", () => {
     const projects: LayoutProject[] = ["a", "b", "c", "d"].map((tabId) => ({
       tabId,
-      terminals: [{ sessionId: Number(tabId.charCodeAt(0)), agentIds: [] }],
+      terminals: [{ sessionId: Number(tabId.charCodeAt(0)), agents: [] }],
     }));
     const positions = layoutLandscape(projects);
     const xs = projects.map((p) => positions.get(projectNodeId(p.tabId))!.x);

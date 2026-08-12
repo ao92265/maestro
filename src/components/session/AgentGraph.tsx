@@ -14,6 +14,7 @@ import {
   statsLine,
   ToolStatsRow,
 } from "@/components/session/agentPresentation";
+import { buildAgentTree, type AgentTreeNode } from "@/lib/agentTree";
 import { useAgentStore } from "@/stores/useAgentStore";
 import { useSessionStore } from "@/stores/useSessionStore";
 
@@ -37,12 +38,12 @@ const COL_GAP = 80;
 /**
  * Live node graph of the agents running inside one terminal session.
  *
- * Structure is the honest one the app actually tracks: a single root node
- * (the main session, from useSessionStore) fanned out to the subagents the
- * transcript watcher reported for that session (useAgentStore — Agent/Task tool
- * spawns and completions). No parent->child nesting exists in the transcript —
- * a subagent's own tool calls are never written to the parent's file — so the
- * graph is always 1 root -> N children.
+ * Structure mirrors what the transcripts record: a single root node (the main
+ * session, from useSessionStore) and the spawn tree of its agents
+ * (useAgentStore). Agents spawned BY an agent are read from the
+ * conversation's subagents folder and carry `parentAgentId`, so the graph
+ * nests to any depth — one column per depth, each parent centered beside the
+ * block of agents it spawned.
  *
  * Nodes persist with their final status until dismissed, so a finished run can
  * be read back; clicking one opens the exchange drawer with the full brief the
@@ -147,17 +148,48 @@ export function AgentGraph({ sessionId }: AgentGraphProps) {
     }
   };
 
-  /* ── Layout: root at left, children stacked in a right column ── */
-  const n = sessionAgents.length;
-  const stackH = n * NODE_H + (n - 1) * V_GAP;
-  const contentW = PAD * 2 + ROOT_W + COL_GAP + NODE_W;
+  /* ── Layout: session root at left, then one agent column per depth ── */
+  const subtreeH = (node: AgentTreeNode): number => {
+    if (node.children.length === 0) return NODE_H;
+    const children =
+      node.children.reduce((sum, child) => sum + subtreeH(child), 0) +
+      (node.children.length - 1) * V_GAP;
+    return Math.max(NODE_H, children);
+  };
+
+  const childX = PAD + ROOT_W + COL_GAP;
+  const placed: { node: AgentTreeNode; x: number; y: number; parentId: string | null }[] = [];
+  // Each node is centered against its own subtree, so a parent sits midway
+  // beside the block of agents it spawned — the same centering the root gets.
+  const place = (node: AgentTreeNode, top: number, parentId: string | null) => {
+    const height = subtreeH(node);
+    placed.push({
+      node,
+      x: childX + (node.depth - 1) * (NODE_W + COL_GAP),
+      y: top + (height - NODE_H) / 2,
+      parentId,
+    });
+    let cursor = top;
+    for (const child of node.children) {
+      place(child, cursor, node.agent.agentId);
+      cursor += subtreeH(child) + V_GAP;
+    }
+  };
+  let stackCursor = PAD;
+  for (const root of buildAgentTree(sessionAgents)) {
+    place(root, stackCursor, null);
+    stackCursor += subtreeH(root) + V_GAP;
+  }
+
+  const stackH = Math.max(0, stackCursor - V_GAP - PAD);
+  const maxDepth = placed.reduce((deepest, p) => Math.max(deepest, p.node.depth), 1);
+  const contentW = PAD * 2 + ROOT_W + COL_GAP + maxDepth * NODE_W + (maxDepth - 1) * COL_GAP;
   const contentH = PAD * 2 + Math.max(ROOT_H, stackH);
   const rootX = PAD;
   const rootY = PAD + Math.max(0, (stackH - ROOT_H) / 2);
-  const childX = PAD + ROOT_W + COL_GAP;
   const rootRight = rootX + ROOT_W;
   const rootMidY = rootY + ROOT_H / 2;
-  const midX = rootRight + COL_GAP / 2;
+  const positionOf = new Map(placed.map((p) => [p.node.agent.agentId, p]));
 
   return (
     <div className="relative h-full w-full overflow-auto bg-maestro-bg">
@@ -200,13 +232,19 @@ export function AgentGraph({ sessionId }: AgentGraphProps) {
           height={contentH}
           aria-hidden="true"
         >
-          {sessionAgents.map((agent, i) => {
-            const childMidY = PAD + i * (NODE_H + V_GAP) + NODE_H / 2;
+          {placed.map(({ node, x, y, parentId }) => {
+            const agent = node.agent;
+            // Edges leave the session root, or the parent agent's right edge.
+            const parent = parentId ? positionOf.get(parentId) : undefined;
+            const startX = parent ? parent.x + NODE_W : rootRight;
+            const startY = parent ? parent.y + NODE_H / 2 : rootMidY;
+            const endY = y + NODE_H / 2;
+            const midX = startX + COL_GAP / 2;
             const running = agent.completedAt === null;
             return (
               <path
                 key={agent.agentId}
-                d={`M ${rootRight} ${rootMidY} C ${midX} ${rootMidY}, ${midX} ${childMidY}, ${childX} ${childMidY}`}
+                d={`M ${startX} ${startY} C ${midX} ${startY}, ${midX} ${endY}, ${x} ${endY}`}
                 fill="none"
                 stroke={edgeStroke(agent)}
                 strokeWidth={1.5}
@@ -223,8 +261,9 @@ export function AgentGraph({ sessionId }: AgentGraphProps) {
           {rootNode}
         </div>
 
-        {/* Subagent nodes */}
-        {sessionAgents.map((agent, i) => {
+        {/* Subagent nodes, one column per nesting depth */}
+        {placed.map(({ node, x, y }) => {
+          const agent = node.agent;
           const badge = agentBadge(agent);
           const running = agent.completedAt === null;
           const stats = statsLine(agent);
@@ -238,8 +277,8 @@ export function AgentGraph({ sessionId }: AgentGraphProps) {
                 running ? "border-maestro-accent/60" : "border-maestro-border"
               }`}
               style={{
-                left: childX,
-                top: PAD + i * (NODE_H + V_GAP),
+                left: x,
+                top: y,
                 width: NODE_W,
                 height: NODE_H,
               }}
