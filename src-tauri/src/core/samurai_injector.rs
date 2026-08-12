@@ -235,6 +235,25 @@ struct PendingInstruction {
     /// the ALERT is one-shot and the parker must stop counting it as pending
     /// — see [`TimeoutVerdict::AlertStuck`] and `has_pending`.
     stuck_alerted: bool,
+    /// Extra age added to the three clocks above when they are read.
+    ///
+    /// Always [`Duration::ZERO`] in the running app; only the `backdate_*`
+    /// test helpers ever set it. `Instant` is anchored at boot on Windows
+    /// and Linux, so ageing a clock with `Instant::checked_sub` underflows
+    /// on a machine that has been up for less than the backdate — the
+    /// stuck-wait test ages the waiting clock by ~39 minutes and panicked
+    /// on any freshly booted machine, CI included. Ageing through an added
+    /// offset instead cannot underflow, and the reset sites zero the
+    /// matching offset exactly where they re-stamp the `Instant`.
+    skew: ClockSkew,
+}
+
+/// Per-clock test-only age offsets — see [`PendingInstruction::skew`].
+#[derive(Debug, Default, Clone, Copy)]
+struct ClockSkew {
+    injected: Duration,
+    waiting: Duration,
+    acked: Duration,
 }
 
 impl PendingInstruction {
@@ -256,7 +275,23 @@ impl PendingInstruction {
             corrective: false,
             failure: None,
             stuck_alerted: false,
+            skew: ClockSkew::default(),
         }
+    }
+
+    /// How long since the latest injection; `None` before the first.
+    fn injected_elapsed(&self) -> Option<Duration> {
+        self.injected_at.map(|t| t.elapsed() + self.skew.injected)
+    }
+
+    /// How long this entry has been WAITING for an idle signal.
+    fn waiting_elapsed(&self) -> Duration {
+        self.waiting_since.elapsed() + self.skew.waiting
+    }
+
+    /// How long since the ACK arrived; `None` before it does.
+    fn acked_elapsed(&self) -> Option<Duration> {
+        self.acked_at.map(|t| t.elapsed() + self.skew.acked)
     }
 }
 
@@ -557,8 +592,10 @@ fn arm_corrective(p: &mut PendingInstruction, failure: String) {
     p.awaiting_retry = true;
     // The wait for the corrective's idle starts now (finding E age cap).
     p.waiting_since = Instant::now();
+    p.skew.waiting = Duration::ZERO;
     p.acked = false;
     p.acked_at = None;
+    p.skew.acked = Duration::ZERO;
     p.validating = false;
     p.corrective = true;
     p.failure = Some(failure);
@@ -976,8 +1013,8 @@ impl SamuraiInjector {
                         p.acked,
                         p.attempts,
                         p.awaiting_retry,
-                        p.injected_at.map(|t| t.elapsed()),
-                        p.waiting_since.elapsed(),
+                        p.injected_elapsed(),
+                        p.waiting_elapsed(),
                         timeout,
                         max_turn_wait,
                     ) {
@@ -990,6 +1027,7 @@ impl SamuraiInjector {
                             // The wait for the retry's idle starts now
                             // (finding E age cap).
                             p.waiting_since = Instant::now();
+                            p.skew.waiting = Duration::ZERO;
                         }
                         TimeoutVerdict::AlertStuck => {
                             // Finding E: no injection was possible yet —
@@ -1058,7 +1096,7 @@ impl SamuraiInjector {
                 match written_verdict(
                     p.validating,
                     p.corrective,
-                    p.acked_at.map(|t| t.elapsed()),
+                    p.acked_elapsed(),
                     written_window,
                 ) {
                     WrittenVerdict::Keep => {}
@@ -1244,6 +1282,7 @@ impl SamuraiInjector {
         }
         p.attempts += 1;
         p.injected_at = Some(Instant::now());
+        p.skew.injected = Duration::ZERO;
         p.awaiting_retry = false;
         // The long turn finally ended and the instruction went in: the entry
         // is live again, so it counts as pending once more and a later
@@ -1306,6 +1345,7 @@ impl SamuraiInjector {
             }
             p.acked = true;
             p.acked_at = Some(Instant::now());
+            p.skew.acked = Duration::ZERO;
             p.awaiting_retry = false;
         } else {
             log::warn!(
@@ -1499,12 +1539,16 @@ impl SamuraiInjector {
 
     /// Test-only: age the latest injection so timeout paths run without
     /// real waiting. `pub(crate)` for the parker's sweep tests (issue #60).
+    ///
+    /// Ages through [`PendingInstruction::skew`] rather than
+    /// `Instant::checked_sub`, which underflows on a machine booted more
+    /// recently than the backdate.
     #[cfg(test)]
     pub(crate) fn backdate_injection(&self, session_id: u32, by: Duration) {
         let mut pending = self.lock_pending();
         let p = pending.get_mut(&session_id).expect("no pending entry");
-        p.injected_at = p.injected_at.expect("nothing injected").checked_sub(by);
-        assert!(p.injected_at.is_some(), "backdate underflowed Instant");
+        assert!(p.injected_at.is_some(), "nothing injected");
+        p.skew.injected += by;
     }
 
     /// Test-only: age the ACK so written-window paths run without waiting.
@@ -1512,8 +1556,8 @@ impl SamuraiInjector {
     fn backdate_ack(&self, session_id: u32, by: Duration) {
         let mut pending = self.lock_pending();
         let p = pending.get_mut(&session_id).expect("no pending entry");
-        p.acked_at = p.acked_at.expect("not acked").checked_sub(by);
-        assert!(p.acked_at.is_some(), "backdate underflowed Instant");
+        assert!(p.acked_at.is_some(), "not acked");
+        p.skew.acked += by;
     }
 
     /// Test-only: age the waiting clock so the stuck-wait cap (finding E)
@@ -1522,10 +1566,7 @@ impl SamuraiInjector {
     fn backdate_waiting(&self, session_id: u32, by: Duration) {
         let mut pending = self.lock_pending();
         let p = pending.get_mut(&session_id).expect("no pending entry");
-        p.waiting_since = p
-            .waiting_since
-            .checked_sub(by)
-            .expect("backdate underflowed Instant");
+        p.skew.waiting += by;
     }
 }
 
