@@ -22,7 +22,7 @@ use crate::core::samurai_injector::strip_extended_prefix;
 use crate::core::samurai_journal::{
     default_journal_file, JournalCategory, JournalEntry, JournalListResult, JournalStore,
 };
-use crate::core::samurai_prompts::{self, epic_slug};
+use crate::core::samurai_prompts::{self, epic_slug, RunRefs};
 use crate::core::samurai_replicator::{derive_repo_pin, SamuraiReplicator};
 use crate::core::samurai_run_config::{RunConfigStatus, RunConfigStore, SamuraiRunConfig};
 use crate::core::samurai_schedule::{SamuraiSchedule, ScheduleEntry};
@@ -381,10 +381,14 @@ pub struct SamuraiLaunchResult {
 /// site per the P5.1 contract (`default_journal_file`); a single space
 /// joins the two single-line instructions, keeping the brief one
 /// paste-able line.
+///
+/// Issue #83 splits a run's refs into epics and issues; the launcher still
+/// sends ONE field, so every ref is an epic here — the wire change follows,
+/// and until it lands the brief reads exactly as it did.
 fn launch_brief(epic: &str, repo_pin: Option<&str>) -> String {
     format!(
         "{} {}",
-        samurai_prompts::launch_instruction(epic, repo_pin),
+        samurai_prompts::launch_instruction(&RunRefs::epics_only(epic), repo_pin),
         samurai_prompts::journal_instruction(&default_journal_file()),
     )
 }
@@ -964,7 +968,10 @@ mod tests {
         // Issue #72: the composed gen-1 brief = the unmodified launch
         // instruction, then the journaling rider, one paste-able line.
         let brief = launch_brief("#38", Some("nachogl1/maestro"));
-        let launch = samurai_prompts::launch_instruction("#38", Some("nachogl1/maestro"));
+        let launch = samurai_prompts::launch_instruction(
+            &RunRefs::epics_only("#38"),
+            Some("nachogl1/maestro"),
+        );
         assert!(
             brief.starts_with(&launch),
             "launch text must ride first, unmodified"
