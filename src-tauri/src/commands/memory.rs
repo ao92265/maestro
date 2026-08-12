@@ -9,7 +9,7 @@
 use chrono::{DateTime, Utc};
 use directories::BaseDirs;
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::claude_sessions::encode_project_path;
 
@@ -134,9 +134,10 @@ fn parse_frontmatter(content: &str) -> (Option<String>, Option<String>) {
     (description, mem_type)
 }
 
-/// Recursively collects `.md` files under `dir`, recording paths relative to
-/// `base`. Missing/unreadable subdirectories are skipped, not fatal.
-fn collect_md_files(dir: &PathBuf, base: &PathBuf, depth: usize, out: &mut Vec<PathBuf>) {
+/// Recursively collects `.md` files under `dir`. Missing/unreadable
+/// subdirectories are skipped, not fatal. Paths are absolute; callers that
+/// want them repo-relative pass each one through [`rel_path_string`].
+fn collect_md_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     if depth > MAX_SCAN_DEPTH {
         return;
     }
@@ -149,7 +150,7 @@ fn collect_md_files(dir: &PathBuf, base: &PathBuf, depth: usize, out: &mut Vec<P
             continue;
         };
         if file_type.is_dir() {
-            collect_md_files(&path, base, depth + 1, out);
+            collect_md_files(&path, depth + 1, out);
         } else if file_type.is_file()
             && path
                 .extension()
@@ -160,7 +161,7 @@ fn collect_md_files(dir: &PathBuf, base: &PathBuf, depth: usize, out: &mut Vec<P
     }
 }
 
-fn rel_path_string(path: &PathBuf, base: &PathBuf) -> Option<String> {
+fn rel_path_string(path: &Path, base: &Path) -> Option<String> {
     let rel = path.strip_prefix(base).ok()?;
     let parts: Vec<String> = rel
         .components()
@@ -200,7 +201,7 @@ pub async fn list_memory_projects(
             continue;
         }
         let mut files = Vec::new();
-        collect_md_files(&memory_dir, &memory_dir, 0, &mut files);
+        collect_md_files(&memory_dir, 0, &mut files);
         if files.is_empty() {
             continue;
         }
@@ -232,7 +233,7 @@ pub async fn list_memory_files(dir_name: String) -> Result<Vec<MemoryFile>, Stri
     }
 
     let mut paths = Vec::new();
-    collect_md_files(&memory_dir, &memory_dir, 0, &mut paths);
+    collect_md_files(&memory_dir, 0, &mut paths);
 
     let mut files: Vec<MemoryFile> = Vec::new();
     for path in paths {

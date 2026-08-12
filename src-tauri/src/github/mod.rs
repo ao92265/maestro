@@ -5,9 +5,9 @@ pub mod watchdog;
 
 pub use error::GitHubError;
 pub use ops::{
-    AuthStatus, BranchPullRequest, Comment, CommentReactions, CreatePullRequestOptions,
-    DiscussionCategory, DiscussionDetail, DiscussionInfo, IssueDetail, IssueFilter, IssueInfo,
-    MergeMethod, PrAuthor, PrLabel, PullRequestDetail, PullRequestFilter, PullRequestInfo,
+    AuthStatus, BranchPullRequest, CreatePullRequestOptions, DiscussionDetail, DiscussionInfo,
+    IssueDetail, IssueFilter, IssueInfo, MergeMethod, PullRequestDetail, PullRequestFilter,
+    PullRequestInfo,
 };
 pub use runner::GitHub;
 pub use watchdog::{GitHubWatchdog, WatchedProject};

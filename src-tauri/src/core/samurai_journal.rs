@@ -475,7 +475,6 @@ pub fn default_journal_file() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
     use tempfile::tempdir;
 
     fn entry(category: JournalCategory, text: &str) -> JournalEntry {

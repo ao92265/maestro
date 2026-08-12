@@ -25,6 +25,16 @@ const OFFICIAL_MARKETPLACE_ID: &str = "official-anthropic-claude-code";
 /// Session key for per-session configuration: (project_path, session_id).
 type SessionKey = (String, u32);
 
+/// What one installed plugin directory contributes, by component kind.
+#[derive(Debug, Default)]
+struct PluginComponents {
+    skills: Vec<String>,
+    commands: Vec<String>,
+    mcp_servers: Vec<String>,
+    agents: Vec<String>,
+    hooks: Vec<String>,
+}
+
 /// Manages marketplace sources, available plugins, and installations.
 ///
 /// Thread-safe via `DashMap` and `RwLock`.
@@ -66,11 +76,15 @@ impl MarketplaceManager {
     }
 
     /// Gets the marketplaces cache directory (~/.claude/plugins/marketplaces/).
+    // Path helpers for the on-disk cache layout, kept alongside the ones in
+    // use so the layout is described in one place.
+    #[allow(dead_code)]
     fn get_marketplaces_cache_dir() -> Option<PathBuf> {
         Self::get_user_plugins_dir().map(|p| p.join("marketplaces"))
     }
 
     /// Gets the repos cache directory (~/.claude/plugins/repos/).
+    #[allow(dead_code)]
     fn get_repos_cache_dir() -> Option<PathBuf> {
         Self::get_user_plugins_dir().map(|p| p.join("repos"))
     }
@@ -565,7 +579,11 @@ impl MarketplaceManager {
     }
 
     /// Discovers plugin components from an installed directory.
-    fn discover_plugin_components(plugin_dir: &Path) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    fn discover_plugin_components(plugin_dir: &Path) -> PluginComponents {
+        // Named fields rather than a 5-tuple: five same-typed `Vec<String>`
+        // positions are trivially swappable at the call site, and the
+        // compiler cannot catch it.
+
         let mut skills = Vec::new();
         let mut commands = Vec::new();
         let mut mcp_servers = Vec::new();
@@ -592,7 +610,7 @@ impl MarketplaceManager {
             if let Ok(entries) = std::fs::read_dir(&commands_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_file() && path.extension().map_or(false, |e| e == "md") {
+                    if path.is_file() && path.extension().is_some_and(|e| e == "md") {
                         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                             commands.push(stem.to_string());
                         }
@@ -621,7 +639,7 @@ impl MarketplaceManager {
             if let Ok(entries) = std::fs::read_dir(&agents_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_file() && path.extension().map_or(false, |e| e == "md") {
+                    if path.is_file() && path.extension().is_some_and(|e| e == "md") {
                         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                             agents.push(stem.to_string());
                         }
@@ -646,7 +664,13 @@ impl MarketplaceManager {
             }
         }
 
-        (skills, commands, mcp_servers, agents, hooks)
+        PluginComponents {
+            skills,
+            commands,
+            mcp_servers,
+            agents,
+            hooks,
+        }
     }
 
     /// Installs a plugin from a marketplace.
@@ -714,7 +738,13 @@ impl MarketplaceManager {
         tokio::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?).await?;
 
         // Discover components
-        let (skills, commands, mcp_servers, agents, hooks) = Self::discover_plugin_components(&plugin_dir);
+        let PluginComponents {
+            skills,
+            commands,
+            mcp_servers,
+            agents,
+            hooks,
+        } = Self::discover_plugin_components(&plugin_dir);
 
         // Create installed plugin record
         let installed_plugin = InstalledPlugin {
@@ -834,6 +864,9 @@ impl MarketplaceManager {
     }
 
     /// Exports marketplace data to a JSON string.
+    // Persistence counterpart to `import_from_json`; the settings UI currently
+    // only imports.
+    #[allow(dead_code)]
     pub fn export_to_json(&self) -> MarketplaceResult<String> {
         let data = MarketplaceData {
             sources: self.sources.read().unwrap().clone(),

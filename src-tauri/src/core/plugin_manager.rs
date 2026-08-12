@@ -152,21 +152,12 @@ fn default_true() -> bool {
 }
 
 /// Combined result of plugin discovery for a project.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectPlugins {
     /// All discovered skills.
     pub skills: Vec<SkillConfig>,
     /// All discovered plugins.
     pub plugins: Vec<PluginConfig>,
-}
-
-impl Default for ProjectPlugins {
-    fn default() -> Self {
-        Self {
-            skills: Vec::new(),
-            plugins: Vec::new(),
-        }
-    }
 }
 
 /// Raw structure of `.plugins.json` file.
@@ -242,6 +233,9 @@ struct PluginManifest {
 
 /// Structure of ~/.claude/plugins/installed_plugins.json.
 #[derive(Debug, Deserialize)]
+// `version` is the on-disk schema version: read by serde, not by us — but a
+// parser that silently ignores it could not notice a format bump.
+#[allow(dead_code)]
 struct InstalledPluginsJson {
     #[serde(default)]
     version: u32,
@@ -584,7 +578,7 @@ fn parse_installed_plugins_json(plugins_dir: &Path) -> Vec<(String, String, Stri
     let mut results = Vec::new();
     for (cli_id, entries) in parsed.plugins {
         // Use the first user-scope entry (or any entry)
-        if let Some(entry) = entries.into_iter().find(|e| e.scope == "user").or_else(|| None) {
+        if let Some(entry) = entries.into_iter().find(|e| e.scope == "user") {
             let version = entry.version.unwrap_or_else(|| "0.0.0".to_string());
             results.push((cli_id, entry.install_path, version));
         }
@@ -819,7 +813,7 @@ impl PluginManager {
     /// 3. Personal skills: `~/.claude/skills/*/SKILL.md`
     /// 4. Personal commands: `~/.claude/commands/*.md`
     /// 5. Installed plugins: `~/.claude/plugins/*/` (with .claude-plugin/plugin.json)
-    /// 5b. CLI-installed plugins: `~/.claude/plugins/installed_plugins.json`
+    ///    — and CLI-installed ones from `~/.claude/plugins/installed_plugins.json`
     /// 6. Legacy .plugins.json
     ///
     /// Skills are deduplicated, with earlier sources taking priority.
@@ -1124,6 +1118,6 @@ mod tests {
             Some(&true)
         );
         // stripe has no cli_id, so it's not in the result
-        assert!(result.get("stripe").is_none());
+        assert!(!result.contains_key("stripe"));
     }
 }

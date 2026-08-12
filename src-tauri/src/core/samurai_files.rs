@@ -685,10 +685,7 @@ mod tests {
         list_files(&f.roots, &f.store.list_with_paths(), &f.timers, sessions)
     }
 
-    fn of_kind<'a>(
-        entries: &'a [SamuraiFileEntry],
-        kind: SamuraiFileKind,
-    ) -> Vec<&'a SamuraiFileEntry> {
+    fn of_kind(entries: &[SamuraiFileEntry], kind: SamuraiFileKind) -> Vec<&SamuraiFileEntry> {
         entries.iter().filter(|e| e.kind == kind).collect()
     }
 

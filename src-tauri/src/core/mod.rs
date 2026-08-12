@@ -48,19 +48,14 @@ pub use claude_event::ClaudeEvent;
 pub use error::PtyError;
 pub use event_bus::EventBus;
 pub use font_detector::{detect_available_fonts, is_font_available, AvailableFont};
-pub use marketplace_manager::MarketplaceManager;
-pub use mcp_manager::McpManager;
-pub use plugin_manager::PluginManager;
 pub use process_manager::ProcessManager;
-pub use session_manager::SessionManager;
 pub use status_server::StatusServer;
-pub use terminal_backend::{
-    BackendCapabilities, BackendType, SubscriptionHandle, TerminalBackend, TerminalConfig,
-    TerminalError, TerminalState,
-};
+// Only the two types `commands::terminal` reads are re-exported here. Every
+// other consumer imports through the defining module (`core::foo::Bar`), so
+// a façade entry for them would be a second name for the same thing that
+// nothing calls.
+pub use terminal_backend::{BackendCapabilities, BackendType};
 pub use transcript_watcher::TranscriptWatcher;
-pub use worktree_manager::WorktreeManager;
-pub use xterm_backend::XtermPassthroughBackend;
 
 #[cfg(feature = "vte-backend")]
 pub use vte_backend::VteBackend;

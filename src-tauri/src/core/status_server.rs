@@ -55,6 +55,9 @@ pub struct SessionStatusPayload {
 }
 
 /// Request payload for the session-start hook.
+// `hook_event_name` is part of Claude's hook contract; it is accepted and
+// validated by serde even though this handler routes on the URL instead.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct HookSessionStartRequest {
     pub session_id: String,
@@ -64,6 +67,7 @@ pub struct HookSessionStartRequest {
 }
 
 /// Generic request payload for hooks that don't need special fields.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct HookGenericRequest {
     pub session_id: String,
@@ -988,12 +992,17 @@ mod tests {
         // Register the session — should flush
         server.register_session(7, "/path/project-x").await;
 
-        let emitted = events.lock().unwrap();
-        assert_eq!(emitted.len(), 1);
-        assert_eq!(emitted[0].session_id, 7);
-        assert_eq!(emitted[0].project_path, "/path/project-x");
-        assert_eq!(emitted[0].status, "Idle");
-        assert_eq!(emitted[0].message, "Buffered hello");
+        // Scoped so the std MutexGuard is dropped before the await below —
+        // holding a blocking guard across an await point is how an async task
+        // deadlocks itself once anything else contends for the same lock.
+        {
+            let emitted = events.lock().unwrap();
+            assert_eq!(emitted.len(), 1);
+            assert_eq!(emitted[0].session_id, 7);
+            assert_eq!(emitted[0].project_path, "/path/project-x");
+            assert_eq!(emitted[0].status, "Idle");
+            assert_eq!(emitted[0].message, "Buffered hello");
+        }
 
         // Buffer should be cleared
         assert!(server.pending_statuses.read().await.is_empty());

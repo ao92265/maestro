@@ -528,6 +528,9 @@ pub struct SamuraiReplicator {
 }
 
 impl SamuraiReplicator {
+    // Eight distinct collaborators, each injected once at startup. A params
+    // struct would only move the same list one level out.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         supervisor: Arc<Supervisor>,
         audit: AuditLog,
@@ -2846,8 +2849,9 @@ mod tests {
         // what it was asked about — and the session state AT consult time
         // (review F3b: the absorber must be evaluated BEFORE the Killed
         // transition, while HANDOFF_WRITTEN still holds the sweep open).
-        let asked: Arc<Mutex<Vec<(String, String, Option<SupervisorState>)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        // (project, epic, session state at consult time)
+        type AbsorbCall = (String, String, Option<SupervisorState>);
+        let asked: Arc<Mutex<Vec<AbsorbCall>>> = Arc::new(Mutex::new(Vec::new()));
         let asked_rec = asked.clone();
         let supervisor_for_absorb = h.supervisor.clone();
         h.replicator.set_absorber(Arc::new(move |project, epic| {
