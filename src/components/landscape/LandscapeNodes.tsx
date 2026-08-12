@@ -63,7 +63,7 @@ export interface LandscapeActions {
   /** Open the agent's brief/report drawer. */
   openAgent: (agent: SubagentInfo) => void;
   /** Remove one finished/running agent from the graph (same as the old graph's ×). */
-  dismissAgent: (agentId: string, sessionId: number) => void;
+  dismissAgent: (sessionId: number, agentId: string) => void;
   /** Leave the landscape and focus that terminal. */
   openTerminal: (tabId: string, sessionId: number) => void;
   /** Leave the landscape and activate that project tab. */
@@ -250,7 +250,7 @@ export function AgentNode({ data, selected }: NodeProps) {
           title="Remove from the graph"
           onClick={(e) => {
             e.stopPropagation();
-            dismissAgent(agent.agentId, agent.sessionId);
+            dismissAgent(agent.sessionId, agent.agentId);
           }}
           className="nodrag shrink-0 rounded p-0.5 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-text"
         >

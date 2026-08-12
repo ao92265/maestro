@@ -60,10 +60,11 @@ interface AgentState {
   handleEvents: (events: ClaudeEvent[]) => void;
   /**
    * Remove one agent from the graph. Nothing else ever removes them.
-   * Scoped to (agentId, sessionId) — the store's identity — because a resumed
-   * conversation in another terminal holds agents with the same tool_use ids.
+   * Keyed on (session, agent) like every event handler: a resumed
+   * conversation replays the same tool_use ids, so the id alone would also
+   * take the other session's node.
    */
-  dismiss: (agentId: string, sessionId: number) => void;
+  dismiss: (sessionId: number, agentId: string) => void;
   /** Remove every finished agent of one session, leaving the running ones. */
   clearFinished: (sessionId: number) => void;
   /**
@@ -231,7 +232,7 @@ export const useAgentStore = create<AgentState>((set) => ({
     });
   },
 
-  dismiss: (agentId: string, sessionId: number) =>
+  dismiss: (sessionId: number, agentId: string) =>
     set((state) => {
       const kept = state.agents.filter(
         (a) => a.agentId !== agentId || a.sessionId !== sessionId

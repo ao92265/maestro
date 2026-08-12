@@ -56,7 +56,7 @@ export function BottomBar({
           type="button"
           onClick={unlaunchedCount > 0 ? onLaunchAll : undefined}
           disabled={unlaunchedCount === 0}
-          className="flex items-center gap-2 rounded-lg bg-maestro-accent px-4 py-1.5 text-xs font-medium text-white shadow-md shadow-black/20 transition-colors hover:bg-maestro-accent/80 disabled:opacity-50 disabled:cursor-not-allowed"
+          className="relative z-10 flex items-center gap-2 rounded-lg bg-maestro-accent px-4 py-1.5 text-xs font-medium text-white shadow-md shadow-black/20 transition-colors hover:bg-maestro-accent/80 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           <Play size={11} fill="currentColor" />
           {unlaunchedCount === 0
@@ -68,8 +68,10 @@ export function BottomBar({
       )}
 
       {/* inset-y-0 + items-center for the same stacking-context reason as the
-          left cluster. */}
-      <div className="absolute inset-y-0 right-4 flex items-center gap-4">
+          left cluster. Bounded like the left one: the inline usage bars grow
+          with however many windows the API reports, and an unbounded absolute
+          cluster would reach past the centre and cover the Launch button. */}
+      <div className="absolute inset-y-0 right-4 flex max-w-[55%] items-center justify-end gap-4 overflow-hidden">
         <SystemMetrics />
         <UsageBar />
       </div>

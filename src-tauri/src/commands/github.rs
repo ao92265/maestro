@@ -1,7 +1,7 @@
 use crate::github::{
-    AuthStatus, CreatePullRequestOptions, DiscussionDetail, DiscussionInfo, GitHub, GitHubError,
-    GitHubWatchdog, IssueDetail, IssueFilter, IssueInfo, MergeMethod, PullRequestDetail,
-    PullRequestFilter, PullRequestInfo, WatchedProject,
+    AuthStatus, BranchPullRequest, CreatePullRequestOptions, DiscussionDetail, DiscussionInfo,
+    GitHub, GitHubError, GitHubWatchdog, IssueDetail, IssueFilter, IssueInfo, MergeMethod,
+    PullRequestDetail, PullRequestFilter, PullRequestInfo, WatchedProject,
 };
 
 /// Checks if the user is authenticated with GitHub CLI.
@@ -36,6 +36,19 @@ pub async fn github_get_pr(
 ) -> Result<PullRequestDetail, GitHubError> {
     let gh = GitHub::new(&repo_path);
     gh.get_pull_request(number).await
+}
+
+/// Finds the pull request opened from `branch`, if there is one.
+///
+/// Returns `None` (not an error) when the branch has no PR — the common case
+/// for the terminal headers that call this.
+#[tauri::command]
+pub async fn github_pr_for_branch(
+    repo_path: String,
+    branch: String,
+) -> Result<Option<BranchPullRequest>, GitHubError> {
+    let gh = GitHub::new(&repo_path);
+    gh.pull_request_for_branch(&branch).await
 }
 
 /// Creates a new pull request.

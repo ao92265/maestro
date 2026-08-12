@@ -580,24 +580,18 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
     requestAnimationFrame(fitAll);
   }, [resetManualPositions, fitAll]);
 
-  // A session whose Claude process is still alive. An agent of any other
-  // session (ended, errored, or closed entirely) can never complete — it is
-  // "dead" and clearable even though it still reads as running.
-  const liveSessionIds = useMemo(
-    () =>
-      new Set(
-        sessions
-          .filter(
-            (s) =>
-              s.status === "Working" ||
-              s.status === "NeedsInput" ||
-              s.status === "Starting" ||
-              s.status === "Idle",
-          )
-          .map((s) => s.id),
-      ),
-    [sessions],
-  );
+  // A session whose terminal is still open. Closing a terminal drops it from
+  // `sessions`, so its agents fall out of this set and stay clearable even
+  // while they read as running — that is the only signal that an agent can
+  // never complete.
+  //
+  // Status is deliberately NOT part of this: `Done`/`Error` come only from the
+  // agent's own MCP self-report and are never reverted (TerminalView's
+  // SAFE_TO_OVERRIDE), so an orchestrator that reports "finished" while its
+  // background subagents are still running would otherwise have those running
+  // agents cleared — and the loss is permanent, since a later
+  // SubagentCompleted for a node that no longer exists is dropped.
+  const liveSessionIds = useMemo(() => new Set(sessions.map((s) => s.id)), [sessions]);
 
   const clearableCount = useMemo(
     () =>
@@ -709,7 +703,7 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
           type="button"
           onClick={handleClearFinished}
           disabled={clearableCount === 0}
-          title="Remove every done agent, plus dead ones whose terminal ended"
+          title="Remove every done agent, plus dead ones whose terminal was closed"
           className={toolbarButton}
         >
           <Trash2 size={11} />

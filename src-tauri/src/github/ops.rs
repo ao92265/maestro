@@ -48,6 +48,54 @@ pub struct PrLabel {
     pub color: String,
 }
 
+/// The little a terminal header needs to link a branch to its pull request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchPullRequest {
+    pub number: u64,
+    pub title: String,
+    /// `OPEN`, `MERGED` or `CLOSED`, as `gh` reports it.
+    pub state: String,
+    pub is_draft: bool,
+    pub url: String,
+}
+
+/// One row of the branch → PR lookup, as `gh pr list --json` returns it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BranchPrRow {
+    number: u64,
+    title: String,
+    state: String,
+    is_draft: bool,
+    url: String,
+    updated_at: String,
+}
+
+/// Picks the one pull request a branch should link to.
+///
+/// A long-lived branch can carry several (one merged, one reopened, …). Open
+/// beats everything else because that is the PR the user is working in; among
+/// PRs of equal standing the most recently updated wins. Timestamps are RFC
+/// 3339 in UTC as `gh` reports them, so comparing the strings orders them
+/// correctly without parsing dates.
+fn pick_branch_pull_request(rows: Vec<BranchPrRow>) -> Option<BranchPullRequest> {
+    rows.into_iter()
+        .max_by(|a, b| {
+            let open = |r: &BranchPrRow| r.state.eq_ignore_ascii_case("open");
+            open(a)
+                .cmp(&open(b))
+                .then_with(|| a.updated_at.cmp(&b.updated_at))
+        })
+        .map(|row| BranchPullRequest {
+            number: row.number,
+            title: row.title,
+            state: row.state,
+            is_draft: row.is_draft,
+            url: row.url,
+        })
+}
+
 /// Detailed pull request info including body and review info.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -307,6 +355,30 @@ impl GitHub {
         }
 
         self.run_json(&args).await
+    }
+
+    /// Finds the pull request opened from `branch`, if there is one.
+    ///
+    /// Powers the PR link in a terminal header, so it asks for the few fields a
+    /// link needs and nothing else. `--state all` on purpose: a branch whose PR
+    /// was merged or closed still deserves a link — that PR is where the work
+    /// ended up. Open PRs win over closed ones, and among equals the most
+    /// recently updated wins, because a long-lived branch can accumulate
+    /// several.
+    pub async fn pull_request_for_branch(
+        &self,
+        branch: &str,
+    ) -> Result<Option<BranchPullRequest>, GitHubError> {
+        let args = vec![
+            "pr", "list",
+            "--head", branch,
+            "--state", "all",
+            "--limit", "20",
+            "--json", "number,title,state,isDraft,url,updatedAt",
+        ];
+
+        let rows: Vec<BranchPrRow> = self.run_json(&args).await?;
+        Ok(pick_branch_pull_request(rows))
     }
 
     /// Gets detailed information about a specific pull request.
@@ -1037,6 +1109,61 @@ mod tests {
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("testuser"));
         assert!(json.contains("true"));
+    }
+
+    fn branch_row(number: u64, state: &str, updated_at: &str) -> BranchPrRow {
+        BranchPrRow {
+            number,
+            title: format!("PR {}", number),
+            state: state.to_string(),
+            is_draft: false,
+            url: format!("https://github.com/owner/repo/pull/{}", number),
+            updated_at: updated_at.to_string(),
+        }
+    }
+
+    #[test]
+    fn pick_branch_pr_returns_none_when_the_branch_has_no_pr() {
+        assert!(pick_branch_pull_request(vec![]).is_none());
+    }
+
+    #[test]
+    fn pick_branch_pr_prefers_an_open_pr_over_a_newer_merged_one() {
+        let picked = pick_branch_pull_request(vec![
+            branch_row(1, "OPEN", "2026-08-01T00:00:00Z"),
+            branch_row(2, "MERGED", "2026-08-07T00:00:00Z"),
+        ])
+        .expect("a PR should be picked");
+        assert_eq!(picked.number, 1);
+    }
+
+    #[test]
+    fn pick_branch_pr_falls_back_to_the_most_recently_updated() {
+        let picked = pick_branch_pull_request(vec![
+            branch_row(1, "CLOSED", "2026-08-01T00:00:00Z"),
+            branch_row(2, "MERGED", "2026-08-07T00:00:00Z"),
+        ])
+        .expect("a PR should be picked");
+        assert_eq!(picked.number, 2);
+        assert_eq!(picked.state, "MERGED");
+    }
+
+    #[test]
+    fn pick_branch_pr_deserializes_the_gh_row_shape() {
+        let json = r#"[{
+            "number": 42,
+            "title": "Add the thing",
+            "state": "OPEN",
+            "isDraft": true,
+            "url": "https://github.com/owner/repo/pull/42",
+            "updatedAt": "2026-08-07T09:00:00Z"
+        }]"#;
+
+        let rows: Vec<BranchPrRow> = serde_json::from_str(json).unwrap();
+        let picked = pick_branch_pull_request(rows).expect("a PR should be picked");
+        assert_eq!(picked.number, 42);
+        assert!(picked.is_draft);
+        assert_eq!(picked.url, "https://github.com/owner/repo/pull/42");
     }
 
     #[test]

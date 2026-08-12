@@ -241,23 +241,21 @@ describe("useAgentStore", () => {
   it("dismiss removes exactly one agent", () => {
     useAgentStore.getState().handleEvent(spawned(1, "toolu_a"));
     useAgentStore.getState().handleEvent(spawned(1, "toolu_b"));
-    useAgentStore.getState().dismiss("toolu_a", 1);
+    useAgentStore.getState().dismiss(1, "toolu_a");
     expect(useAgentStore.getState().agents.map((a) => a.agentId)).toEqual(["toolu_b"]);
   });
 
-  // A resumed conversation in another terminal holds an agent with the SAME
-  // tool_use id under a different session; dismissing one must not kill both.
-  it("dismiss is scoped to its session", () => {
+  it("dismiss keeps the same tool_use id belonging to another session", () => {
     useAgentStore.getState().handleEvent(spawned(1, "toolu_a"));
     useAgentStore.getState().handleEvent(spawned(2, "toolu_a"));
-    useAgentStore.getState().dismiss("toolu_a", 1);
+    useAgentStore.getState().dismiss(1, "toolu_a");
     expect(useAgentStore.getState().agents.map((a) => a.sessionId)).toEqual([2]);
   });
 
   it("dismiss of an unknown id leaves the state untouched", () => {
     useAgentStore.getState().handleEvent(spawned(1, "toolu_a"));
     const before = useAgentStore.getState().agents;
-    useAgentStore.getState().dismiss("nope", 1);
+    useAgentStore.getState().dismiss(1, "nope");
     expect(useAgentStore.getState().agents).toBe(before);
   });
 

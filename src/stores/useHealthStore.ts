@@ -106,13 +106,7 @@ export const useHealthStore = create<HealthState & HealthActions>()((set, get) =
     set({ isChecking: true });
     try {
       const now = Date.now();
-      const {
-        flags: prevFlags,
-        streaks: prevStreaks,
-        baselineKeys,
-        dismissedKeys,
-        toasts,
-      } = get();
+      const { flags: prevFlags, streaks: prevStreaks, baselineKeys } = get();
 
       // Areas are checked independently: a failing one keeps its last-known
       // flags and its baseline, so a transient error neither clears the badge
@@ -156,6 +150,13 @@ export const useHealthStore = create<HealthState & HealthActions>()((set, get) =
         ...(memoryFlags ?? keep("memory")),
         ...(processResult?.flags ?? keep("processes")),
       ];
+
+      // Read dismissals and toasts here rather than before the awaits above:
+      // those take seconds, and a flag or toast the user dismissed while the
+      // check was in flight must not be resurrected by a stale snapshot.
+      // Nothing can interleave between this read and the `set` below — there
+      // is no await between them.
+      const { dismissedKeys, toasts } = get();
 
       // Dismissals only hide what is currently raised; pruning them here is
       // what lets a flag that clears and later returns show up again.

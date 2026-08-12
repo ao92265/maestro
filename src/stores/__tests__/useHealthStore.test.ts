@@ -228,6 +228,26 @@ describe("useHealthStore", () => {
     ).toEqual(["running 24h"]);
   });
 
+  it("keeps a dismissal made while a check is in flight", async () => {
+    mockBackend(sprawlingProject());
+    await useHealthStore.getState().runCheck();
+    const key = useHealthStore.getState().flags[0].key;
+
+    // Dismiss from inside the process listing: that lands after runCheck has
+    // read the state it later writes back, which is the window a stale
+    // snapshot would silently undo.
+    mockBackend(sprawlingProject());
+    const backend = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "list_dev_processes") useHealthStore.getState().dismissFlag(key);
+      return backend(cmd, args);
+    });
+    await useHealthStore.getState().runCheck();
+
+    expect(useHealthStore.getState().dismissedKeys).toContain(key);
+    expect(useHealthStore.getState().flags).toEqual([]);
+  });
+
   it("ignores a re-entrant check while one is in flight", async () => {
     mockBackend(sprawlingProject());
     const first = useHealthStore.getState().runCheck();

@@ -51,8 +51,9 @@ export function NotificationToasts() {
         <Toast
           key={toast.id}
           accentColor={projectColors.get(toast.projectName) ?? projectColorFor(toast.projectName)}
-          title={toast.projectName}
-          subtitle={`${toast.kind === "pr" ? "Review requested" : "Issue assigned"} — #${toast.number} ${toast.title}`}
+          kicker={toast.kind === "pr" ? "Review requested" : "Issue assigned"}
+          title={`#${toast.number} ${toast.title}`}
+          detail={toast.projectName}
           onClick={() => {
             openUrl(toast.url).catch((err) => console.error("Failed to open URL:", err));
             dismissWatchdogToast(toast.id);
@@ -64,8 +65,9 @@ export function NotificationToasts() {
         <Toast
           key={toast.id}
           accentColor={HEALTH_ACCENT}
-          title={toast.area === "memory" ? "Memory" : "Processes"}
-          subtitle={`${toast.target} — ${toast.reason}`}
+          kicker={toast.area === "memory" ? "Memory" : "Processes"}
+          title={toast.target}
+          detail={toast.reason}
           onDismiss={() => dismissHealthToast(toast.id)}
         />
       ))}

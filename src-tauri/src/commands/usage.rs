@@ -106,8 +106,12 @@ struct ApiUsageResponse {
     /// appear ONLY here — there is no `seven_day_fable` top-level key
     /// (observed 2026-08-07: `kind: "weekly_scoped"` with
     /// `scope.model.display_name: "Fable"`).
+    /// `Option` rather than a bare `Vec`: `serde(default)` covers a *missing*
+    /// key but not an explicit `"limits": null`, which would fail the whole
+    /// response deserialize and blank every usage bar — the same nullable-
+    /// where-a-structure-is-expected shape already handled on `UsageWindow`.
     #[serde(default)]
-    limits: Vec<ApiLimit>,
+    limits: Option<Vec<ApiLimit>>,
 }
 
 /// One entry of the `limits` array.
@@ -323,7 +327,7 @@ fn to_usage_data(api: ApiUsageResponse) -> UsageData {
     // name). Skip models whose dedicated top-level window is already
     // reported, and repeats of the same name, so each model gets one bar.
     let mut model_windows: Vec<ModelWindow> = Vec::new();
-    for limit in api.limits {
+    for limit in api.limits.unwrap_or_default() {
         if limit.kind.as_deref() != Some("weekly_scoped") {
             continue;
         }
@@ -634,6 +638,21 @@ mod tests {
         assert!(usage.model_windows.is_empty());
         assert!(!usage.needs_auth);
         assert_eq!(usage.error_message, None);
+    }
+
+    #[test]
+    fn parses_a_null_limits_array() {
+        // This API emits null where a structure is expected (see the
+        // `utilization` note on UsageWindow). `serde(default)` alone does not
+        // cover an explicit null, and failing here would blank every usage
+        // bar rather than just the model-scoped ones.
+        let body = ENTERPRISE_RESPONSE.replace("\"limits\": []", "\"limits\": null");
+        let parsed: ApiUsageResponse =
+            serde_json::from_str(&body).expect("null limits must not fail the whole response");
+        let usage = to_usage_data(parsed);
+        assert!(usage.model_windows.is_empty());
+        // The rest of the response still parses.
+        assert_eq!(usage.spend_limit_dollars, Some(1000.0));
     }
 
     /// Trimmed real /api/oauth/usage response captured from a Pro/Max seat
