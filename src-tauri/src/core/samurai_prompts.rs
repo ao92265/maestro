@@ -122,10 +122,11 @@ impl RunRefs {
         }
     }
 
-    /// Every ref is an epic — the pre-#83 wire, where the launcher had ONE
-    /// field holding a ref or a comma-separated list of them. Commas split
-    /// (the `commands::samurai::normalize_epic_ref` spelling rule), so call
-    /// sites that have not been split yet keep today's behaviour.
+    /// Every ref is an epic, from ONE comma-separated string — the pre-#83
+    /// launcher wire. The launch path now sends the two fields separately
+    /// (`commands::samurai::run_refs`), so this survives as the shorthand the
+    /// prompt suites build their epic-only fixtures with.
+    #[cfg(test)]
     pub fn epics_only(epics: &str) -> Self {
         Self::new(epics.split(','), std::iter::empty::<&str>())
     }
@@ -142,8 +143,6 @@ impl RunRefs {
 
     /// No usable ref on either side — the launch command refuses this before
     /// any prompt is built.
-    // Tests-only until the launcher sends both fields (issue #83 wire step).
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.epics.is_empty() && self.issues.is_empty()
     }
@@ -151,10 +150,8 @@ impl RunRefs {
     /// The run's identity/display string: `epic #5 · issues #7, #9`,
     /// `issues #7, #9`, `epic #5`, `epics #5, #12`. Empty when there is
     /// nothing to name — [`epic_slug`] then falls back to `epic`, so the
-    /// slug is never empty.
-    // Tests-only until the launcher sends both fields (issue #83 wire step),
-    // which stores this as the run's `epic` identity field.
-    #[allow(dead_code)]
+    /// slug is never empty. The launch path stores this as the run's `epic`
+    /// identity field ([`SamuraiRunConfig::epic`](super::samurai_run_config::SamuraiRunConfig::epic)).
     pub fn label(&self) -> String {
         let epics = self.epic_phrase();
         let issues = self.issue_phrase();

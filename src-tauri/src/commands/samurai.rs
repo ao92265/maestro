@@ -278,21 +278,22 @@ fn epic_branch(epic: &str) -> String {
     format!("samurai-{}", epic_slug(epic))
 }
 
-/// Canonical spelling of what the user typed in the launcher's "Issues" field.
+/// The run's refs, built from the launcher's two fields (issue #83): parent
+/// EPICS whose children the orchestrator discovers, and standalone ISSUES
+/// named directly.
 ///
-/// The field accepts an epic ref, ONE issue, or a comma-separated list
-/// (`77, 78`) — a run is scoped to a set of issues, and an epic is just the
-/// common case where that set is named by one parent. Splitting on commas
-/// lets `#77,78` and `#77 , 78` land on the same identity, which matters:
-/// this string is the run's key everywhere (branch slug, worktree, handoff
-/// filenames, resume timers), so two spellings of one run must not produce
-/// two runs. Whitespace inside a single ref is collapsed for the same reason.
-fn normalize_epic_ref(epic: &str) -> String {
-    epic.split(',')
-        .map(|part| part.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(", ")
+/// Every element is split on commas before [`RunRefs`] normalises it. The
+/// frontend splits its own comma-separated inputs, but the backend must not
+/// depend on that: `["7, 9"]` and `["7", "9"]` have to produce ONE identity,
+/// because [`RunRefs::label`] is the run's key everywhere (branch slug,
+/// worktree, handoff filenames, resume timers) and two spellings of one run
+/// must never produce two runs. `RunRefs` collapses whitespace and drops
+/// empties for the same reason.
+fn run_refs(epics: &[String], issues: &[String]) -> RunRefs {
+    RunRefs::new(
+        epics.iter().flat_map(|e| e.split(',')),
+        issues.iter().flat_map(|i| i.split(',')),
+    )
 }
 
 /// The launch refusal matrix, in check order. `None` = clear to launch.
@@ -382,13 +383,13 @@ pub struct SamuraiLaunchResult {
 /// joins the two single-line instructions, keeping the brief one
 /// paste-able line.
 ///
-/// Issue #83 splits a run's refs into epics and issues; the launcher still
-/// sends ONE field, so every ref is an epic here — the wire change follows,
-/// and until it lands the brief reads exactly as it did.
-fn launch_brief(epic: &str, repo_pin: Option<&str>) -> String {
+/// Issue #83: the refs arrive already split into epics and issues, so the
+/// gen-1 brief names each set for what it is instead of calling a pair of
+/// sibling issues an epic.
+fn launch_brief(refs: &RunRefs, repo_pin: Option<&str>) -> String {
     format!(
         "{} {}",
-        samurai_prompts::launch_instruction(&RunRefs::epics_only(epic), repo_pin),
+        samurai_prompts::launch_instruction(refs, repo_pin),
         samurai_prompts::journal_instruction(&default_journal_file()),
     )
 }
@@ -407,15 +408,20 @@ pub(crate) async fn launch_run_inner(
     preflight: &SamuraiPreflight,
     global_config: SamuraiConfig,
     project: &str,
-    epic: &str,
+    refs: &RunRefs,
     model: Option<String>,
     handoff_context_pct: Option<f64>,
     worktree_base: Option<&Path>,
 ) -> Result<SamuraiLaunchResult, String> {
-    let epic = normalize_epic_ref(epic);
-    if epic.is_empty() {
-        return Err("an epic reference is required".to_string());
+    // Issue #83: the refs are the launch input, and `label()` is the single
+    // identity string every downstream surface already keys off — branch,
+    // worktree, run config filename, handoff filenames, resume timers and the
+    // supervisor's session epic all flow through `epic_slug` on this value, so
+    // nothing below had to learn about the split.
+    if refs.is_empty() {
+        return Err("at least one epic or issue reference is required".to_string());
     }
+    let epic = refs.label();
     let model = model
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty());
@@ -478,13 +484,14 @@ pub(crate) async fn launch_run_inner(
     // reconciliation flags as reconcile_unstartable — the human relaunches
     // (accepted).
     let mut config =
-        SamuraiRunConfig::new(project.to_string(), epic.clone(), worktree_path.clone());
+        SamuraiRunConfig::new(project.to_string(), epic.clone(), worktree_path.clone())
+            .with_refs(refs);
     config.repo_pin = repo_pin.clone();
     config.model = model;
     config.thresholds = thresholds;
     run_configs.save(&config)?;
 
-    let instruction = launch_brief(&epic, repo_pin.as_deref());
+    let instruction = launch_brief(refs, repo_pin.as_deref());
     replicator.spawn_first_generation(project, &epic, &worktree_path, instruction);
 
     log::info!(
@@ -516,11 +523,16 @@ pub async fn samurai_launch_run(
     replicator: State<'_, Arc<SamuraiReplicator>>,
     config: State<'_, SharedSamuraiConfig>,
     project_path: String,
-    epic: String,
+    epics: Vec<String>,
+    issues: Vec<String>,
     model: Option<String>,
     handoff_context_pct: Option<f64>,
 ) -> Result<SamuraiLaunchResult, String> {
     let project = canonical_project_path(&project_path);
+    // The frontend validates its two fields, but the backend re-normalises
+    // them here and `launch_run_inner` refuses an empty set — the wire is not
+    // trusted to have done either.
+    let refs = run_refs(&epics, &issues);
     let preflight = run_preflight(&project).await;
     let global_config = config
         .read()
@@ -535,7 +547,7 @@ pub async fn samurai_launch_run(
         &preflight,
         global_config,
         &project,
-        &epic,
+        &refs,
         model,
         handoff_context_pct,
         None,
@@ -950,24 +962,39 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_epic_ref_collapses_spellings_of_one_run() {
-        // A single ref is just trimmed and internally collapsed.
-        assert_eq!(normalize_epic_ref("  #38  "), "#38");
-        assert_eq!(normalize_epic_ref("Epic  12:\tAuth"), "Epic 12: Auth");
-        // Every spelling of the same list lands on one identity — otherwise
-        // the same two issues could be launched twice as two separate runs.
-        for spelling in ["77,78", "77, 78", " 77 ,  78 ", "77,,78", "77, 78,"] {
-            assert_eq!(normalize_epic_ref(spelling), "77, 78", "spelling: {spelling}");
+    fn test_run_refs_collapses_spellings_of_one_run() {
+        // Whatever shape the frontend sends — one comma-separated element or
+        // one element per ref — the same run must land on one identity, or
+        // the same work could be launched twice as two separate runs.
+        for spelling in [
+            vec!["77,78".to_string()],
+            vec!["77, 78".to_string()],
+            vec![" 77 ,  78 ".to_string()],
+            vec!["77,,78".to_string()],
+            vec!["77, 78,".to_string()],
+            vec!["#77".to_string(), " 78 ".to_string()],
+        ] {
+            let refs = run_refs(&spelling, &[]);
+            assert_eq!(refs.epics(), ["77", "78"], "spelling: {spelling:?}");
+            assert_eq!(refs.label(), "epics #77, #78", "spelling: {spelling:?}");
         }
-        // Empty stays empty so the caller's "epic required" check still fires.
-        assert_eq!(normalize_epic_ref("   ,  , "), "");
+
+        // The two fields stay apart, and each is normalised the same way.
+        let refs = run_refs(&["#5".to_string()], &["7, #9".to_string()]);
+        assert_eq!(refs.epics(), ["5"]);
+        assert_eq!(refs.issues(), ["7", "9"]);
+        assert_eq!(refs.label(), "epic #5 · issues #7, #9");
+
+        // Junk on both sides is empty, so the launch refusal still fires.
+        assert!(run_refs(&["   ,  , ".to_string()], &["#".to_string()]).is_empty());
+        assert!(run_refs(&[], &[]).is_empty());
     }
 
     #[test]
     fn test_launch_brief_is_launch_instruction_plus_journal_rider() {
         // Issue #72: the composed gen-1 brief = the unmodified launch
         // instruction, then the journaling rider, one paste-able line.
-        let brief = launch_brief("#38", Some("nachogl1/maestro"));
+        let brief = launch_brief(&RunRefs::epics_only("#38"), Some("nachogl1/maestro"));
         let launch = samurai_prompts::launch_instruction(
             &RunRefs::epics_only("#38"),
             Some("nachogl1/maestro"),
@@ -1116,6 +1143,32 @@ mod tests {
         }
     }
 
+    /// A launch through the harness — the same collaborators cleanup uses,
+    /// with preflight forced green and the worktree base kept in the tempdir.
+    async fn run_launch(
+        h: &CleanupHarness,
+        epics: &[&str],
+        issues: &[&str],
+    ) -> Result<SamuraiLaunchResult, String> {
+        let epics: Vec<String> = epics.iter().map(|s| s.to_string()).collect();
+        let issues: Vec<String> = issues.iter().map(|s| s.to_string()).collect();
+        launch_run_inner(
+            &h.supervisor,
+            &h.schedule,
+            &h.worktrees,
+            &h.run_configs,
+            &h.replicator,
+            &preflight(true, true),
+            SamuraiConfig::default(),
+            &h.project,
+            &run_refs(&epics, &issues),
+            None,
+            None,
+            Some(h.base.path()),
+        )
+        .await
+    }
+
     async fn run_cleanup(h: &CleanupHarness, epic: &str) -> Result<SamuraiCleanupReport, String> {
         cleanup_epic_inner(
             &h.supervisor,
@@ -1249,13 +1302,14 @@ mod tests {
         ));
         replicator.set_run_configs(run_configs.clone());
 
-        // A stale timer from the epic's previous run — armed under the "#38"
-        // spelling while the relaunch below types "38": the cancel must match
-        // by slug (re-review F5), not exact string.
+        // A stale timer from the run's previous generation — armed under the
+        // "epic 38" spelling of the identity label while the relaunch below
+        // produces "epic #38": the cancel must match by slug (re-review F5),
+        // not exact string.
         schedule
             .arm(ScheduleEntry {
                 project_path: project.clone(),
-                epic: "#38".to_string(),
+                epic: "epic 38".to_string(),
                 fire_at: "2030-01-01T00:00:00+00:00".to_string(),
                 reason: "park".to_string(),
             })
@@ -1271,7 +1325,7 @@ mod tests {
             &preflight(true, true),
             global.clone(),
             &project,
-            "38",
+            &run_refs(&["38".to_string()], &[]),
             Some("opus".to_string()),
             Some(30.0),
             Some(base.path()),
@@ -1279,13 +1333,14 @@ mod tests {
         .await
         .unwrap();
 
-        // F5: the "#38"-spelled timer is gone despite the "38" launch
-        // spelling, and the result reports it.
+        // F5: the "epic 38"-spelled timer is gone despite the launch's own
+        // "epic #38" spelling, and the result reports it.
+        assert_eq!(result.epic, "epic #38");
         assert!(result.stale_timer_cancelled);
         assert!(schedule.list().is_empty(), "stale timer cancelled");
 
         // F4: model + the one-field thresholds override are persisted.
-        let config = run_configs.get(&project, "#38").unwrap();
+        let config = run_configs.get(&project, &result.epic).unwrap();
         assert_eq!(config.model.as_deref(), Some("opus"));
         let thresholds = config.thresholds.expect("override stored");
         assert_eq!(thresholds.handoff_context_pct, 30.0);
@@ -1313,7 +1368,7 @@ mod tests {
             &preflight(true, true),
             global,
             &project,
-            "#38",
+            &run_refs(&["#38".to_string()], &[]),
             None,
             None,
             Some(base.path()),
@@ -1321,7 +1376,80 @@ mod tests {
         .await
         .unwrap();
         assert!(!again.stale_timer_cancelled);
-        assert_eq!(run_configs.get(&project, "#38").unwrap().thresholds, None);
+        assert_eq!(again.epic, "epic #38", "`38` and `#38` are one run");
+        assert_eq!(
+            run_configs.get(&project, "epic #38").unwrap().thresholds,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_launch_identity_per_ref_shape() {
+        // Issue #83 §3: one run carries ALL its numbers. The label is the
+        // run's identity, and branch, worktree folder and run-config filename
+        // are its slug — epics-only, issues-only and both.
+        let h = cleanup_harness();
+        for (epics, issues, label, slug) in [
+            (vec!["5"], vec![], "epic #5", "epic-5"),
+            (vec![], vec!["7", "9"], "issues #7, #9", "issues-7-9"),
+            (
+                vec!["5"],
+                vec!["7", "9"],
+                "epic #5 · issues #7, #9",
+                "epic-5-issues-7-9",
+            ),
+        ] {
+            let result = run_launch(&h, &epics, &issues).await.unwrap();
+            assert_eq!(result.epic, label, "label for {epics:?} + {issues:?}");
+            assert_eq!(result.branch, format!("samurai-{slug}"));
+            assert!(
+                Path::new(&result.worktree_path).ends_with(format!("samurai-{slug}")),
+                "worktree {} must use the combined slug",
+                result.worktree_path
+            );
+
+            // The config is keyed by the label and keeps the two lists that
+            // built it, so the prompt shape survives a resume.
+            let config = h
+                .run_configs
+                .get(&h.project, label)
+                .expect("config saved under the label");
+            assert_eq!(config.epics, epics);
+            assert_eq!(config.issues, issues);
+            assert_eq!(config.worktree_path, result.worktree_path);
+        }
+        assert_eq!(h.run_configs.load_active().len(), 3, "three distinct runs");
+    }
+
+    #[tokio::test]
+    async fn test_launch_refuses_empty_refs_and_a_live_duplicate_run() {
+        let h = cleanup_harness();
+
+        // Nothing usable on either side: refused before any side effect, no
+        // matter what the frontend thought it validated.
+        let err = run_launch(&h, &["  ", "#"], &[","]).await.unwrap_err();
+        assert!(
+            err.contains("at least one epic or issue reference"),
+            "{err}"
+        );
+        assert!(h.run_configs.load_active().is_empty());
+        assert!(h.spawns.lock().unwrap().is_empty());
+
+        // A real launch, then a live session registered for it the way the
+        // frontend does — under the run's label.
+        let result = run_launch(&h, &["5"], &["7", "9"]).await.unwrap();
+        h.supervisor
+            .register_session(1, h.project.clone(), result.epic.clone(), 1)
+            .unwrap();
+
+        // Relaunching the same run is refused, and the duplicate check
+        // matches by SLUG: a differently spelled but identical set of refs is
+        // the same run.
+        let dup = run_launch(&h, &["#5"], &["#7", "9"]).await.unwrap_err();
+        assert!(dup.contains("live supervised session"), "{dup}");
+
+        // A DIFFERENT set is a different run and still launches.
+        assert!(run_launch(&h, &["5"], &["7"]).await.is_ok());
     }
 
     #[test]
