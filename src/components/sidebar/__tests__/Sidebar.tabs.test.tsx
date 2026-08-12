@@ -106,10 +106,12 @@ function mockInvoke() {
       case "get_project_plugins":
       case "refresh_project_plugins":
         return { skills: [], plugins: [] };
-      // History tab reads. Claude files transcripts per working directory, so
-      // this conversation only shows up if the worktree is scanned too.
-      case "list_claude_sessions":
-        if (args?.projectPath !== WORKTREE_PATH) {
+      // History tab reads. Claude files transcripts per working directory, and
+      // Maestro keeps worktrees outside the repo — so this conversation only
+      // shows up if the worktree was passed as an extra scan root.
+      case "list_claude_sessions": {
+        const roots = (args?.extraRoots as string[] | undefined) ?? [];
+        if (!roots.includes(WORKTREE_PATH)) {
           return { sessions: [], total_found: 0, truncated: false, unreadable: 0 };
         }
         return {
@@ -130,6 +132,7 @@ function mockInvoke() {
           truncated: false,
           unreadable: 0,
         };
+      }
       case "git_worktree_list":
         return [
           {
@@ -233,11 +236,14 @@ describe("Sidebar tab bar", () => {
     fireEvent.click(screen.getByRole("button", { name: /maestro/ }));
 
     await screen.findByText("Fix the login bug");
-    const scanned = invokeMock.mock.calls
-      .filter(([cmd]) => cmd === "list_claude_sessions")
-      .map(([, args]) => (args as { projectPath: string }).projectPath);
-    expect(scanned).toContain("C:\\git\\maestro");
-    expect(scanned).toContain(WORKTREE_PATH);
+    // ONE call for the whole project (issue #78): the backend derives the
+    // repo's subdirectories itself, and the worktrees ride along as extra
+    // roots because Maestro keeps them outside the repo.
+    const calls = invokeMock.mock.calls.filter(([cmd]) => cmd === "list_claude_sessions");
+    expect(calls).toHaveLength(1);
+    const args = calls[0][1] as { projectPath: string; extraRoots: string[] };
+    expect(args.projectPath).toBe("C:\\git\\maestro");
+    expect(args.extraRoots).toContain(WORKTREE_PATH);
   });
 
   it("History tab falls back to the project path when the directory is gone", async () => {
