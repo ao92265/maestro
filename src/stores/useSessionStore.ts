@@ -652,6 +652,36 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       return removed;
     } catch (err) {
       console.error("Failed to remove sessions for project:", err);
+      // The backend rejects whenever `canonicalize` fails on the project path
+      // — a directory that was moved, deleted, or sits on a drive that went
+      // away — and `closeTab` drops the tab either way. Returning early left
+      // that project's sessions in the store with no tab left to reach them:
+      // stale parked chips in the eagle shelf and inflated session/agent
+      // counts, forever (issue #76). Prune them locally instead; their PTYs
+      // were already killed alongside this call.
+      const orphaned = get().sessions.filter((s) => samePath(s.project_path, projectPath));
+      if (orphaned.length === 0) return [];
+      const isOrphan = (id: number) => orphaned.some((s) => s.id === id);
+      // Same stale-id hygiene as the success path.
+      for (const session of orphaned) {
+        lastContextUsage.delete(session.id);
+        clearSubagentWatchdog(session.id);
+        terminalReportedThisTurn.delete(session.id);
+      }
+      set((state) => {
+        const samuraiBySessionId = { ...state.samuraiBySessionId };
+        for (const session of orphaned) {
+          delete samuraiBySessionId[session.id];
+        }
+        return {
+          sessions: state.sessions.filter((s) => !isOrphan(s.id)),
+          parkedSessionIds: state.parkedSessionIds.filter((id) => !isOrphan(id)),
+          flaggedSessionIds: state.flaggedSessionIds.filter((id) => !isOrphan(id)),
+          attentionSessionIds: state.attentionSessionIds.filter((id) => !isOrphan(id)),
+          samuraiBySessionId,
+        };
+      });
+      // The backend still holds them: nothing was removed there.
       return [];
     }
   },
