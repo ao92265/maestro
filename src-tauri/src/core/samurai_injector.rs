@@ -10,10 +10,10 @@
 //!    reports the agent finished its turn (`SessionEnded { reason: "stop" }`),
 //!    never on trigger alone. The signal is tapped in `lib.rs`'s
 //!    `hook_emit_fn` chain via [`observe_hook`](SamuraiInjector::observe_hook),
-//!    NOT the EventBus tee: the bus dedup key for `SessionEnded` ignores
-//!    `reason` (5s window, see `claude_event.rs`), so a Stop landing shortly
-//!    after a SessionEnd — or after another Stop — could be swallowed before
-//!    it ever reached a bus-side tee. Issue #54 closes P2.2's known gap: the
+//!    NOT the EventBus tee: the bus dedups `SessionEnded` by session *and*
+//!    reason inside a 5s window (see `claude_event.rs`), so a Stop landing
+//!    shortly after another Stop could be swallowed before it ever reached
+//!    a bus-side tee. Issue #54 closes P2.2's known gap: the
 //!    controller also tracks whether each session's most recent signal *was*
 //!    a Stop ([`idle_effect`]), and a session that is idle right now is
 //!    injected at tick time instead of waiting for a future Stop that will

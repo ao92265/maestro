@@ -117,6 +117,44 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1, "identical events should be deduped");
     }
 
+    /// Helper: produce a `SessionEnded` event with the given reason.
+    fn session_ended(reason: &str) -> ClaudeEvent {
+        ClaudeEvent::SessionEnded {
+            session_id: 1,
+            reason: reason.to_string(),
+            timestamp: "2026-02-24T00:00:00Z".to_string(),
+        }
+    }
+
+    /// The Stop hook reports every agent turn end as
+    /// `SessionEnded { reason: "stop" }`, so a genuine session end (`/clear`,
+    /// `/exit`, a crash) landing inside the same 5s window carries the same
+    /// session id. They are two different occurrences: if the reason is not
+    /// part of the identity, the real end is silently swallowed and the
+    /// activity feed never shows it (issue #76).
+    #[test]
+    fn real_session_end_survives_a_preceding_stop() {
+        let (bus, counter) = bus_with_counter();
+        bus.emit(session_ended("stop"));
+        bus.emit(session_ended("clear"));
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "a turn end and a session end are distinct occurrences"
+        );
+    }
+
+    /// The flip side: two turn ends in the same window are still one logical
+    /// occurrence for the feed (the Samurai idle gate reads the hook chain
+    /// pre-dedup, so it never depends on this).
+    #[test]
+    fn repeated_stop_signals_still_dedup() {
+        let (bus, counter) = bus_with_counter();
+        bus.emit(session_ended("stop"));
+        bus.emit(session_ended("stop"));
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "repeated stops dedup");
+    }
+
     #[test]
     fn test_different_events_not_deduped() {
         let (bus, counter) = bus_with_counter();
