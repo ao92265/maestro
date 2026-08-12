@@ -235,8 +235,8 @@ function RunRow({
         onClick={() => onCleanup(run)}
         disabled={busy}
         className="rounded p-1 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-red disabled:opacity-40"
-        aria-label={`Clean up epic ${run.epic}`}
-        title="Delete this epic's worktree and branch, cancel its timer, archive its run config (asks first)"
+        aria-label={`Clean up run ${run.epic}`}
+        title="Delete this run's worktree and branch, cancel its timer, archive its run config (asks first)"
       >
         <Trash2 size={12} />
       </button>
@@ -432,8 +432,8 @@ export function LaunchSection() {
     // Destructive, never silent (PRD §5.9) — same ask() confirm pattern as
     // the audit clear.
     const confirmed = await ask(
-      `Clean up epic ${run.epic}? This deletes its worktree and samurai branch, cancels its resume timer, and archives its run config. It cannot be undone.`,
-      { title: "Clean Up Epic", kind: "warning" },
+      `Clean up run ${run.epic}? This deletes its worktree and samurai branch, cancels its resume timer, and archives its run config. It cannot be undone.`,
+      { title: "Clean Up Run", kind: "warning" },
     ).catch(() => false);
     if (!confirmed) return;
     setCleaningEpic(run.epic);
@@ -450,8 +450,8 @@ export function LaunchSection() {
       ].filter(Boolean);
       setNotice(
         removed.length > 0
-          ? `Cleaned up epic ${report.epic}: removed ${removed.join(", ")}.`
-          : `Epic ${report.epic} was already clean.`,
+          ? `Cleaned up run ${report.epic}: removed ${removed.join(", ")}.`
+          : `Run ${report.epic} was already clean.`,
       );
       await refreshRuns();
     } catch (err) {

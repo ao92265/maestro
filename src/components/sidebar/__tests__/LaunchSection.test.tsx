@@ -358,7 +358,7 @@ describe("LaunchSection (issue #63)", () => {
     render(<LaunchSection />);
 
     expect(await screen.findByText("#38")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Clean up epic #38" }));
+    fireEvent.click(screen.getByRole("button", { name: "Clean up run #38" }));
 
     await waitFor(() => expect(callsOf("samurai_cleanup_epic")).toHaveLength(1));
     expect(askMock).toHaveBeenCalledTimes(1);
@@ -368,7 +368,7 @@ describe("LaunchSection (issue #63)", () => {
       epic: "#38",
     });
     expect(
-      await screen.findByText(/Cleaned up epic #38: removed worktree, branch samurai-38/),
+      await screen.findByText(/Cleaned up run #38: removed worktree, branch samurai-38/),
     ).toBeInTheDocument();
   });
 
@@ -397,7 +397,7 @@ describe("LaunchSection (issue #63)", () => {
     askMock.mockResolvedValue(false);
     render(<LaunchSection />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Clean up epic #38" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Clean up run #38" }));
     await waitFor(() => expect(askMock).toHaveBeenCalledTimes(1));
     expect(callsOf("samurai_cleanup_epic")).toHaveLength(0);
   });

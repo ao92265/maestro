@@ -287,8 +287,8 @@ describe("SecondBrainSection (issue #66)", () => {
     render(<SecondBrainSection />);
     expect(await screen.findByText("#38")).toBeInTheDocument();
 
-    expect(screen.queryByRole("button", { name: "Clean up epic #40" })).toBeNull();
-    const cleanButton = screen.getByRole("button", { name: "Clean up epic #38" });
+    expect(screen.queryByRole("button", { name: "Clean up run #40" })).toBeNull();
+    const cleanButton = screen.getByRole("button", { name: "Clean up run #38" });
 
     // Declined — nothing cleaned.
     fireEvent.click(cleanButton);
@@ -305,7 +305,7 @@ describe("SecondBrainSection (issue #66)", () => {
     );
     expect(
       await screen.findByText(
-        "Cleaned up epic #38: removed worktree, branch samurai/38, run config.",
+        "Cleaned up run #38: removed worktree, branch samurai/38, run config.",
       ),
     ).toBeInTheDocument();
   });
