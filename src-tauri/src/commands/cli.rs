@@ -59,6 +59,10 @@ fn cli_install_path() -> Option<PathBuf> {
     }
 }
 
+// Only the macOS install path builds an AppleScript command, but its escaping
+// rules are platform-independent and unit-tested everywhere — hence `test` in
+// the gate rather than macOS alone.
+#[cfg(any(target_os = "macos", test))]
 /// Escapes a path for safe interpolation inside an AppleScript `do shell script
 /// "..."` single-quoted shell string.
 ///
@@ -107,6 +111,10 @@ fn try_install_cli_direct(dest: &Path) -> std::io::Result<()> {
 
 /// Sentinel string the frontend uses to distinguish user-cancel from a real
 /// install failure. Keep in sync with `MaestroSettingsModal.tsx`.
+///
+/// Only the macOS and Linux install paths can be cancelled by the user — the
+/// Windows path never prompts, so the constant is compiled out there.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const CANCEL_SENTINEL: &str = "CANCELLED_BY_USER";
 
 fn install_cli_elevated(dest: &Path) -> Result<(), String> {
@@ -166,7 +174,7 @@ fn install_cli_elevated(dest: &Path) -> Result<(), String> {
     {
         let _ = std::fs::remove_file(&tmp);
         let _ = dest; // avoid unused-variable warning
-        return Err("CLI install is not yet supported on this platform.".to_string());
+        Err("CLI install is not yet supported on this platform.".to_string())
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

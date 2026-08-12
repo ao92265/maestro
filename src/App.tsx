@@ -8,11 +8,18 @@ import { MAC_TITLE_BAR_INSET_PX, useMacTitleBarPadding } from "@/hooks/useMacTit
 import { getDeduplicatedCurrentBranch, invalidateCurrentBranchCache } from "@/lib/git";
 import { isMac } from "@/lib/platform";
 import { projectColorFor } from "@/lib/projectColor";
+import { initSamuraiSpawnListener, stopSamuraiSpawnListener } from "@/lib/spawnSession";
 import { killSession } from "@/lib/terminal";
 import { useOpenProject } from "@/lib/useOpenProject";
 import { useProjectColors } from "@/lib/useProjectColors";
 import { useFDAStore } from "@/stores/useFDAStore";
-import { useSessionStore } from "@/stores/useSessionStore";
+import {
+  initContextUsageListener,
+  initSamuraiSupervisorListener,
+  stopContextUsageListener,
+  stopSamuraiSupervisorListener,
+  useSessionStore,
+} from "@/stores/useSessionStore";
 import { type RepositoryInfo, useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { GitGraphPanel } from "./components/git/GitGraphPanel";
 import type { GitPanelTab } from "./components/git/GitPanelTabs";
@@ -221,6 +228,43 @@ function App() {
     });
     return () => {
       stopActivityListener();
+    };
+  }, []);
+
+  // Initialize context usage listener (per-session context-window % from
+  // ContextUsageUpdate events, surfaced on the session store)
+  useEffect(() => {
+    initContextUsageListener().catch((err) => {
+      console.error("Failed to initialize context usage listener:", err);
+    });
+    return () => {
+      stopContextUsageListener();
+    };
+  }, []);
+
+  // Samurai supervisor listener: tracks generation/state for the badges
+  // (issue #46), flips DEAD sessions (silent-death watchdog, issue #44) to
+  // Error chrome + attention, and flags supervised sessions on allowance
+  // threshold crossings (issue #45).
+  useEffect(() => {
+    initSamuraiSupervisorListener().catch((err) => {
+      console.error("Failed to initialize samurai supervisor listener:", err);
+    });
+    return () => {
+      stopSamuraiSupervisorListener();
+    };
+  }, []);
+
+  // Samurai successor spawns (issue #55): after killing gen-N the backend
+  // emits samurai-spawn-successor; this listener queues the gen-N+1 launch
+  // through the existing pending-launch flow (same path as History-tab
+  // recoveries) and the grid registers it under supervision.
+  useEffect(() => {
+    initSamuraiSpawnListener().catch((err) => {
+      console.error("Failed to initialize samurai spawn listener:", err);
+    });
+    return () => {
+      stopSamuraiSpawnListener();
     };
   }, []);
 
@@ -814,6 +858,10 @@ function App() {
               onToggleNotesPanel={() => handleToggleUtilityPanel("notes")}
               aiPanelOpen={utilityPanel === "ai"}
               onToggleAiPanel={() => handleToggleUtilityPanel("ai")}
+              secondBrainPanelOpen={utilityPanel === "secondbrain"}
+              onToggleSecondBrainPanel={() => handleToggleUtilityPanel("secondbrain")}
+              launchPanelOpen={utilityPanel === "launch"}
+              onToggleLaunchPanel={() => handleToggleUtilityPanel("launch")}
               onWatchdogNavigate={handleWatchdogNavigate}
             />
 

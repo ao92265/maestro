@@ -87,6 +87,8 @@ impl WorktreeManager {
     }
 
     /// Compute the worktree path for a given repo + branch.
+    // Thin wrappers over the `_with_base` variants the callers use directly.
+    #[allow(dead_code)]
     pub(crate) async fn worktree_path(&self, repo_path: &Path, branch: &str) -> PathBuf {
         self.worktree_path_with_base(repo_path, branch, None).await
     }
@@ -132,6 +134,9 @@ impl WorktreeManager {
     /// before creating (returns `BranchAlreadyCheckedOut` if so). Parent
     /// directories are created automatically. The worktree checks out the
     /// existing branch -- no new branch is created.
+    // Thin wrapper over `create_with_base`, which every caller uses so it can
+    // pass the samurai worktree base explicitly.
+    #[allow(dead_code)]
     pub async fn create(
         &self,
         branch: &str,
@@ -262,6 +267,9 @@ impl WorktreeManager {
     /// subdirectories that are no longer in git's worktree list. Orphaned
     /// directories are deleted with `remove_dir_all`. No-ops gracefully if
     /// the managed directory does not exist yet.
+    // Orphan cleanup is currently driven per-epic by `samurai_cleanup_epic`
+    // rather than by a global sweep.
+    #[allow(dead_code)]
     pub async fn prune(&self, repo_path: &Path) -> Result<(), GitError> {
         let git = Git::new(repo_path);
         git.worktree_prune().await?;
@@ -467,7 +475,7 @@ mod tests {
 
         let managed = wm.list_managed(&path).await.unwrap();
         // Should contain only the managed worktree, not the main repo
-        assert!(managed.len() >= 1);
+        assert!(!managed.is_empty());
         for wt in &managed {
             assert!(!wt.is_main_worktree);
         }

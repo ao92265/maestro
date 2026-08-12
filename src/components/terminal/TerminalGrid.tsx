@@ -50,6 +50,7 @@ import {
   writeStdin,
 } from "@/lib/terminal";
 import { checkFullDiskAccess, pathRequiresFDA } from "@/lib/permissions";
+import { registerSamuraiSuccessor, samuraiSuccessorCliFlags, successorLaunchImminent } from "@/lib/spawnSession";
 import { useFDAStore } from "@/stores/useFDAStore";
 import { useCliSettingsStore } from "@/stores/useCliSettingsStore";
 import { cleanupSessionWorktree, prepareSessionWorktree } from "@/lib/worktreeManager";
@@ -60,7 +61,7 @@ import { useWorktreeSettingsStore } from "@/stores/useWorktreeSettingsStore";
 import { usePluginStore } from "@/stores/usePluginStore";
 import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
 import { useActivityStore } from "@/stores/useActivityStore";
-import { useSessionStore } from "@/stores/useSessionStore";
+import { SAMURAI_TILE_CLOSE_STATES, useSessionStore } from "@/stores/useSessionStore";
 import type { AiMode } from "@/stores/useSessionStore";
 import { useWorkspaceStore, type RepositoryInfo, type WorkspaceType } from "@/stores/useWorkspaceStore";
 import { shellEscapePaths } from "@/lib/shellEscape";
@@ -343,6 +344,13 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   // Ref to access latest onAllSessionsClosed without adding it to callback deps
   const onAllSessionsClosedRef = useRef(onAllSessionsClosed);
   onAllSessionsClosedRef.current = onAllSessionsClosed;
+  // Slots configured from consumed pending launches (History tab / samurai
+  // successor) whose deferred launch has not fired yet. An array, not a
+  // single id: the FIFO pending-launch store can deliver several claims
+  // before the first launch fires (fresh-eyes finding B). Also feeds the
+  // landing-view guard in handleKill (finding A) — a claimed-but-unlaunched
+  // successor must keep this grid mounted.
+  const autoLaunchSlotIdsRef = useRef<string[]>([]);
 
   // Clear a pane's yellow attention highlight (set when it was auto-unparked
   // because its agent asked for input). Called only from USER-driven selection
@@ -989,9 +997,28 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
             // Brief delay for shell to initialize
             await new Promise((resolve) => setTimeout(resolve, 100));
 
-            // Build CLI command with user-configured flags
+            // Build CLI command with user-configured flags. A samurai
+            // successor (issue #55) additionally forces skip-permissions —
+            // an autonomous generation cannot answer permission prompts —
+            // and carries the run config's model preference (review F4).
             const cliFlags = useCliSettingsStore.getState().getFlags(slot.mode);
-            const cliCommand = buildCliCommand(slot.mode, cliFlags, slot.resumeSessionId ?? undefined);
+            const effectiveFlags = slot.samurai
+              ? samuraiSuccessorCliFlags(cliFlags, slot.samurai.model)
+              : cliFlags;
+            const cliCommand = buildCliCommand(slot.mode, effectiveFlags, slot.resumeSessionId ?? undefined);
+
+            // Samurai successor: register under supervision BEFORE the CLI
+            // launches, so the backend's verify-ritual delivery is armed
+            // strictly ahead of claude's SessionStart hook. Registration
+            // failure is logged, not fatal — the session still launches and
+            // the backend's successor_no_start ALERT surfaces the gap.
+            if (slot.samurai) {
+              try {
+                await registerSamuraiSuccessor(sessionId, slot.samurai);
+              } catch (err) {
+                console.error("[Samurai] Failed to register successor session:", err);
+              }
+            }
 
             // Send CLI launch command
             await writeStdin(sessionId, `${cliCommand}\r`);
@@ -1082,15 +1109,35 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   /**
    * Handles killing/closing a session, updating the slot state.
    * Also cleans up any associated worktree and session-specific MCP config.
+   *
+   * `opts.keepDirArtifacts` (samurai kills, issue #55) skips every
+   * working-directory cleanup — MCP/plugin/hooks config removal and the
+   * worktree prompt/delete — because the successor launches into the SAME
+   * directory moments later (stable epic worktree, PRD §5.9) and a
+   * fire-and-forget remove racing its config writes would strip the hooks
+   * the successor depends on.
    */
-  const handleKill = useCallback((sessionId: number) => {
+  const handleKill = useCallback((sessionId: number, opts?: { keepDirArtifacts?: boolean }) => {
+    const keepDirArtifacts = opts?.keepDirArtifacts ?? false;
     // Find the slot to get worktree path before removing
     const slot = slotsRef.current.find((s) => s.sessionId === sessionId);
     const worktreePath = slot?.worktreePath;
     const workingDir = worktreePath || projectPath;
 
-    // If this is the last slot, return to idle landing view immediately
-    if (slotsRef.current.length <= 1 && onAllSessionsClosedRef.current) {
+    // If this is the last slot, return to idle landing view immediately —
+    // UNLESS a queued/claimed launch is about to land in this grid (samurai
+    // successor spawn, issue #55 — fresh-eyes finding A; History-tab resume
+    // shares the mechanism). Dropping to the landing view unmounts the grid,
+    // which would destroy that launch: a successor whose predecessor was the
+    // project's only session would never spawn. In that case fall through to
+    // the normal in-place removal and let the pending-launch effects (below)
+    // spawn the successor into the surviving grid.
+    const launchImminent = successorLaunchImminent(
+      usePendingLaunchStore.getState().pending,
+      autoLaunchSlotIdsRef.current.length,
+      tabId,
+    );
+    if (slotsRef.current.length <= 1 && !launchImminent && onAllSessionsClosedRef.current) {
       // Clean up focus callback
       if (slot) {
         focusCallbacksRef.current.delete(slot.id);
@@ -1138,7 +1185,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     }
 
     // Clean up session-specific MCP config (fire-and-forget)
-    if (workingDir) {
+    if (workingDir && !keepDirArtifacts) {
       if (slot?.mode === "OpenCode") {
         removeOpenCodeMcpConfig(workingDir, sessionId).catch(console.error);
       } else {
@@ -1147,17 +1194,17 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     }
 
     // Clean up session-specific plugin config (fire-and-forget)
-    if (workingDir) {
+    if (workingDir && !keepDirArtifacts) {
       removeSessionPluginConfig(workingDir).catch(console.error);
     }
 
     // Clean up session-specific hooks config (fire-and-forget)
-    if (workingDir && slot?.mode === "Claude") {
+    if (workingDir && slot?.mode === "Claude" && !keepDirArtifacts) {
       removeSessionHooksConfig(workingDir).catch(console.error);
     }
 
     // Clean up worktree based on session close action setting
-    if (effectiveRepoPath && worktreePath) {
+    if (effectiveRepoPath && worktreePath && !keepDirArtifacts) {
       const closeAction = useWorktreeSettingsStore.getState().worktreeCloseAction;
       if (closeAction === "delete") {
         cleanupSessionWorktree(effectiveRepoPath, worktreePath, worktreeBasePath)
@@ -1596,24 +1643,35 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     [addSession, launchAll, refreshBranches, focusSession, zoomSession, killSessionById, zoomedSlotId],
   );
 
-  // ── History-tab launches ─────────────────────────────────────────
-  // The sidebar History tab queues a pre-configured launch (resume id and/or
-  // worktree dir) in usePendingLaunchStore because this grid may not even be
-  // mounted when the user clicks. Consume it here: configure a slot, then let
-  // the effect below launch it once the slot has committed to state.
+  // ── History-tab / samurai-successor launches ─────────────────────
+  // The sidebar History tab (and the samurai successor spawn listener)
+  // queues a pre-configured launch (resume id and/or worktree dir) in
+  // usePendingLaunchStore because this grid may not even be mounted when
+  // the request lands. Consume it here: configure a slot, then let the
+  // effect below launch it once the slot has committed to state. One claim
+  // per run — a FIFO store (finding B) with several entries for this tab
+  // re-triggers this effect (the selector returns the next head entry) and
+  // each claim gets its own slot.
   const pendingLaunch = usePendingLaunchStore((s) =>
-    tabId && s.pending?.tabId === tabId ? s.pending : null
+    tabId ? s.pending.find((p) => p.tabId === tabId) ?? null : null
   );
-  const autoLaunchSlotIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!pendingLaunch || !tabId) return;
     const launch = usePendingLaunchStore.getState().consume(tabId);
     if (!launch) return;
 
-    // Reuse the pristine initial slot when it's the only one; otherwise append.
+    // Reuse the pristine initial slot when it's the only one — unless an
+    // earlier claim already configured it and is merely waiting for its
+    // deferred launch (finding B: two claims must never share one slot);
+    // otherwise append.
     const current = slotsRef.current;
-    const reusable = current.length === 1 && current[0].sessionId === null ? current[0] : null;
+    const reusable =
+      current.length === 1 &&
+      current[0].sessionId === null &&
+      !autoLaunchSlotIdsRef.current.includes(current[0].id)
+        ? current[0]
+        : null;
     if (!reusable && current.length >= MAX_SESSIONS) {
       setError(`Cannot resume: maximum of ${MAX_SESSIONS} sessions per project`);
       return;
@@ -1625,31 +1683,80 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       branch: launch.branch,
       resumeSessionId: launch.resumeSessionId,
       workingDirOverride: launch.workingDirOverride,
+      // Samurai successor launches (issue #55) name their session and carry
+      // the registration metadata; History launches leave both unset.
+      customName: launch.customName ?? base.customName,
+      samurai: launch.samurai ?? null,
       // The History tab always names the exact directory to run in. Reusing the
       // pristine slot would otherwise inherit its worktreeMode, and any mode but
       // "project" sends launchSlotInner into prepareSessionWorktree — moving the
       // session into a worktree where `claude --resume` cannot find the session.
       worktreeMode: "project",
     };
-    autoLaunchSlotIdRef.current = slot.id;
+    autoLaunchSlotIdsRef.current = [...autoLaunchSlotIdsRef.current, slot.id];
     if (reusable) {
       setSlots((prev) => prev.map((s) => (s.id === reusable.id ? slot : s)));
     } else {
-      setSlots((prev) => (prev.length >= MAX_SESSIONS ? prev : [...prev, slot]));
+      // Dedupe by id instead of re-checking MAX_SESSIONS: the cap was already
+      // enforced against current state above, and a refusal here would strand
+      // the claim registered in autoLaunchSlotIdsRef forever (nothing clears a
+      // claim whose slot never appears), permanently latching
+      // successorLaunchImminent. A pathological same-batch double-claim now
+      // overshoots the cap by one instead — transient and recoverable.
+      setSlots((prev) => (prev.some((s) => s.id === slot.id) ? prev : [...prev, slot]));
       setLayoutTree(() => buildGridTree([...orderedSlotIds, slot.id]));
     }
     setFocusedSlotId(slot.id);
   }, [pendingLaunch, tabId, mcpServers, skills, plugins, orderedSlotIds]);
 
-  // Launch the queued slot only after it exists in committed state — calling
+  // Launch queued slots only after they exist in committed state — calling
   // launchSlot in the effect above would race slotsRef against the setSlots.
   useEffect(() => {
-    const slotId = autoLaunchSlotIdRef.current;
-    if (!slotId) return;
-    if (!slots.some((s) => s.id === slotId)) return;
-    autoLaunchSlotIdRef.current = null;
-    void launchSlot(slotId);
+    const ids = autoLaunchSlotIdsRef.current;
+    if (ids.length === 0) return;
+    const ready = ids.filter((id) => slots.some((s) => s.id === id));
+    if (ready.length === 0) return;
+    autoLaunchSlotIdsRef.current = ids.filter((id) => !ready.includes(id));
+    for (const id of ready) void launchSlot(id);
   }, [slots, launchSlot]);
+
+  // Samurai kills (issue #55) and parks (issue #60): after a validated
+  // handoff — or a validated allowance park — the session is announced by
+  // transitioning to KILLED/PARKED on the samurai-supervisor-event channel.
+  // No PTY-exit event exists and terminal teardown is otherwise always
+  // frontend-initiated, so without this the dead tile would linger as a
+  // zombie. Reuse the manual close path (kill IPC + handleKill), minus the
+  // working-dir artifacts the successor (or the resume's fresh spawn) is
+  // about to reuse.
+  //
+  // Deliberately placed AFTER the pending-launch consume/launch effects
+  // (fresh-eyes finding A): effects run in definition order, so when the
+  // KILLED update and the successor's queued launch land in the same commit,
+  // the consume effect claims and appends the successor slot FIRST, and this
+  // effect's handleKill then removes the predecessor leaf from the layout
+  // tree the consume effect just rebuilt — the reverse order would leave a
+  // stale leaf behind (and, before the handleKill guard, unmounted the grid
+  // under the claimed launch).
+  const samuraiBySessionId = useSessionStore((s) => s.samuraiBySessionId);
+  useEffect(() => {
+    for (const slot of slotsRef.current) {
+      if (slot.sessionId === null) continue;
+      const info = samuraiBySessionId[slot.sessionId];
+      if (info && SAMURAI_TILE_CLOSE_STATES.has(info.state)) {
+        // The replicator/parker paths already tore the PTY down, but the
+        // Phase-2 circuit breaker (samurai_progress.rs) only transitions to
+        // PARKED — kill here so no path can orphan a live agent running with
+        // --dangerously-skip-permissions. A second kill is a harmless
+        // SessionNotFound (process_manager.rs removes from the map before
+        // signalling).
+        //
+        // handleKill → removeSession drops the supervision entry, so this
+        // effect cannot re-fire for the same session.
+        killSession(slot.sessionId).catch(console.error);
+        handleKill(slot.sessionId, { keepDirArtifacts: true });
+      }
+    }
+  }, [samuraiBySessionId, handleKill]);
 
   // Handle zoom toggle for a slot
   const handleToggleZoom = useCallback((slotId: string) => {

@@ -3,11 +3,13 @@ import {
   Activity,
   Bird,
   Brain,
+  BrainCircuit,
   GitMerge,
   Minus,
   Network,
   PanelLeft,
   Plus,
+  Rocket,
   Sparkles,
   Square,
   StickyNote,
@@ -67,6 +69,12 @@ interface TopBarProps {
   /** Right-side AI panel (Report / Plan / Catalog tabs) */
   aiPanelOpen?: boolean;
   onToggleAiPanel?: () => void;
+  /** Right-side Samurai Second Brain panel — audit stream + files (issue #66) */
+  secondBrainPanelOpen?: boolean;
+  onToggleSecondBrainPanel?: () => void;
+  /** Right-side Samurai run launcher panel (issue #63) */
+  launchPanelOpen?: boolean;
+  onToggleLaunchPanel?: () => void;
   /** GitHub watchdog badge: navigate to the git panel with the matching
    *  tab + search filter. Badge hides itself when totals are zero. */
   onWatchdogNavigate?: (kind: "prs" | "issues") => void;
@@ -97,6 +105,10 @@ export function TopBar({
   onToggleNotesPanel,
   aiPanelOpen = false,
   onToggleAiPanel,
+  secondBrainPanelOpen = false,
+  onToggleSecondBrainPanel,
+  launchPanelOpen = false,
+  onToggleLaunchPanel,
   onWatchdogNavigate,
 }: TopBarProps) {
   const appWindow = useMemo(() => getCurrentWindow(), []);
@@ -311,6 +323,37 @@ export function TopBar({
             title={titleWithShortcut("AI — daily report and plan", modLabel(), "6")}
           >
             <Sparkles size={14} />
+          </button>
+        )}
+        {onToggleSecondBrainPanel && (
+          <button
+            type="button"
+            onClick={onToggleSecondBrainPanel}
+            className={`relative rounded p-1.5 transition-colors ${
+              secondBrainPanelOpen
+                ? "text-maestro-accent hover:bg-maestro-accent/10"
+                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
+            }`}
+            aria-label="Second Brain"
+            title="Samurai Second Brain — audit stream and managed files"
+          >
+            <BrainCircuit size={14} />
+            <HealthAttentionBadge area="secondbrain" />
+          </button>
+        )}
+        {onToggleLaunchPanel && (
+          <button
+            type="button"
+            onClick={onToggleLaunchPanel}
+            className={`rounded p-1.5 transition-colors ${
+              launchPanelOpen
+                ? "text-maestro-accent hover:bg-maestro-accent/10"
+                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
+            }`}
+            aria-label="Launch"
+            title="Samurai launch — start and clean up autonomous epic runs"
+          >
+            <Rocket size={14} />
           </button>
         )}
         {/* Git panel — in eagle view it becomes a per-project carousel

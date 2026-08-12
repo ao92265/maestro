@@ -6,11 +6,25 @@ import {
   ChevronRight,
   Loader2,
   RefreshCw,
+  Swords,
   Terminal,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { SamuraiConfig } from "@/lib/samurai";
 import { useUpdateStore } from "@/stores/useUpdateStore";
+
+const SAMURAI_FIELDS: { key: keyof SamuraiConfig; label: string }[] = [
+  { key: "handoff_context_pct", label: "Handoff trigger (context %)" },
+  { key: "park_soft_5h_pct", label: "Park soft, 5h window (%)" },
+  { key: "park_hard_5h_pct", label: "Park hard, 5h window (%)" },
+  { key: "park_hard_7d_pct", label: "Park hard, 7d window (%)" },
+  { key: "ack_timeout_secs", label: "ACK timeout (seconds)" },
+  { key: "staleness_window_secs", label: "Staleness window (seconds)" },
+  { key: "handoff_retention_days", label: "Handoff retention (days)" },
+  { key: "breaker_events", label: "Circuit breaker events (zero-progress trip)" },
+  { key: "size_warn_bytes", label: "File size warning (bytes)" },
+];
 
 interface MaestroSettingsModalProps {
   onClose: () => void;
@@ -49,6 +63,8 @@ export function MaestroSettingsModal({ onClose }: MaestroSettingsModalProps) {
   const [endpointInput, setEndpointInput] = useState("");
   const [cliInstalled, setCliInstalled] = useState<boolean | null>(null);
   const [cliStatus, setCliStatus] = useState<CliStatus | null>(null);
+  const [samuraiConfig, setSamuraiConfig] = useState<SamuraiConfig | null>(null);
+  const [samuraiError, setSamuraiError] = useState<string | null>(null);
 
   const status = useUpdateStore((s) => s.status);
   const lastCheckedAt = useUpdateStore((s) => s.lastCheckedAt);
@@ -63,6 +79,30 @@ export function MaestroSettingsModal({ onClose }: MaestroSettingsModalProps) {
   useEffect(() => {
     invoke<boolean>("is_cli_installed").then(setCliInstalled).catch(() => setCliInstalled(false));
   }, []);
+
+  useEffect(() => {
+    invoke<SamuraiConfig>("samurai_get_config")
+      .then(setSamuraiConfig)
+      .catch((err) => setSamuraiError(String(err)));
+  }, []);
+
+  const handleSamuraiChange = (key: keyof SamuraiConfig, raw: string) => {
+    setSamuraiConfig((prev) => (prev ? { ...prev, [key]: Number(raw) } : prev));
+  };
+
+  // Persist on blur: the backend validates, saves to the settings store and
+  // applies to the running allowance watcher; on rejection the saved config
+  // is untouched, so re-fetch to show what is actually in force.
+  const handleSamuraiBlur = () => {
+    if (!samuraiConfig) return;
+    setSamuraiError(null);
+    invoke<SamuraiConfig>("samurai_set_config", { config: samuraiConfig })
+      .then(setSamuraiConfig)
+      .catch((err) => {
+        setSamuraiError(String(err));
+        invoke<SamuraiConfig>("samurai_get_config").then(setSamuraiConfig).catch(() => {});
+      });
+  };
 
   useEffect(() => {
     invoke<string>("get_app_version")
@@ -279,6 +319,47 @@ export function MaestroSettingsModal({ onClose }: MaestroSettingsModalProps) {
                   </button>
                 )}
               </div>
+            </div>
+          </div>
+
+          {/* Samurai supervisor thresholds (PRD §7) */}
+          <div>
+            <div className="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-maestro-muted">
+              <Swords size={13} className="text-maestro-accent" />
+              Samurai Thresholds
+            </div>
+            <div className="space-y-1 px-1">
+              <p className="text-[11px] text-maestro-muted">
+                Low values are the test mode: set a park threshold below current
+                usage and watch the crossing land in the audit log.
+              </p>
+              {samuraiError && (
+                <div className="text-[11px] text-maestro-red">{samuraiError}</div>
+              )}
+              {samuraiConfig ? (
+                SAMURAI_FIELDS.map(({ key, label }) => (
+                  <div
+                    key={key}
+                    className="flex items-center gap-2 rounded-md px-2 py-1 text-xs text-maestro-text"
+                  >
+                    <span className="flex-1 text-maestro-muted">{label}</span>
+                    <input
+                      type="number"
+                      value={samuraiConfig[key]}
+                      onChange={(e) => handleSamuraiChange(key, e.target.value)}
+                      onBlur={handleSamuraiBlur}
+                      className="w-20 rounded border border-maestro-border bg-maestro-surface px-1.5 py-0.5 text-right text-[11px] text-maestro-text outline-none focus:border-maestro-accent"
+                    />
+                  </div>
+                ))
+              ) : (
+                !samuraiError && (
+                  <div className="flex items-center gap-2 px-1 text-[11px] text-maestro-muted">
+                    <Loader2 size={11} className="animate-spin" />
+                    Loading...
+                  </div>
+                )
+              )}
             </div>
           </div>
 

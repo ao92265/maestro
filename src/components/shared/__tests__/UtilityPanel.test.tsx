@@ -18,6 +18,11 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   ask: vi.fn(),
 }));
 
+// AuditSection subscribes to the samurai-audit-event stream on mount.
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn().mockResolvedValue(() => {}),
+}));
+
 import { UtilityPanel } from "../UtilityPanel";
 import { useNotesStore } from "@/stores/useNotesStore";
 import { usePlanStore } from "@/stores/usePlanStore";
@@ -90,6 +95,36 @@ function mockInvoke() {
         return [];
       case "list_docker_containers":
         return { available: false, containers: [] };
+      case "samurai_audit_read":
+        return {
+          events: [
+            {
+              ts: "2026-08-06T12:00:00Z",
+              epic: "#36",
+              event: "SPAWN",
+              generation: 2,
+              session_id: 1,
+              details: { kind: "registered" },
+            },
+          ],
+          file_size_bytes: 128,
+        };
+      case "samurai_list_runs":
+        return [];
+      case "samurai_files_list":
+        return [
+          {
+            kind: "HANDOFF",
+            path: "C:\\data\\worktrees\\maestro\\samurai-38\\.maestro\\handoffs\\38-gen2.md",
+            size_bytes: 4096,
+            modified_at: "2026-08-06T12:00:00Z",
+            project_path: "C:\\git\\maestro",
+            epic: "#38",
+            in_use: false,
+            has_live_session: false,
+            fire_at: null,
+          },
+        ];
       default:
         return undefined;
     }
@@ -188,6 +223,30 @@ describe("UtilityPanel", () => {
     } finally {
       errorSpy.mockRestore();
     }
+  });
+
+  it("renders the Second Brain panel with the audit stream and the files section", async () => {
+    render(<UtilityPanel panel="secondbrain" width={320} onResize={() => {}} onClose={() => {}} />);
+    expect(screen.getByText("Second Brain")).toBeInTheDocument();
+    // Audit on top: the absorbed AuditSection, behavior unchanged.
+    expect(screen.getByText("Samurai Audit")).toBeInTheDocument();
+    expect(await screen.findByText("SPAWN")).toBeInTheDocument();
+    expect(screen.getByText("gen-2")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clear audit log" })).toBeInTheDocument();
+    // Files below: the grouped inventory from samurai_files_list.
+    expect(screen.getByText("Files")).toBeInTheDocument();
+    expect(await screen.findByText("38-gen2.md")).toBeInTheDocument();
+    expect(screen.getByText("Handoffs")).toBeInTheDocument();
+  });
+
+  it("renders the Launch panel with the run form and active runs", async () => {
+    render(<UtilityPanel panel="launch" width={320} onResize={() => {}} onClose={() => {}} />);
+    expect(screen.getByText("Launch Run")).toBeInTheDocument();
+    expect(screen.getByLabelText("Issues")).toBeInTheDocument();
+    // One button: it runs preflight itself, so there is no separate step.
+    expect(screen.queryByRole("button", { name: "Run preflight" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Launch" })).toBeDisabled();
+    expect(await screen.findByText("No active runs. Launch one above.")).toBeInTheDocument();
   });
 
   it("calls onClose from the header close button", () => {

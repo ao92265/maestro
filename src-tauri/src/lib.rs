@@ -27,6 +27,10 @@ use core::marketplace_manager::MarketplaceManager;
 use core::mcp_manager::McpManager;
 use core::plugin_manager::PluginManager;
 use core::status_server::StatusServer;
+use core::samurai_audit::{AuditEvent, AuditLog};
+use core::samurai_context::SamuraiContextStore;
+use core::samurai_injector::SamuraiInjector;
+use core::supervisor::{SessionSnapshot, Supervisor, SupervisorState};
 use core::{ClaudeEvent, EventBus, TranscriptWatcher};
 use core::ProcessManager;
 use core::session_manager::SessionManager;
@@ -219,10 +223,32 @@ pub fn run() {
             let data_ready = Arc::new(tokio::sync::Notify::new());
             let flush_now = Arc::new(tokio::sync::Notify::new());
 
+            // Samurai (issue #52): backend tee. The context store observes
+            // every deduped event before it enters the frontend batch buffer,
+            // retaining the latest context % per session for Phase 2's
+            // handoff trigger and ACK scanner. Observation only — the
+            // batching path below is unchanged.
+            let samurai_context = Arc::new(SamuraiContextStore::new());
+
+            // Samurai (issue #53): the injection controller is constructed
+            // further down (it needs the supervisor/config/audit created
+            // there), but both event tees are built here — a late-bound slot
+            // bridges the gap. Events arriving before it is filled concern no
+            // supervised session and are safely ignored.
+            let samurai_injector: Arc<std::sync::OnceLock<Arc<SamuraiInjector>>> =
+                Arc::new(std::sync::OnceLock::new());
+
             let pending_for_emit = pending_events.clone();
             let data_ready_for_emit = data_ready.clone();
             let flush_now_for_emit = flush_now.clone();
+            let samurai_context_for_emit = samurai_context.clone();
+            let samurai_injector_for_emit = samurai_injector.clone();
             let emit_fn: Arc<dyn Fn(ClaudeEvent) + Send + Sync> = Arc::new(move |event: ClaudeEvent| {
+                samurai_context_for_emit.observe(&event);
+                // Samurai (issue #53): ACK scanning over AssistantMessage.
+                if let Some(injector) = samurai_injector_for_emit.get() {
+                    injector.observe(&event);
+                }
                 // Recover from a poisoned lock rather than dropping the event —
                 // losing one silently would corrupt the frontend's activity feed.
                 let len = {
@@ -278,12 +304,21 @@ pub fn run() {
             // When SessionStarted events arrive via hooks, start watching the transcript
             let event_bus_for_hooks = event_bus.clone();
             let transcript_watcher_for_hooks = transcript_watcher.clone();
+            let samurai_injector_for_hooks = samurai_injector.clone();
             let hook_emit_fn: Arc<dyn Fn(ClaudeEvent) + Send + Sync> = Arc::new(move |event: ClaudeEvent| {
                 if let ClaudeEvent::SessionStarted { session_id, ref transcript_path, .. } = event {
                     transcript_watcher_for_hooks.start_watching(
                         session_id,
                         std::path::PathBuf::from(transcript_path),
                     );
+                }
+                // Samurai (issue #53): idle-gate signal (Stop hook →
+                // SessionEnded reason "stop"). Tapped here, pre-dedup: the
+                // EventBus dedup key for SessionEnded ignores the reason, so
+                // a Stop landing within the 5s window of another SessionEnded
+                // would never reach a bus-side tee.
+                if let Some(injector) = samurai_injector_for_hooks.get() {
+                    injector.observe_hook(&event);
                 }
                 event_bus_for_hooks.emit(event);
             });
@@ -314,6 +349,440 @@ pub fn run() {
 
             app.manage(event_bus);
             app.manage(transcript_watcher);
+
+            // Samurai (Phase 1): audit log + per-session supervisor state
+            // machine. The audit log is a single writer task — every append,
+            // read and clear serializes through one channel (no interleaved
+            // writes; see core::samurai_audit). Audit rows and supervisor
+            // state changes are mirrored to the frontend as events.
+            // Samurai (issue #57): the progress tracker (circuit breaker +
+            // handoff churn) tees off the two callbacks below — audit appends
+            // feed the per-epic breaker counter, supervisor changes feed the
+            // per-generation HEAD baselines — but it is constructed further
+            // down (it needs the config and the session-dir resolver). Same
+            // late-bound slot pattern as the injector; both tees only QUEUE
+            // work, so the synchronous callbacks are never blocked.
+            let samurai_progress_slot: Arc<
+                std::sync::OnceLock<Arc<core::samurai_progress::SamuraiProgress>>,
+            > = Arc::new(std::sync::OnceLock::new());
+            let audit_app_handle = app.handle().clone();
+            let progress_for_append = samurai_progress_slot.clone();
+            let (audit_log, audit_task) = AuditLog::new(
+                commands::ai_runner::artifact_base_dir("audit"),
+                Some(Arc::new(move |project: &str, event: &AuditEvent| {
+                    if let Some(progress) = progress_for_append.get() {
+                        progress.observe_audit(project, event);
+                    }
+                    let _ = audit_app_handle.emit(
+                        "samurai-audit-event",
+                        serde_json::json!({ "project": project, "event": event }),
+                    );
+                })),
+            );
+            tauri::async_runtime::spawn(audit_task);
+            // Samurai (issue #56): the replicator is constructed further
+            // down (it needs the supervisor), but the supervisor's change
+            // callback must reach it to chain DEAD → recovery spawn — same
+            // late-bound slot pattern as the injector above. DEAD is a
+            // terminal state, so the transition (and this callback) fires at
+            // most once per session: the chain cannot double-spawn.
+            let samurai_replicator_slot: Arc<
+                std::sync::OnceLock<Arc<core::samurai_replicator::SamuraiReplicator>>,
+            > = Arc::new(std::sync::OnceLock::new());
+            let supervisor_app_handle = app.handle().clone();
+            let replicator_for_dead = samurai_replicator_slot.clone();
+            let progress_for_change = samurai_progress_slot.clone();
+            let supervisor = Arc::new(Supervisor::new(
+                audit_log.clone(),
+                Some(Arc::new(move |snapshot: &SessionSnapshot| {
+                    let _ = supervisor_app_handle.emit("samurai-supervisor-event", snapshot);
+                    // Issue #57: registrations record a HEAD baseline,
+                    // terminal states drop it (queue-only, non-blocking).
+                    if let Some(progress) = progress_for_change.get() {
+                        progress.on_state_change(snapshot);
+                    }
+                    if snapshot.state == SupervisorState::Dead {
+                        if let Some(replicator) = replicator_for_dead.get() {
+                            replicator.on_dead(snapshot);
+                        }
+                    }
+                })),
+            ));
+            app.manage(audit_log.clone());
+            app.manage(supervisor.clone());
+            // Samurai (issue #52): per-session context store, fed by the
+            // event tee above. Managed so later phases (and the session
+            // teardown commands) reach it via `app.state()`.
+            app.manage(samurai_context.clone());
+
+            // Samurai (issue #45): thresholds config + backend allowance
+            // watcher. The config is seeded from the settings store and
+            // shared (Arc<RwLock<…>>) between the get/set commands and the
+            // allowance loop, which polls the usage API on its own ~60s
+            // timer — independent of the frontend — and emits edge-triggered
+            // ALERT audit rows + `samurai-allowance-event` on threshold
+            // crossings (events only; parking is Phase 3).
+            // Constructed before the watchdog below: that loop reads
+            // `staleness_window_secs` from it once per tick.
+            let samurai_config: core::samurai_config::SharedSamuraiConfig = Arc::new(
+                std::sync::RwLock::new(commands::samurai::load_config_from_store(app.handle())),
+            );
+            app.manage(samurai_config.clone());
+
+            // Samurai silent-death watchdog (issue #44): one periodic tick
+            // that declares a supervised session DEAD when its transcript
+            // went stale AND no claude process survives under its shell.
+            // The DEAD transition chains through the supervisor callback
+            // above into the replicator's recovery spawn (issue #56).
+            core::samurai_watchdog::spawn_watchdog(
+                supervisor.clone(),
+                app.state::<Arc<TranscriptWatcher>>().inner().clone(),
+                app.state::<ProcessManager>().inner().clone(),
+                samurai_config.clone(),
+            );
+
+            // Samurai (issue #53): injection controller. Its 30s tick moves
+            // WORKING sessions past `handoff_context_pct` into
+            // HANDOFF_REQUESTED; the instruction itself is only typed into
+            // the terminal on the Stop-hook idle signal and must be ACKed
+            // (`<samurai-ack>…</samurai-ack>`), with one timed retry and an
+            // ack_timeout ALERT after that. Filling the OnceLock arms the
+            // two event tees above.
+            //
+            // Issue #54: after the ACK the controller watches for the
+            // `<samurai-handoff-written>` marker and validates the handoff
+            // (file exists + WIP committed) with git run in the directory
+            // the session's shell actually works in — resolved late from
+            // the SessionManager (worktree/sub-repo aware, falling back to
+            // the project root when no explicit working dir was recorded).
+            let session_dirs_handle = app.handle().clone();
+            let session_dirs: core::samurai_injector::SessionDirResolver =
+                Arc::new(move |session_id| {
+                    session_dirs_handle
+                        .state::<SessionManager>()
+                        .get_session(session_id)
+                        .map(|s| s.working_directory.unwrap_or(s.project_path))
+                });
+
+            // Samurai (issue #57): circuit breaker + handoff churn. Progress
+            // is measured in commits only for v1 (gh issue-update polling is
+            // explicitly out of scope): registrations record a per-generation
+            // HEAD baseline; each samurai audit event re-reads HEAD in the
+            // epic's working dir on a worker task, and `breaker_events`
+            // consecutive events with HEAD unchanged park the epic's WORKING
+            // session with a circuit_breaker ALERT. A handoff triggered with
+            // HEAD still at the generation's baseline fires a handoff_churn
+            // ALERT (signal only — the handoff proceeds).
+            let (samurai_progress, samurai_progress_task) =
+                core::samurai_progress::SamuraiProgress::new(
+                    supervisor.clone(),
+                    samurai_config.clone(),
+                    audit_log.clone(),
+                    session_dirs.clone(),
+                );
+            tauri::async_runtime::spawn(samurai_progress_task);
+            // Managed so the session-teardown commands can propagate removals
+            // (fresh-eyes finding H): a session closed outside the samurai
+            // pipeline must drop its baseline (and, when last, its epic's
+            // breaker entry).
+            app.manage(samurai_progress.clone());
+            // Arms both tees (audit on_append + supervisor change callback).
+            let _ = samurai_progress_slot.set(samurai_progress);
+
+            // Samurai (issue #55): replication controller. A validated
+            // handoff chains here from the injector: full teardown of gen-N
+            // (the same four steps the manual kill command performs) →
+            // KILLED transition (audit row + the supervisor event the
+            // frontend clears the dead tile on) → `samurai-spawn-successor`
+            // to the frontend, which runs its normal spawn flow and
+            // registers gen-N+1. The verify-ritual prompt stays queued in
+            // the backend and is typed in on the successor's first
+            // SessionStarted hook signal (frontend write-timing would race
+            // claude's startup).
+            let teardown_pm = app.state::<ProcessManager>().inner().clone();
+            let teardown_status = app.state::<Arc<StatusServer>>().inner().clone();
+            let teardown_watcher = app.state::<Arc<TranscriptWatcher>>().inner().clone();
+            let teardown_context = samurai_context.clone();
+            let teardown: core::samurai_replicator::SessionTeardown =
+                Arc::new(move |session_id| {
+                    let pm = teardown_pm.clone();
+                    let status = teardown_status.clone();
+                    let watcher = teardown_watcher.clone();
+                    let context = teardown_context.clone();
+                    Box::pin(async move {
+                        // Mirrors commands::terminal::kill_session: PTY tree
+                        // kill, status-server unregister, transcript watcher
+                        // release, stale-context removal.
+                        if let Err(e) = pm.kill_session(session_id).await {
+                            log::warn!(
+                                "samurai replicator: kill_session({session_id}) failed: {e}"
+                            );
+                        }
+                        status.unregister_session(session_id).await;
+                        watcher.stop_watching(session_id);
+                        context.remove(session_id);
+                    })
+                });
+            let spawn_event_handle = app.handle().clone();
+            let emit_spawn: core::samurai_replicator::SuccessorEmitter = Arc::new(move |spawn| {
+                let _ = spawn_event_handle.emit("samurai-spawn-successor", spawn);
+            });
+            // Issue #56: transcript resolution for the recovery digest. The
+            // watcher usually still tails a DEAD session (the watchdog never
+            // stops it); when it does not, fall back to the newest transcript
+            // in the session's Claude project directory. The fallback does
+            // blocking FS work (canonicalize + read_dir + metadata), so the
+            // replicator invokes this resolver via spawn_blocking only —
+            // never inline on the runtime or a notify callback.
+            let transcript_watcher_for_recovery = app.state::<Arc<TranscriptWatcher>>().inner().clone();
+            let recovery_dirs_handle = app.handle().clone();
+            let transcript_paths: core::samurai_replicator::TranscriptPathResolver =
+                Arc::new(move |session_id| {
+                    transcript_watcher_for_recovery
+                        .transcript_path(session_id)
+                        .or_else(|| {
+                            let dir = recovery_dirs_handle
+                                .state::<SessionManager>()
+                                .get_session(session_id)
+                                .map(|s| s.working_directory.unwrap_or(s.project_path))?;
+                            commands::claude_sessions::newest_transcript_for_project(&dir)
+                        })
+                });
+            let ritual_pm = app.state::<ProcessManager>().inner().clone();
+            let ritual_writer: core::samurai_replicator::StdinWriter =
+                Arc::new(move |session_id, data| {
+                    // write_stdin is fully blocking (same policy as the
+                    // injector's spawn_write) — blocking pool, never inline.
+                    let pm = ritual_pm.clone();
+                    tauri::async_runtime::spawn(async move {
+                        match tokio::task::spawn_blocking(move || pm.write_stdin(session_id, &data))
+                            .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => log::warn!(
+                                "samurai replicator: writing ritual to session {session_id} failed: {e}"
+                            ),
+                            Err(e) => log::warn!(
+                                "samurai replicator: ritual write task for session {session_id} failed: {e}"
+                            ),
+                        }
+                    });
+                });
+            // The parker (issue #60) tears parked sessions down with this
+            // same closure — a PARKED terminal serves no purpose, every
+            // wake-up is a fresh spawn (PRD decision #6).
+            let teardown_for_parker = teardown.clone();
+            let replicator = Arc::new(core::samurai_replicator::SamuraiReplicator::new(
+                supervisor.clone(),
+                audit_log.clone(),
+                samurai_config.clone(),
+                session_dirs.clone(),
+                transcript_paths,
+                teardown,
+                emit_spawn,
+                ritual_writer,
+            ));
+            app.manage(replicator.clone());
+            // Arms the DEAD → recovery chain in the supervisor callback.
+            let _ = samurai_replicator_slot.set(replicator.clone());
+
+            let injector = Arc::new(SamuraiInjector::new(
+                supervisor.clone(),
+                samurai_context.clone(),
+                samurai_config.clone(),
+                app.state::<ProcessManager>().inner().clone(),
+                audit_log.clone(),
+                session_dirs.clone(),
+                Some(replicator.clone()),
+            ));
+            // Managed for the same teardown propagation as the progress
+            // tracker above (finding H): pending instruction + idle flag.
+            app.manage(injector.clone());
+            let _ = samurai_injector.set(injector.clone());
+            core::samurai_injector::spawn_injector(injector.clone());
+
+            // Samurai (issue #59): per-epic run-config store + persisted
+            // resume timers. Both managed so the later command layers reach
+            // them via `app.state()`.
+            let run_configs = Arc::new(core::samurai_run_config::RunConfigStore::new(
+                commands::ai_runner::artifact_base_dir("runs"),
+            ));
+            app.manage(run_configs.clone());
+            // PRD §8 row 1 (issue #45's `handoff_retention_days`): handoff
+            // files auto-clean once their epic has completed — i.e. its run
+            // config is ARCHIVED. One sweep per app start: it is the only
+            // moment every stored config is looked at, and the window is
+            // measured in days, so a periodic tick would be pure noise.
+            {
+                let retention_days = samurai_config
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .handoff_retention_days;
+                let swept = core::samurai_files::sweep_handoff_retention(
+                    &run_configs.list_with_paths(),
+                    retention_days,
+                );
+                if !swept.is_empty() {
+                    log::info!(
+                        "samurai retention: removed {} handoff file(s) older than {retention_days} days from archived epics",
+                        swept.len()
+                    );
+                }
+            }
+            // Review F4: the replicator resolves the per-run `model` at
+            // spawn-emit time, and the injector's trigger pass consults the
+            // per-run `thresholds` override (handoff trigger only — park
+            // thresholds stay global, see allowance_watcher). Late-bound
+            // like set_absorber/set_parker: the store is constructed after
+            // both controllers.
+            replicator.set_run_configs(run_configs.clone());
+            injector.set_run_configs(run_configs.clone());
+            // Samurai journal (Phase 5, issue #69): the ops-journal store —
+            // an app-data JSONL where agents and the user record
+            // bottlenecks/errors/improvements/skill gaps/concerns; the
+            // harvest runner (next issue) consumes and archives entries via
+            // markers. Mutex-serialized like the run-config store above.
+            app.manage(Arc::new(core::samurai_journal::JournalStore::new(
+                commands::ai_runner::artifact_base_dir("journal"),
+            )));
+            // Samurai (issue #61): the resume handler — a fired park timer
+            // becomes a FRESH generation spawn (guards → working dir →
+            // next generation → RESUME row → replicator.spawn_generation).
+            // Constructed before the schedule because it IS the fire
+            // callback; the schedule and parker are late-bound below (the
+            // construction order is circular: schedule → resumer → parker →
+            // schedule).
+            let samurai_resumer = core::samurai_resumer::SamuraiResumer::new(
+                supervisor.clone(),
+                replicator.clone(),
+                run_configs.clone(),
+                audit_log.clone(),
+                session_dirs,
+            );
+            let resumer_for_fire = samurai_resumer.clone();
+            // Issue #61: every schedule mutation (arm/cancel/fire) pushes
+            // the full timer list to the frontend — the park-countdown chip
+            // stays live without polling.
+            let schedule_event_handle = app.handle().clone();
+            let (samurai_schedule, samurai_schedule_task) =
+                core::samurai_schedule::SamuraiSchedule::new(
+                    commands::ai_runner::artifact_base_dir("samurai"),
+                    Arc::new(move |entry: core::samurai_schedule::ScheduleEntry| {
+                        resumer_for_fire.on_fire(entry);
+                    }),
+                    Some(Arc::new(
+                        move |entries: &[core::samurai_schedule::ScheduleEntry]| {
+                            let _ = schedule_event_handle.emit("samurai-schedule-event", entries);
+                        },
+                    )),
+                );
+            // Issue #62: snapshot the pending timers BEFORE the fire loop is
+            // spawned — a past-due entry fires on the loop's first tick and
+            // self-cleans, so reading `list()` from the reconciliation task
+            // later would race it and double-spawn the fired epic. A fire
+            // cannot precede its own task spawn, so this snapshot is complete.
+            // The fire loop itself is spawned BELOW, after `samurai_resumer
+            // .bind(...)` — fires must never precede the bind (review F2):
+            // a past-due timer firing in that gap would be dropped by the
+            // resumer's unset OnceLocks yet still self-clean from
+            // schedule.json, stranding the epic (the reconciler snapshot
+            // lists it as timer-owned, so nothing respawns it either).
+            let reconcile_timers = samurai_schedule.list();
+            app.manage(samurai_schedule.clone());
+
+            // Samurai (issue #60): the allowance parker — the backend
+            // consumer of the watcher's threshold events. Soft crossing →
+            // wind-down instructions through the injector's ladder; hard
+            // crossing → sequential park sweep (highest context first),
+            // teardown per parked session, one persisted resume timer per
+            // parked/absorbed epic. The injector chains park outcomes back
+            // in (set_parker) and the replicator consults the parking-
+            // engaged check before staging a successor (set_absorber).
+            let samurai_parker = core::samurai_parker::SamuraiParker::new(
+                supervisor.clone(),
+                samurai_context.clone(),
+                injector.clone(),
+                samurai_schedule.clone(),
+                audit_log.clone(),
+                teardown_for_parker,
+            );
+            app.manage(samurai_parker.clone());
+            injector.set_parker(samurai_parker.clone());
+            let parker_for_absorb = samurai_parker.clone();
+            replicator.set_absorber(Arc::new(move |project: &str, epic: &str| {
+                parker_for_absorb.absorb_handoff(project, epic)
+            }));
+            // Issue #61: closes the circular construction order — the
+            // resumer can now re-arm deferred timers and consult the
+            // parking-engaged guard.
+            samurai_resumer.bind(samurai_schedule, samurai_parker.clone());
+            // Ordering invariant (review F2): the schedule's fire loop is
+            // spawned only AFTER the bind above — its first tick fires every
+            // past-due timer immediately, and a fire before the bind would
+            // hit unset OnceLocks (dropped resume) while still self-cleaning
+            // the entry from schedule.json.
+            tauri::async_runtime::spawn(samurai_schedule_task);
+
+            // Samurai (issue #63): periodic gh auth re-check while any run
+            // config is ACTIVE — corporate SSO tokens expire mid-run (PRD
+            // §5.8: park + ALERT, not a crash loop). The probe is injected
+            // (the reconciler's closure pattern); gh runs in the active
+            // config's project directory — auth is account-global, the cwd
+            // only anchors it to a repo.
+            let auth_probe: core::samurai_auth_watch::AuthProbe = Arc::new(|project: String| {
+                Box::pin(async move {
+                    github::GitHub::new(project)
+                        .auth_status()
+                        .await
+                        .map(|status| status.logged_in)
+                        .map_err(|e| e.to_string())
+                })
+            });
+            core::samurai_auth_watch::spawn_auth_watch(
+                run_configs.clone(),
+                samurai_parker.clone(),
+                auth_probe.clone(),
+            );
+
+            core::allowance_watcher::spawn_allowance_loop(
+                app.handle().clone(),
+                samurai_config,
+                supervisor.clone(),
+                audit_log.clone(),
+                samurai_parker,
+            );
+
+            // Samurai (issue #62): cold-start reconciliation — PRD §5.6's
+            // first-class flow. Runs ONCE, after every samurai component
+            // above is constructed: for each ACTIVE run config, skip epics a
+            // pending timer or live session already owns, alert on probable
+            // pre-restart survivors, and fresh-spawn the next generation for
+            // the rest (the replicator's spawn-retry tolerates the frontend
+            // not being mounted yet). The probes are the watchdog's process
+            // scan and the project's newest transcript age — both real IO,
+            // injected so the module stays harness-testable.
+            let transcript_ages: core::samurai_reconciler::TranscriptAgeProbe =
+                Arc::new(|project| {
+                    commands::claude_sessions::newest_transcript_for_project(project)
+                        .and_then(|path| core::samurai_watchdog::transcript_age(&path))
+                });
+            let claude_alive: core::samurai_reconciler::ClaudeAliveProbe = Arc::new(|| {
+                !core::samurai_watchdog::scan_claude_ancestor_pids().is_empty()
+            });
+            // The auth probe gates the resume side: an epic parked because gh
+            // auth died must not be respawned before gh is healthy again
+            // (PRD §5.8) — otherwise a restart resurrects it straight into
+            // the same failure.
+            tauri::async_runtime::spawn(core::samurai_reconciler::reconcile_with_auth(
+                run_configs,
+                reconcile_timers,
+                supervisor,
+                replicator,
+                audit_log,
+                transcript_ages,
+                claude_alive,
+                auth_probe,
+            ));
 
             // GitHub watchdog: background poller for review requests /
             // assigned issues across all configured projects. The frontend
@@ -528,6 +997,30 @@ pub fn run() {
             commands::catalog::scan_project_catalog,
             commands::catalog::cancel_project_catalog,
             commands::catalog::load_project_catalog,
+            // Samurai supervisor + audit log (Phase 1)
+            commands::samurai::samurai_register_session,
+            commands::samurai::samurai_transition,
+            commands::samurai::samurai_list_sessions,
+            commands::samurai::samurai_audit_read,
+            commands::samurai::samurai_audit_clear,
+            commands::samurai::samurai_schedule_list,
+            commands::samurai::samurai_get_config,
+            commands::samurai::samurai_set_config,
+            // Samurai run launcher (issue #63)
+            commands::samurai::samurai_preflight,
+            commands::samurai::samurai_launch_run,
+            commands::samurai::samurai_list_runs,
+            commands::samurai::samurai_cleanup_epic,
+            // Samurai Second Brain file inventory (issue #65)
+            commands::samurai::samurai_files_list,
+            commands::samurai::samurai_file_delete,
+            commands::samurai::samurai_timer_cancel,
+            // Samurai journal (Phase 5, issue #69)
+            commands::samurai::samurai_journal_add,
+            commands::samurai::samurai_journal_list,
+            // Samurai harvest (Phase 5, issue #70)
+            commands::harvest::samurai_harvest_run,
+            commands::harvest::samurai_harvest_read,
             // CLI commands
             commands::cli::install_cli,
             commands::cli::uninstall_cli,

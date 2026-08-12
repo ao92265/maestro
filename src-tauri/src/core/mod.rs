@@ -1,3 +1,4 @@
+pub mod allowance_watcher;
 pub mod claude_event;
 pub mod cli_path;
 pub mod config_recovery;
@@ -16,8 +17,25 @@ pub mod mcp_settings;
 pub mod plugin_config_writer;
 pub mod plugin_manager;
 pub mod process_manager;
+pub mod samurai_audit;
+pub mod samurai_auth_watch;
+pub mod samurai_config;
+pub mod samurai_context;
+pub mod samurai_files;
+pub mod samurai_injector;
+pub mod samurai_journal;
+pub mod samurai_parker;
+pub mod samurai_progress;
+pub mod samurai_prompts;
+pub mod samurai_reconciler;
+pub mod samurai_replicator;
+pub mod samurai_resumer;
+pub mod samurai_run_config;
+pub mod samurai_schedule;
+pub mod samurai_watchdog;
 pub mod session_manager;
 pub mod status_server;
+pub mod supervisor;
 pub mod terminal_backend;
 pub mod windows_process;
 pub mod worktree_manager;
@@ -30,19 +48,14 @@ pub use claude_event::ClaudeEvent;
 pub use error::PtyError;
 pub use event_bus::EventBus;
 pub use font_detector::{detect_available_fonts, is_font_available, AvailableFont};
-pub use marketplace_manager::MarketplaceManager;
-pub use mcp_manager::McpManager;
-pub use plugin_manager::PluginManager;
 pub use process_manager::ProcessManager;
-pub use session_manager::SessionManager;
 pub use status_server::StatusServer;
-pub use terminal_backend::{
-    BackendCapabilities, BackendType, SubscriptionHandle, TerminalBackend, TerminalConfig,
-    TerminalError, TerminalState,
-};
+// Only the two types `commands::terminal` reads are re-exported here. Every
+// other consumer imports through the defining module (`core::foo::Bar`), so
+// a façade entry for them would be a second name for the same thing that
+// nothing calls.
+pub use terminal_backend::{BackendCapabilities, BackendType};
 pub use transcript_watcher::TranscriptWatcher;
-pub use worktree_manager::WorktreeManager;
-pub use xterm_backend::XtermPassthroughBackend;
 
 #[cfg(feature = "vte-backend")]
 pub use vte_backend::VteBackend;

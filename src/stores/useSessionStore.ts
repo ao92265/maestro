@@ -2,7 +2,16 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { create } from "zustand";
 import { samePath } from "@/lib/path";
+import {
+  samuraiListSessions,
+  samuraiScheduleList,
+  type SamuraiScheduleEntry,
+  type SamuraiSupervisorState,
+} from "@/lib/samurai";
 import { useAgentStore } from "@/stores/useAgentStore";
+import type { ClaudeEvent } from "@/types/claude-events";
+
+export type { SamuraiScheduleEntry, SamuraiSupervisorState };
 
 /** AI provider variants supported by the backend orchestrator. */
 export type AiMode = "Claude" | "Gemini" | "Codex" | "OpenCode" | "Plain";
@@ -64,6 +73,18 @@ export interface SessionConfig {
   needsInputPrompt?: string;
   /** Timestamp of the last MCP-driven status update (used by activity heuristic). */
   lastMcpUpdateTime?: number;
+  /**
+   * Derived context-window usage % (0-100, one decimal) of the session's
+   * Claude conversation, from the transcript watcher's ContextUsageUpdate
+   * events. Frontend-only — not part of the Rust SessionConfig. Undefined
+   * until the first assistant message with usage data arrives; idle sessions
+   * keep their last-known value (no decay).
+   */
+  contextPercent?: number;
+  /** Tokens in the latest API call's context (input + cache read + cache creation). */
+  contextTokens?: number;
+  /** The model's context window in tokens (e.g. 200000 or 1000000). */
+  contextWindow?: number;
 }
 
 /** Shape of the Tauri `session-status-changed` event payload. */
@@ -83,6 +104,19 @@ interface SessionStatusPayload {
 type RawSessionStatusPayload = Omit<SessionStatusPayload, "status"> & {
   status: BackendSessionStatus | "AwaitingInput";
 };
+
+/**
+ * What the badge UI (issue #46) needs to know about one Samurai-supervised
+ * session: which project it belongs to (ids alone are not trusted to be
+ * unique across projects), its epic, and the latest generation + state.
+ */
+export interface SamuraiSessionInfo {
+  /** Canonical project path, `\\?\` prefix already stripped by the backend. */
+  project: string;
+  epic: string;
+  generation: number;
+  state: SamuraiSupervisorState;
+}
 
 /**
  * Zustand store slice for session metadata (not PTY I/O -- that lives in terminal.ts).
@@ -116,6 +150,20 @@ interface SessionState {
    * parkedSessionIds.
    */
   attentionSessionIds: number[];
+  /**
+   * Samurai-supervised sessions, keyed by session id — fed by
+   * `samurai-supervisor-event` and seeded from `samurai_list_sessions` on
+   * listener init. Sessions absent from this map are not supervised and
+   * render no Samurai chrome (issue #46: non-supervised sessions unchanged).
+   */
+  samuraiBySessionId: Record<number, SamuraiSessionInfo>;
+  /**
+   * Every pending Samurai resume timer, all projects (issue #61; PRD §9 park
+   * countdown) — fed by `samurai-schedule-event` (full list per event) and
+   * seeded from `samurai_schedule_list` on listener init. Drives the
+   * project-level "parked — resumes at HH:MM" chip.
+   */
+  samuraiSchedule: SamuraiScheduleEntry[];
   isLoading: boolean;
   error: string | null;
   parkSession: (sessionId: number) => void;
@@ -154,6 +202,35 @@ const pendingStatusUpdates: Map<string, SessionStatusPayload> = new Map();
  */
 const startupTimeouts: Map<number, ReturnType<typeof setTimeout>> = new Map();
 
+/** Last-known context-window usage of one session (see lastContextUsage). */
+interface ContextUsage {
+  percent: number;
+  tokens: number;
+  window: number;
+}
+
+/**
+ * Last-known context usage per session id, fed by the claude-events listener
+ * (initContextUsageListener). Kept outside the store — same rationale as
+ * pendingStatusUpdates — so a fetchSessions() replacing the session list, or
+ * an event arriving before its session is added, cannot lose the value: it is
+ * re-applied on fetch and on addSession. In-memory only; session IDs are
+ * ephemeral (reassigned each app launch).
+ */
+const lastContextUsage: Map<number, ContextUsage> = new Map();
+
+/** Merge the remembered context usage into a (freshly fetched) session. */
+function withContextUsage(session: SessionConfig): SessionConfig {
+  const usage = lastContextUsage.get(session.id);
+  if (!usage) return session;
+  return {
+    ...session,
+    contextPercent: usage.percent,
+    contextTokens: usage.tokens,
+    contextWindow: usage.window,
+  };
+}
+
 /** Generate a unique key for buffering status updates */
 function statusBufferKey(sessionId: number, projectPath: string): string {
   return `${sessionId}:${projectPath}`;
@@ -176,6 +253,8 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
   parkedSessionIds: [],
   flaggedSessionIds: [],
   attentionSessionIds: [],
+  samuraiBySessionId: {},
+  samuraiSchedule: [],
   isLoading: false,
   error: null,
 
@@ -228,7 +307,9 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
   fetchSessions: async () => {
     set({ isLoading: true, error: null });
     try {
-      const sessions = await invoke<SessionConfig[]>("get_sessions");
+      const fetched = await invoke<SessionConfig[]>("get_sessions");
+      // Re-apply last-known context usage — the backend doesn't carry it.
+      const sessions = fetched.map(withContextUsage);
       set((state) => ({
         sessions,
         isLoading: false,
@@ -252,9 +333,11 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
   fetchSessionsForProject: async (projectPath: string) => {
     set({ isLoading: true, error: null });
     try {
-      const sessions = await invoke<SessionConfig[]>("get_sessions_for_project", {
+      const fetched = await invoke<SessionConfig[]>("get_sessions_for_project", {
         projectPath,
       });
+      // Re-apply last-known context usage — the backend doesn't carry it.
+      const sessions = fetched.map(withContextUsage);
       set((state) => ({
         sessions,
         isLoading: false,
@@ -342,7 +425,9 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       if (state.sessions.some((s) => s.id === session.id)) {
         return state;
       }
-      return { sessions: [...state.sessions, session] };
+      // Apply context usage that arrived before the session was added
+      // (transcript catch-up can beat addSession).
+      return { sessions: [...state.sessions, withContextUsage(session)] };
     });
   },
 
@@ -374,6 +459,10 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     // Clear any startup timeout for this session
     clearStartupTimeout(sessionId);
 
+    // Forget the context usage so a future session reusing this id doesn't
+    // inherit a stale percentage.
+    lastContextUsage.delete(sessionId);
+
     // Clear any buffered status for this session to prevent pollution on restart
     const sessionsToRemove = get().sessions.filter((s) => s.id === sessionId);
     for (const session of sessionsToRemove) {
@@ -381,12 +470,19 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       pendingStatusUpdates.delete(bufferKey);
     }
 
-    set((state) => ({
-      sessions: state.sessions.filter((s) => s.id !== sessionId),
-      parkedSessionIds: state.parkedSessionIds.filter((id) => id !== sessionId),
-      flaggedSessionIds: state.flaggedSessionIds.filter((id) => id !== sessionId),
-      attentionSessionIds: state.attentionSessionIds.filter((id) => id !== sessionId),
-    }));
+    set((state) => {
+      // Same stale-id hygiene for the supervision map: a future session
+      // reusing this id must not inherit a Samurai badge.
+      const samuraiBySessionId = { ...state.samuraiBySessionId };
+      delete samuraiBySessionId[sessionId];
+      return {
+        sessions: state.sessions.filter((s) => s.id !== sessionId),
+        parkedSessionIds: state.parkedSessionIds.filter((id) => id !== sessionId),
+        flaggedSessionIds: state.flaggedSessionIds.filter((id) => id !== sessionId),
+        attentionSessionIds: state.attentionSessionIds.filter((id) => id !== sessionId),
+        samuraiBySessionId,
+      };
+    });
   },
 
   removeSessionsForProject: async (projectPath: string) => {
@@ -394,21 +490,32 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       const removed = await invoke<SessionConfig[]>("remove_sessions_for_project", {
         projectPath,
       });
+      // Same stale-id hygiene as removeSession.
+      for (const session of removed) {
+        lastContextUsage.delete(session.id);
+      }
       // Remove the sessions from local state
-      set((state) => ({
-        sessions: state.sessions.filter(
-          (s) => !removed.some((r) => r.id === s.id)
-        ),
-        parkedSessionIds: state.parkedSessionIds.filter(
-          (id) => !removed.some((r) => r.id === id)
-        ),
-        flaggedSessionIds: state.flaggedSessionIds.filter(
-          (id) => !removed.some((r) => r.id === id)
-        ),
-        attentionSessionIds: state.attentionSessionIds.filter(
-          (id) => !removed.some((r) => r.id === id)
-        ),
-      }));
+      set((state) => {
+        const samuraiBySessionId = { ...state.samuraiBySessionId };
+        for (const session of removed) {
+          delete samuraiBySessionId[session.id];
+        }
+        return {
+          sessions: state.sessions.filter(
+            (s) => !removed.some((r) => r.id === s.id)
+          ),
+          parkedSessionIds: state.parkedSessionIds.filter(
+            (id) => !removed.some((r) => r.id === id)
+          ),
+          flaggedSessionIds: state.flaggedSessionIds.filter(
+            (id) => !removed.some((r) => r.id === id)
+          ),
+          attentionSessionIds: state.attentionSessionIds.filter(
+            (id) => !removed.some((r) => r.id === id)
+          ),
+          samuraiBySessionId,
+        };
+      });
       return removed;
     } catch (err) {
       console.error("Failed to remove sessions for project:", err);
@@ -549,4 +656,306 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     };
   },
 }));
+
+// ---------------------------------------------------------------------------
+// Context usage listener (claude-events -> per-session context %)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fold a claude-events batch into per-session context usage.
+ *
+ * Events arrive in transcript order, so within a batch the last
+ * ContextUsageUpdate per session wins — that is the latest assistant
+ * message's context. Sessions without new events are left untouched, which
+ * is what keeps idle sessions at their last-known percentage.
+ */
+function applyContextUsageEvents(events: ClaudeEvent[]): void {
+  const updates = new Map<number, ContextUsage>();
+  for (const event of events) {
+    if (event.event_type === "ContextUsageUpdate") {
+      updates.set(event.session_id, {
+        percent: event.percent,
+        tokens: event.context_tokens,
+        window: event.context_window,
+      });
+    }
+  }
+  if (updates.size === 0) return;
+
+  for (const [sessionId, usage] of updates) {
+    lastContextUsage.set(sessionId, usage);
+  }
+
+  useSessionStore.setState((state) => {
+    let changed = false;
+    const sessions = state.sessions.map((s) => {
+      const usage = updates.get(s.id);
+      if (
+        !usage ||
+        (s.contextPercent === usage.percent && s.contextTokens === usage.tokens)
+      ) {
+        return s;
+      }
+      changed = true;
+      return {
+        ...s,
+        contextPercent: usage.percent,
+        contextTokens: usage.tokens,
+        contextWindow: usage.window,
+      };
+    });
+    // No-op guard: don't replace the array (and re-render subscribers) when
+    // nothing changed — e.g. the session isn't in the store yet (the map
+    // buffers the value for addSession/fetchSessions to apply).
+    return changed ? { sessions } : state;
+  });
+}
+
+// Global claude-events listener. `active` tracks the *desired* state so an
+// init/stop pair that races the pending listen() promise (React StrictMode's
+// dev double-mount) can't leak a second listener. Mirrors useActivityStore.
+let contextUnlisten: UnlistenFn | null = null;
+let contextStarting: Promise<void> | null = null;
+let contextActive = false;
+
+export async function initContextUsageListener(): Promise<void> {
+  contextActive = true;
+  if (contextUnlisten || contextStarting) return;
+  contextStarting = listen<ClaudeEvent[]>("claude-events", (event) => {
+    applyContextUsageEvents(event.payload);
+  })
+    .then((fn) => {
+      if (!contextActive) {
+        fn();
+        return;
+      }
+      contextUnlisten = fn;
+    })
+    .finally(() => {
+      contextStarting = null;
+    });
+  await contextStarting;
+}
+
+export function stopContextUsageListener(): void {
+  contextActive = false;
+  if (contextUnlisten) {
+    contextUnlisten();
+    contextUnlisten = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Samurai supervisor listener (samurai-supervisor-event + samurai-allowance-
+// event -> badge map, DEAD => error chrome, allowance => attention;
+// samurai-schedule-event -> pending resume timers for the countdown chip)
+// ---------------------------------------------------------------------------
+
+/**
+ * Subset of the backend's `SessionSnapshot` payload (emitted on every Samurai
+ * supervisor state change) that the listener uses.
+ */
+interface SamuraiSupervisorEvent {
+  session_id: number;
+  /** Canonical project path, `\\?\` prefix already stripped by the backend. */
+  project: string;
+  epic: string;
+  generation: number;
+  state: string;
+}
+
+/** Terminal supervisor states — sessions past saving, no allowance attention. */
+const SAMURAI_TERMINAL_STATES = new Set(["KILLED", "PARKED", "DEAD"]);
+
+/**
+ * Supervisor states whose backend teardown already ran, so the frontend must
+ * close the tile (TerminalGrid's samurai-close effect): KILLED (replication,
+ * issue #55) and PARKED (allowance park, issue #60 — resume is always a fresh
+ * spawn, a parked terminal serves no purpose). DEAD deliberately stays open:
+ * that tile shows the error until a human dismisses it.
+ */
+export const SAMURAI_TILE_CLOSE_STATES: ReadonlySet<string> = new Set(["KILLED", "PARKED"]);
+
+/**
+ * Tracks every supervisor state change into `samuraiBySessionId` (the badge
+ * data for issue #46), and surfaces a watchdog-declared death (issue #44):
+ * a crashed claude fires no hook, so without this the session would sit on
+ * its last MCP status — usually "Working" — forever. On a DEAD supervisor
+ * event the session flips to Error chrome and gets the same unpark +
+ * attention treatment as an auto-unparked NeedsInput session.
+ */
+function applySamuraiSupervisorEvent(payload: SamuraiSupervisorEvent): void {
+  useSessionStore.setState((state) => {
+    const samuraiBySessionId: Record<number, SamuraiSessionInfo> = {
+      ...state.samuraiBySessionId,
+      [payload.session_id]: {
+        project: payload.project,
+        epic: payload.epic,
+        generation: payload.generation,
+        state: payload.state as SamuraiSupervisorState,
+      },
+    };
+    if (payload.state !== "DEAD") return { samuraiBySessionId };
+    const session = state.sessions.find(
+      (s) => s.id === payload.session_id && samePath(s.project_path, payload.project)
+    );
+    if (!session) return { samuraiBySessionId };
+    return {
+      samuraiBySessionId,
+      sessions: state.sessions.map((s) =>
+        s === session
+          ? {
+              ...s,
+              status: "Error" as BackendSessionStatus,
+              statusMessage: "claude process died (Samurai watchdog)",
+            }
+          : s
+      ),
+      parkedSessionIds: state.parkedSessionIds.filter((id) => id !== payload.session_id),
+      attentionSessionIds: state.attentionSessionIds.includes(payload.session_id)
+        ? state.attentionSessionIds
+        : [...state.attentionSessionIds, payload.session_id],
+    };
+  });
+}
+
+/**
+ * Allowance threshold crossed (issue #45, edge-triggered ~once per window):
+ * flag every live supervised session with the existing attention highlight —
+ * those are the runs the crossing is about (issue #46: existing attention
+ * mechanism, no new alert UI). Details land as ALERT rows in the audit
+ * stream; non-supervised sessions stay untouched.
+ */
+function applySamuraiAllowanceEvent(): void {
+  useSessionStore.setState((state) => {
+    const flagged = state.sessions
+      .filter((s) => {
+        const info = state.samuraiBySessionId[s.id];
+        return (
+          info !== undefined &&
+          !SAMURAI_TERMINAL_STATES.has(info.state) &&
+          samePath(s.project_path, info.project)
+        );
+      })
+      .map((s) => s.id)
+      .filter((id) => !state.attentionSessionIds.includes(id));
+    // No-op guard: nothing supervised (or all already flagged) — don't
+    // replace the array and re-render subscribers.
+    if (flagged.length === 0) return state;
+    return { attentionSessionIds: [...state.attentionSessionIds, ...flagged] };
+  });
+}
+
+/**
+ * Review F8: whether a live `samurai-schedule-event` has been applied since
+ * this listener lifetime started. The seed's IPC round-trip can resolve
+ * AFTER a live event already delivered a newer list — applying the stale
+ * snapshot then would resurrect a fired timer's countdown chip. Reset on
+ * listener init so the restart-seed case still works.
+ */
+let samuraiScheduleEventApplied = false;
+
+/**
+ * Replaces the pending-timer list (issue #61). The backend sends the FULL
+ * current list on every arm/cancel/fire, so this is a plain replace — no
+ * merging, no ordering assumptions.
+ */
+function applySamuraiScheduleEvent(payload: SamuraiScheduleEntry[]): void {
+  // Defensive: a mocked/failed IPC layer may hand back a non-array.
+  if (!Array.isArray(payload)) return;
+  samuraiScheduleEventApplied = true;
+  useSessionStore.setState({ samuraiSchedule: payload });
+}
+
+/**
+ * Seeds `samuraiSchedule` from the backend's current timers, so timers armed
+ * before this frontend mounted (app restart with parked epics) still show
+ * their countdown chip. Live events always carry the full current list, so
+ * once one has been applied the seed's snapshot is stale by definition and
+ * is dropped (review F8).
+ */
+async function seedSamuraiSchedule(): Promise<void> {
+  try {
+    const entries = await samuraiScheduleList();
+    if (samuraiScheduleEventApplied) return;
+    if (!Array.isArray(entries) || entries.length === 0) return;
+    useSessionStore.setState({ samuraiSchedule: entries });
+  } catch (err) {
+    console.error("Failed to seed samurai resume timers:", err);
+  }
+}
+
+/**
+ * Seeds `samuraiBySessionId` from the supervisor's current snapshots, so
+ * sessions registered before this frontend mounted (dev reload, late mount)
+ * still get badges. Live events won the race for any id already present.
+ */
+async function seedSamuraiSessions(): Promise<void> {
+  try {
+    const snapshots = await samuraiListSessions();
+    // Defensive: a mocked/failed IPC layer may hand back a non-array.
+    if (!Array.isArray(snapshots) || snapshots.length === 0) return;
+    useSessionStore.setState((state) => {
+      const samuraiBySessionId = { ...state.samuraiBySessionId };
+      for (const snapshot of snapshots) {
+        if (samuraiBySessionId[snapshot.session_id]) continue;
+        samuraiBySessionId[snapshot.session_id] = {
+          project: snapshot.project,
+          epic: snapshot.epic,
+          generation: snapshot.generation,
+          state: snapshot.state,
+        };
+      }
+      return { samuraiBySessionId };
+    });
+  } catch (err) {
+    console.error("Failed to seed samurai supervised sessions:", err);
+  }
+}
+
+// Same StrictMode-safe init/stop shape as the context usage listener above.
+let samuraiUnlisten: UnlistenFn | null = null;
+let samuraiStarting: Promise<void> | null = null;
+let samuraiActive = false;
+
+export async function initSamuraiSupervisorListener(): Promise<void> {
+  samuraiActive = true;
+  if (samuraiUnlisten || samuraiStarting) return;
+  // Review F8: fresh listener lifetime — the seed may apply until the first
+  // live schedule event of THIS lifetime lands.
+  samuraiScheduleEventApplied = false;
+  samuraiStarting = Promise.all([
+    listen<SamuraiSupervisorEvent>("samurai-supervisor-event", (event) => {
+      applySamuraiSupervisorEvent(event.payload);
+    }),
+    listen("samurai-allowance-event", () => {
+      applySamuraiAllowanceEvent();
+    }),
+    listen<SamuraiScheduleEntry[]>("samurai-schedule-event", (event) => {
+      applySamuraiScheduleEvent(event.payload);
+    }),
+  ])
+    .then((fns) => {
+      const unlistenAll = () => fns.forEach((fn) => fn());
+      if (!samuraiActive) {
+        unlistenAll();
+        return;
+      }
+      samuraiUnlisten = unlistenAll;
+    })
+    .finally(() => {
+      samuraiStarting = null;
+    });
+  await samuraiStarting;
+  void seedSamuraiSessions();
+  void seedSamuraiSchedule();
+}
+
+export function stopSamuraiSupervisorListener(): void {
+  samuraiActive = false;
+  if (samuraiUnlisten) {
+    samuraiUnlisten();
+    samuraiUnlisten = null;
+  }
+}
 

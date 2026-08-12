@@ -4,8 +4,12 @@ use std::sync::Arc;
 use serde::Serialize;
 use tauri::{AppHandle, State};
 
+use crate::core::samurai_context::SamuraiContextStore;
+use crate::core::samurai_injector::SamuraiInjector;
+use crate::core::samurai_progress::SamuraiProgress;
 use crate::core::session_manager::SessionManager;
 use crate::core::status_server::StatusServer;
+use crate::core::supervisor::Supervisor;
 use crate::core::transcript_watcher::TranscriptWatcher;
 use crate::core::{BackendCapabilities, BackendType, ProcessManager, PtyError};
 
@@ -171,12 +175,19 @@ pub async fn resize_pty(
 /// Also unregisters the session from the status server and stops the
 /// transcript watcher so its notify handle and tokio task are released
 /// (entries otherwise accumulate until the watcher cap refuses new sessions).
+// Same as `remove_sessions_for_project`: the `State` parameters are Tauri's
+// injection points, one per subsystem that must forget the dead session.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn kill_session(
     state: State<'_, ProcessManager>,
     session_mgr: State<'_, SessionManager>,
     status_server: State<'_, Arc<StatusServer>>,
     transcript_watcher: State<'_, Arc<TranscriptWatcher>>,
+    samurai_context: State<'_, Arc<SamuraiContextStore>>,
+    supervisor: State<'_, Arc<Supervisor>>,
+    samurai_injector: State<'_, Arc<SamuraiInjector>>,
+    samurai_progress: State<'_, Arc<SamuraiProgress>>,
     session_id: u32,
 ) -> Result<(), PtyError> {
     // Kill the PTY session
@@ -188,6 +199,18 @@ pub async fn kill_session(
 
     // Release the transcript watcher entry for this terminal
     transcript_watcher.stop_watching(session_id);
+
+    // Drop the samurai context entry — a stale percentage for a gone
+    // session must never arm a handoff (issue #52)
+    samurai_context.remove(session_id);
+
+    // A supervised session closed through this manual path leaves the
+    // supervisor too (fresh-eyes finding H): a zombie WORKING entry would
+    // pollute every 30s tick and leak baselines/idle flags forever. Teardown,
+    // not a transition — no event, no audit row (user-driven, UI-visible).
+    supervisor.remove_session(session_id);
+    samurai_injector.remove_session(session_id);
+    samurai_progress.remove_session(session_id);
 
     // Log for debugging
     let _project_path = session_mgr
@@ -281,6 +304,10 @@ pub async fn kill_all_sessions(
     state: State<'_, ProcessManager>,
     session_state: State<'_, SessionManager>,
     transcript_watcher: State<'_, Arc<TranscriptWatcher>>,
+    samurai_context: State<'_, Arc<SamuraiContextStore>>,
+    supervisor: State<'_, Arc<Supervisor>>,
+    samurai_injector: State<'_, Arc<SamuraiInjector>>,
+    samurai_progress: State<'_, Arc<SamuraiProgress>>,
 ) -> Result<u32, PtyError> {
     let pm = state.inner().clone();
     let killed = pm.kill_all_sessions().await?;
@@ -290,6 +317,16 @@ pub async fn kill_all_sessions(
     // their activity feed.
     for session_id in transcript_watcher.watched_sessions() {
         transcript_watcher.stop_watching(session_id);
+    }
+    // Every session is gone: clear the whole samurai context store, which
+    // may hold entries for sessions whose watcher already stopped (issue #52)
+    samurai_context.clear();
+    // Same teardown propagation as kill_session (finding H): every PTY died,
+    // so every supervised entry is now a zombie — remove them all.
+    for snapshot in supervisor.list_sessions() {
+        supervisor.remove_session(snapshot.session_id);
+        samurai_injector.remove_session(snapshot.session_id);
+        samurai_progress.remove_session(snapshot.session_id);
     }
     log::info!(
         "Cleanup: killed {} PTY session(s), cleared {} session entries",

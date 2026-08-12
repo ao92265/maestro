@@ -1,0 +1,181 @@
+import { createRef } from "react";
+import { act, render, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+// The persisted zustand stores hydrate through the Tauri store plugin at
+// import time; happy-dom has no Tauri backend, so stub it out.
+vi.mock("@tauri-apps/plugin-store", () => ({
+  LazyStore: class {
+    async get() {
+      return undefined;
+    }
+    async set() {}
+    async save() {}
+  },
+}));
+
+// useTerminalDragDrop subscribes to the real Tauri window on mount.
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({
+    onDragDropEvent: async () => () => {},
+  }),
+}));
+
+// xterm.js cannot mount in happy-dom — the grid only needs a pane placeholder.
+vi.mock("../TerminalView", () => ({
+  TerminalView: () => <div data-testid="terminal-view" />,
+}));
+
+vi.mock("@/lib/terminal", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/terminal")>();
+  return {
+    ...actual,
+    spawnShell: vi.fn(async () => 1),
+    createSession: vi.fn(async (id: number) => ({
+      id,
+      mode: "Claude",
+      branch: null,
+      status: "Working",
+      worktree_path: null,
+      project_path: "C:/proj",
+      name: null,
+    })),
+    // Skips the CLI-launch half of launchSlotInner — this test only needs a
+    // slot that owns a session id.
+    checkCliAvailable: vi.fn(async () => false),
+    killSession: vi.fn(async () => {}),
+    assignSessionBranch: vi.fn(async () => ({ branch: null, worktree_path: null })),
+    waitForTerminalReady: vi.fn(async () => {}),
+    writeStdin: vi.fn(async () => {}),
+    writeSessionHooksConfig: vi.fn(async () => {}),
+    removeSessionHooksConfig: vi.fn(async () => {}),
+  };
+});
+
+vi.mock("@/lib/mcp", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/mcp")>();
+  return {
+    ...actual,
+    getProjectMcpServers: vi.fn(async () => []),
+    loadProjectMcpDefaults: vi.fn(async () => null),
+    setSessionMcpServers: vi.fn(async () => {}),
+    writeSessionMcpConfig: vi.fn(async () => {}),
+    writeOpenCodeMcpConfig: vi.fn(async () => {}),
+    removeSessionMcpConfig: vi.fn(async () => {}),
+    removeOpenCodeMcpConfig: vi.fn(async () => {}),
+  };
+});
+
+vi.mock("@/lib/plugins", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/plugins")>();
+  return {
+    ...actual,
+    getProjectPlugins: vi.fn(async () => ({ plugins: [], skills: [] })),
+    loadProjectSkillDefaults: vi.fn(async () => null),
+    loadProjectPluginDefaults: vi.fn(async () => null),
+    loadBranchConfig: vi.fn(async () => null),
+    saveBranchConfig: vi.fn(async () => {}),
+    setSessionSkills: vi.fn(async () => {}),
+    setSessionPlugins: vi.fn(async () => {}),
+    writeSessionPluginConfig: vi.fn(async () => {}),
+    removeSessionPluginConfig: vi.fn(async () => {}),
+  };
+});
+
+vi.mock("@/lib/git", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/git")>();
+  return {
+    ...actual,
+    getBranchesWithWorktreeStatus: vi.fn(async () => []),
+    invalidateCurrentBranchCache: vi.fn(),
+  };
+});
+
+vi.mock("@/lib/worktreeManager", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/worktreeManager")>();
+  return {
+    ...actual,
+    prepareSessionWorktree: vi.fn(),
+    cleanupSessionWorktree: vi.fn(async () => {}),
+  };
+});
+
+import { invoke } from "@tauri-apps/api/core";
+import { killSession } from "@/lib/terminal";
+import { useSessionStore } from "@/stores/useSessionStore";
+import { TerminalGrid, type TerminalGridHandle } from "../TerminalGrid";
+
+const invokeMock = vi.mocked(invoke);
+const killSessionMock = vi.mocked(killSession);
+
+/** Puts a supervision entry on the session, as the supervisor listener would. */
+function superviseSession(sessionId: number, state: string) {
+  useSessionStore.setState((s) => ({
+    samuraiBySessionId: {
+      ...s.samuraiBySessionId,
+      [sessionId]: { project: "C:/proj", epic: "#38", generation: 1, state: state as never },
+    },
+  }));
+}
+
+/** Renders the grid and launches its single slot, returning the session id. */
+async function renderLaunchedGrid() {
+  const ref = createRef<TerminalGridHandle>();
+  render(<TerminalGrid ref={ref} projectPath="C:/proj" tabId="tab-1" isActive />);
+  await act(async () => {
+    await ref.current!.launchAll();
+  });
+  await waitFor(() => expect(useSessionStore.getState().sessions).toHaveLength(1));
+  return useSessionStore.getState().sessions[0].id;
+}
+
+describe("TerminalGrid samurai tile close", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "generate_project_hash") return "hash";
+      // Everything else the card/grid probes (resume sessions, mcp projects)
+      // is a list — an undefined default crashes PreLaunchCard.
+      return [];
+    });
+    killSessionMock.mockClear();
+    useSessionStore.setState({ sessions: [], samuraiBySessionId: {}, parkedSessionIds: [] });
+  });
+
+  it("kills the PTY when a supervised session goes PARKED", async () => {
+    const sessionId = await renderLaunchedGrid();
+    expect(killSessionMock).not.toHaveBeenCalled();
+
+    // The Phase-2 circuit breaker (samurai_progress.rs) transitions to PARKED
+    // with no backend teardown — closing the tile without this kill would
+    // orphan a live `claude --dangerously-skip-permissions` PTY.
+    await act(async () => {
+      superviseSession(sessionId, "PARKED");
+    });
+
+    await waitFor(() => expect(killSessionMock).toHaveBeenCalledWith(sessionId));
+    // The tile is gone too: handleKill still runs the rest of the cleanup.
+    expect(useSessionStore.getState().sessions).toHaveLength(0);
+  });
+
+  it("kills the PTY when a supervised session goes KILLED", async () => {
+    const sessionId = await renderLaunchedGrid();
+
+    await act(async () => {
+      superviseSession(sessionId, "KILLED");
+    });
+
+    await waitFor(() => expect(killSessionMock).toHaveBeenCalledWith(sessionId));
+  });
+
+  it("leaves a DEAD session's tile and PTY alone", async () => {
+    const sessionId = await renderLaunchedGrid();
+
+    await act(async () => {
+      superviseSession(sessionId, "DEAD");
+    });
+
+    expect(killSessionMock).not.toHaveBeenCalled();
+    expect(useSessionStore.getState().sessions).toHaveLength(1);
+  });
+});
