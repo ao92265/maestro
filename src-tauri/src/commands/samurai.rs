@@ -800,6 +800,91 @@ pub fn samurai_file_delete(
     samurai_files::delete_file(&roots, &configs, &entries, &path, force)
 }
 
+/// Biggest file [`samurai_file_read`] will hand to the webview: 2 MB. The
+/// audit logs and the ops journal are append-only JSONL that grow without
+/// bound (the health checker flags them for size), and a multi-MB string
+/// crossing the IPC boundary into a `<pre>` freezes the window. Over the
+/// cap the command says so instead of loading it.
+const FILE_READ_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// The guarded read behind [`samurai_file_read`], extracted from the Tauri
+/// command for testability (the `cleanup_epic_inner` / `harvest::read_report`
+/// precedent).
+///
+/// The containment rule is deliberately the NARROWEST one that serves the
+/// Second Brain: the requested path must canonicalize to a path the CURRENT
+/// inventory returned. Not "any file under the managed roots", not "any file
+/// in a project" — a listed file and nothing else, so this can never become
+/// a general-purpose file reader handed to a webview. Both sides go through
+/// [`samurai_files::canonical_stripped`], so `..` traversal, symlinks, 8.3
+/// short names and Windows `\\?\` / `\\?\UNC\` spellings all collapse to the
+/// same on-disk identity before the compare.
+///
+/// Every refusal is a plain readable string (the command convention here) —
+/// the viewer renders it inline.
+fn read_listed_file(entries: &[SamuraiFileEntry], path: &str) -> Result<String, String> {
+    // A path that cannot be resolved never reaches the compare — this is
+    // also the deleted-between-listing-and-click case, which must read as an
+    // explanation, not a panic.
+    let requested = samurai_files::canonical_stripped(Path::new(path)).ok_or_else(|| {
+        format!("cannot read {path}: the file does not exist or cannot be resolved")
+    })?;
+
+    let listed = entries.iter().any(|entry| {
+        samurai_files::canonical_stripped(Path::new(&entry.path)).is_some_and(|p| p == requested)
+    });
+    if !listed {
+        return Err(format!(
+            "refusing to read {}: the path is not a Samurai-managed file",
+            requested.display()
+        ));
+    }
+
+    let meta = std::fs::metadata(&requested)
+        .map_err(|e| format!("failed to read {}: {e}", requested.display()))?;
+    // The inventory only ever lists regular files, so this can only fire if
+    // the path was swapped for a directory after the listing.
+    if !meta.is_file() {
+        return Err(format!(
+            "refusing to read {}: not a regular file",
+            requested.display()
+        ));
+    }
+    if meta.len() > FILE_READ_MAX_BYTES {
+        return Err(format!(
+            "refusing to read {}: the file is {:.1} MB, over the 2 MB viewer limit — open it in an \
+             external editor",
+            requested.display(),
+            meta.len() as f64 / (1024.0 * 1024.0)
+        ));
+    }
+
+    std::fs::read_to_string(&requested)
+        .map_err(|e| format!("failed to read {}: {e}", requested.display()))
+}
+
+/// Reads one Samurai-managed file by absolute path, read-only — the Second
+/// Brain's file viewer (issue #82) serves every row's content from here, not
+/// just harvest reports. The path is accepted ONLY if it is one the
+/// inventory this command computes itself (the same
+/// [`samurai_files_list`] snapshot) currently returns; anything else, and
+/// anything over the 2 MB cap, is refused with a readable error.
+#[tauri::command]
+pub fn samurai_file_read(
+    supervisor: State<'_, Arc<Supervisor>>,
+    schedule: State<'_, Arc<SamuraiSchedule>>,
+    run_configs: State<'_, Arc<RunConfigStore>>,
+    path: String,
+) -> Result<String, String> {
+    let entries = samurai_files::list_files(
+        &samurai_files_roots(),
+        &run_configs.list_with_paths(),
+        &schedule.list(),
+        &supervisor.list_sessions(),
+    );
+    read_listed_file(&entries, &path)
+}
+
 /// The cancel itself, extracted from the Tauri command for testability (the
 /// `cleanup_epic_inner` precedent): the same `SamuraiSchedule::cancel` path
 /// cleanup step 1 uses, on its own. Like cleanup, the outcome is logged, not
@@ -867,6 +952,7 @@ pub fn samurai_journal_list(
 mod tests {
     use super::*;
     use crate::core::samurai_audit::AuditLog;
+    use crate::core::samurai_files::{strip_extended_length, SamuraiFileKind};
     use crate::core::windows_process::StdCommandExt;
     use tempfile::tempdir;
 
@@ -1576,5 +1662,175 @@ mod tests {
         assert!(report.worktree_removed);
         assert!(report.branch_deleted);
         assert!(!worktree.exists());
+    }
+
+    // --- issue #82: guarded read of any listed Samurai file ---
+
+    /// One inventory row for `path`, the shape `samurai_files_list` returns.
+    /// Only `path` participates in the guard; the rest is presentation.
+    fn listed_row(path: &Path) -> SamuraiFileEntry {
+        SamuraiFileEntry {
+            kind: SamuraiFileKind::Handoff,
+            path: path.to_string_lossy().into_owned(),
+            size_bytes: 0,
+            modified_at: None,
+            project_path: None,
+            epic: None,
+            in_use: false,
+            has_live_session: false,
+            fire_at: None,
+        }
+    }
+
+    #[test]
+    fn test_read_listed_file_reads_a_listed_file_and_refuses_the_rest() {
+        let base = tempdir().unwrap();
+        let dir = base.path().join("handoffs");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let listed = dir.join("handoff.md");
+        std::fs::write(&listed, "# handoff").unwrap();
+        // A real neighbour that is NOT listed, and a real file outside the
+        // directory entirely — both exist, so each is refused by the
+        // containment rule itself rather than by failing to resolve.
+        std::fs::write(dir.join("neighbour.md"), "neighbour").unwrap();
+        std::fs::write(base.path().join("outside.md"), "outside").unwrap();
+        let entries = vec![listed_row(&listed)];
+
+        // Happy path: a listed file reads back verbatim.
+        assert_eq!(
+            read_listed_file(&entries, &listed.to_string_lossy()).unwrap(),
+            "# handoff"
+        );
+
+        // The same file spelled through a `..` hop IS the same file: the
+        // canonicalization is symmetric, so a legitimate spelling still reads.
+        let round_trip = dir.join("sub").join("..").join("handoff.md");
+        assert_eq!(
+            read_listed_file(&entries, &round_trip.to_string_lossy()).unwrap(),
+            "# handoff"
+        );
+
+        // An unrelated absolute path is refused...
+        let err = read_listed_file(&entries, &base.path().join("outside.md").to_string_lossy())
+            .unwrap_err();
+        assert!(err.contains("not a Samurai-managed file"), "{err}");
+
+        // ...and so is the `..` traversal that lands on it: the `..` resolves
+        // BEFORE the compare, so the spelling buys nothing.
+        let sneaky = dir.join("..").join("outside.md");
+        let err = read_listed_file(&entries, &sneaky.to_string_lossy()).unwrap_err();
+        assert!(err.contains("not a Samurai-managed file"), "{err}");
+
+        // A sibling in the very same directory is refused too — the rule is
+        // "a path the listing returned", NOT "anything under a managed root".
+        let err =
+            read_listed_file(&entries, &dir.join("neighbour.md").to_string_lossy()).unwrap_err();
+        assert!(err.contains("not a Samurai-managed file"), "{err}");
+
+        // A LISTED path that is a directory (swapped after the listing) is
+        // refused as content instead of being read.
+        let dirs = vec![listed_row(&dir.join("sub"))];
+        let err = read_listed_file(&dirs, &dir.join("sub").to_string_lossy()).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    #[test]
+    fn test_read_listed_file_refuses_foreign_spellings_on_any_host() {
+        let base = tempdir().unwrap();
+        let listed = base.path().join("journal.jsonl");
+        std::fs::write(&listed, "{}\n").unwrap();
+        let entries = vec![listed_row(&listed)];
+
+        // Windows AND POSIX spellings, asserted on BOTH runners (CI is Linux,
+        // developers are on Windows). Whichever host runs this, one family
+        // resolves and is refused by containment while the other fails to
+        // resolve and is refused before the compare — both are refusals, and
+        // neither ever yields content.
+        for foreign in [
+            r"C:\Windows\win.ini",
+            r"\\?\C:\Windows\win.ini",
+            r"C:\Users\someone\.ssh\id_rsa",
+            r"\\?\UNC\server\share\secret.txt",
+            r"\\server\share\secret.txt",
+            r"..\..\..\..\Windows\win.ini",
+            "/etc/passwd",
+            "/etc/./passwd",
+            "../../../../etc/passwd",
+        ] {
+            match read_listed_file(&entries, foreign) {
+                Ok(content) => panic!("read a path outside the listing ({foreign}): {content:?}"),
+                Err(err) => assert!(
+                    err.contains("not a Samurai-managed file")
+                        || err.contains("does not exist or cannot be resolved"),
+                    "unexpected refusal for {foreign}: {err}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_strip_extended_length_maps_both_windows_prefixes() {
+        // The guard's Windows spelling rule as pure string logic, so it is
+        // asserted on a Linux runner too — `fs::canonicalize` only ever emits
+        // `\\?\` on Windows, so the canonicalizing path cannot exercise it
+        // there. `\\?\UNC\` is the twin trap flagged in harvest.rs: dropping
+        // only `\\?\` leaves a RELATIVE `UNC\server\share\…` that resolves
+        // against the process cwd.
+        let unc = strip_extended_length(r"\\?\UNC\server\share\journal.jsonl");
+        assert_eq!(unc, r"\\server\share\journal.jsonl");
+        assert!(!unc.starts_with("UNC"), "{unc}");
+        assert_eq!(
+            strip_extended_length(r"\\?\C:\data\journal.jsonl"),
+            r"C:\data\journal.jsonl"
+        );
+        // Already-plain spellings pass through untouched, both families.
+        assert_eq!(
+            strip_extended_length(r"C:\data\journal.jsonl"),
+            r"C:\data\journal.jsonl"
+        );
+        assert_eq!(
+            strip_extended_length("/var/data/journal.jsonl"),
+            "/var/data/journal.jsonl"
+        );
+    }
+
+    #[test]
+    fn test_read_listed_file_refuses_over_the_size_cap() {
+        let base = tempdir().unwrap();
+        let big = base.path().join("audit.jsonl");
+        std::fs::write(&big, vec![b'x'; FILE_READ_MAX_BYTES as usize + 1]).unwrap();
+        let entries = vec![listed_row(&big)];
+
+        // Over the cap: an explanation, and the bytes stay on disk.
+        let err = read_listed_file(&entries, &big.to_string_lossy()).unwrap_err();
+        assert!(err.contains("over the 2 MB viewer limit"), "{err}");
+        assert!(err.contains("2.0 MB"), "{err}");
+
+        // Exactly at the cap still reads — the refusal is strictly ">".
+        std::fs::write(&big, vec![b'x'; FILE_READ_MAX_BYTES as usize]).unwrap();
+        assert_eq!(
+            read_listed_file(&entries, &big.to_string_lossy())
+                .unwrap()
+                .len(),
+            FILE_READ_MAX_BYTES as usize
+        );
+    }
+
+    #[test]
+    fn test_read_listed_file_explains_a_file_deleted_after_the_listing() {
+        let base = tempdir().unwrap();
+        let gone = base.path().join("handoff.md");
+        std::fs::write(&gone, "# handoff").unwrap();
+        let entries = vec![listed_row(&gone)];
+        std::fs::remove_file(&gone).unwrap();
+
+        // Deleted between the listing and the click: a readable explanation
+        // the viewer can render inline, never a panic.
+        let err = read_listed_file(&entries, &gone.to_string_lossy()).unwrap_err();
+        assert!(
+            err.contains("does not exist or cannot be resolved"),
+            "{err}"
+        );
+        assert!(err.contains("handoff.md"), "{err}");
     }
 }

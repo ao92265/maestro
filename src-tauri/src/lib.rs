@@ -1007,6 +1007,8 @@ pub fn run() {
             // Samurai Second Brain file inventory (issue #65)
             commands::samurai::samurai_files_list,
             commands::samurai::samurai_file_delete,
+            // Guarded read of any listed Samurai file (issue #82)
+            commands::samurai::samurai_file_read,
             commands::samurai::samurai_timer_cancel,
             // Samurai journal (Phase 5, issue #69)
             commands::samurai::samurai_journal_add,

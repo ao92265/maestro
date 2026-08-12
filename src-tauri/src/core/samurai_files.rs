@@ -534,19 +534,34 @@ fn stat(path: &Path) -> Option<(u64, Option<String>)> {
 /// `fs::canonicalize` + `\\?\` strip: the one true on-disk identity of a
 /// path (resolves `..`, short names and case), per fork convention. `None`
 /// when the path does not exist.
-fn canonical_stripped(path: &Path) -> Option<PathBuf> {
+///
+/// `pub(crate)`: the Second Brain's guarded read
+/// (`commands/samurai.rs::samurai_file_read`, issue #82) must canonicalize
+/// both sides of its containment check exactly the way the delete above
+/// does — one canonicalization shared, never a second copy that can drift.
+pub(crate) fn canonical_stripped(path: &Path) -> Option<PathBuf> {
     let canonical = std::fs::canonicalize(path).ok()?;
-    let s = canonical.to_string_lossy();
-    // `\\?\UNC\server\share\…` is a NETWORK path: it must strip back to
-    // `\\server\share\…`. Dropping only `\\?\` would leave a RELATIVE
-    // `UNC\…` path, which resolves against the process cwd and fails every
-    // `is_file()` — the case that hits any redirected AppData or
-    // share-hosted worktree.
-    let stripped = match s.strip_prefix(r"\\?\UNC\") {
+    Some(PathBuf::from(strip_extended_length(
+        &canonical.to_string_lossy(),
+    )))
+}
+
+/// The `\\?\` / `\\?\UNC\` strip on its own, as a pure string step.
+///
+/// `\\?\UNC\server\share\…` is a NETWORK path: it must strip back to
+/// `\\server\share\…`. Dropping only `\\?\` would leave a RELATIVE `UNC\…`
+/// path, which resolves against the process cwd and fails every
+/// `is_file()` — the case that hits any redirected AppData or share-hosted
+/// worktree.
+///
+/// Split out of [`canonical_stripped`] so that rule is unit-testable on a
+/// host that cannot produce the prefix: `fs::canonicalize` only ever emits
+/// `\\?\` on Windows, and CI runs on Linux.
+pub(crate) fn strip_extended_length(path: &str) -> String {
+    match path.strip_prefix(r"\\?\UNC\") {
         Some(rest) => format!(r"\\{rest}"),
-        None => s.strip_prefix(r"\\?\").unwrap_or(&s).to_string(),
-    };
-    Some(PathBuf::from(stripped))
+        None => path.strip_prefix(r"\\?\").unwrap_or(path).to_string(),
+    }
 }
 
 /// Lossless `\\?\`-strip of a path for display/wire use (no canonicalize —
