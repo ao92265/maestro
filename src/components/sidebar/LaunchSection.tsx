@@ -760,7 +760,15 @@ export function LaunchSection({
               <RunRow
                 key={`${run.project_path}-${run.epic}`}
                 run={run}
-                target={findOpenTarget(run, samuraiBySessionId, tabs)}
+                // No route out of the sidebar means the button cannot do what
+                // it offers, so it must not offer it — "no silent no-op"
+                // applies to a missing `onNavigate` exactly as it does to a
+                // missing session.
+                target={
+                  onNavigate
+                    ? findOpenTarget(run, samuraiBySessionId, tabs)
+                    : { kind: "blocked", reason: NO_SESSION_REASON }
+                }
                 onOpen={(tabId, sessionId) => onNavigate?.(tabId, sessionId)}
                 onCleanup={handleCleanup}
                 busy={cleaningEpic !== null}
