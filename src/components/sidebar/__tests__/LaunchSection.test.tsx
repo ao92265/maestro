@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The persisted zustand stores hydrate through the Tauri store plugin at
 // import time; happy-dom has no Tauri backend, so stub it out.
@@ -26,10 +26,55 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(),
 }));
 
-import type { SamuraiPreflight, SamuraiRunConfig, SamuraiTestGateProgress } from "@/lib/samurai";
+import type {
+  SamuraiPreflight,
+  SamuraiRunConfig,
+  SamuraiTestGateProgress,
+  SamuraiWorkflowGraph,
+} from "@/lib/samurai";
 import type { UsageData } from "@/lib/usageParser";
+import { useSamuraiWorkflowStore } from "@/stores/useSamuraiWorkflowStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 import { LaunchSection } from "../LaunchSection";
+
+/**
+ * The section now embeds the React Flow workflow editor (issue #91), which
+ * measures through browser APIs happy-dom lacks — the LandscapeView test's
+ * stub block.
+ */
+beforeAll(() => {
+  class ResizeObserverStub {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  vi.stubGlobal("ResizeObserver", ResizeObserverStub);
+  vi.stubGlobal(
+    "DOMMatrixReadOnly",
+    class {
+      m22 = 1;
+      constructor(_transform?: string) {}
+    },
+  );
+  Object.defineProperty(HTMLElement.prototype, "getBoundingClientRect", {
+    configurable: true,
+    value: () => ({
+      x: 0,
+      y: 0,
+      width: 1200,
+      height: 800,
+      top: 0,
+      left: 0,
+      right: 1200,
+      bottom: 800,
+      toJSON: () => {},
+    }),
+  });
+  Object.defineProperty(SVGElement.prototype, "getBBox", {
+    configurable: true,
+    value: () => ({ x: 0, y: 0, width: 0, height: 0 }),
+  });
+});
 
 const invokeMock = vi.mocked(invoke);
 const askMock = vi.mocked(ask);
@@ -94,9 +139,22 @@ function run(overrides: Partial<SamuraiRunConfig> = {}): SamuraiRunConfig {
     worktree_path: "C:\\data\\worktrees\\maestro-abc\\samurai-38",
     model: null,
     thresholds: null,
+    workflow: null,
     status: "ACTIVE",
     created_at: "2026-08-06T10:00:00Z",
     ...overrides,
+  };
+}
+
+/** A minimal workflow graph, for the editor fallback and edited-graph cases. */
+function workflowGraph(): SamuraiWorkflowGraph {
+  return {
+    nodes: [
+      { id: "implement", text: "Implement the issue." },
+      { id: "verify", text: "Verify and push." },
+    ],
+    edges: [{ from: "implement", to: "verify" }],
+    start: "implement",
   };
 }
 
@@ -132,6 +190,9 @@ function mockInvoke({
           worktree_path: "C:\\data\\worktrees\\maestro-abc\\samurai-38",
           branch_deleted: true,
         };
+      // The embedded workflow editor's display fallback (issue #91).
+      case "samurai_default_workflow":
+        return workflowGraph();
       default:
         return undefined;
     }
@@ -157,6 +218,8 @@ describe("LaunchSection (issue #63)", () => {
     }) as typeof listen);
     mockInvoke();
     useWorkspaceStore.setState({ tabs: [buildTab()] });
+    // Untouched workflow editor by default — launches send workflow: null.
+    useSamuraiWorkflowStore.setState({ graph: null });
   });
 
   it("renders the form with the active project and a disabled Launch button", async () => {
@@ -198,11 +261,24 @@ describe("LaunchSection (issue #63)", () => {
       model: null,
       handoffContextPct: null,
       skipTestGate: false,
-      // Issue #91: no workflow editor input on this panel yet — the backend
-      // falls back to (and snapshots) the default template.
+      // Issue #91: the workflow editor is untouched — null lets the backend
+      // fall back to (and snapshot) the default template.
       workflow: null,
     });
     expect(await screen.findByText(/Run launched: #38 on samurai-38/)).toBeInTheDocument();
+  });
+
+  it("sends the edited workflow graph with the launch (issue #91)", async () => {
+    // A persisted edit (here: the chain cut after "implement") rides the
+    // launch verbatim — the backend snapshots exactly what the editor holds.
+    const edited: SamuraiWorkflowGraph = { ...workflowGraph(), edges: [] };
+    useSamuraiWorkflowStore.setState({ graph: edited });
+    render(<LaunchSection />);
+    fireEvent.change(screen.getByLabelText("Issues"), { target: { value: "#38" } });
+    fireEvent.click(screen.getByRole("button", { name: "Launch" }));
+
+    await waitFor(() => expect(callsOf("samurai_launch_run")).toHaveLength(1));
+    expect(callsOf("samurai_launch_run")[0][1]).toMatchObject({ workflow: edited });
   });
 
   it("accepts a comma-separated issue list as one run", async () => {

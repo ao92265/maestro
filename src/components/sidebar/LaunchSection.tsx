@@ -23,9 +23,11 @@ import {
   samuraiPreflight,
 } from "@/lib/samurai";
 import type { UsageData } from "@/lib/usageParser";
+import { useSamuraiWorkflowStore } from "@/stores/useSamuraiWorkflowStore";
 import { useUsageStore } from "@/stores/useUsageStore";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { cardClass, SectionHeader } from "./sectionChrome";
+import { WorkflowGraphEditor } from "./WorkflowGraphEditor";
 
 /** Last path segment, for compact project display. */
 function baseName(path: string): string {
@@ -295,6 +297,11 @@ export function LaunchSection() {
   const startPolling = useUsageStore((s) => s.startPolling);
   useEffect(() => startPolling(), [startPolling]);
 
+  // Issue #91: the edited workflow graph (null = never edited — the backend
+  // then compiles its default template). Whatever this holds at launch is
+  // snapshotted into the run config.
+  const workflow = useSamuraiWorkflowStore((s) => s.graph);
+
   const [epic, setEpic] = useState("");
   const [model, setModel] = useState("");
   // Review F4: optional per-run handoff trigger override. Empty = the
@@ -441,6 +448,7 @@ export function LaunchSection() {
         model.trim() || null,
         pct,
         skipGate,
+        workflow,
       );
       if (currentProjectRef.current !== target) return;
       setNotice(
@@ -703,6 +711,10 @@ export function LaunchSection() {
           </div>
         )}
       </div>
+
+      {/* Issue #91: the run workflow the briefs compile from — edited here,
+          persisted across restarts, sent with the launch above. */}
+      <WorkflowGraphEditor />
     </div>
   );
 }
