@@ -549,6 +549,8 @@ fn apply(
             );
             // The RESUME row BEFORE the spawn, so the trail always explains
             // the SPAWN row that follows (the resumer's discipline).
+            // `predecessor_generation` names what gen-N+1 resumes from
+            // (issue #101).
             audit.append(
                 &config.project_path,
                 AuditEvent::now(
@@ -557,7 +559,7 @@ fn apply(
                     next,
                     // 0 sentinel: the successor session does not exist yet.
                     0,
-                    json!({ "trigger": "cold_start" }),
+                    json!({ "trigger": "cold_start", "predecessor_generation": prior }),
                 ),
             );
             replicator.spawn_generation(
@@ -566,6 +568,7 @@ fn apply(
                 &config.worktree_path,
                 next,
                 Some(prior),
+                "cold_start",
             );
         }
         ReconcileAction::AlertNoGhAuth => {
@@ -991,6 +994,11 @@ mod tests {
         assert_eq!(resumes[0].generation, 2);
         assert_eq!(resumes[0].session_id, 0);
         assert_eq!(resumes[0].details["trigger"], "cold_start");
+        // Issue #101: the row names the generation it resumes from, and the
+        // staged spawn's SPAWN linkage carries the same trigger.
+        assert_eq!(resumes[0].details["predecessor_generation"], 1);
+        let staged = h.replicator.spawn_details(project, "#2", 2).unwrap();
+        assert_eq!(staged["trigger"], "cold_start");
     }
 
     #[tokio::test]

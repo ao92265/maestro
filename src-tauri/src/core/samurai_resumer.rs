@@ -236,7 +236,10 @@ impl SamuraiResumer {
             entry.fire_at,
         );
         // The RESUME row (this kind's first producer) BEFORE the spawn, so
-        // the trail always explains the SPAWN row that follows.
+        // the trail always explains the SPAWN row that follows. `fire_at`
+        // doubles as the timer id — the schedule keys entries by (project,
+        // epic, fire_at) — and `predecessor_generation` names what gen-N+1
+        // resumes from (issue #101).
         self.audit.append(
             &entry.project_path,
             AuditEvent::now(
@@ -245,7 +248,11 @@ impl SamuraiResumer {
                 generation,
                 // 0 sentinel: the successor session does not exist yet.
                 0,
-                json!({ "fire_at": entry.fire_at }),
+                json!({
+                    "trigger": "resume_timer",
+                    "fire_at": entry.fire_at,
+                    "predecessor_generation": prior,
+                }),
             ),
         );
         self.replicator.spawn_generation(
@@ -254,6 +261,7 @@ impl SamuraiResumer {
             &working_dir,
             generation,
             Some(prior),
+            "resume_timer",
         );
     }
 
@@ -636,6 +644,10 @@ mod tests {
         assert_eq!(resume[0].generation, 3);
         assert_eq!(resume[0].session_id, 0);
         assert_eq!(resume[0].details["fire_at"], "2026-08-06T12:00:00+00:00");
+        // Issue #101: the row names its trigger (fire_at doubles as the
+        // timer id) and the generation it resumes from.
+        assert_eq!(resume[0].details["trigger"], "resume_timer");
+        assert_eq!(resume[0].details["predecessor_generation"], 2);
 
         // The handoff exists → the staged ritual is the normal successor
         // one (verify required — the fixture handoff has no SHA), never
@@ -646,6 +658,7 @@ mod tests {
             .expect("gen-3 must be staged");
         assert_eq!(staged["predecessor_generation"], 2);
         assert_eq!(staged["predecessor_session_id"], 0);
+        assert_eq!(staged["trigger"], "resume_timer");
     }
 
     #[tokio::test]

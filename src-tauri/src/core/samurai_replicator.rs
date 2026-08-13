@@ -197,6 +197,11 @@ struct PendingRitual {
     /// predecessor at all, so the SPAWN audit details carry
     /// `trigger: "launch"` instead of predecessor linkage.
     launch: bool,
+    /// What started this generation (issue #101): `"handoff"` (validated
+    /// handoff chain), `"watchdog"` (DEAD recovery), `"resume_timer"` /
+    /// `"cold_start"` (fresh spawns) or `"launch"`. Rides into the SPAWN
+    /// audit row's details so the trail explains why gen-N+1 exists.
+    trigger: &'static str,
     queued_at: AgeableInstant,
     /// Set when the frontend registered the successor: (session id, when).
     /// The no-start clock runs from here; before registration it runs from
@@ -944,6 +949,7 @@ impl SamuraiReplicator {
             predecessor_generation: snapshot.generation,
             recovery,
             launch: false,
+            trigger: "handoff",
             queued_at: AgeableInstant::now(),
             registered: None,
             alerted: false,
@@ -1048,6 +1054,7 @@ impl SamuraiReplicator {
                 predecessor_generation: snapshot.generation,
                 recovery: true,
                 launch: false,
+                trigger: "watchdog",
                 queued_at: AgeableInstant::now(),
                 registered: None,
                 alerted: false,
@@ -1158,6 +1165,7 @@ impl SamuraiReplicator {
         working_dir: &str,
         generation: u32,
         prior_generation: Option<u32>,
+        trigger: &'static str,
     ) {
         let Some(prior) = prior_generation else {
             log::error!(
@@ -1249,6 +1257,7 @@ impl SamuraiReplicator {
                 predecessor_generation: prior,
                 recovery: true,
                 launch: false,
+                trigger,
                 queued_at: AgeableInstant::now(),
                 registered: None,
                 alerted: false,
@@ -1424,6 +1433,7 @@ impl SamuraiReplicator {
                 predecessor_generation: 0,
                 recovery: false,
                 launch: true,
+                trigger: "launch",
                 queued_at: AgeableInstant::now(),
                 registered: None,
                 alerted: false,
@@ -1519,6 +1529,9 @@ impl SamuraiReplicator {
                 let mut details = json!({
                     "predecessor_session_id": p.predecessor_session_id,
                     "predecessor_generation": p.predecessor_generation,
+                    // Issue #101: WHY this generation exists — handoff,
+                    // watchdog recovery, resume timer or cold start.
+                    "trigger": p.trigger,
                 });
                 // Issue #56: mark RECOVERY successors on their SPAWN row;
                 // normal successors keep the exact P2.4 shape.
@@ -1625,6 +1638,35 @@ impl SamuraiReplicator {
             );
             // Text only — the writer submits it (see [`StdinWriter`]).
             (self.write_stdin)(*session_id, p.instruction.clone());
+            // Issue #101: the brief Maestro typed into the fresh terminal is
+            // an injection like any other — record what was said (bounded
+            // excerpt) and what let it through (the first SessionStarted).
+            // No ACK ladder exists here; submission is watched below and
+            // failures land as submit_retry / submit_unconfirmed ALERTs.
+            let (excerpt, total_chars) =
+                super::samurai_audit::instruction_excerpt(&p.instruction);
+            self.audit.append(
+                &p.project,
+                AuditEvent::now(
+                    p.epic.clone(),
+                    AuditEventKind::Inject,
+                    p.generation,
+                    *session_id,
+                    json!({
+                        "phase": "delivered",
+                        "instruction": if p.launch {
+                            "launch_brief"
+                        } else if p.recovery {
+                            "recovery_ritual"
+                        } else {
+                            "successor_ritual"
+                        },
+                        "gate": "session_started",
+                        "excerpt": excerpt,
+                        "total_chars": total_chars,
+                    }),
+                ),
+            );
             self.lock_delivered().push(DeliveredWatch {
                 project: p.project.clone(),
                 epic: p.epic.clone(),
@@ -2430,6 +2472,8 @@ mod tests {
         let details = h.replicator.spawn_details(project, "epic-9", 3).unwrap();
         assert_eq!(details["predecessor_session_id"], 1);
         assert_eq!(details["predecessor_generation"], 2);
+        // Issue #101: the SPAWN details name why gen-3 exists.
+        assert_eq!(details["trigger"], "handoff");
         let snapshot = h
             .supervisor
             .register_session_with_details(2, project.into(), "epic-9".into(), 3, details)
@@ -2453,6 +2497,7 @@ mod tests {
         assert_eq!(spawn_rows.len(), 1);
         assert_eq!(spawn_rows[0].details["predecessor_session_id"], 1);
         assert_eq!(spawn_rows[0].details["predecessor_generation"], 2);
+        assert_eq!(spawn_rows[0].details["trigger"], "handoff");
         assert_eq!(spawn_rows[0].details["state"], "WORKING");
         assert_eq!(spawn_rows[0].generation, 3);
 
@@ -2471,6 +2516,36 @@ mod tests {
         assert!(!writes[0].1.contains('\n'));
         assert!(writes[0].1.contains("generation 3"));
         assert!(writes[0].1.contains(".maestro/handoffs/epic-9-gen2.md"));
+
+        // Issue #101: the delivered ritual lands an INJECT audit row with a
+        // bounded excerpt of the exact text typed in.
+        let mut inject_rows = Vec::new();
+        for _ in 0..200 {
+            let rows = h.audit.read(project, None, None).await.unwrap().events;
+            inject_rows = rows
+                .into_iter()
+                .filter(|r| r.event == AuditEventKind::Inject)
+                .collect();
+            if !inject_rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(inject_rows.len(), 1);
+        let inject = &inject_rows[0];
+        assert_eq!(inject.session_id, 2);
+        assert_eq!(inject.generation, 3);
+        assert_eq!(inject.epic, "epic-9");
+        assert_eq!(inject.details["phase"], "delivered");
+        assert_eq!(inject.details["instruction"], "successor_ritual");
+        assert_eq!(inject.details["gate"], "session_started");
+        let excerpt = inject.details["excerpt"].as_str().unwrap();
+        assert!(writes[0].1.starts_with(excerpt), "excerpt is a prefix");
+        assert!(excerpt.chars().count() <= crate::core::samurai_audit::EXCERPT_MAX_CHARS);
+        assert_eq!(
+            inject.details["total_chars"].as_u64().unwrap() as usize,
+            writes[0].1.chars().count()
+        );
 
         // Delivery completes the entry: a restart never re-injects.
         assert!(h.replicator.pending_view(3).is_none());
@@ -3005,6 +3080,8 @@ mod tests {
         assert_eq!(details["recovery"], true);
         assert_eq!(details["predecessor_session_id"], 1);
         assert_eq!(details["predecessor_generation"], 2);
+        // Issue #101: the watchdog's DEAD verdict is what spawned gen-3.
+        assert_eq!(details["trigger"], "watchdog");
         let registered = h
             .supervisor
             .register_session_with_details(2, project.into(), "epic-9".into(), 3, details)
@@ -3349,7 +3426,7 @@ mod tests {
 
         // A fresh spawn (resume/reconcile path) carries the config's model …
         h.replicator
-            .spawn_generation(project, "epic-9", &working_dir, 4, Some(3));
+            .spawn_generation(project, "epic-9", &working_dir, 4, Some(3), "resume_timer");
         wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
         assert_eq!(
             h.spawns.lock().unwrap()[0].model.as_deref(),
@@ -3418,7 +3495,7 @@ mod tests {
 
         // The successor ritual (handoff present) carries the STORED graph.
         h.replicator
-            .spawn_generation(project, "epic-9", &working_dir, 4, Some(3));
+            .spawn_generation(project, "epic-9", &working_dir, 4, Some(3), "resume_timer");
         wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
         let (_, instruction) = h.replicator.pending_view(4).unwrap();
         assert!(
@@ -3438,7 +3515,7 @@ mod tests {
         // takes the recovery ritual — no epic-88 handoff exists — which
         // must carry the workflow too).
         h.replicator
-            .spawn_generation(project, "epic-88", &working_dir, 6, Some(5));
+            .spawn_generation(project, "epic-88", &working_dir, 6, Some(5), "resume_timer");
         wait_until(|| h.spawns.lock().unwrap().len() >= 2).await;
         let (_, instruction) = h.replicator.pending_view(6).unwrap();
         assert!(instruction.contains("RECOVERY MODE"), "{instruction}");
@@ -3462,7 +3539,7 @@ mod tests {
         let working_dir = repo.path().to_string_lossy().into_owned();
 
         h.replicator
-            .spawn_generation("C:/git/proj-sg-match", "epic-9", &working_dir, 4, Some(3));
+            .spawn_generation("C:/git/proj-sg-match", "epic-9", &working_dir, 4, Some(3), "resume_timer");
         wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
 
         // The spawn event names the fresh generation and its working dir.
@@ -3484,6 +3561,15 @@ mod tests {
         assert!(instruction.contains("journal.jsonl"));
         assert!(instruction.contains("\"BOTTLENECK\""));
         assert!(!instruction.contains('\n'));
+
+        // Issue #101: a fresh spawn's SPAWN linkage names its trigger (the
+        // resumer passes "resume_timer", the reconciler "cold_start").
+        let details = h
+            .replicator
+            .spawn_details("C:/git/proj-sg-match", "epic-9", 4)
+            .unwrap();
+        assert_eq!(details["trigger"], "resume_timer");
+        assert_eq!(details["predecessor_generation"], 3);
     }
 
     #[tokio::test]
@@ -3495,7 +3581,7 @@ mod tests {
         let working_dir = repo.path().to_string_lossy().into_owned();
 
         h.replicator
-            .spawn_generation("C:/git/proj-sg-rec", "epic-9", &working_dir, 4, Some(3));
+            .spawn_generation("C:/git/proj-sg-rec", "epic-9", &working_dir, 4, Some(3), "resume_timer");
         wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
 
         let (_, instruction) = h.replicator.pending_view(4).unwrap();
@@ -3527,9 +3613,9 @@ mod tests {
         let working_dir = repo.path().to_string_lossy().into_owned();
 
         h.replicator
-            .spawn_generation("C:/git/proj-sg-idem", "epic-9", &working_dir, 4, Some(3));
+            .spawn_generation("C:/git/proj-sg-idem", "epic-9", &working_dir, 4, Some(3), "resume_timer");
         h.replicator
-            .spawn_generation("C:/git/proj-sg-idem", "epic-9", &working_dir, 4, Some(3));
+            .spawn_generation("C:/git/proj-sg-idem", "epic-9", &working_dir, 4, Some(3), "resume_timer");
         wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
         // Give the (single) async prep task time to finish emitting.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3545,7 +3631,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         h.replicator
-            .spawn_generation("C:/git/proj-sg-gen1", "epic-9", "C:/tmp/wt", 1, None);
+            .spawn_generation("C:/git/proj-sg-gen1", "epic-9", "C:/tmp/wt", 1, None, "resume_timer");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(h.replicator.pending_count(1), 0);
         assert!(h.spawns.lock().unwrap().is_empty());
@@ -3886,7 +3972,7 @@ mod tests {
         let working_dir = repo.path().to_string_lossy().into_owned();
 
         h.replicator
-            .spawn_generation(project, "epic-9", &working_dir, 4, Some(3));
+            .spawn_generation(project, "epic-9", &working_dir, 4, Some(3), "resume_timer");
         wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
         assert_eq!(h.spawns.lock().unwrap().len(), 1);
 
@@ -3975,7 +4061,7 @@ mod tests {
         let working_dir = repo.path().to_string_lossy().into_owned();
 
         h.replicator
-            .spawn_generation(project, "epic-9", &working_dir, 4, Some(3));
+            .spawn_generation(project, "epic-9", &working_dir, 4, Some(3), "resume_timer");
         wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
 
         let details = h.replicator.spawn_details(project, "epic-9", 4).unwrap();

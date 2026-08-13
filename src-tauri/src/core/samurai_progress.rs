@@ -133,6 +133,11 @@ enum Job {
 fn is_self_event(event: &AuditEvent) -> bool {
     match event.event {
         AuditEventKind::Park => true,
+        // INJECT rows (issue #101) record Maestro's OWN typing — replay
+        // telemetry, not evidence of orchestrator burn. Counting them would
+        // add two rows per handoff cycle and trip the breaker faster for
+        // the same behavior.
+        AuditEventKind::Inject => true,
         AuditEventKind::Alert => matches!(
             event.details["kind"].as_str(),
             Some("circuit_breaker") | Some("handoff_churn")
