@@ -73,7 +73,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::json;
@@ -83,7 +83,7 @@ use crate::commands::ai_runner::{strip_ansi, truncate_chars};
 use super::claude_event::ClaudeEvent;
 use super::samurai_audit::{AuditEvent, AuditEventKind, AuditLog};
 use super::samurai_config::SharedSamuraiConfig;
-use super::samurai_injector::{strip_extended_prefix, SessionDirResolver};
+use super::samurai_injector::{strip_extended_prefix, AgeableInstant, SessionDirResolver};
 use super::samurai_journal::default_journal_file;
 use super::samurai_prompts;
 use super::supervisor::{SessionSnapshot, Supervisor, SupervisorState};
@@ -187,11 +187,11 @@ struct PendingRitual {
     /// predecessor at all, so the SPAWN audit details carry
     /// `trigger: "launch"` instead of predecessor linkage.
     launch: bool,
-    queued_at: Instant,
+    queued_at: AgeableInstant,
     /// Set when the frontend registered the successor: (session id, when).
     /// The no-start clock runs from here; before registration it runs from
     /// `queued_at` so a spawn flow that never happens still ALERTs.
-    registered: Option<(u32, Instant)>,
+    registered: Option<(u32, AgeableInstant)>,
     /// The no-start timeout fired for this entry (fresh-eyes finding G).
     /// Latched instead of deleted: a successor registered LATE (frontend
     /// stall past the timeout) must still get its ritual armed and
@@ -224,7 +224,11 @@ fn head_matches(handoff_sha: Option<&str>, current_head: Option<&str>) -> bool {
 
 /// Whether one pending ritual has waited too long for its successor to
 /// start. Strict boundary, same discipline as the injector's timeouts.
-fn no_start_expired(queued_at: Instant, registered_at: Option<Instant>, timeout: Duration) -> bool {
+fn no_start_expired(
+    queued_at: AgeableInstant,
+    registered_at: Option<AgeableInstant>,
+    timeout: Duration,
+) -> bool {
     registered_at.unwrap_or(queued_at).elapsed() > timeout
 }
 
@@ -815,7 +819,7 @@ impl SamuraiReplicator {
             predecessor_generation: snapshot.generation,
             recovery,
             launch: false,
-            queued_at: Instant::now(),
+            queued_at: AgeableInstant::now(),
             registered: None,
             alerted: false,
             respawn: None,
@@ -915,7 +919,7 @@ impl SamuraiReplicator {
                 predecessor_generation: snapshot.generation,
                 recovery: true,
                 launch: false,
-                queued_at: Instant::now(),
+                queued_at: AgeableInstant::now(),
                 registered: None,
                 alerted: false,
                 respawn: None,
@@ -1109,7 +1113,7 @@ impl SamuraiReplicator {
                 predecessor_generation: prior,
                 recovery: true,
                 launch: false,
-                queued_at: Instant::now(),
+                queued_at: AgeableInstant::now(),
                 registered: None,
                 alerted: false,
                 respawn: Some(RespawnState {
@@ -1282,7 +1286,7 @@ impl SamuraiReplicator {
                 predecessor_generation: 0,
                 recovery: false,
                 launch: true,
-                queued_at: Instant::now(),
+                queued_at: AgeableInstant::now(),
                 registered: None,
                 alerted: false,
                 respawn: Some(RespawnState {
@@ -1433,7 +1437,7 @@ impl SamuraiReplicator {
                 && p.epic == snapshot.epic
                 && p.project == snapshot.project
         }) {
-            p.registered = Some((snapshot.session_id, Instant::now()));
+            p.registered = Some((snapshot.session_id, AgeableInstant::now()));
             if p.alerted {
                 // Finding G: the successor_no_start ALERT already fired, but
                 // the entry was latched — a late registration still gets the
@@ -1547,7 +1551,7 @@ impl SamuraiReplicator {
                                 respawn.attempts += 1;
                                 // Restart the window so each emit gets a
                                 // full ack_timeout to land.
-                                p.queued_at = Instant::now();
+                                p.queued_at = AgeableInstant::now();
                                 re_emits.push(respawn.spawn.clone());
                             }
                         }
@@ -1679,6 +1683,12 @@ impl SamuraiReplicator {
 
     /// Test-only: age a staged ritual's clocks so timeout paths run without
     /// real waiting.
+    ///
+    /// Ages by advancing the clocks' *reading* side (`AgeableInstant`'s
+    /// extra elapsed time) rather than rewinding the stored `Instant` —
+    /// `Instant::now().checked_sub(by)` underflows whenever machine uptime
+    /// is shorter than `by` (issue #90), which made this flaky right after
+    /// a reboot.
     #[cfg(test)]
     fn backdate(&self, generation: u32, by: Duration) {
         let mut pending = self.lock_pending();
@@ -1686,9 +1696,9 @@ impl SamuraiReplicator {
             .iter_mut()
             .find(|p| p.generation == generation)
             .expect("no staged ritual");
-        p.queued_at = p.queued_at.checked_sub(by).expect("backdate underflow");
-        if let Some((id, at)) = p.registered {
-            p.registered = Some((id, at.checked_sub(by).expect("backdate underflow")));
+        p.queued_at.backdate(by);
+        if let Some((_, at)) = &mut p.registered {
+            at.backdate(by);
         }
     }
 }
@@ -1894,8 +1904,11 @@ mod tests {
     #[test]
     fn test_no_start_expiry_is_strict_and_prefers_registration_clock() {
         let timeout = Duration::from_secs(180);
-        let now = Instant::now();
-        let old = now.checked_sub(Duration::from_secs(181)).unwrap();
+        let now = AgeableInstant::now();
+        // Backdating (not `Instant::checked_sub`) so this can't underflow on
+        // a freshly booted machine — see issue #90.
+        let mut old = AgeableInstant::now();
+        old.backdate(Duration::from_secs(181));
         // Unregistered: the queue clock decides.
         assert!(no_start_expired(old, None, timeout));
         assert!(!no_start_expired(now, None, timeout));

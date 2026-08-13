@@ -199,8 +199,10 @@ fn corrective_instruction_for(
 /// machine's uptime is shorter than `by` — flaky right after a reboot, green
 /// on a long-running box. Advancing the *reading* side instead (adding to
 /// elapsed time) can never underflow, so tests age these clocks that way.
+/// `pub(crate)`: shared with `samurai_replicator`, which has the same
+/// backdate-for-tests need on its own staged-ritual clocks.
 #[derive(Clone, Copy)]
-struct AgeableInstant {
+pub(crate) struct AgeableInstant {
     at: Instant,
     /// Test-only extra age layered on top of `at`'s real elapsed time.
     /// Always zero outside tests; production reads are unaffected.
@@ -209,7 +211,7 @@ struct AgeableInstant {
 }
 
 impl AgeableInstant {
-    fn now() -> Self {
+    pub(crate) fn now() -> Self {
         Self {
             at: Instant::now(),
             #[cfg(test)]
@@ -217,7 +219,7 @@ impl AgeableInstant {
         }
     }
 
-    fn elapsed(&self) -> Duration {
+    pub(crate) fn elapsed(&self) -> Duration {
         #[cfg(test)]
         {
             self.at.elapsed() + self.extra
@@ -230,7 +232,7 @@ impl AgeableInstant {
 
     /// Test-only: simulate `by` additional elapsed time on this timestamp.
     #[cfg(test)]
-    fn backdate(&mut self, by: Duration) {
+    pub(crate) fn backdate(&mut self, by: Duration) {
         self.extra += by;
     }
 }
