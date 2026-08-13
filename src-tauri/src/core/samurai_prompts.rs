@@ -554,9 +554,16 @@ pub fn launch_instruction(epic: &str, repo_pin: Option<&str>) -> String {
          Do the following: \
          (1) {gh_read}. \
          (2) Assess whether each issue is AGENT-READY — scope clear enough to implement, \
-         acceptance criteria stated, no open product or design decision that needs a human. \
+         acceptance criteria stated, no open product or design decision that needs a human, \
+         and every command named in its acceptance criteria exists and is RUNNABLE in this \
+         repo. VERIFY runnability before treating an issue as agent-ready — check the \
+         repo instead of assuming (e.g. the script is listed in package.json's scripts \
+         table, the tool answers a `--version`/`--help` probe, the build target exists); \
+         an issue whose acceptance criteria name a command that is missing is NOT \
+         agent-ready. \
          Work only the ready ones. For each issue that is NOT ready, comment on it saying \
-         exactly what is missing, and say so in {progress_note} instead of guessing at the \
+         exactly what is missing (for a missing command, name exactly which command), \
+         exclude it from this run, and say so in {progress_note} instead of guessing at the \
          intent. \
          (3) Plan the work across the agent-ready issues before touching code. \
          (4) Work them via SMALL idempotent subagent tasks, each committing its \
@@ -1254,6 +1261,46 @@ mod tests {
         assert!(text.contains("this run's remaining work"));
         assert!(!text.to_lowercase().contains("epic"));
         assert!(text.contains("RECOVERY MODE"));
+    }
+
+    // --- issue #89: acceptance-criteria commands must be runnable ---
+
+    #[test]
+    fn test_launch_instruction_verifies_acceptance_criteria_commands() {
+        // Issues #82–#84 gated on `npm run lint` when no lint script existed;
+        // agents shipped against unrunnable criteria. The assessment step
+        // must demand VERIFIED runnability, not assumption — for the epic
+        // shape AND the list shape.
+        for text in [
+            launch_instruction("#38", Some("nachogl1/maestro")),
+            launch_instruction("#76, #77, #78", None),
+        ] {
+            // Runnability is part of the agent-ready bar…
+            assert!(
+                text.contains(
+                    "every command named in its acceptance criteria exists and is RUNNABLE"
+                ),
+                "{text}"
+            );
+            // …and it is VERIFIED against the repo, never assumed.
+            assert!(text.contains("VERIFY runnability"), "{text}");
+            assert!(text.contains("check the repo instead of assuming"), "{text}");
+            assert!(text.contains("package.json"), "{text}");
+            assert!(text.contains("`--version`/`--help` probe"), "{text}");
+            // A missing command disqualifies the issue…
+            assert!(
+                text.contains("name a command that is missing is NOT agent-ready"),
+                "{text}"
+            );
+            // …and the issue is named-and-excluded, never guessed at.
+            assert!(
+                text.contains("for a missing command, name exactly which command"),
+                "{text}"
+            );
+            assert!(text.contains("exclude it from this run"), "{text}");
+            // Still one paste-able line (module doc).
+            assert!(!text.contains('\n'));
+        }
     }
 
     // --- issue #95: PR-issue linking (Closes/Fixes) ---
