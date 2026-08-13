@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -19,13 +20,23 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   ask: vi.fn(),
 }));
 
-import type { SamuraiPreflight, SamuraiRunConfig } from "@/lib/samurai";
+// The section subscribes to the live test-gate channel on mount (issue
+// #90b) — the AuditSection test's listen-capture pattern.
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(),
+}));
+
+import type { SamuraiPreflight, SamuraiRunConfig, SamuraiTestGateProgress } from "@/lib/samurai";
 import type { UsageData } from "@/lib/usageParser";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 import { LaunchSection } from "../LaunchSection";
 
 const invokeMock = vi.mocked(invoke);
 const askMock = vi.mocked(ask);
+const listenMock = vi.mocked(listen);
+
+/** Captured `samurai-test-gate-event` handler, so tests can stream ticks. */
+let emitGateEvent: (payload: SamuraiTestGateProgress) => void;
 
 function buildTab(overrides: Partial<WorkspaceTab> = {}): WorkspaceTab {
   return {
@@ -136,6 +147,14 @@ describe("LaunchSection (issue #63)", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     askMock.mockReset();
+    listenMock.mockReset();
+    emitGateEvent = () => {};
+    listenMock.mockImplementation(((event: string, handler: (e: unknown) => void) => {
+      if (event === "samurai-test-gate-event") {
+        emitGateEvent = (payload) => handler({ payload });
+      }
+      return Promise.resolve(() => {});
+    }) as typeof listen);
     mockInvoke();
     useWorkspaceStore.setState({ tabs: [buildTab()] });
   });
@@ -148,9 +167,11 @@ describe("LaunchSection (issue #63)", () => {
     expect(screen.getByLabelText("Issues")).toBeInTheDocument();
     expect(screen.getByLabelText("Model")).toBeInTheDocument();
     expect(screen.getByLabelText("Handoff at context %")).toBeInTheDocument();
-    // The agent-readiness declaration is gone — it is the model's call now,
-    // and all that is left is the warning.
-    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    // The agent-readiness declaration is gone — it is the model's call now.
+    // The only checkbox is the test-gate skip toggle (issue #90b), OFF by
+    // default: the gate runs unless the user explicitly opts out.
+    expect(screen.getAllByRole("checkbox")).toHaveLength(1);
+    expect(screen.getByRole("checkbox", { name: "Skip test-suite gate" })).not.toBeChecked();
     expect(screen.getByText(/Make sure the issues are agent-ready/)).toBeInTheDocument();
     // Nothing to work yet → Launch stays disabled.
     expect(screen.getByRole("button", { name: "Launch" })).toBeDisabled();
@@ -176,6 +197,7 @@ describe("LaunchSection (issue #63)", () => {
       epic: "#38",
       model: null,
       handoffContextPct: null,
+      skipTestGate: false,
     });
     expect(await screen.findByText(/Run launched: #38 on samurai-38/)).toBeInTheDocument();
   });
@@ -227,10 +249,83 @@ describe("LaunchSection (issue #63)", () => {
       epic: "#38",
       model: null,
       handoffContextPct: 30,
+      skipTestGate: false,
     });
     // The field clears with the rest of the form after a launch.
     await screen.findByText(/Run launched: #38/);
     expect(screen.getByLabelText("Handoff at context %")).toHaveValue(null);
+  });
+
+  it("sends the skip test-gate toggle with the launch args (issue #90b)", async () => {
+    render(<LaunchSection />);
+    fireEvent.change(screen.getByLabelText("Issues"), { target: { value: "#38" } });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Skip test-suite gate" }));
+    fireEvent.click(screen.getByRole("button", { name: "Launch" }));
+
+    await waitFor(() => expect(callsOf("samurai_launch_run")).toHaveLength(1));
+    expect(callsOf("samurai_launch_run")[0][1]).toMatchObject({ skipTestGate: true });
+  });
+
+  it("renders live test-gate progress with elapsed time during a launch (issue #90b)", async () => {
+    let resolveLaunch: (result: unknown) => void = () => {};
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "samurai_preflight":
+          return passPreflight();
+        case "samurai_list_runs":
+          return [];
+        case "get_claude_usage":
+          return buildUsage();
+        case "samurai_launch_run":
+          return new Promise((resolve) => {
+            resolveLaunch = resolve;
+          });
+        default:
+          return undefined;
+      }
+    });
+    render(<LaunchSection />);
+    fireEvent.change(screen.getByLabelText("Issues"), { target: { value: "#38" } });
+    fireEvent.click(screen.getByRole("button", { name: "Launch" }));
+    await waitFor(() => expect(callsOf("samurai_launch_run")).toHaveLength(1));
+
+    // A backend tick lands: the button shows the step with elapsed time.
+    act(() => {
+      emitGateEvent({
+        project: "C:\\git\\maestro",
+        epic: "#38",
+        step: "cargo_test",
+        detail: "cargo test: running the workspace suite…",
+        elapsed_secs: 12,
+      });
+    });
+    expect(screen.getByText(/cargo test: running the workspace suite… · \d+s/)).toBeInTheDocument();
+
+    // Another project's tick must not repaint this launcher.
+    act(() => {
+      emitGateEvent({
+        project: "C:\\git\\other",
+        epic: "#9",
+        step: "bootstrap_npm",
+        detail: "bootstrap: npm install…",
+        elapsed_secs: 3,
+      });
+    });
+    expect(screen.queryByText(/npm install… ·/)).not.toBeInTheDocument();
+    expect(screen.getByText(/cargo test: running the workspace suite…/)).toBeInTheDocument();
+
+    // The launch resolves: the progress line clears with the phase.
+    await act(async () => {
+      resolveLaunch({
+        epic: "#38",
+        branch: "samurai-38",
+        worktree_path: "C:\\data\\worktrees\\maestro-abc\\samurai-38",
+        repo_pin: null,
+        stale_timer_cancelled: false,
+      });
+    });
+    expect(await screen.findByText(/Run launched: #38/)).toBeInTheDocument();
+    expect(screen.queryByText(/cargo test: running/)).not.toBeInTheDocument();
   });
 
   it("stops at failing preflight rows and never reaches the launch", async () => {

@@ -173,6 +173,24 @@ export interface SamuraiRunConfig {
   created_at: string;
 }
 
+/**
+ * One tick of the launch test-suite gate (issue #90b) — payload of the live
+ * `samurai-test-gate-event` channel, emitted while the launch bootstraps the
+ * epic worktree and runs `cargo test --workspace` in it. Mirrors the Rust
+ * `TestGateProgress` (`core/samurai_test_gate.rs`).
+ */
+export interface SamuraiTestGateProgress {
+  /** Canonical project path — filter on it, like every samurai channel. */
+  project: string;
+  epic: string;
+  /** Wire step name. */
+  step: "bootstrap_npm" | "bootstrap_mcp" | "cargo_test" | "passed" | "failed";
+  /** Human line for the progress row ("bootstrap: npm install…"). */
+  detail: string;
+  /** Seconds since the gate started, as of this tick. */
+  elapsed_secs: number;
+}
+
 /** What a successful launch set up. */
 export interface SamuraiLaunchResult {
   epic: string;
@@ -203,9 +221,12 @@ export function samuraiPreflight(projectPath: string): Promise<SamuraiPreflight>
 
 /**
  * Launches an epic run: server-side preflight re-check, epic worktree at the
- * stable path, ACTIVE run config, gen-1 spawn with the opening brief.
- * Refusals (gh auth, no governing window, live session) arrive as rejected
- * promises with the reason.
+ * stable path, test-suite gate inside that worktree (issue #90b — bootstrap
+ * + `cargo test --workspace`, progress on `samurai-test-gate-event`; a red
+ * suite blocks the launch unless `skipTestGate` overrides), ACTIVE run
+ * config, gen-1 spawn with the opening brief. Refusals (gh auth, no
+ * governing window, live session, red gate) arrive as rejected promises
+ * with the reason.
  *
  * `epic` accepts an epic ref, one issue, or a comma-separated list — the
  * backend normalizes the spelling so `#77,78` and `#77 , 78` are one run.
@@ -215,12 +236,14 @@ export function samuraiLaunchRun(
   epic: string,
   model: string | null,
   handoffContextPct: number | null,
+  skipTestGate: boolean,
 ): Promise<SamuraiLaunchResult> {
   return invoke("samurai_launch_run", {
     projectPath,
     epic,
     model,
     handoffContextPct,
+    skipTestGate,
   });
 }
 

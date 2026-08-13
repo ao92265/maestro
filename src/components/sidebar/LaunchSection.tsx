@@ -1,3 +1,4 @@
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import {
   AlertTriangle,
@@ -11,9 +12,11 @@ import {
   XCircle,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { samePath } from "@/lib/path";
 import {
   type SamuraiPreflight,
   type SamuraiRunConfig,
+  type SamuraiTestGateProgress,
   samuraiCleanupEpic,
   samuraiLaunchRun,
   samuraiListRuns,
@@ -254,6 +257,14 @@ const PHASE_LABEL: Record<LaunchPhase, string> = {
   spawning: "Creating worktree, spawning gen-1…",
 };
 
+/** Gate steps that are still running (issue #90b) — the ones worth a live
+ *  progress row; `passed`/`failed` resolve through the launch promise. */
+const GATE_RUNNING_STEPS: SamuraiTestGateProgress["step"][] = [
+  "bootstrap_npm",
+  "bootstrap_mcp",
+  "cargo_test",
+];
+
 /**
  * Samurai run launcher (issue #63, PRD §5.8 + §9): the form that starts an
  * autonomous run — project (the active tab, read-only), the issues to work,
@@ -277,6 +288,14 @@ export function LaunchSection() {
   // Review F4: optional per-run handoff trigger override. Empty = the
   // global config applies (backend stores thresholds: None).
   const [handoffPct, setHandoffPct] = useState("");
+  // Issue #90b: the explicit red-baseline override. Default OFF — the gate
+  // runs and a red `cargo test --workspace` blocks the launch.
+  const [skipGate, setSkipGate] = useState(false);
+  // The latest test-gate tick plus when it arrived, so the elapsed display
+  // keeps counting between backend ticks (cargo test is one long step).
+  const [gate, setGate] = useState<{ progress: SamuraiTestGateProgress; at: number } | null>(null);
+  // 1 Hz re-render while the gate line is showing (drives the elapsed time).
+  const [, setGateTick] = useState(0);
   const [preflight, setPreflight] = useState<SamuraiPreflight | null>(null);
   // The project a running launch belongs to — a result that outlives a tab
   // switch is dropped rather than applied to the newly active project.
@@ -308,7 +327,43 @@ export function LaunchSection() {
     setPreflight(null);
     setError(null);
     setNotice(null);
+    setGate(null);
   }, [projectPath]);
+
+  // Issue #90b: live test-gate progress. The backend streams one tick per
+  // gate step during the launch; other projects' ticks are skipped (the
+  // AuditSection subscription pattern).
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: UnlistenFn | null = null;
+    listen<SamuraiTestGateProgress>("samurai-test-gate-event", (e) => {
+      if (!samePath(e.payload.project, currentProjectRef.current)) return;
+      setGate({ progress: e.payload, at: Date.now() });
+    })
+      .then((fn) => {
+        if (disposed) {
+          fn();
+          return;
+        }
+        unlisten = fn;
+      })
+      .catch(() => {
+        // Event system unavailable (tests) — the launch still resolves.
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  // Tick the elapsed display once a second while a gate step is running.
+  const gateRunning =
+    phase === "spawning" && gate !== null && GATE_RUNNING_STEPS.includes(gate.progress.step);
+  useEffect(() => {
+    if (!gateRunning) return;
+    const id = setInterval(() => setGateTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, [gateRunning]);
 
   const issueCount = useMemo(
     () => epic.split(",").filter((part) => part.trim().length > 0).length,
@@ -337,6 +392,7 @@ export function LaunchSection() {
     setError(null);
     setNotice(null);
     setPreflight(null);
+    setGate(null);
 
     // Phase 1 — preflight. The backend re-runs it inside the launch anyway;
     // running it here first is what lets a failure render as pass/fail rows
@@ -364,10 +420,16 @@ export function LaunchSection() {
       return;
     }
 
-    // Phase 2 — the launch proper.
+    // Phase 2 — the launch proper (worktree → test gate → gen-1 spawn).
     setPhase("spawning");
     try {
-      const result = await samuraiLaunchRun(target, epic.trim(), model.trim() || null, pct);
+      const result = await samuraiLaunchRun(
+        target,
+        epic.trim(),
+        model.trim() || null,
+        pct,
+        skipGate,
+      );
       if (currentProjectRef.current !== target) return;
       setNotice(
         `Run launched: ${result.epic} on ${result.branch} (worktree ${result.worktree_path})${result.stale_timer_cancelled ? " — stale resume timer cancelled" : ""}`,
@@ -380,6 +442,7 @@ export function LaunchSection() {
       if (currentProjectRef.current === target) setError(String(err));
     } finally {
       setPhase(null);
+      setGate(null);
     }
   };
 
@@ -500,6 +563,25 @@ export function LaunchSection() {
             </p>
           </div>
 
+          <div>
+            <label
+              className="flex items-center gap-1.5 text-[11px] text-maestro-text"
+              title="The launch bootstraps the epic worktree (npm install, mcp-server build) and runs `cargo test --workspace` in it first; a red suite blocks the launch. Tick this to skip that gate and launch anyway."
+            >
+              <input
+                type="checkbox"
+                checked={skipGate}
+                onChange={(e) => setSkipGate(e.target.checked)}
+                disabled={phase !== null}
+                className="h-3 w-3 accent-maestro-accent"
+              />
+              Skip test-suite gate
+            </label>
+            <p className="mt-0.5 text-[10px] leading-snug text-maestro-muted">
+              Off (default): the launch runs the worktree's test suite first and blocks on red.
+            </p>
+          </div>
+
           <div className="flex items-start gap-1.5 rounded border border-maestro-orange/40 bg-maestro-orange/10 p-1.5 text-[10px] leading-snug text-maestro-text">
             <AlertTriangle size={12} className="mt-px shrink-0 text-maestro-orange" />
             <span>
@@ -518,7 +600,14 @@ export function LaunchSection() {
             {phase ? (
               <span className="flex items-center justify-center gap-1.5">
                 <Loader2 size={11} className="animate-spin" />
-                {PHASE_LABEL[phase]}
+                {/* Issue #90b: while the test gate runs, its live step (with
+                    elapsed time, ticking between backend events) replaces
+                    the generic spawning label. */}
+                {gateRunning && gate
+                  ? `${gate.progress.detail} · ${
+                      gate.progress.elapsed_secs + Math.floor((Date.now() - gate.at) / 1000)
+                    }s`
+                  : PHASE_LABEL[phase]}
               </span>
             ) : (
               "Launch"
