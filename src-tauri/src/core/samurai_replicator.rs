@@ -111,6 +111,15 @@ pub type SuccessorEmitter = Arc<dyn Fn(&SuccessorSpawn) + Send + Sync>;
 /// unsubmitted.
 pub type StdinWriter = Arc<dyn Fn(u32, String) + Send + Sync>;
 
+/// Issue #103: re-sends ONLY the lone Enter into a session's PTY. Used by
+/// the post-delivery watch when a typed-in instruction shows no evidence of
+/// a started turn — the Enter of a very long paste (the gen-1 launch brief
+/// above all) can be consumed as part of the paste burst, leaving the brief
+/// fully typed but never submitted. The body is NEVER re-sent: it already
+/// sits in the input box, and a re-paste would duplicate the prompt. The
+/// production closure wraps `samurai_pty::resend_submit`.
+pub type EnterResender = Arc<dyn Fn(u32) + Send + Sync>;
+
 /// Resolves a session's transcript file for the recovery digest (issue #56).
 /// The production closure (lib.rs) asks the transcript watcher first — it is
 /// usually still attached to a DEAD session — and falls back to the newest
@@ -230,6 +239,94 @@ fn no_start_expired(
     timeout: Duration,
 ) -> bool {
     registered_at.unwrap_or(queued_at).elapsed() > timeout
+}
+
+// ---------------------------------------------------------------------------
+// Issue #103: post-delivery watch — did the typed-in instruction ever submit?
+// ---------------------------------------------------------------------------
+
+/// How long a delivered instruction may sit with NO turn-start evidence
+/// before the lone Enter is re-sent. Evidence for a landed submit arrives
+/// within seconds (the CLI appends the `UserMessage` transcript entry at
+/// submission; the PreToolUse hook pushes on the first tool call), so 45s is
+/// an order-of-magnitude margin against false resends — and with the 30s
+/// tick driving this check, a swallowed Enter is recovered 45–75s after
+/// delivery instead of stranding the run until a human presses Enter
+/// (observed live 2026-08-12). Constant, not config: like `SUBMIT_DELAY`
+/// it is a property of the delivery mechanics, not a user preference.
+const ENTER_RESEND_WINDOW: Duration = Duration::from_secs(45);
+
+/// Bounded resends: one covers the observed failure (a single swallowed
+/// Enter), the second covers the resend itself being swallowed. Beyond that
+/// more Enters cannot be the fix, so the watch gives up with an ALERT.
+const MAX_ENTER_RESENDS: u32 = 2;
+
+/// One instruction typed into a successor's PTY, watched until something
+/// proves the submit landed (or the watch gives up). Armed at delivery
+/// time in [`SamuraiReplicator::observe_hook`]; released by
+/// [`turn_activity_session`] evidence; driven by the tick.
+struct DeliveredWatch {
+    project: String,
+    epic: String,
+    generation: u32,
+    session_id: u32,
+    /// Gen-1 LAUNCH flag, carried into the audit rows: the launch brief is
+    /// the longest paste and the reason this watch exists (issue #103).
+    launch: bool,
+    /// Delivery time, re-stamped on each resend so every attempt gets a
+    /// full window.
+    delivered_at: AgeableInstant,
+    resends: u32,
+}
+
+/// What the tick concluded about one delivered-but-unconfirmed instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnterResendVerdict {
+    /// Still inside the window — keep waiting.
+    Keep,
+    /// The window expired with resends left: re-send the lone Enter.
+    Resend,
+    /// The window expired and the resend budget is spent: ALERT and stop.
+    GiveUp,
+}
+
+/// Pure resend decision. Strict boundary (`>`), same discipline as every
+/// other timeout in the supervision chain.
+fn enter_resend_verdict(elapsed: Duration, resends: u32) -> EnterResendVerdict {
+    if elapsed <= ENTER_RESEND_WINDOW {
+        EnterResendVerdict::Keep
+    } else if resends < MAX_ENTER_RESENDS {
+        EnterResendVerdict::Resend
+    } else {
+        EnterResendVerdict::GiveUp
+    }
+}
+
+/// The events that release a delivery watch, keyed by session:
+///
+/// - `UserMessage` — the CLI writes the user entry to the transcript at
+///   prompt submission: the DIRECT proof the Enter landed. This is the same
+///   signal the injector's `idle_effect` already treats as "a genuine turn
+///   restart".
+/// - `ToolUseStarted` — the PreToolUse hook, an independent (non-transcript)
+///   channel: even if the transcript watcher never attached, the first tool
+///   call proves a turn is running.
+/// - `AssistantMessage` — covers a watcher that attached mid-turn and missed
+///   the user entry.
+/// - `SessionEnded` — any reason: `"stop"` is a turn boundary (a turn that
+///   ended must have started), anything else means the session is gone and
+///   there is nothing left to resend into.
+///
+/// `SessionStarted` is deliberately NOT evidence: it is the very signal the
+/// delivery rides on.
+fn turn_activity_session(event: &ClaudeEvent) -> Option<u32> {
+    match event {
+        ClaudeEvent::UserMessage { session_id, .. }
+        | ClaudeEvent::ToolUseStarted { session_id, .. }
+        | ClaudeEvent::AssistantMessage { session_id, .. }
+        | ClaudeEvent::SessionEnded { session_id, .. } => Some(*session_id),
+        _ => None,
+    }
 }
 
 /// `git rev-parse HEAD` in `dir` — fixed argv, no shell, hidden console.
@@ -524,7 +621,11 @@ pub struct SamuraiReplicator {
     teardown: SessionTeardown,
     emit_spawn: SuccessorEmitter,
     write_stdin: StdinWriter,
+    /// Issue #103: the Enter-only resend for the post-delivery watch.
+    resend_enter: EnterResender,
     pending: Mutex<Vec<PendingRitual>>,
+    /// Issue #103: instructions typed in but not yet proven submitted.
+    delivered: Mutex<Vec<DeliveredWatch>>,
     /// Issue #60: the parking-engaged check (see [`HandoffAbsorber`]).
     /// Unset (tests without a parker, or before setup finishes) = never
     /// absorb — successors spawn as in Phase 2.
@@ -537,7 +638,7 @@ pub struct SamuraiReplicator {
 }
 
 impl SamuraiReplicator {
-    // Eight distinct collaborators, each injected once at startup. A params
+    // Nine distinct collaborators, each injected once at startup. A params
     // struct would only move the same list one level out.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -549,6 +650,7 @@ impl SamuraiReplicator {
         teardown: SessionTeardown,
         emit_spawn: SuccessorEmitter,
         write_stdin: StdinWriter,
+        resend_enter: EnterResender,
     ) -> Self {
         Self {
             supervisor,
@@ -559,7 +661,9 @@ impl SamuraiReplicator {
             teardown,
             emit_spawn,
             write_stdin,
+            resend_enter,
             pending: Mutex::new(Vec::new()),
+            delivered: Mutex::new(Vec::new()),
             absorber: std::sync::OnceLock::new(),
             run_configs: std::sync::OnceLock::new(),
         }
@@ -1463,7 +1567,13 @@ impl SamuraiReplicator {
     /// `SessionStarted` means claude is up and sitting at its prompt, so the
     /// ritual is typed in and the entry completes. Later SessionStarted
     /// events for the same id find no entry and do nothing.
+    ///
+    /// Issue #103: delivery also arms a [`DeliveredWatch`] — the writer's
+    /// Enter can be swallowed when the CLI is still consuming the paste
+    /// burst, and no ACK ladder covers these instructions. Hook-side
+    /// activity (PreToolUse above all) releases the watch here too.
     pub fn observe_hook(&self, event: &ClaudeEvent) {
+        self.note_turn_activity(event);
         let ClaudeEvent::SessionStarted { session_id, .. } = event else {
             return;
         };
@@ -1481,6 +1591,40 @@ impl SamuraiReplicator {
             );
             // Text only — the writer submits it (see [`StdinWriter`]).
             (self.write_stdin)(*session_id, p.instruction.clone());
+            self.lock_delivered().push(DeliveredWatch {
+                project: p.project.clone(),
+                epic: p.epic.clone(),
+                generation: p.generation,
+                session_id: *session_id,
+                launch: p.launch,
+                delivered_at: AgeableInstant::now(),
+                resends: 0,
+            });
+        }
+    }
+
+    /// EventBus tap (forwarded by the injector's `observe`, the same tee the
+    /// ACK scanner reads): transcript-side activity — the `UserMessage` the
+    /// CLI writes at prompt submission above all — releases the delivery
+    /// watch (issue #103). Every other variant is ignored, so the tee can
+    /// pass the whole stream without filtering.
+    pub fn observe(&self, event: &ClaudeEvent) {
+        self.note_turn_activity(event);
+    }
+
+    /// Releases the delivery watch for a session that shows turn activity
+    /// (or is gone) — see [`turn_activity_session`] for the evidence table.
+    fn note_turn_activity(&self, event: &ClaudeEvent) {
+        let Some(session_id) = turn_activity_session(event) else {
+            return;
+        };
+        let mut delivered = self.lock_delivered();
+        let before = delivered.len();
+        delivered.retain(|d| d.session_id != session_id);
+        if delivered.len() != before {
+            log::info!(
+                "samurai replicator: session {session_id} shows turn activity — delivered instruction confirmed submitted"
+            );
         }
     }
 
@@ -1651,6 +1795,74 @@ impl SamuraiReplicator {
                 ),
             );
         }
+
+        // Issue #103: the post-delivery watch. A delivered instruction whose
+        // session shows no turn activity within the window gets the lone
+        // Enter re-sent (NEVER the body — it already sits in the input box),
+        // bounded by MAX_ENTER_RESENDS, then a final ALERT.
+        let mut resend_ids: Vec<u32> = Vec::new();
+        let mut rows: Vec<(String, AuditEvent)> = Vec::new();
+        {
+            let mut delivered = self.lock_delivered();
+            delivered.retain_mut(|d| {
+                if !sessions.iter().any(|s| s.session_id == d.session_id) {
+                    // Torn down / unregistered outside the samurai pipeline:
+                    // never write into a session that is no longer ours.
+                    return false;
+                }
+                match enter_resend_verdict(d.delivered_at.elapsed(), d.resends) {
+                    EnterResendVerdict::Keep => true,
+                    EnterResendVerdict::Resend => {
+                        d.resends += 1;
+                        // Re-stamp so each resend gets a full window.
+                        d.delivered_at = AgeableInstant::now();
+                        resend_ids.push(d.session_id);
+                        rows.push((
+                            d.project.clone(),
+                            AuditEvent::now(
+                                d.epic.clone(),
+                                AuditEventKind::Alert,
+                                d.generation,
+                                d.session_id,
+                                json!({
+                                    "kind": "submit_retry",
+                                    "attempt": d.resends,
+                                    "launch": d.launch,
+                                }),
+                            ),
+                        ));
+                        true
+                    }
+                    EnterResendVerdict::GiveUp => {
+                        rows.push((
+                            d.project.clone(),
+                            AuditEvent::now(
+                                d.epic.clone(),
+                                AuditEventKind::Alert,
+                                d.generation,
+                                d.session_id,
+                                json!({
+                                    "kind": "submit_unconfirmed",
+                                    "resends": d.resends,
+                                    "launch": d.launch,
+                                }),
+                            ),
+                        ));
+                        false
+                    }
+                }
+            });
+        }
+        // I/O outside the lock, like every other tick pass.
+        for session_id in resend_ids {
+            log::warn!(
+                "samurai replicator: no turn activity from session {session_id} since its instruction was typed in — re-sending the lone Enter (swallowed-submit recovery, issue #103)"
+            );
+            (self.resend_enter)(session_id);
+        }
+        for (project, row) in rows {
+            self.audit.append(&project, row);
+        }
     }
 
     /// Recover from a poisoned lock rather than panicking — event-path
@@ -1659,6 +1871,32 @@ impl SamuraiReplicator {
         self.pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Same poisoned-lock policy for the delivery watches (issue #103).
+    fn lock_delivered(&self) -> std::sync::MutexGuard<'_, Vec<DeliveredWatch>> {
+        self.delivered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Test-only: how many delivery watches are armed (issue #103).
+    #[cfg(test)]
+    fn delivered_count(&self) -> usize {
+        self.lock_delivered().len()
+    }
+
+    /// Test-only: age one session's delivery watch so the resend path runs
+    /// without real waiting (same `AgeableInstant` discipline as
+    /// [`Self::backdate`]).
+    #[cfg(test)]
+    fn backdate_delivered(&self, session_id: u32, by: Duration) {
+        let mut delivered = self.lock_delivered();
+        let d = delivered
+            .iter_mut()
+            .find(|d| d.session_id == session_id)
+            .expect("no delivery watch for the session");
+        d.delivered_at.backdate(by);
     }
 
     /// Test-only view of one staged ritual by successor generation:
@@ -1727,6 +1965,8 @@ mod tests {
         torn_down: Arc<Mutex<Vec<u32>>>,
         spawns: Arc<Mutex<Vec<SuccessorSpawn>>>,
         writes: Arc<Mutex<Vec<(u32, String)>>>,
+        /// Issue #103: session ids the Enter-only resend fired for.
+        resends: Arc<Mutex<Vec<u32>>>,
         config: SharedSamuraiConfig,
     }
 
@@ -1765,6 +2005,12 @@ mod tests {
             writes_rec.lock().unwrap().push((id, data));
         });
 
+        let resends: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let resends_rec = resends.clone();
+        let resend_enter: EnterResender = Arc::new(move |id| {
+            resends_rec.lock().unwrap().push(id);
+        });
+
         let replicator = Arc::new(SamuraiReplicator::new(
             supervisor.clone(),
             audit.clone(),
@@ -1774,6 +2020,7 @@ mod tests {
             teardown,
             emit_spawn,
             write_stdin,
+            resend_enter,
         ));
         Harness {
             replicator,
@@ -1784,6 +2031,7 @@ mod tests {
             torn_down,
             spawns,
             writes,
+            resends,
             config,
         }
     }
@@ -3250,6 +3498,208 @@ mod tests {
             .backdate(1, SHA_TIMEOUT + Duration::from_secs(1));
         h.replicator.tick();
         assert_eq!(h.spawns.lock().unwrap().len(), 2, "dropped launch re-emits");
+    }
+
+    // --- issue #103: post-delivery watch (swallowed-Enter recovery) ---
+
+    #[test]
+    fn test_enter_resend_verdict_table() {
+        let inside = ENTER_RESEND_WINDOW - Duration::from_secs(1);
+        let expired = ENTER_RESEND_WINDOW + Duration::from_secs(1);
+        // (elapsed, resends so far, expected)
+        let table = [
+            (inside, 0, EnterResendVerdict::Keep),
+            // Strict boundary, like every other timeout in the chain.
+            (ENTER_RESEND_WINDOW, 0, EnterResendVerdict::Keep),
+            (expired, 0, EnterResendVerdict::Resend),
+            (expired, MAX_ENTER_RESENDS - 1, EnterResendVerdict::Resend),
+            (expired, MAX_ENTER_RESENDS, EnterResendVerdict::GiveUp),
+            // A fresh window keeps waiting even with the budget spent —
+            // GiveUp only ever fires on an EXPIRED window.
+            (inside, MAX_ENTER_RESENDS, EnterResendVerdict::Keep),
+        ];
+        for (elapsed, resends, expected) in table {
+            assert_eq!(
+                enter_resend_verdict(elapsed, resends),
+                expected,
+                "elapsed {elapsed:?}, resends {resends}"
+            );
+        }
+    }
+
+    fn user_message(session_id: u32) -> ClaudeEvent {
+        ClaudeEvent::UserMessage {
+            session_id,
+            uuid: "u".into(),
+            text: "[Maestro Samurai] …".into(),
+            timestamp: "t".into(),
+        }
+    }
+
+    fn tool_use_started(session_id: u32) -> ClaudeEvent {
+        ClaudeEvent::ToolUseStarted {
+            session_id,
+            tool_name: "Bash".into(),
+            tool_use_id: "tu".into(),
+            input_summary: String::new(),
+            timestamp: "t".into(),
+        }
+    }
+
+    #[test]
+    fn test_turn_activity_classification() {
+        // Releases: the prompt-submission transcript entry, the first tool
+        // call (PreToolUse hook), an assistant reply, the session going away.
+        assert_eq!(turn_activity_session(&user_message(5)), Some(5));
+        assert_eq!(turn_activity_session(&tool_use_started(5)), Some(5));
+        assert_eq!(
+            turn_activity_session(&ClaudeEvent::AssistantMessage {
+                session_id: 5,
+                uuid: "a".into(),
+                text: "hi".into(),
+                model: "m".into(),
+                token_usage: None,
+                timestamp: "t".into(),
+            }),
+            Some(5)
+        );
+        assert_eq!(
+            turn_activity_session(&ClaudeEvent::SessionEnded {
+                session_id: 5,
+                reason: "stop".into(),
+                timestamp: "t".into(),
+            }),
+            Some(5)
+        );
+        // NOT evidence: SessionStarted is the very signal delivery rides on.
+        assert_eq!(turn_activity_session(&session_started(5)), None);
+    }
+
+    /// Stages a gen-1 launch, registers session 5 and delivers the brief on
+    /// its first SessionStarted — the armed-watch state every delivery-watch
+    /// test starts from.
+    fn deliver_launch_brief(h: &Harness, project: &str) {
+        let brief = samurai_prompts::launch_instruction("#38", Some("nachogl1/maestro"));
+        h.replicator
+            .spawn_first_generation(project, "#38", "C:/tmp/wt-103", brief);
+        let details = h.replicator.spawn_details(project, "#38", 1).unwrap();
+        let snapshot = h
+            .supervisor
+            .register_session_with_details(5, project.into(), "#38".into(), 1, details)
+            .unwrap();
+        h.replicator.on_registered(&snapshot);
+        h.replicator.observe_hook(&session_started(5));
+        assert_eq!(h.writes.lock().unwrap().len(), 1, "brief delivered once");
+        assert_eq!(h.replicator.delivered_count(), 1, "delivery arms the watch");
+    }
+
+    #[tokio::test]
+    async fn test_swallowed_enter_resends_only_the_submit_key_and_is_bounded() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-103-resend";
+        deliver_launch_brief(&h, project);
+
+        // Inside the window: quiet.
+        h.replicator.tick();
+        assert!(h.resends.lock().unwrap().is_empty());
+
+        // First expiry: the lone Enter is re-sent — and ONLY the Enter, the
+        // brief body is never re-pasted (it already sits in the input box).
+        h.replicator
+            .backdate_delivered(5, ENTER_RESEND_WINDOW + Duration::from_secs(1));
+        h.replicator.tick();
+        assert_eq!(h.resends.lock().unwrap().clone(), vec![5]);
+        assert_eq!(h.writes.lock().unwrap().len(), 1, "body never re-sent");
+
+        // Second expiry: the bounded second resend.
+        h.replicator
+            .backdate_delivered(5, ENTER_RESEND_WINDOW + Duration::from_secs(1));
+        h.replicator.tick();
+        assert_eq!(h.resends.lock().unwrap().clone(), vec![5, 5]);
+
+        // Third expiry: budget spent — final ALERT and the watch is gone;
+        // further ticks stay quiet.
+        h.replicator
+            .backdate_delivered(5, ENTER_RESEND_WINDOW + Duration::from_secs(1));
+        h.replicator.tick();
+        assert_eq!(h.replicator.delivered_count(), 0);
+        h.replicator.tick();
+        assert_eq!(h.resends.lock().unwrap().len(), 2, "no resend after give-up");
+
+        // Audit trail: one submit_retry per resend, one final
+        // submit_unconfirmed, all naming the launch.
+        let mut retries = Vec::new();
+        let mut unconfirmed = Vec::new();
+        for _ in 0..200 {
+            let rows = h.audit.read(project, None, None).await.unwrap().events;
+            retries = rows
+                .iter()
+                .filter(|r| r.details["kind"] == "submit_retry")
+                .cloned()
+                .collect();
+            unconfirmed = rows
+                .into_iter()
+                .filter(|r| r.details["kind"] == "submit_unconfirmed")
+                .collect();
+            if retries.len() == 2 && unconfirmed.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(retries.len(), 2);
+        assert_eq!(retries[0].session_id, 5);
+        assert_eq!(retries[0].generation, 1);
+        assert_eq!(retries[0].details["attempt"], 1);
+        assert_eq!(retries[0].details["launch"], true);
+        assert_eq!(retries[1].details["attempt"], 2);
+        assert_eq!(unconfirmed.len(), 1);
+        assert_eq!(unconfirmed[0].session_id, 5);
+        assert_eq!(unconfirmed[0].details["resends"], 2);
+        assert_eq!(unconfirmed[0].details["launch"], true);
+    }
+
+    #[tokio::test]
+    async fn test_turn_activity_releases_the_watch_and_stops_all_retries() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-103-release";
+        deliver_launch_brief(&h, project);
+
+        // Activity from an UNRELATED session must not release the watch.
+        h.replicator.observe(&user_message(99));
+        assert_eq!(h.replicator.delivered_count(), 1);
+
+        // The transcript-side UserMessage — the CLI writes the prompt entry
+        // at submission — proves the Enter landed (EventBus tee → observe).
+        h.replicator.observe(&user_message(5));
+        assert_eq!(h.replicator.delivered_count(), 0);
+
+        // Released: ticks never resend and never write audit rows.
+        h.replicator.tick();
+        assert!(h.resends.lock().unwrap().is_empty());
+        let rows = h.audit.read(project, None, None).await.unwrap().events;
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.details["kind"] == "submit_retry"
+                    || r.details["kind"] == "submit_unconfirmed"),
+            "no retry bookkeeping once the submit is confirmed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hook_side_tool_use_releases_the_watch_too() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        deliver_launch_brief(&h, "C:/git/proj-103-hook");
+
+        // PreToolUse arrives on the hook chain (observe_hook), an
+        // independent channel from the transcript watcher.
+        h.replicator.observe_hook(&tool_use_started(5));
+        assert_eq!(h.replicator.delivered_count(), 0);
+        h.replicator.tick();
+        assert!(h.resends.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

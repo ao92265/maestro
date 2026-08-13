@@ -17,15 +17,44 @@
 //! [`SUBMIT_DELAY`] is deliberately a constant, not config: it is a property
 //! of the CLI's input handling, not a user preference, and a value the user
 //! could set to 0 would silently resurrect the original bug.
+//!
+//! Issue #103: a FIXED gap is not enough either. The gen-1 launch brief is a
+//! multi-KB paste, and when the CLI is still consuming the burst 250 ms in,
+//! the Enter is read as part of the paste (or dropped) and the brief sits in
+//! the input box unsubmitted. The gap therefore scales with the payload
+//! ([`submit_delay`]), and the replicator arms a post-delivery check that
+//! re-sends the lone Enter ([`resend_submit`]) when no turn ever starts.
 
 use std::time::Duration;
 
 use super::process_manager::ProcessManager;
 
-/// Gap between the instruction text and the Enter that submits it — long
-/// enough for the CLI to finish processing the paste burst and return to
-/// reading single keys, short enough to stay imperceptible.
+/// FLOOR of the gap between the instruction text and the Enter that submits
+/// it — long enough for the CLI to finish processing a short (< ~0.5 KB)
+/// paste burst and return to reading single keys, short enough to stay
+/// imperceptible.
 pub const SUBMIT_DELAY: Duration = Duration::from_millis(250);
+
+/// CAP on the scaled gap. Past ~4 KiB more waiting stops buying certainty —
+/// the drain rate of the CLI's input pipeline is not observable from this
+/// side of the PTY (the `ProcessManager` exposes no read side) — so beyond
+/// the cap the recovery mechanism is the replicator's Enter-resend check
+/// (issue #103), not a longer sleep.
+pub const SUBMIT_DELAY_CAP: Duration = Duration::from_secs(2);
+
+/// Pre-Enter gap for a payload of `payload_bytes`: 1 ms per 2 bytes (≈ half
+/// a second per KiB), clamped to [`SUBMIT_DELAY`] .. [`SUBMIT_DELAY_CAP`].
+///
+/// Sizing rationale: 250 ms proved sufficient for short instructions but was
+/// observed live (2026-08-12) to lose the Enter after the multi-KB launch
+/// brief. The CLI consumes a paste in chunks with re-renders in between, so
+/// the time it needs grows with payload size; since nobody is typing in a
+/// supervised terminal at delivery time and the write task is
+/// fire-and-forget, over-waiting is free while under-waiting strands the
+/// run — hence a deliberately generous slope with a hard cap.
+pub fn submit_delay(payload_bytes: usize) -> Duration {
+    Duration::from_millis(payload_bytes as u64 / 2).clamp(SUBMIT_DELAY, SUBMIT_DELAY_CAP)
+}
 
 /// The lone submit frame. Named so the split is greppable from both call
 /// sites and the tests that assert on it.
@@ -39,7 +68,7 @@ pub fn submit_frames(text: &str) -> [String; 2] {
 }
 
 /// Types `text` into a session's PTY and submits it as a separate write
-/// [`SUBMIT_DELAY`] later.
+/// [`submit_delay`]`(text.len())` later.
 ///
 /// `write_stdin` is fully blocking (std mutex + pipe write with no bounded
 /// completion time), so both frames run on the blocking pool — the policy
@@ -58,14 +87,33 @@ pub fn submit_instruction(
     ctx: &'static str,
 ) {
     tauri::async_runtime::spawn(async move {
+        let delay = submit_delay(text.len());
         let [body, submit] = submit_frames(&text);
         if !write_frame(&processes, session_id, body, ctx, "instruction").await {
             // The text never landed — sending a bare Enter now would submit
             // whatever the user happened to have typed in that box.
             return;
         }
-        tokio::time::sleep(SUBMIT_DELAY).await;
+        tokio::time::sleep(delay).await;
         write_frame(&processes, session_id, submit, ctx, "submit").await;
+    });
+}
+
+/// Re-sends ONLY the lone submit key (issue #103): the recovery for an Enter
+/// that was swallowed by a still-draining paste burst. NEVER re-sends any
+/// instruction body — the text already sits in the CLI's input box, and a
+/// re-paste would duplicate the prompt. An extra Enter, by contrast, is
+/// harmless when the first one did land (an empty input box ignores it).
+pub fn resend_submit(processes: ProcessManager, session_id: u32, ctx: &'static str) {
+    tauri::async_runtime::spawn(async move {
+        write_frame(
+            &processes,
+            session_id,
+            SUBMIT_KEY.to_string(),
+            ctx,
+            "submit-resend",
+        )
+        .await;
     });
 }
 
@@ -112,5 +160,32 @@ mod tests {
         // A zero gap re-merges the two writes into one burst and the CLI
         // treats the pair as a paste again — the original bug.
         assert!(SUBMIT_DELAY > Duration::ZERO);
+    }
+
+    #[test]
+    fn test_submit_delay_keeps_the_floor_for_short_instructions() {
+        // Short instructions keep the exact pre-#103 behavior: the floor.
+        assert_eq!(submit_delay(0), SUBMIT_DELAY);
+        assert_eq!(submit_delay(100), SUBMIT_DELAY);
+        // 1 ms per 2 bytes: the scaled value only overtakes the floor past
+        // 500 bytes.
+        assert_eq!(submit_delay(500), SUBMIT_DELAY);
+        assert!(submit_delay(502) > SUBMIT_DELAY);
+    }
+
+    #[test]
+    fn test_submit_delay_scales_with_payload_and_is_capped() {
+        // A ~2 KiB launch brief gets about a second of settle time.
+        assert_eq!(submit_delay(2048), Duration::from_millis(1024));
+        // The cap: 4000 bytes hits it exactly, anything bigger stays there.
+        assert_eq!(submit_delay(4000), SUBMIT_DELAY_CAP);
+        assert_eq!(submit_delay(1_000_000), SUBMIT_DELAY_CAP);
+        // Monotone: a longer payload never waits less.
+        let mut last = Duration::ZERO;
+        for bytes in [0usize, 250, 500, 1000, 2000, 4000, 8000, 100_000] {
+            let d = submit_delay(bytes);
+            assert!(d >= last, "delay must not shrink at {bytes} bytes");
+            last = d;
+        }
     }
 }

@@ -561,6 +561,15 @@ pub fn run() {
                         "replicator",
                     );
                 });
+            // Issue #103: the Enter-only resend for the post-delivery watch
+            // — when a typed-in instruction (the gen-1 launch brief above
+            // all) shows no turn activity, the replicator re-sends the lone
+            // submit key. NEVER the body: it already sits in the input box.
+            let resend_pm = app.state::<ProcessManager>().inner().clone();
+            let enter_resender: core::samurai_replicator::EnterResender =
+                Arc::new(move |session_id| {
+                    core::samurai_pty::resend_submit(resend_pm.clone(), session_id, "replicator");
+                });
             // The parker (issue #60) tears parked sessions down with this
             // same closure — a PARKED terminal serves no purpose, every
             // wake-up is a fresh spawn (PRD decision #6).
@@ -574,6 +583,7 @@ pub fn run() {
                 teardown,
                 emit_spawn,
                 ritual_writer,
+                enter_resender,
             ));
             app.manage(replicator.clone());
             // Arms the DEAD → recovery chain in the supervisor callback.

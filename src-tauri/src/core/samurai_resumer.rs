@@ -325,7 +325,8 @@ mod tests {
     use crate::core::samurai_context::SamuraiContextStore;
     use crate::core::samurai_injector::SamuraiInjector;
     use crate::core::samurai_replicator::{
-        SessionTeardown, StdinWriter, SuccessorEmitter, SuccessorSpawn, TranscriptPathResolver,
+        EnterResender, SessionTeardown, StdinWriter, SuccessorEmitter, SuccessorSpawn,
+        TranscriptPathResolver,
     };
     use crate::core::samurai_run_config::SamuraiRunConfig;
     use crate::core::supervisor::SupervisorState;
@@ -472,6 +473,7 @@ mod tests {
             spawns_rec.lock().unwrap().push(s.clone());
         });
         let write_stdin: StdinWriter = Arc::new(|_, _| {});
+        let resend_enter: EnterResender = Arc::new(|_| {});
         let replicator = Arc::new(SamuraiReplicator::new(
             supervisor.clone(),
             audit.clone(),
@@ -481,6 +483,7 @@ mod tests {
             teardown.clone(),
             emit_spawn,
             write_stdin,
+            resend_enter,
         ));
         let injector = Arc::new(SamuraiInjector::new(
             supervisor.clone(),

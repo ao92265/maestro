@@ -1170,7 +1170,8 @@ mod tests {
     ) {
         use crate::core::samurai_injector::SessionDirResolver;
         use crate::core::samurai_replicator::{
-            SessionTeardown, StdinWriter, SuccessorEmitter, SuccessorSpawn, TranscriptPathResolver,
+            EnterResender, SessionTeardown, StdinWriter, SuccessorEmitter, SuccessorSpawn,
+            TranscriptPathResolver,
         };
         use std::sync::{Mutex, RwLock};
 
@@ -1182,6 +1183,7 @@ mod tests {
         let transcript_paths: TranscriptPathResolver = Arc::new(|_| None);
         let teardown: SessionTeardown = Arc::new(|_| Box::pin(async {}));
         let write_stdin: StdinWriter = Arc::new(|_, _| {});
+        let resend_enter: EnterResender = Arc::new(|_| {});
         let shared: SharedSamuraiConfig = Arc::new(RwLock::new(SamuraiConfig::default()));
         let replicator = Arc::new(SamuraiReplicator::new(
             supervisor,
@@ -1192,6 +1194,7 @@ mod tests {
             teardown,
             emit_spawn,
             write_stdin,
+            resend_enter,
         ));
         (replicator, spawns)
     }
@@ -1344,7 +1347,8 @@ mod tests {
         // and the gen-1 spawn event already carries the model.
         use crate::core::samurai_injector::SessionDirResolver;
         use crate::core::samurai_replicator::{
-            SessionTeardown, StdinWriter, SuccessorEmitter, SuccessorSpawn, TranscriptPathResolver,
+            EnterResender, SessionTeardown, StdinWriter, SuccessorEmitter, SuccessorSpawn,
+            TranscriptPathResolver,
         };
         use std::sync::{Arc, Mutex, RwLock};
 
@@ -1372,6 +1376,7 @@ mod tests {
         let transcript_paths: TranscriptPathResolver = Arc::new(|_| None);
         let teardown: SessionTeardown = Arc::new(|_| Box::pin(async {}));
         let write_stdin: StdinWriter = Arc::new(|_, _| {});
+        let resend_enter: EnterResender = Arc::new(|_| {});
         let shared: SharedSamuraiConfig = Arc::new(RwLock::new(SamuraiConfig::default()));
         let replicator = Arc::new(SamuraiReplicator::new(
             supervisor.clone(),
@@ -1382,6 +1387,7 @@ mod tests {
             teardown,
             emit_spawn,
             write_stdin,
+            resend_enter,
         ));
         replicator.set_run_configs(run_configs.clone());
 

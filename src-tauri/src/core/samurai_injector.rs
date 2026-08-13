@@ -896,6 +896,12 @@ impl SamuraiInjector {
     /// transcript-side activity update the idle flag. Every other variant is
     /// ignored, so the tee can pass the whole stream without filtering.
     pub fn observe(&self, event: &ClaudeEvent) {
+        // Issue #103: the replicator's post-delivery watch reads
+        // transcript-side turn activity (UserMessage above all) from this
+        // same tee — the forwarding mirror of `observe_hook` below.
+        if let Some(replicator) = &self.replicator {
+            replicator.observe(event);
+        }
         self.note_idle(event);
         if let ClaudeEvent::AssistantMessage {
             session_id, text, ..
