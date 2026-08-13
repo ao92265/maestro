@@ -32,6 +32,11 @@ const KIND: &str = "harvest";
 const NOUN: &str = "harvest report";
 /// Cap on the rendered entries block (the model sees a bounded prompt).
 const MAX_ENTRIES_CHARS: usize = 12_000;
+/// First line the report template mandates — the shared runner's save-time
+/// validation checks a generated report actually opens with it (issue #97:
+/// a leaked personal instruction can otherwise turn the saved artifact into
+/// a one-line chat reply instead of this report).
+const EXPECTED_HEADING: &str = "## Recurring themes";
 /// The empty-journal refusal — pinned by test, surfaced verbatim in the UI.
 const NOTHING_TO_HARVEST: &str = "Nothing to harvest — no unconsumed journal entries.";
 /// The concurrent-run refusal — pinned by test, surfaced verbatim in the UI.
@@ -216,8 +221,15 @@ pub async fn samurai_harvest_run(
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| format!("Failed to create {} directory: {}", NOUN, e))?;
-    let markdown =
-        ai_runner::run_and_save(&dir.to_string_lossy(), prompt, &dir, &today, NOUN).await?;
+    let markdown = ai_runner::run_and_save(
+        &dir.to_string_lossy(),
+        prompt,
+        &dir,
+        &today,
+        Some(EXPECTED_HEADING),
+        NOUN,
+    )
+    .await?;
 
     // Fix M1: consume exactly the snapshot the model digested — entries
     // appended during the run (or withheld by the cap) stay unconsumed.
@@ -312,6 +324,9 @@ mod tests {
         // HARVEST_REPORT rows; changing it would orphan saved reports.
         assert_eq!(KIND, "harvest");
         assert_eq!(NOUN, "harvest report");
+        // The save-time validation's expected heading must stay byte-
+        // identical to what the template actually asks the model to write.
+        assert!(DEFAULT_HARVEST_PROMPT_TEMPLATE.contains(EXPECTED_HEADING));
         assert!(harvest_dir().ends_with("harvest"));
         assert_eq!(
             NOTHING_TO_HARVEST,

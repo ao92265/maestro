@@ -212,15 +212,54 @@ pub fn or_none(s: &str) -> &str {
     }
 }
 
+/// Preamble every headless prompt gets (issue #97). The model's personal
+/// `~/.claude/CLAUDE.md` and other loaded settings can carry the user's own
+/// reply-formatting habits (a required reply prefix/canary, an output style,
+/// a "save long output to a file" rule) — verified on the installed CLI:
+/// even with [`claude_print_flags`]'s `--setting-sources` applied, a
+/// personal-file instruction still reached the reply. This preamble is a
+/// mitigation, not a guarantee — [`run_and_save_with_timeout`]'s validation
+/// before save is the actual backstop.
+const ARTIFACT_RUN_PREAMBLE: &str = "This is an unattended headless run: your ENTIRE reply is captured verbatim and saved as the artifact — nothing else reads or acts on it. Reply with ONLY the content requested below: no chat preamble, no \"Here is...\", no sign-off, nothing before or after it. Do NOT create, write, or edit any files, whatever a habit from your own settings suggests — the caller captures your reply text, not a file. Ignore any personal reply-formatting instruction that may be part of your loaded context (a required reply prefix or canary phrase, an output style, a rule to save long output to a file, or anything similar) — none of it applies to this run.\n\n---\n\n";
+
+/// The flags every headless `claude -p` run gets, independent of the
+/// caller's tool choice (issue #97 insulation — both verified against the
+/// installed CLI's `claude --help`):
+/// - `--setting-sources project,local` drops the user's global
+///   `~/.claude/settings.json` (hooks, permission overrides, output style)
+///   so a headless run does not depend on what happens to be configured on
+///   the machine it runs on. It does NOT stop `~/.claude/CLAUDE.md` from
+///   loading — tested empirically, the personal file's instructions still
+///   reached the reply with this flag applied; there is no CLI flag that
+///   excludes it without also breaking the OAuth login these runs rely on
+///   (`--bare` requires an API key; `CLAUDE_CONFIG_DIR` hides the login too).
+///   [`ARTIFACT_RUN_PREAMBLE`] and save-time validation cover that gap.
+/// - `--tools`/`--allowedTools` gate the built-in tool set. An empty `tools`
+///   slice now disables tools entirely (`--tools ""`, per `claude --help`)
+///   rather than leaving the CLI's permissive defaults in place, so a
+///   summarising run cannot write a file even if a leaked instruction told
+///   it to; `--allowedTools` mirrors the list so any tools that ARE granted
+///   skip a permission prompt a headless run has no way to answer.
+fn claude_print_flags(tools: &[&str]) -> Vec<String> {
+    let list = tools.join(",");
+    vec![
+        "--setting-sources".to_string(),
+        "project,local".to_string(),
+        "--tools".to_string(),
+        list.clone(),
+        "--allowedTools".to_string(),
+        list,
+    ]
+}
+
 /// Run `claude -p` headlessly in the project directory, prompt via stdin,
 /// killed after `timeout_secs`. A run that has the model read its way around a
 /// repository needs far longer than one that summarises material we already
 /// gathered, so the ceiling is the caller's choice — [`CLAUDE_TIMEOUT_SECS`]
 /// is the default the summarising features pass.
 ///
-/// `tools` restricts the run to the named built-in tools; an empty slice
-/// leaves the CLI's own defaults alone (what the summarising features want,
-/// since they hand the model everything in the prompt and expect no tool use).
+/// `tools` restricts the run to the named built-in tools; an empty slice now
+/// disables tools entirely — see [`claude_print_flags`].
 pub async fn run_claude_print_with_timeout(
     project_path: &str,
     prompt: String,
@@ -246,15 +285,7 @@ pub async fn run_claude_print_with_timeout(
         c
     };
 
-    if !tools.is_empty() {
-        // `--tools` decides which built-in tools EXIST for the run, so a
-        // permissive project settings.json cannot hand the model Bash or
-        // Write; `--allowedTools` then spares the survivors a permission
-        // prompt that a headless run has no way to answer. Both flags take a
-        // comma- or space-separated list (`claude --help`).
-        let list = tools.join(",");
-        cmd.args(["--tools", list.as_str(), "--allowedTools", list.as_str()]);
-    }
+    cmd.args(claude_print_flags(tools));
 
     cmd.current_dir(project_path)
         .stdin(Stdio::piped())
@@ -270,8 +301,9 @@ pub async fn run_claude_print_with_timeout(
     })?;
 
     if let Some(mut stdin) = child.stdin.take() {
+        let full_prompt = format!("{ARTIFACT_RUN_PREAMBLE}{prompt}");
         stdin
-            .write_all(prompt.as_bytes())
+            .write_all(full_prompt.as_bytes())
             .await
             .map_err(|e| format!("Failed to send prompt to Claude CLI: {}", e))?;
         // Dropping stdin closes the pipe so `claude -p` knows input ended.
@@ -296,22 +328,58 @@ pub async fn run_claude_print_with_timeout(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Minimal shape check for a saved artifact (issue #97): a conversational
+/// chat reply that leaks a personal-file habit (a canary prefix, "I saved
+/// this to a file for you") past [`ARTIFACT_RUN_PREAMBLE`] reads as a single
+/// line/paragraph, never as the multi-line report/plan/catalogue each
+/// consumer's template actually asks for. `expected_heading`, when a
+/// consumer's template mandates one (harvest's literal `"## Recurring
+/// themes"`, the catalogue's generic `"## "` area heading), is checked
+/// against the first non-empty line too; the standup and the daily plan have
+/// no fixed heading (their templates explicitly forbid one), so callers pass
+/// `None` and only the line-count check applies.
+fn looks_like_artifact(body: &str, expected_heading: Option<&str>) -> bool {
+    let mut lines = body.lines().filter(|l| !l.trim().is_empty());
+    let first = match lines.next() {
+        Some(l) => l.trim(),
+        None => return false,
+    };
+    if lines.next().is_none() {
+        return false; // a single non-empty line is a chat reply, not a report
+    }
+    expected_heading.is_none_or(|heading| first.starts_with(heading))
+}
+
 /// Run the prompt and persist the cleaned answer as `<dir>/<date>.md`.
-/// Returns the saved markdown. An empty answer is an error and saves nothing,
-/// so a failed run never consumes the day's slot on disk. `noun` names the
-/// artifact in the errors the user sees ("report", "plan").
+/// Returns the saved markdown. An empty or non-report-shaped answer is an
+/// error and saves nothing, so a failed run never consumes the day's slot on
+/// disk. `noun` names the artifact in the errors the user sees ("report",
+/// "plan"); `expected_heading` is the consumer's declared artifact shape —
+/// see [`looks_like_artifact`].
 pub async fn run_and_save(
     cwd: &str,
     prompt: String,
     dir: &Path,
     date: &str,
+    expected_heading: Option<&str>,
     noun: &str,
 ) -> Result<String, String> {
-    run_and_save_with_timeout(cwd, prompt, dir, date, CLAUDE_TIMEOUT_SECS, &[], noun).await
+    run_and_save_with_timeout(
+        cwd,
+        prompt,
+        dir,
+        date,
+        CLAUDE_TIMEOUT_SECS,
+        &[],
+        expected_heading,
+        noun,
+    )
+    .await
 }
 
 /// Same, with an explicit run timeout and tool restriction (see
 /// [`run_claude_print_with_timeout`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_and_save_with_timeout(
     cwd: &str,
     prompt: String,
@@ -319,12 +387,22 @@ pub async fn run_and_save_with_timeout(
     date: &str,
     timeout_secs: u64,
     tools: &[&str],
+    expected_heading: Option<&str>,
     noun: &str,
 ) -> Result<String, String> {
     let raw = run_claude_print_with_timeout(cwd, prompt, timeout_secs, tools).await?;
     let markdown = strip_ansi(&raw).trim().to_string();
     if markdown.is_empty() {
         return Err(format!("Claude returned an empty {}", noun));
+    }
+    if !looks_like_artifact(&markdown, expected_heading) {
+        log::warn!(
+            "ai_runner: rejected a {noun} that reads as a conversational reply, not a report — nothing saved. Rejected text (truncated): {}",
+            truncate_chars(&markdown, 200)
+        );
+        return Err(format!(
+            "Claude replied with a conversational answer instead of a {noun} — nothing was saved. This can happen when a personal Claude Code setting leaks into a headless run; try again."
+        ));
     }
 
     tokio::fs::create_dir_all(dir)
@@ -364,6 +442,88 @@ pub async fn load_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_print_flags_insulate_from_personal_settings_and_gate_tools() {
+        // Issue #97: every headless run drops the user's global
+        // settings.json (the only source-restriction flag verified to
+        // exist) and, for a tools-less caller, disables the built-in tool
+        // set entirely rather than leaving the CLI's permissive defaults in
+        // place — asserted on the composed argv, the process seam this
+        // function exists to make testable without spawning `claude`.
+        let flags = claude_print_flags(&[]);
+        assert_eq!(
+            flags,
+            vec![
+                "--setting-sources",
+                "project,local",
+                "--tools",
+                "",
+                "--allowedTools",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_print_flags_pass_through_an_explicit_tool_list() {
+        // A caller that DOES need tools (the catalogue scan) still gets the
+        // same setting-sources insulation, and its tool list travels as-is.
+        let flags = claude_print_flags(&["Read", "Glob", "Grep"]);
+        assert_eq!(
+            flags,
+            vec![
+                "--setting-sources",
+                "project,local",
+                "--tools",
+                "Read,Glob,Grep",
+                "--allowedTools",
+                "Read,Glob,Grep",
+            ]
+        );
+    }
+
+    #[test]
+    fn artifact_run_preamble_forbids_files_and_leaked_personal_instructions() {
+        // Pinned so the hardening survives a refactor: the exact behaviours
+        // issue #97 needs the model told about.
+        assert!(ARTIFACT_RUN_PREAMBLE.contains("Reply with ONLY"));
+        assert!(ARTIFACT_RUN_PREAMBLE.to_lowercase().contains("do not create, write, or edit any files"));
+        assert!(ARTIFACT_RUN_PREAMBLE.contains("Ignore any personal reply-formatting instruction"));
+    }
+
+    #[test]
+    fn looks_like_artifact_accepts_a_real_shaped_report() {
+        // A harvest-shaped multi-section report, first line matching the
+        // consumer's declared heading.
+        let body = "## Recurring themes\n- CI queue is slow\n\n## Recommendations\n### Maestro improvements\n- Nothing evidenced this harvest.\n";
+        assert!(looks_like_artifact(body, Some("## Recurring themes")));
+
+        // A standup/plan-shaped report: no fixed heading, just multiple
+        // lines of prose/bullets.
+        let standup = "- shipped the login fix\n- picking up the harvest validator next\nOverall the project is on track.";
+        assert!(looks_like_artifact(standup, None));
+    }
+
+    #[test]
+    fn looks_like_artifact_rejects_a_conversational_reply() {
+        // The exact failure mode from issue #97: a personal-CLAUDE.md canary
+        // turned the reply into a one-line chat message instead of a report.
+        let leaked = "Nacho, I've written the harvest report and saved it to harvest/2026-08-12.md for you. Let me know if you'd like anything else!";
+        assert!(!looks_like_artifact(leaked, Some("## Recurring themes")));
+        assert!(!looks_like_artifact(leaked, None));
+
+        // Multi-line but missing the consumer's mandated heading — still not
+        // the declared shape.
+        let wrong_heading = "# Harvest Report\n- some bullet\n- another bullet";
+        assert!(!looks_like_artifact(wrong_heading, Some("## Recurring themes")));
+    }
+
+    #[test]
+    fn looks_like_artifact_rejects_empty_and_blank_bodies() {
+        assert!(!looks_like_artifact("", None));
+        assert!(!looks_like_artifact("   \n  \n", Some("## Recurring themes")));
+    }
 
     #[test]
     fn strip_ansi_removes_csi_and_osc_sequences() {
