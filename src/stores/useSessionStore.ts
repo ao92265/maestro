@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { create } from "zustand";
-import { samePath } from "@/lib/path";
+import { normalizePath, samePath } from "@/lib/path";
 import {
   type SamuraiScheduleEntry,
   type SamuraiSupervisorState,
@@ -92,13 +92,107 @@ interface SessionStatusPayload {
 }
 
 /**
- * Raw wire payload for `session-status-changed`. The Claude Stop hook emits
- * "AwaitingInput" (agent ended its turn, user's move); it is normalized to
- * NeedsInput before it reaches the store, so it never appears in a session.
+ * Statuses that exist only on the `session-status-changed` wire, never on a
+ * session — hook-derived signals the store interprets against the session's
+ * current state (see resolveStatusEvent):
+ * - "AwaitingInput": Stop hook — the agent ended its turn, user's move.
+ * - "SessionEnded": SessionEnd hook — the claude process exited.
+ */
+type WireOnlyStatus = "AwaitingInput" | "SessionEnded";
+
+/**
+ * Raw wire payload for `session-status-changed`. Wire-only statuses are
+ * normalized by resolveStatusEvent before they reach a session, so they
+ * never appear in the store.
  */
 type RawSessionStatusPayload = Omit<SessionStatusPayload, "status"> & {
-  status: BackendSessionStatus | "AwaitingInput";
+  status: BackendSessionStatus | WireOnlyStatus;
 };
+
+/** Output of resolveStatusEvent: what to write onto the session. */
+interface ResolvedStatus {
+  status: BackendSessionStatus;
+  statusMessage?: string;
+  needsInputPrompt?: string;
+}
+
+/**
+ * The single signal→state merge rule for `session-status-changed` events
+ * (issue #105). Pure so the mapping is unit-testable as a table.
+ *
+ * @param payload - The raw wire payload (status + message + prompt).
+ * @param existingStatus - The session's current status, or undefined when the
+ *   session isn't in the store yet (the event will be buffered).
+ * @param runningSubagents - Count of this session's still-running background
+ *   subagents (only consulted for "AwaitingInput").
+ * @returns The fields to write, or null when the event must be DROPPED.
+ *
+ * Rules, in order:
+ * 1. "AwaitingInput" (Stop hook, fires on every turn end):
+ *    - dropped when the session already reached Done/Error/Timeout — a weak
+ *      implicit signal never downgrades an explicit terminal state;
+ *    - while background subagents still run it means "handed off", not
+ *      "waiting on you" → Working;
+ *    - otherwise → NeedsInput.
+ * 2. "SessionEnded" (SessionEnd hook, the claude process exited): whatever
+ *    the session showed is stale → Idle, clearing any needs-input prompt.
+ *    Done/Error survive — the user still wants to see the outcome.
+ * 3. "NeedsInput" (Notification hook, AskUserQuestion, or the MCP tool):
+ *    dropped on Done/Error — the CLI's 60s idle-prompt reminder fires after
+ *    every turn and must not repaint a finished session red. Timeout is
+ *    deliberately NOT protected: an explicit needs-input proves the CLI is
+ *    alive, recovering a false startup timeout.
+ * 4. Everything else applies verbatim (last writer wins).
+ */
+export function resolveStatusEvent(
+  payload: Pick<RawSessionStatusPayload, "status" | "message" | "needs_input_prompt">,
+  existingStatus: BackendSessionStatus | undefined,
+  runningSubagents: number,
+): ResolvedStatus | null {
+  const terminal: BackendSessionStatus[] = ["Done", "Error"];
+
+  if (payload.status === "AwaitingInput") {
+    if (existingStatus !== undefined && [...terminal, "Timeout"].includes(existingStatus)) {
+      return null;
+    }
+    // The Stop hook fires whenever the agent ends its turn — including when
+    // it ends the turn precisely because it handed work off to background
+    // subagents. Those are still running, so the session is working, not
+    // waiting on the user. Self-correcting: the next turn end, once no
+    // subagent is running, reports NeedsInput as normal.
+    if (runningSubagents > 0) {
+      return {
+        status: "Working",
+        statusMessage: `${runningSubagents} subagent${runningSubagents === 1 ? "" : "s"} running`,
+        needsInputPrompt: payload.needs_input_prompt,
+      };
+    }
+    return {
+      status: "NeedsInput",
+      statusMessage: payload.message,
+      needsInputPrompt: payload.needs_input_prompt,
+    };
+  }
+
+  if (payload.status === "SessionEnded") {
+    if (existingStatus !== undefined && terminal.includes(existingStatus)) {
+      return null;
+    }
+    return { status: "Idle", statusMessage: payload.message, needsInputPrompt: undefined };
+  }
+
+  if (payload.status === "NeedsInput") {
+    if (existingStatus !== undefined && terminal.includes(existingStatus)) {
+      return null;
+    }
+  }
+
+  return {
+    status: payload.status,
+    statusMessage: payload.message,
+    needsInputPrompt: payload.needs_input_prompt,
+  };
+}
 
 /**
  * What the badge UI (issue #46) needs to know about one Samurai-supervised
@@ -226,9 +320,14 @@ function withContextUsage(session: SessionConfig): SessionConfig {
   };
 }
 
-/** Generate a unique key for buffering status updates */
+/**
+ * Generate a unique key for buffering status updates. The path half is
+ * normalized so a buffered event keyed on the backend's canonical form
+ * (`\\?\C:\…` on Windows) still matches the session added with the plain
+ * form — a mismatch here loses the buffered status silently.
+ */
 function statusBufferKey(sessionId: number, projectPath: string): string {
-  return `${sessionId}:${projectPath}`;
+  return `${sessionId}:${normalizePath(projectPath)}`;
 }
 
 /**
@@ -524,46 +623,29 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       if (!activeUnlisten) {
         if (!pendingInit) {
           pendingInit = listen<RawSessionStatusPayload>("session-status-changed", (event) => {
-            const { session_id, project_path, message, needs_input_prompt } = event.payload;
+            const { session_id, project_path } = event.payload;
 
-            // Normalize the Stop-hook signal: treat "AwaitingInput" as
-            // NeedsInput, but never downgrade an explicit terminal state
-            // (Done/Error) or a startup Timeout the agent/frontend already set.
-            let status: BackendSessionStatus;
-            let statusMessage = message;
-            if (event.payload.status === "AwaitingInput") {
-              const existing = get().sessions.find(
-                (s) => s.id === session_id && s.project_path === project_path,
-              );
-              if (existing && ["Done", "Error", "Timeout"].includes(existing.status)) {
-                return;
-              }
-              // The Stop hook fires whenever the agent ends its turn — including
-              // when it ends the turn precisely because it handed work off to
-              // background subagents. Those are still running, so the session is
-              // working, not waiting on the user. Self-correcting: the next turn
-              // end, once no subagent is running, reports NeedsInput as normal.
-              const runningSubagents = useAgentStore
-                .getState()
-                .agents.filter((a) => a.sessionId === session_id && a.completedAt === null).length;
-              if (runningSubagents > 0) {
-                status = "Working";
-                statusMessage = `${runningSubagents} subagent${
-                  runningSubagents === 1 ? "" : "s"
-                } running`;
-              } else {
-                status = "NeedsInput";
-              }
-            } else {
-              status = event.payload.status;
-            }
-
-            // Check if session exists in store
-            const sessionExists = get().sessions.some(
-              (s) => s.id === session_id && s.project_path === project_path,
+            // samePath, not strict equality: the backend canonicalizes paths
+            // (`\\?\C:\…` on Windows) and a form mismatch here silently
+            // buffers every status event forever — the session then never
+            // updates (issue #105).
+            const existing = get().sessions.find(
+              (s) => s.id === session_id && samePath(s.project_path, project_path),
             );
 
-            if (!sessionExists) {
+            // Subagent count is only consulted for the Stop-hook signal.
+            const runningSubagents =
+              event.payload.status === "AwaitingInput"
+                ? useAgentStore
+                    .getState()
+                    .agents.filter((a) => a.sessionId === session_id && a.completedAt === null)
+                    .length
+                : 0;
+
+            const resolved = resolveStatusEvent(event.payload, existing?.status, runningSubagents);
+            if (!resolved) return;
+
+            if (!existing) {
               // Buffer this status update - it will be applied when the session is added
               const bufferKey = statusBufferKey(session_id, project_path);
               console.log(
@@ -571,14 +653,15 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
               );
               pendingStatusUpdates.set(bufferKey, {
                 ...event.payload,
-                status,
-                message: statusMessage,
+                status: resolved.status,
+                message: resolved.statusMessage,
+                needs_input_prompt: resolved.needsInputPrompt,
               });
               return;
             }
 
             // Clear startup timeout when session transitions out of Starting state (Bug #74)
-            if (status !== "Starting") {
+            if (resolved.status !== "Starting") {
               clearStartupTimeout(session_id);
             }
 
@@ -590,23 +673,23 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
               // it. Edge-triggered on purpose — if the user re-parks the
               // still-stopped session, repeated events for the same status are
               // not a new transition and must not undo that manual choice.
-              const existing = state.sessions.find(
-                (s) => s.id === session_id && s.project_path === project_path,
+              const current = state.sessions.find(
+                (s) => s.id === session_id && samePath(s.project_path, project_path),
               );
               const autoUnpark =
-                existing !== undefined &&
-                READY_FOR_USER_STATUSES.includes(status) &&
-                existing.status !== status &&
+                current !== undefined &&
+                READY_FOR_USER_STATUSES.includes(resolved.status) &&
+                current.status !== resolved.status &&
                 state.parkedSessionIds.includes(session_id);
 
               return {
                 sessions: state.sessions.map((s) =>
-                  s.id === session_id && s.project_path === project_path
+                  s.id === session_id && samePath(s.project_path, project_path)
                     ? {
                         ...s,
-                        status,
-                        statusMessage,
-                        needsInputPrompt: needs_input_prompt,
+                        status: resolved.status,
+                        statusMessage: resolved.statusMessage,
+                        needsInputPrompt: resolved.needsInputPrompt,
                         lastMcpUpdateTime: Date.now(),
                       }
                     : s,

@@ -47,7 +47,7 @@ export function PullRequestFilters({ repoPath }: PullRequestFiltersProps) {
         .replace(/\s+/g, " ")
         .trim();
     } else {
-      next = (searchInput.trim() + " " + clause).trim();
+      next = `${searchInput.trim()} ${clause}`.trim();
     }
     setSearchInput(next);
     applySearch(next);
