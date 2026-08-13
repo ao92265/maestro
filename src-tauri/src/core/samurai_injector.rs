@@ -193,6 +193,48 @@ fn corrective_instruction_for(
     }
 }
 
+/// A capture-time [`Instant`] that test code can artificially age without
+/// rewinding the underlying clock (issue #90). `Instant` is boot-relative on
+/// Windows, so `Instant::now().checked_sub(by)` underflows whenever the
+/// machine's uptime is shorter than `by` — flaky right after a reboot, green
+/// on a long-running box. Advancing the *reading* side instead (adding to
+/// elapsed time) can never underflow, so tests age these clocks that way.
+#[derive(Clone, Copy)]
+struct AgeableInstant {
+    at: Instant,
+    /// Test-only extra age layered on top of `at`'s real elapsed time.
+    /// Always zero outside tests; production reads are unaffected.
+    #[cfg(test)]
+    extra: Duration,
+}
+
+impl AgeableInstant {
+    fn now() -> Self {
+        Self {
+            at: Instant::now(),
+            #[cfg(test)]
+            extra: Duration::ZERO,
+        }
+    }
+
+    fn elapsed(&self) -> Duration {
+        #[cfg(test)]
+        {
+            self.at.elapsed() + self.extra
+        }
+        #[cfg(not(test))]
+        {
+            self.at.elapsed()
+        }
+    }
+
+    /// Test-only: simulate `by` additional elapsed time on this timestamp.
+    #[cfg(test)]
+    fn backdate(&mut self, by: Duration) {
+        self.extra += by;
+    }
+}
+
 /// One instruction the controller is shepherding from trigger to ACK to the
 /// validated handoff. Created when the trigger transitions a session into
 /// HANDOFF_REQUESTED; dropped when the session leaves that state, validation
@@ -210,18 +252,18 @@ struct PendingInstruction {
     /// Injection attempts so far: 0 (waiting for first idle), 1, or 2 (max).
     attempts: u8,
     /// When the latest injection was written; `None` before the first.
-    injected_at: Option<Instant>,
+    injected_at: Option<AgeableInstant>,
     /// When the entry started (or resumed) WAITING for an idle signal:
     /// stamped at creation, and re-stamped whenever a retry/corrective is
     /// armed. Caps the wait (finding E): no injection possible within
     /// `ack_timeout_secs * STUCK_WAIT_MULTIPLIER` of this → ALERT.
-    waiting_since: Instant,
+    waiting_since: AgeableInstant,
     /// The orchestrator replied with the expected ACK marker.
     acked: bool,
     /// Attempt 1 timed out; re-inject at the next idle signal.
     awaiting_retry: bool,
     /// When the ACK arrived — the written-marker window runs from here.
-    acked_at: Option<Instant>,
+    acked_at: Option<AgeableInstant>,
     /// The written marker arrived and the two-check validation is in flight.
     validating: bool,
     /// This entry carries the single corrective re-instruction; any further
@@ -248,7 +290,7 @@ impl PendingInstruction {
             instruction,
             attempts: 0,
             injected_at: None,
-            waiting_since: Instant::now(),
+            waiting_since: AgeableInstant::now(),
             acked: false,
             awaiting_retry: false,
             acked_at: None,
@@ -556,7 +598,7 @@ fn arm_corrective(p: &mut PendingInstruction, failure: String) {
     p.attempts = 1;
     p.awaiting_retry = true;
     // The wait for the corrective's idle starts now (finding E age cap).
-    p.waiting_since = Instant::now();
+    p.waiting_since = AgeableInstant::now();
     p.acked = false;
     p.acked_at = None;
     p.validating = false;
@@ -989,7 +1031,7 @@ impl SamuraiInjector {
                             p.awaiting_retry = true;
                             // The wait for the retry's idle starts now
                             // (finding E age cap).
-                            p.waiting_since = Instant::now();
+                            p.waiting_since = AgeableInstant::now();
                         }
                         TimeoutVerdict::AlertStuck => {
                             // Finding E: no injection was possible yet —
@@ -1243,7 +1285,7 @@ impl SamuraiInjector {
             return None;
         }
         p.attempts += 1;
-        p.injected_at = Some(Instant::now());
+        p.injected_at = Some(AgeableInstant::now());
         p.awaiting_retry = false;
         // The long turn finally ended and the instruction went in: the entry
         // is live again, so it counts as pending once more and a later
@@ -1305,7 +1347,7 @@ impl SamuraiInjector {
                 return;
             }
             p.acked = true;
-            p.acked_at = Some(Instant::now());
+            p.acked_at = Some(AgeableInstant::now());
             p.awaiting_retry = false;
         } else {
             log::warn!(
@@ -1499,33 +1541,40 @@ impl SamuraiInjector {
 
     /// Test-only: age the latest injection so timeout paths run without
     /// real waiting. `pub(crate)` for the parker's sweep tests (issue #60).
+    ///
+    /// Ages the clock by advancing its *reading* side (`AgeableInstant`'s
+    /// extra elapsed time) rather than rewinding the stored `Instant` —
+    /// `Instant::now().checked_sub(by)` underflows whenever machine uptime
+    /// is shorter than `by` (issue #90), which made this flaky right after
+    /// a reboot.
     #[cfg(test)]
     pub(crate) fn backdate_injection(&self, session_id: u32, by: Duration) {
         let mut pending = self.lock_pending();
         let p = pending.get_mut(&session_id).expect("no pending entry");
-        p.injected_at = p.injected_at.expect("nothing injected").checked_sub(by);
-        assert!(p.injected_at.is_some(), "backdate underflowed Instant");
+        p.injected_at
+            .as_mut()
+            .expect("nothing injected")
+            .backdate(by);
     }
 
     /// Test-only: age the ACK so written-window paths run without waiting.
+    /// See [`Self::backdate_injection`] for why this advances rather than
+    /// rewinds the clock.
     #[cfg(test)]
     fn backdate_ack(&self, session_id: u32, by: Duration) {
         let mut pending = self.lock_pending();
         let p = pending.get_mut(&session_id).expect("no pending entry");
-        p.acked_at = p.acked_at.expect("not acked").checked_sub(by);
-        assert!(p.acked_at.is_some(), "backdate underflowed Instant");
+        p.acked_at.as_mut().expect("not acked").backdate(by);
     }
 
     /// Test-only: age the waiting clock so the stuck-wait cap (finding E)
-    /// runs without real waiting.
+    /// runs without real waiting. See [`Self::backdate_injection`] for why
+    /// this advances rather than rewinds the clock.
     #[cfg(test)]
     fn backdate_waiting(&self, session_id: u32, by: Duration) {
         let mut pending = self.lock_pending();
         let p = pending.get_mut(&session_id).expect("no pending entry");
-        p.waiting_since = p
-            .waiting_since
-            .checked_sub(by)
-            .expect("backdate underflowed Instant");
+        p.waiting_since.backdate(by);
     }
 }
 
