@@ -1114,6 +1114,8 @@ pub fn run() {
             // Samurai journal (Phase 5, issue #69)
             commands::samurai::samurai_journal_add,
             commands::samurai::samurai_journal_list,
+            // Per-entry journal delete (issue #100)
+            commands::samurai::samurai_journal_delete,
             // Samurai harvest (issue #98: interactive triage session; the
             // read command keeps serving previously generated reports)
             commands::harvest::samurai_harvest_arm,

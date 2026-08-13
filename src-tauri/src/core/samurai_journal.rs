@@ -26,6 +26,15 @@
 //! are skipped with a warning, never a failed read — and `commit_harvest`
 //! carries such lines through its rewrite verbatim rather than deleting
 //! data it could not parse.
+//!
+//! **Per-entry delete (issue #100):** entries carry no id, so
+//! [`JournalStore::delete_entry`] identifies one by its exact on-disk JSONL
+//! text (the `raw` field `list()` hands back) and removes every line
+//! byte-identical to it — see that method's docs for the identity and
+//! duplicate-handling rationale. Unlike `commit_harvest`, a delete must not
+//! lose a same-window out-of-process append (an agent's `>>`): it re-reads
+//! the file immediately before its atomic rewrite and carries any newly
+//! appended bytes through untouched.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -133,6 +142,13 @@ pub enum JournalEntryStatus {
 pub struct JournalEntryWithStatus {
     pub entry: JournalEntry,
     pub status: JournalEntryStatus,
+    /// The exact on-disk JSONL text this entry came from (no trailing
+    /// newline), verbatim — never a re-serialization. Entries carry no id
+    /// (issue #100: the wire shape is a hand-written agent contract), so
+    /// this is the smallest identity that survives a list -> confirm ->
+    /// delete round trip; the frontend hands it back unmodified to
+    /// [`JournalStore::delete_entry`].
+    pub raw: String,
 }
 
 /// Result of a list: the active file's entries (newest last) plus the file
@@ -145,11 +161,25 @@ pub struct JournalListResult {
 
 /// One parsed line of the active file, in file order. `Opaque` lines
 /// (malformed or unknown shape) are never listed, archived or dropped —
-/// they ride through rewrites verbatim.
+/// they ride through rewrites verbatim. `Entry`/`Marker` additionally carry
+/// their own exact original text (not a re-serialization) — [`delete_entry`]
+/// needs it to match a caller's raw identity and to carry every untouched
+/// line through its rewrite byte-for-byte.
 enum RawLine {
-    Entry(JournalEntry),
-    Marker(HarvestMarker),
+    Entry(JournalEntry, String),
+    Marker(HarvestMarker, String),
     Opaque(String),
+}
+
+impl RawLine {
+    /// The exact on-disk bytes (minus the trailing newline) this line came
+    /// from, for every variant.
+    fn raw(&self) -> &str {
+        match self {
+            RawLine::Entry(_, raw) | RawLine::Marker(_, raw) => raw,
+            RawLine::Opaque(raw) => raw,
+        }
+    }
 }
 
 /// The on-disk store. Constructed once at app setup (rooted at
@@ -210,9 +240,10 @@ impl JournalStore {
             .iter()
             .enumerate()
             .filter_map(|(i, line)| match line {
-                RawLine::Entry(entry) => Some(JournalEntryWithStatus {
+                RawLine::Entry(entry, raw) => Some(JournalEntryWithStatus {
                     entry: entry.clone(),
                     status: entry_status(i, last, prev),
+                    raw: raw.clone(),
                 }),
                 _ => None,
             })
@@ -266,7 +297,7 @@ impl JournalStore {
         // there move out (the active file never holds more than two markers).
         let archive_before = lines
             .iter()
-            .rposition(|l| matches!(l, RawLine::Marker(_)))
+            .rposition(|l| matches!(l, RawLine::Marker(..)))
             .unwrap_or(0);
         let marker_line = serde_json::to_string(&HarvestMarker::now(report_date))
             .map_err(|e| format!("failed to serialize harvest marker: {e}"))?;
@@ -280,7 +311,7 @@ impl JournalStore {
         let mut marker_inserted = false;
         for (i, line) in lines.iter().enumerate() {
             match line {
-                RawLine::Entry(entry) => {
+                RawLine::Entry(entry, _) => {
                     let raw = serde_json::to_string(entry)
                         .map_err(|e| format!("failed to serialize journal entry: {e}"))?;
                     if i < archive_before {
@@ -297,7 +328,7 @@ impl JournalStore {
                         consumed += 1;
                     }
                 }
-                RawLine::Marker(marker) => {
+                RawLine::Marker(marker, _) => {
                     let raw = serde_json::to_string(marker)
                         .map_err(|e| format!("failed to serialize harvest marker: {e}"))?;
                     let target = if i < archive_before {
@@ -331,6 +362,110 @@ impl JournalStore {
         }
         atomic_write(&journal_path, &kept)
     }
+
+    /// Deletes every active-file line whose entry's raw JSONL text is
+    /// exactly `raw_line` (issue #100). `raw_line` is meant to be the `raw`
+    /// field `list()` handed back for the row the user picked — a caller
+    /// round trips it unmodified.
+    ///
+    /// **Identity & duplicate semantic.** Entries carry no id (the on-wire
+    /// shape is a hand-written contract with agents, PRD §5.12) — the
+    /// exact on-disk bytes of the line are the smallest identity available
+    /// that survives a list -> confirm -> delete round trip. Two entries
+    /// that happen to serialize identically are indistinguishable once
+    /// round-tripped through `list()` — there is no sharper handle to say
+    /// "just this one, not that other one that reads the same" — so the
+    /// chosen semantic deletes EVERY line byte-identical to `raw_line`.
+    /// Markers and opaque (malformed/unknown-shape) lines are never
+    /// matched, so they never move or reorder. Returns the number of lines
+    /// removed; 0 means `raw_line` no longer matches anything currently in
+    /// the file (a stale list taken before a harvest reformatted/archived
+    /// the line, or a second delete of the same row) — the caller treats
+    /// that as "not found", not a crash.
+    ///
+    /// **Race safety.** The whole read-filter-write happens under
+    /// [`JournalStore::lock`], so no IN-PROCESS writer (append/list/
+    /// commit_harvest/another delete) can interleave. An OUT-OF-PROCESS
+    /// append — an agent's shell `>>`, entirely outside this mutex — can
+    /// still land between the read and the rename; unlike
+    /// `commit_harvest`'s accepted loss window, a delete must not eat it.
+    /// So immediately before writing, this re-reads the file and requires
+    /// it to still literally start with the exact bytes just filtered:
+    /// anything appended past that point was written after we looked and
+    /// is carried into the rewrite untouched. A few retries absorb another
+    /// append landing during the recheck itself; a change that is neither
+    /// "unchanged" nor "our bytes plus an appended tail" should be
+    /// impossible under the append-only contract and surfaces as an error
+    /// rather than risking building on stale content.
+    pub fn delete_entry(&self, raw_line: &str) -> Result<usize, String> {
+        self.delete_entry_with_hook(raw_line, || {})
+    }
+
+    /// [`JournalStore::delete_entry`]'s body, with a test-only hook fired
+    /// once — right after the delete-candidate content is computed and
+    /// before the pre-write recheck — so a test can land a same-window
+    /// external append exactly there and prove the recheck carries it
+    /// through.
+    fn delete_entry_with_hook(
+        &self,
+        raw_line: &str,
+        on_after_filter: impl FnOnce(),
+    ) -> Result<usize, String> {
+        let _guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let path = self.journal_path();
+        let mut hook = Some(on_after_filter);
+        const MAX_ATTEMPTS: usize = 5;
+        for attempt in 0..MAX_ATTEMPTS {
+            let original = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+                Err(e) => return Err(format!("failed to read journal file {path:?}: {e}")),
+            };
+            let text = String::from_utf8(original.clone())
+                .map_err(|e| format!("journal file {path:?} is not valid UTF-8: {e}"))?;
+            let lines = parse_lines(&text, &path);
+
+            let mut removed = 0usize;
+            let mut kept = String::new();
+            for line in &lines {
+                if matches!(line, RawLine::Entry(_, raw) if raw == raw_line) {
+                    removed += 1;
+                    continue;
+                }
+                kept.push_str(line.raw());
+                kept.push('\n');
+            }
+            if removed == 0 {
+                return Ok(0);
+            }
+            if let Some(h) = hook.take() {
+                h();
+            }
+
+            let current = std::fs::read(&path)
+                .map_err(|e| format!("failed to read journal file {path:?}: {e}"))?;
+            if current == original {
+                atomic_write(&path, &kept)?;
+                return Ok(removed);
+            }
+            if current.len() > original.len() && current.starts_with(&original) {
+                // A same-window out-of-process append — carry its exact
+                // bytes into the rewrite so it is never lost.
+                kept.push_str(&String::from_utf8_lossy(&current[original.len()..]));
+                atomic_write(&path, &kept)?;
+                return Ok(removed);
+            }
+            // Neither unchanged nor our bytes plus an appended tail —
+            // should be impossible under the contract; retry with a fresh
+            // read rather than risk writing over content we never saw.
+            if attempt + 1 == MAX_ATTEMPTS {
+                return Err(format!(
+                    "journal file {path:?} changed unexpectedly while deleting; try again"
+                ));
+            }
+        }
+        unreachable!("loop always returns or errors within MAX_ATTEMPTS")
+    }
 }
 
 /// Positions of the last and second-to-last markers, when present.
@@ -338,7 +473,7 @@ fn marker_positions(lines: &[RawLine]) -> (Option<usize>, Option<usize>) {
     let markers: Vec<usize> = lines
         .iter()
         .enumerate()
-        .filter_map(|(i, l)| matches!(l, RawLine::Marker(_)).then_some(i))
+        .filter_map(|(i, l)| matches!(l, RawLine::Marker(..)).then_some(i))
         .collect();
     let last = markers.last().copied();
     let prev = markers.len().checked_sub(2).map(|i| markers[i]);
@@ -366,12 +501,19 @@ fn read_lines(path: &Path) -> Result<(Vec<RawLine>, u64), String> {
     };
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read journal file {path:?}: {e}"))?;
-    let lines = content
+    let lines = parse_lines(&content, path);
+    Ok((lines, metadata.len()))
+}
+
+/// Parses every non-blank line of `content` in file order (the shared body
+/// of [`read_lines`] and [`JournalStore::delete_entry_with_hook`], which
+/// additionally needs the exact source bytes `content` came from).
+fn parse_lines(content: &str, path: &Path) -> Vec<RawLine> {
+    content
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| parse_line(l, path))
-        .collect();
-    Ok((lines, metadata.len()))
+        .collect()
 }
 
 fn parse_line(line: &str, path: &Path) -> RawLine {
@@ -385,9 +527,10 @@ fn parse_line(line: &str, path: &Path) -> RawLine {
     // Marker lines are the ones carrying a `kind` discriminator; anything
     // else must parse as an entry or it is opaque.
     let parsed = if value.get("kind").is_some() {
-        serde_json::from_value::<HarvestMarker>(value).map(RawLine::Marker)
+        serde_json::from_value::<HarvestMarker>(value)
+            .map(|m| RawLine::Marker(m, line.to_string()))
     } else {
-        serde_json::from_value::<JournalEntry>(value).map(RawLine::Entry)
+        serde_json::from_value::<JournalEntry>(value).map(|e| RawLine::Entry(e, line.to_string()))
     };
     parsed.unwrap_or_else(|e| {
         log::warn!("skipping unknown-shape journal line in {path:?}: {e}");
@@ -796,5 +939,212 @@ mod tests {
         let path = default_journal_file();
         assert!(path.ends_with(JOURNAL_FILE), "{path}");
         assert!(!path.starts_with(r"\\?\"), "{path}");
+    }
+
+    // --- issue #100: per-entry delete ---
+
+    #[test]
+    fn test_delete_entry_removes_only_the_matching_line() {
+        let dir = tempdir().unwrap();
+        let s = store(dir.path());
+        s.append_entry(&entry(JournalCategory::Error, "one"))
+            .unwrap();
+        s.append_entry(&entry(JournalCategory::Skill, "two"))
+            .unwrap();
+        s.append_entry(&entry(JournalCategory::Concern, "three"))
+            .unwrap();
+
+        let raw_two = s
+            .list()
+            .unwrap()
+            .entries
+            .into_iter()
+            .find(|e| e.entry.text == "two")
+            .unwrap()
+            .raw;
+        assert_eq!(s.delete_entry(&raw_two).unwrap(), 1);
+
+        let remaining: Vec<String> = s
+            .list()
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|e| e.entry.text)
+            .collect();
+        assert_eq!(remaining, vec!["one".to_string(), "three".to_string()]);
+        // No torn-write leftovers.
+        assert!(!dir.path().join("journal.jsonl.tmp").exists());
+    }
+
+    #[test]
+    fn test_delete_entry_removes_all_byte_identical_duplicates() {
+        // Pins the chosen duplicate semantic (issue #100): entries carry no
+        // id, so two lines that serialize identically are indistinguishable
+        // once round-tripped through `list()` — deleting "this entry" means
+        // deleting every line that reads the same.
+        let dir = tempdir().unwrap();
+        let s = store(dir.path());
+        let dup = JournalEntry {
+            ts: "2026-08-13T10:00:00+00:00".to_string(),
+            category: JournalCategory::Error,
+            text: "same text".to_string(),
+            project: None,
+            agent: None,
+        };
+        s.append_entry(&dup).unwrap();
+        s.append_entry(&dup).unwrap();
+        s.append_entry(&entry(JournalCategory::Skill, "unique"))
+            .unwrap();
+
+        let listed = s.list().unwrap().entries;
+        let raw = listed[0].raw.clone();
+        assert_eq!(listed[1].raw, raw, "the two dup entries share identical raw bytes");
+
+        let removed = s.delete_entry(&raw).unwrap();
+        assert_eq!(removed, 2, "byte-identical duplicates are deleted together");
+
+        let remaining = s.list().unwrap().entries;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].entry.text, "unique");
+    }
+
+    #[test]
+    fn test_delete_entry_preserves_malformed_lines_verbatim_and_in_order() {
+        // The append-only contract: a delete must not destroy or reorder
+        // lines the reader could not parse.
+        let dir = tempdir().unwrap();
+        let s = store(dir.path());
+        s.append_entry(&entry(JournalCategory::Error, "keep me"))
+            .unwrap();
+        let path = dir.path().join(JOURNAL_FILE);
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str("{ garbage not json\n");
+        std::fs::write(&path, &content).unwrap();
+        s.append_entry(&entry(JournalCategory::Skill, "delete me"))
+            .unwrap();
+
+        let raw_to_delete = s
+            .list()
+            .unwrap()
+            .entries
+            .into_iter()
+            .find(|e| e.entry.text == "delete me")
+            .unwrap()
+            .raw;
+        assert_eq!(s.delete_entry(&raw_to_delete).unwrap(), 1);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("{ garbage not json"), "{after}");
+        assert!(after.contains("keep me"), "{after}");
+        assert!(!after.contains("delete me"), "{after}");
+        // Order preserved: the garbage line still sits after "keep me".
+        assert!(after.find("keep me").unwrap() < after.find("{ garbage not json").unwrap());
+    }
+
+    #[test]
+    fn test_delete_entry_missing_identity_and_missing_file() {
+        let dir = tempdir().unwrap();
+        let never_written = store(&dir.path().join("never-written"));
+        assert_eq!(never_written.delete_entry("anything").unwrap(), 0);
+
+        let s = store(dir.path());
+        s.append_entry(&entry(JournalCategory::Error, "x"))
+            .unwrap();
+        assert_eq!(s.delete_entry("not a real raw line").unwrap(), 0);
+        // The untouched entry is still there.
+        assert_eq!(s.list().unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn test_delete_preserves_other_entries_consumed_and_unconsumed_status() {
+        // The consumption marker interplay: deleting a CONSUMED entry must
+        // not disturb another CONSUMED entry's status, and deleting an
+        // UNCONSUMED entry must not disturb another UNCONSUMED one — the
+        // markers themselves are never touched by a delete.
+        let dir = tempdir().unwrap();
+        let s = store(dir.path());
+        s.append_entry(&entry(JournalCategory::Error, "keep-consumed"))
+            .unwrap();
+        s.append_entry(&entry(JournalCategory::Error, "delete-consumed"))
+            .unwrap();
+        s.commit_harvest("2026-08-07", 2).unwrap();
+        s.append_entry(&entry(JournalCategory::Error, "keep-unconsumed"))
+            .unwrap();
+        s.append_entry(&entry(JournalCategory::Error, "delete-unconsumed"))
+            .unwrap();
+
+        let listed = s.list().unwrap().entries;
+        let raw_of = |text: &str| {
+            listed
+                .iter()
+                .find(|e| e.entry.text == text)
+                .unwrap()
+                .raw
+                .clone()
+        };
+        let del_consumed = raw_of("delete-consumed");
+        let del_unconsumed = raw_of("delete-unconsumed");
+
+        assert_eq!(s.delete_entry(&del_consumed).unwrap(), 1);
+        assert_eq!(s.delete_entry(&del_unconsumed).unwrap(), 1);
+
+        let after: Vec<(String, JournalEntryStatus)> = s
+            .list()
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|e| (e.entry.text, e.status))
+            .collect();
+        assert_eq!(
+            after,
+            vec![
+                ("keep-consumed".to_string(), JournalEntryStatus::Consumed),
+                ("keep-unconsumed".to_string(), JournalEntryStatus::Unconsumed),
+            ]
+        );
+        // The marker itself survives the deletes untouched.
+        let journal = std::fs::read_to_string(dir.path().join(JOURNAL_FILE)).unwrap();
+        let markers = journal
+            .lines()
+            .filter(|l| {
+                serde_json::from_str::<HarvestMarker>(l)
+                    .is_ok_and(|m| m.kind == MarkerKind::Harvest)
+            })
+            .count();
+        assert_eq!(markers, 1);
+    }
+
+    #[test]
+    fn test_delete_entry_preserves_concurrent_append() {
+        // A delete must not lose an out-of-process append that lands
+        // between the read and the rename — unlike `commit_harvest`'s
+        // accepted loss window. The hook simulates the agent's shell `>>`
+        // landing exactly in that gap.
+        let dir = tempdir().unwrap();
+        let s = store(dir.path());
+        s.append_entry(&entry(JournalCategory::Error, "to delete"))
+            .unwrap();
+        let raw = s.list().unwrap().entries[0].raw.clone();
+
+        let path = dir.path().join(JOURNAL_FILE);
+        let appended_line =
+            serde_json::to_string(&entry(JournalCategory::Concern, "landed mid-delete")).unwrap();
+
+        let removed = s
+            .delete_entry_with_hook(&raw, || {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap();
+                writeln!(f, "{appended_line}").unwrap();
+            })
+            .unwrap();
+
+        assert_eq!(removed, 1);
+        let remaining = s.list().unwrap().entries;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].entry.text, "landed mid-delete");
+        assert!(!dir.path().join("journal.jsonl.tmp").exists());
     }
 }

@@ -1008,6 +1008,31 @@ pub fn samurai_journal_list(
     journal.list()
 }
 
+/// Deletes one journal entry (issue #100), identified by the exact `raw`
+/// text `samurai_journal_list` handed back for the row the user picked
+/// (see `JournalStore::delete_entry` for the identity and duplicate
+/// semantics — byte-identical duplicate lines are deleted together, since
+/// entries carry no id to tell them apart). Destructive; the frontend
+/// confirms before calling. Consumed/archived entries are deletable the
+/// same as unconsumed ones — deleting never touches the harvest markers.
+#[tauri::command]
+pub fn samurai_journal_delete(
+    journal: State<'_, Arc<JournalStore>>,
+    raw: String,
+) -> Result<usize, String> {
+    if raw.trim().is_empty() {
+        return Err("journal entry identity must not be empty".to_string());
+    }
+    match journal.delete_entry(&raw)? {
+        0 => Err(
+            "journal entry not found — it may already be gone, or a harvest changed it since \
+             this list was loaded; refresh and try again"
+                .to_string(),
+        ),
+        removed => Ok(removed),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
