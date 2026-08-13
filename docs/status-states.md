@@ -1,0 +1,131 @@
+# Session status: signal → state mapping
+
+How the per-session status (the 3-dot indicator: blue = working, red = needs
+input, green = done, gray = idle) is derived, and how to verify each failure
+class from issue #105 in the live app.
+
+Statuses live in `useSessionStore` (`src/stores/useSessionStore.ts`). Every
+producer below ends up either as a `session-status-changed` Tauri event
+(merged by `resolveStatusEvent`) or as a direct store write.
+
+## Producers
+
+### Claude Code hooks → status server (`src-tauri/src/core/status_server.rs`)
+
+Written per session into `.claude/settings.local.json` by
+`hook_config_writer.rs` (Claude sessions only — other CLIs get none of these):
+
+| Hook | Route | Wire status | Meaning |
+| --- | --- | --- | --- |
+| `SessionStart` | `/hook/session-start` | `Idle` | CLI (re)started and sits at its prompt. It is *not* working yet. |
+| `UserPromptSubmit` | `/hook/user-prompt` | `Working` | A prompt was submitted (typed by the human or injected by Maestro). Authoritative turn start. |
+| `PreToolUse` (any tool) | `/hook/pre-tool` | `Working` ("Running {tool}") | The agent is executing a tool. Also repairs state after a permission prompt approved via digit shortcut. |
+| `PreToolUse` (`AskUserQuestion`) | `/hook/pre-tool` | `NeedsInput` | The agent opened an interactive question dialog mid-turn. |
+| `Notification` | `/hook/notification` | `NeedsInput` | The CLI is waiting on the human: permission prompt, or the 60s idle-prompt reminder. The notification text becomes the needs-input prompt. |
+| `Stop` | `/hook/stop` | `AwaitingInput` (wire-only) | Turn ended, control returned to the user. |
+| `SessionEnd` | `/hook/session-end` | `SessionEnded` (wire-only) | The claude process exited (`/exit`, `/clear`, logout). |
+
+### MCP status tool (`maestro-mcp-server`, tool `maestro_status`)
+
+Voluntary agent self-reports: `idle`/`working`/`needs_input`/`finished`/`error`
+→ `Idle`/`Working`/`NeedsInput`/`Done`/`Error`. `Done` and `Error` only ever
+come from here (and from the samurai watchdog).
+
+### Frontend-only producers
+
+| Producer | Where | Writes |
+| --- | --- | --- |
+| PTY-output heuristic | `TerminalView.tsx` | `Working` after ≥500ms of output, `Idle` after 5s of silence — but only when the last wire status is >10s old, and never over `NeedsInput`/`Done`/`Error`/`Timeout`. Main signal for non-Claude CLIs. |
+| Enter-key flip | `TerminalView.tsx` | Bare `\r` while `NeedsInput` → `Working` (the user just answered). |
+| Startup timeout | `useSessionStore.ts` | `Starting` for >30s → `Timeout`. |
+| Samurai watchdog | `useSessionStore.ts` | Supervisor `DEAD` → `Error`. |
+
+## Merge rules (`resolveStatusEvent`, exact order)
+
+1. **`AwaitingInput`** (Stop hook — weak, fires on every turn end):
+   - dropped if the session is `Done`/`Error`/`Timeout` (a turn-end blip never
+     downgrades an explicit terminal state);
+   - `Working` ("N subagents running") while background subagents run;
+   - otherwise `NeedsInput`.
+2. **`SessionEnded`**: dropped if `Done`/`Error` (the outcome stays visible);
+   otherwise `Idle`, clearing any needs-input prompt.
+3. **`NeedsInput`**: dropped if `Done`/`Error` (the 60s idle reminder fires
+   after every turn and must not repaint a finished session red). A `Timeout`
+   session *is* overwritten — an explicit needs-input proves the CLI is alive.
+4. **Everything else applies verbatim** — last writer wins. In particular
+   `Working` from `UserPromptSubmit` is what moves a session out of
+   `Done`/`Error` when a new turn starts.
+
+Precedence is therefore temporal, not ranked: the newest signal wins unless a
+rule above drops it. The PTY heuristic sits below all wire signals (10s grace,
+restricted target states).
+
+## Repro checklists (issue #105 — human sign-off)
+
+Run `npm run tauri dev`, open a project, start a Claude session.
+
+### Class 1 — "working while waiting"
+
+1. Ask the agent to run a command that needs permission approval (e.g.
+   "run `git push --dry-run`" with no pre-approval for it).
+2. Wait for the permission dialog to render in the terminal. Do not touch it.
+3. **Correct:** within ~1s of the dialog appearing, the indicator turns red
+   (needs input) and the header shows the permission message. Broken behavior
+   was: stays blue (working) or gray for as long as the dialog sits there.
+4. Also: launch a fresh session and type nothing. **Correct:** the indicator
+   is gray (idle) after startup, not blue. It turns blue only once you submit
+   a prompt.
+
+### Class 2 — "stale after finish"
+
+1. Ask the agent: "report your status as finished via the maestro status
+   tool, then stop." When the session shows green (done), send a NEW prompt
+   ("say hi").
+2. **Correct:** the indicator flips to blue the moment the prompt is
+   submitted, and to red when the turn ends. Broken behavior was: stays green
+   forever after the first Done.
+3. Then type `/exit` in the terminal (while the status is red or blue).
+4. **Correct:** the indicator goes gray (idle) within ~1s of the CLI exiting
+   and any "needs input" prompt text disappears. A green/red Done/Error badge
+   from a reported outcome survives `/exit` on purpose.
+
+### Class 3 — "needs-input missed"
+
+1. Ask the agent: "use the AskUserQuestion tool to ask me which of two
+   options I prefer." Wait for the question dialog.
+2. **Correct:** the indicator turns red as soon as the dialog appears
+   (mid-turn — before the turn ends), with "Waiting for you to answer a
+   question". Broken behavior was: blue/gray until the whole turn ended.
+3. Answer the question (arrow keys + Enter). **Correct:** back to blue while
+   the agent continues, red again at turn end.
+
+### Class 4 — "lag / flicker"
+
+1. Submit any prompt. **Correct:** blue within ~1s of pressing Enter (no
+   longer waits for 500ms of sustained output after a 10s grace window).
+2. Let a turn run tools (e.g. "list the files in this repo, then count the
+   lines in three of them"). **Correct:** solid blue for the whole turn — no
+   blue↔gray flapping between tool calls (every tool start refreshes the
+   authoritative Working signal, which keeps the PTY heuristic silenced).
+3. Leave the finished session alone for >60s after the turn-end red.
+   **Correct:** stays red (the idle reminder re-asserts needs-input); a
+   session that reported Done stays green.
+
+## Known residual gaps (documented, not silently ignored)
+
+- **Esc-interrupt:** interrupting a turn fires no Stop hook. The status stays
+  blue until the CLI's 60s idle Notification (→ red) or the PTY heuristic's
+  idle flip (→ gray) corrects it.
+- **Hard kill:** a `kill -9`/crash fires no SessionEnd hook. Samurai-supervised
+  sessions are covered by the watchdog (→ Error); unsupervised sessions keep
+  their last status until PTY output resumes.
+- **PreToolUse/Notification ordering:** both are near-simultaneous localhost
+  POSTs when a gated tool starts, and PreToolUse is async (fire-and-forget),
+  so a `Working` can in principle land after the permission `NeedsInput`.
+  Self-corrects on the next signal; the 60s idle reminder is the backstop.
+- **Empty-Enter flip:** pressing Enter on an empty prompt while red flips the
+  indicator to blue even though no turn starts (the flip cannot distinguish a
+  submit from a nudge). The next real signal corrects it.
+- **Non-Claude CLIs** (Gemini/Codex/OpenCode/Plain) have no hooks: they keep
+  the PTY heuristic + (OpenCode) MCP self-reports, with all four classes'
+  original limitations.
