@@ -111,18 +111,22 @@ fn extract_prompt_text(content: &str) -> String {
 
 /// Encodes a filesystem path into Claude Code's projects-directory naming scheme.
 ///
-/// Empirically, Claude Code replaces every character that isn't ASCII alphanumeric,
-/// `_`, or `-` with a `-`. That means `/`, `.`, and space all map to `-`, and a
+/// Empirically, Claude Code replaces every character that isn't ASCII alphanumeric
+/// or `-` with a `-`. That means `/`, `.`, space, and `_` all map to `-`, and a
 /// dotfile like `/Users/alice/.config` becomes `-Users-alice--config` (the slash
 /// *and* the dot each become a dash, producing `--`).
 ///
 /// An earlier version only replaced `/`, which silently returned an empty list
 /// for any path containing a dot — e.g. hidden directories or extensions.
+///
+/// A later version kept `_` as-is, which silently returned an empty list for
+/// any path containing an underscore — e.g. `C:\git\Dreadnought_Father_Folder`,
+/// whose real transcript directory is `C--git-Dreadnought-Father-Folder` (issue #86).
 pub(crate) fn encode_project_path(project_path: &str) -> String {
     project_path
         .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            if c.is_ascii_alphanumeric() || c == '-' {
                 c
             } else {
                 '-'
@@ -503,10 +507,22 @@ mod tests {
     }
 
     #[test]
-    fn encode_preserves_existing_dashes_and_underscores() {
+    fn encode_preserves_dashes_but_maps_underscores_to_dashes() {
         assert_eq!(
             encode_project_path("/a-b_c/d_e-f"),
-            "-a-b_c-d_e-f"
+            "-a-b-c-d-e-f"
+        );
+    }
+
+    #[test]
+    fn encode_maps_underscore_in_real_world_path() {
+        // Regression (issue #86): Claude Code's own encoder maps `_` to `-`
+        // just like every other special char. Keeping `_` produced a directory
+        // name (`C--git-Dreadnought_Father_Folder`) that never exists on disk,
+        // so sessions/memories for any underscore path were invisible.
+        assert_eq!(
+            encode_project_path(r"C:\git\Dreadnought_Father_Folder"),
+            "C--git-Dreadnought-Father-Folder"
         );
     }
 
