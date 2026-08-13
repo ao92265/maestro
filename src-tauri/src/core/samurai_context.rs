@@ -22,8 +22,12 @@ use super::claude_event::ClaudeEvent;
 
 /// Latest context-window usage snapshot for one session. Field semantics
 /// mirror [`ClaudeEvent::ContextUsageUpdate`].
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ContextUsage {
+    /// Model string of the assistant message the usage came from (issue
+    /// #102 — the Active Runs panel's orchestrator model, read here rather
+    /// than re-parsed).
+    pub model: String,
     /// input + cache_read + cache_creation tokens of the latest call.
     pub context_tokens: u64,
     /// The model's context window in tokens.
@@ -54,6 +58,7 @@ impl SamuraiContextStore {
     pub fn observe(&self, event: &ClaudeEvent) {
         if let ClaudeEvent::ContextUsageUpdate {
             session_id,
+            model,
             context_tokens,
             context_window,
             percent,
@@ -63,6 +68,7 @@ impl SamuraiContextStore {
             self.lock().insert(
                 *session_id,
                 ContextUsage {
+                    model: model.clone(),
                     context_tokens: *context_tokens,
                     context_window: *context_window,
                     percent: *percent,
@@ -80,7 +86,7 @@ impl SamuraiContextStore {
     /// Latest full snapshot (tokens + window + percent) for a session.
     #[allow(dead_code)] // read API for the handoff trigger / ACK scanner (later P2 issues)
     pub fn usage(&self, session_id: u32) -> Option<ContextUsage> {
-        self.lock().get(&session_id).copied()
+        self.lock().get(&session_id).cloned()
     }
 
     /// Drop one session's entry. Called from session teardown.
@@ -129,6 +135,7 @@ mod tests {
         let usage = store.usage(1).expect("usage must be retained");
         assert_eq!(usage.context_tokens, 90_000);
         assert_eq!(usage.context_window, 200_000);
+        assert_eq!(usage.model, "claude-opus-4");
     }
 
     #[test]

@@ -17,6 +17,7 @@ use tauri_plugin_store::StoreExt;
 use crate::commands::ai_runner::{artifact_base_dir, canonical_project_path};
 use crate::commands::usage::{get_claude_usage, UsageData};
 use crate::core::samurai_audit::{AuditEvent, AuditEventKind, AuditLog, AuditReadResult};
+use crate::core::samurai_context::SamuraiContextStore;
 use crate::core::samurai_config::{SamuraiConfig, SharedSamuraiConfig};
 use crate::core::samurai_files::{self, SamuraiFileEntry, SamuraiFilesRoots};
 use crate::core::samurai_injector::strip_extended_prefix;
@@ -614,12 +615,95 @@ pub fn samurai_default_workflow() -> WorkflowGraph {
     WorkflowGraph::default()
 }
 
+/// The live orchestrator facts behind one run row (issue #102). `generation`
+/// and `session_id` come from the supervisor's session list, joined to the
+/// run by project + epic slug — the same identity `launch_refusal` and
+/// `cleanup_epic_inner` already match sessions on. `model`, `context_window`
+/// and `context_percent` come from [`SamuraiContextStore`] — the exact
+/// per-session reading the 45% handoff trigger reads (`core/samurai_context.rs`),
+/// never re-parsed here.
+///
+/// Every field is `None` when its source has nothing yet: a config with no
+/// session registered (the brief window between the config write and the
+/// frontend's `samurai_register_session` call), or a COMPLETED run whose
+/// terminal already tore down and cleared its `SamuraiContextStore` entry.
+/// The frontend renders an absent field as a dash, never a guess.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SamuraiRunOrchestrator {
+    pub generation: Option<u32>,
+    pub session_id: Option<u32>,
+    pub model: Option<String>,
+    pub context_window: Option<u64>,
+    pub context_percent: Option<f64>,
+}
+
+/// One Active Runs row: the persisted config, flattened, plus its live
+/// orchestrator details.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SamuraiRunListEntry {
+    #[serde(flatten)]
+    pub config: SamuraiRunConfig,
+    pub orchestrator: SamuraiRunOrchestrator,
+}
+
+/// The session that represents this run's CURRENT generation: every
+/// supervised session matching the run's project and epic (by slug, so
+/// "#38" and "38" find the same session), highest generation wins. Ties
+/// (a successor briefly registered before the predecessor's terminal
+/// transition lands) prefer the non-terminal one — the live session is the
+/// current orchestrator, not the one about to be superseded.
+fn latest_session_for_run<'a>(
+    sessions: &'a [SessionSnapshot],
+    project: &str,
+    epic: &str,
+) -> Option<&'a SessionSnapshot> {
+    sessions
+        .iter()
+        .filter(|s| s.project == project && epic_slug(&s.epic) == epic_slug(epic))
+        .max_by_key(|s| (s.generation, !s.state.is_terminal()))
+}
+
+/// Joins run configs to their orchestrator's live details — extracted from
+/// the tauri command for testability (the `launch_run_inner` precedent), so
+/// the join logic runs against plain data without a Tauri mock context.
+pub(crate) fn build_run_list_entries(
+    configs: Vec<SamuraiRunConfig>,
+    sessions: &[SessionSnapshot],
+    context: &SamuraiContextStore,
+) -> Vec<SamuraiRunListEntry> {
+    configs
+        .into_iter()
+        .map(|config| {
+            let session = latest_session_for_run(sessions, &config.project_path, &config.epic);
+            let (generation, session_id) = match session {
+                Some(s) => (Some(s.generation), Some(s.session_id)),
+                None => (None, None),
+            };
+            let usage = session_id.and_then(|id| context.usage(id));
+            let orchestrator = SamuraiRunOrchestrator {
+                generation,
+                session_id,
+                model: usage.as_ref().map(|u| u.model.clone()),
+                context_window: usage.as_ref().map(|u| u.context_window),
+                context_percent: usage.as_ref().map(|u| u.percent),
+            };
+            SamuraiRunListEntry { config, orchestrator }
+        })
+        .collect()
+}
+
 /// Every unarchived run config across all projects — the launcher panel's
 /// runs list: ACTIVE (live) plus COMPLETED (issue #96 — verified finished,
-/// awaiting the manual cleanup that archives it).
+/// awaiting the manual cleanup that archives it). Each row is enriched with
+/// its orchestrator's live details (issue #102): model, max context window,
+/// live context %, generation, session id.
 #[tauri::command]
-pub fn samurai_list_runs(run_configs: State<'_, Arc<RunConfigStore>>) -> Vec<SamuraiRunConfig> {
-    run_configs.load_unarchived()
+pub fn samurai_list_runs(
+    run_configs: State<'_, Arc<RunConfigStore>>,
+    supervisor: State<'_, Arc<Supervisor>>,
+    context: State<'_, Arc<SamuraiContextStore>>,
+) -> Vec<SamuraiRunListEntry> {
+    build_run_list_entries(run_configs.load_unarchived(), &supervisor.list_sessions(), &context)
 }
 
 /// What one cleanup pass removed (PRD §5.9: surfaced in the UI, never
@@ -1091,6 +1175,132 @@ mod tests {
     fn test_default_workflow_command_returns_the_template() {
         // The UI's reset-to-default has ONE source of truth.
         assert_eq!(samurai_default_workflow(), WorkflowGraph::default());
+    }
+
+    // --- issue #102: Active Runs orchestrator details ---
+
+    fn session_snapshot(
+        session_id: u32,
+        project: &str,
+        epic: &str,
+        generation: u32,
+        state: SupervisorState,
+    ) -> SessionSnapshot {
+        SessionSnapshot {
+            session_id,
+            project: project.to_string(),
+            epic: epic.to_string(),
+            generation,
+            state,
+            previous_state: None,
+            in_flight: None,
+            ts: "2026-08-13T00:00:00Z".to_string(),
+        }
+    }
+
+    fn context_usage_event(session_id: u32, model: &str, window: u64, percent: f64) -> crate::core::claude_event::ClaudeEvent {
+        crate::core::claude_event::ClaudeEvent::ContextUsageUpdate {
+            session_id,
+            model: model.to_string(),
+            context_tokens: (window as f64 * percent / 100.0) as u64,
+            context_window: window,
+            percent,
+            timestamp: "2026-08-13T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_latest_session_for_run_picks_highest_generation() {
+        let sessions = vec![
+            session_snapshot(1, "C:/git/x", "#38", 1, SupervisorState::Killed),
+            session_snapshot(2, "C:/git/x", "#38", 2, SupervisorState::Working),
+            // A different epic in the same project must not match.
+            session_snapshot(3, "C:/git/x", "#39", 5, SupervisorState::Working),
+        ];
+        let found = latest_session_for_run(&sessions, "C:/git/x", "#38").unwrap();
+        assert_eq!(found.session_id, 2);
+        assert_eq!(found.generation, 2);
+    }
+
+    #[test]
+    fn test_latest_session_for_run_matches_by_slug_not_exact_spelling() {
+        // The launcher/cleanup precedent: "38" and "#38" are one identity.
+        let sessions = vec![session_snapshot(7, "C:/git/x", "#38", 3, SupervisorState::Working)];
+        let found = latest_session_for_run(&sessions, "C:/git/x", "38").unwrap();
+        assert_eq!(found.session_id, 7);
+    }
+
+    #[test]
+    fn test_latest_session_for_run_ties_prefer_the_live_session() {
+        // A successor registers at the same generation number the
+        // predecessor's terminal transition hasn't landed for yet — the
+        // still-live one is the current orchestrator.
+        let sessions = vec![
+            session_snapshot(1, "C:/git/x", "#38", 2, SupervisorState::Killed),
+            session_snapshot(2, "C:/git/x", "#38", 2, SupervisorState::Working),
+        ];
+        let found = latest_session_for_run(&sessions, "C:/git/x", "#38").unwrap();
+        assert_eq!(found.session_id, 2);
+    }
+
+    #[test]
+    fn test_latest_session_for_run_no_match_is_none() {
+        let sessions = vec![session_snapshot(1, "C:/git/x", "#38", 1, SupervisorState::Working)];
+        assert!(latest_session_for_run(&sessions, "C:/git/x", "#99").is_none());
+        assert!(latest_session_for_run(&sessions, "C:/git/other", "#38").is_none());
+    }
+
+    #[test]
+    fn test_build_run_list_entries_joins_generation_session_and_live_context() {
+        let config = SamuraiRunConfig::new("C:/git/x", "#38", "C:/git/x-wt");
+        let sessions = vec![session_snapshot(9, "C:/git/x", "#38", 2, SupervisorState::Working)];
+        let context = crate::core::samurai_context::SamuraiContextStore::new();
+        context.observe(&context_usage_event(9, "claude-opus-4-6[1m]", 1_000_000, 38.5));
+
+        let entries = build_run_list_entries(vec![config], &sessions, &context);
+        assert_eq!(entries.len(), 1);
+        let orch = &entries[0].orchestrator;
+        assert_eq!(orch.generation, Some(2));
+        assert_eq!(orch.session_id, Some(9));
+        assert_eq!(orch.model.as_deref(), Some("claude-opus-4-6[1m]"));
+        assert_eq!(orch.context_window, Some(1_000_000));
+        assert_eq!(orch.context_percent, Some(38.5));
+    }
+
+    #[test]
+    fn test_build_run_list_entries_omits_fields_it_has_no_source_for() {
+        // No supervised session registered yet for this config (the window
+        // between the config write and the frontend's register call): every
+        // orchestrator field is None, never a guess.
+        let config = SamuraiRunConfig::new("C:/git/x", "#38", "C:/git/x-wt");
+        let context = crate::core::samurai_context::SamuraiContextStore::new();
+
+        let entries = build_run_list_entries(vec![config], &[], &context);
+        let orch = &entries[0].orchestrator;
+        assert_eq!(orch.generation, None);
+        assert_eq!(orch.session_id, None);
+        assert_eq!(orch.model, None);
+        assert_eq!(orch.context_window, None);
+        assert_eq!(orch.context_percent, None);
+    }
+
+    #[test]
+    fn test_build_run_list_entries_session_known_but_no_live_context_yet() {
+        // A session is registered (generation + session id known) but no
+        // assistant message has landed yet (or a COMPLETED run's session
+        // already tore down its context-store entry): the identity fields
+        // are populated, the live reading is not — never frozen into 0%.
+        let config = SamuraiRunConfig::new("C:/git/x", "#38", "C:/git/x-wt");
+        let sessions = vec![session_snapshot(9, "C:/git/x", "#38", 3, SupervisorState::Working)];
+        let context = crate::core::samurai_context::SamuraiContextStore::new();
+
+        let entries = build_run_list_entries(vec![config], &sessions, &context);
+        let orch = &entries[0].orchestrator;
+        assert_eq!(orch.generation, Some(3));
+        assert_eq!(orch.session_id, Some(9));
+        assert_eq!(orch.model, None);
+        assert_eq!(orch.context_window, None);
+        assert_eq!(orch.context_percent, None);
     }
 
     // --- worktree + cleanup (tempfile git fixtures) ---

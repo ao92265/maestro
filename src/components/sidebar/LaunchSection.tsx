@@ -15,7 +15,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { samePath } from "@/lib/path";
 import {
   type SamuraiPreflight,
-  type SamuraiRunConfig,
+  type SamuraiRunListEntry,
+  type SamuraiRunOrchestrator,
   type SamuraiTestGateProgress,
   samuraiCleanupEpic,
   samuraiLaunchRun,
@@ -80,6 +81,70 @@ function allowanceClass(left: number | null): string {
   if (left <= 10) return "text-maestro-red";
   if (left <= 25) return "text-maestro-orange";
   return "text-maestro-green";
+}
+
+/** Compact token-count display: `1_000_000` -> `1M`, `200_000` -> `200K`. */
+function formatContextWindow(tokens: number): string {
+  if (tokens >= 1_000_000) {
+    const millions = tokens / 1_000_000;
+    return `${Number.isInteger(millions) ? millions : millions.toFixed(1)}M`;
+  }
+  if (tokens >= 1_000) return `${Math.round(tokens / 1000)}K`;
+  return String(tokens);
+}
+
+/** Context-fill meter colouring: green plenty of room, amber filling up, red
+ *  near the handoff trigger — the inverse of `allowanceClass` (here HIGH is
+ *  the concerning direction). */
+function contextMeterClass(percent: number): string {
+  if (percent >= 80) return "bg-maestro-red";
+  if (percent >= 50) return "bg-maestro-orange";
+  return "bg-maestro-green";
+}
+
+/**
+ * One run row's orchestrator details (issue #102): model, generation,
+ * session id, and — while the run is still live — a small context-fill
+ * meter. A COMPLETED run's context reading is no longer live (its terminal
+ * has torn down), so the meter is omitted rather than showing a frozen or
+ * absent number under a "live" bar. Missing individual fields (no session
+ * registered yet) render as a dash, never a guess.
+ */
+function OrchestratorDetails({
+  orchestrator,
+  showLiveContext,
+}: {
+  orchestrator: SamuraiRunOrchestrator;
+  showLiveContext: boolean;
+}) {
+  const { generation, session_id, model, context_window, context_percent } = orchestrator;
+  return (
+    <div className="flex items-center gap-1.5 pl-1 text-[10px] text-maestro-muted">
+      <span className="min-w-0 flex-1 truncate" title={model ?? undefined}>
+        {model ?? "—"}
+      </span>
+      <span className="shrink-0">Gen {generation ?? "—"}</span>
+      <span className="shrink-0" title={session_id != null ? `Session ${session_id}` : undefined}>
+        Session {session_id ?? "—"}
+      </span>
+      {showLiveContext && (
+        <span className="flex shrink-0 items-center gap-1 tabular-nums">
+          <span className="h-1 w-8 overflow-hidden rounded-full bg-maestro-border/60">
+            {context_percent != null && (
+              <span
+                className={`block h-full ${contextMeterClass(context_percent)}`}
+                style={{ width: `${Math.min(100, Math.max(0, context_percent))}%` }}
+              />
+            )}
+          </span>
+          <span>
+            {context_percent != null ? `${context_percent}%` : "—"}
+            {context_window != null ? ` / ${formatContextWindow(context_window)}` : ""}
+          </span>
+        </span>
+      )}
+    </div>
+  );
 }
 
 /** One pass/fail preflight row. */
@@ -199,45 +264,50 @@ function RunRow({
   onCleanup,
   busy,
 }: {
-  run: SamuraiRunConfig;
-  onCleanup: (run: SamuraiRunConfig) => void;
+  run: SamuraiRunListEntry;
+  onCleanup: (run: SamuraiRunListEntry) => void;
   busy: boolean;
 }) {
+  const isCompleted = run.status === "COMPLETED";
   return (
     <div
-      className="flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] hover:bg-maestro-surface"
+      className="rounded px-1 py-0.5 hover:bg-maestro-surface"
       title={`worktree: ${run.worktree_path}\nrepo pin: ${run.repo_pin ?? "none"}\ncreated: ${run.created_at}`}
     >
-      {/* Issue #96: a COMPLETED run is verified finished (all issues closed,
-          PR open) and only awaits the manual cleanup — visually distinct
-          from a live ACTIVE run. */}
-      {run.status === "COMPLETED" ? (
-        <span
-          className="shrink-0 rounded bg-maestro-accent/20 px-1 py-px text-[9px] font-bold tracking-wide text-maestro-accent"
-          title="Run verified complete — every issue closed, PR open. Awaiting cleanup."
+      <div className="flex items-center gap-1.5 text-[11px]">
+        {/* Issue #96: a COMPLETED run is verified finished (all issues closed,
+            PR open) and only awaits the manual cleanup — visually distinct
+            from a live ACTIVE run. */}
+        {isCompleted ? (
+          <span
+            className="shrink-0 rounded bg-maestro-accent/20 px-1 py-px text-[9px] font-bold tracking-wide text-maestro-accent"
+            title="Run verified complete — every issue closed, PR open. Awaiting cleanup."
+          >
+            FINISHED
+          </span>
+        ) : (
+          <span className="shrink-0 rounded bg-maestro-green/20 px-1 py-px text-[9px] font-bold tracking-wide text-maestro-green">
+            ACTIVE
+          </span>
+        )}
+        <span className="min-w-0 flex-1 truncate text-maestro-text">
+          {run.epic}
+          <span className="text-maestro-muted"> · {baseName(run.project_path)}</span>
+        </span>
+        <button
+          type="button"
+          onClick={() => onCleanup(run)}
+          disabled={busy}
+          className="rounded p-1 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-red disabled:opacity-40"
+          aria-label={`Clean up epic ${run.epic}`}
+          title="Delete this epic's worktree and branch, cancel its timer, archive its run config (asks first)"
         >
-          FINISHED
-        </span>
-      ) : (
-        <span className="shrink-0 rounded bg-maestro-green/20 px-1 py-px text-[9px] font-bold tracking-wide text-maestro-green">
-          ACTIVE
-        </span>
-      )}
-      <span className="min-w-0 flex-1 truncate text-maestro-text">
-        {run.epic}
-        <span className="text-maestro-muted"> · {baseName(run.project_path)}</span>
-        {run.model ? <span className="text-maestro-muted"> · {run.model}</span> : null}
-      </span>
-      <button
-        type="button"
-        onClick={() => onCleanup(run)}
-        disabled={busy}
-        className="rounded p-1 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-red disabled:opacity-40"
-        aria-label={`Clean up epic ${run.epic}`}
-        title="Delete this epic's worktree and branch, cancel its timer, archive its run config (asks first)"
-      >
-        <Trash2 size={12} />
-      </button>
+          <Trash2 size={12} />
+        </button>
+      </div>
+      {/* Issue #102: the orchestrator's live details — a COMPLETED run's
+          context reading is no longer live, so the meter is omitted. */}
+      <OrchestratorDetails orchestrator={run.orchestrator} showLiveContext={!isCompleted} />
     </div>
   );
 }
@@ -323,7 +393,7 @@ export function LaunchSection() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   // null = loading.
-  const [runs, setRuns] = useState<SamuraiRunConfig[] | null>(null);
+  const [runs, setRuns] = useState<SamuraiRunListEntry[] | null>(null);
   const [cleaningEpic, setCleaningEpic] = useState<string | null>(null);
 
   const refreshRuns = useCallback(async () => {
@@ -466,7 +536,7 @@ export function LaunchSection() {
     }
   };
 
-  const handleCleanup = async (run: SamuraiRunConfig) => {
+  const handleCleanup = async (run: SamuraiRunListEntry) => {
     // Destructive, never silent (PRD §5.9) — same ask() confirm pattern as
     // the audit clear.
     const confirmed = await ask(

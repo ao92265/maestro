@@ -28,7 +28,8 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import type {
   SamuraiPreflight,
-  SamuraiRunConfig,
+  SamuraiRunListEntry,
+  SamuraiRunOrchestrator,
   SamuraiTestGateProgress,
   SamuraiWorkflowGraph,
 } from "@/lib/samurai";
@@ -131,7 +132,19 @@ function buildUsage(overrides: Partial<UsageData> = {}): UsageData {
   };
 }
 
-function run(overrides: Partial<SamuraiRunConfig> = {}): SamuraiRunConfig {
+/** Default orchestrator: nothing known yet — every field absent. */
+function orchestrator(overrides: Partial<SamuraiRunOrchestrator> = {}): SamuraiRunOrchestrator {
+  return {
+    generation: null,
+    session_id: null,
+    model: null,
+    context_window: null,
+    context_percent: null,
+    ...overrides,
+  };
+}
+
+function run(overrides: Partial<SamuraiRunListEntry> = {}): SamuraiRunListEntry {
   return {
     project_path: "C:\\git\\maestro",
     epic: "#38",
@@ -142,6 +155,7 @@ function run(overrides: Partial<SamuraiRunConfig> = {}): SamuraiRunConfig {
     workflow: null,
     status: "ACTIVE",
     created_at: "2026-08-06T10:00:00Z",
+    orchestrator: orchestrator(),
     ...overrides,
   };
 }
@@ -161,7 +175,7 @@ function workflowGraph(): SamuraiWorkflowGraph {
 /** Routes the invoke mock by command; unknown commands resolve empty. */
 function mockInvoke({
   preflight = passPreflight(),
-  runs = [] as SamuraiRunConfig[],
+  runs = [] as SamuraiRunListEntry[],
   usage = buildUsage(),
 } = {}) {
   invokeMock.mockImplementation(async (cmd: string) => {
@@ -459,6 +473,68 @@ describe("LaunchSection (issue #63)", () => {
     expect(screen.getByText("FINISHED").getAttribute("title")).toContain("Awaiting cleanup");
     // Cleanup stays the separate manual step (PRD §5.9) — still offered.
     expect(screen.getByRole("button", { name: "Clean up epic #39" })).toBeInTheDocument();
+  });
+
+  it("shows the orchestrator's live details on a run row (issue #102)", async () => {
+    mockInvoke({
+      runs: [
+        run({
+          orchestrator: orchestrator({
+            generation: 3,
+            session_id: 42,
+            model: "claude-opus-4-6[1m]",
+            context_window: 1_000_000,
+            context_percent: 38.5,
+          }),
+        }),
+      ],
+    });
+    render(<LaunchSection />);
+
+    expect(await screen.findByText("claude-opus-4-6[1m]")).toBeInTheDocument();
+    expect(screen.getByText("Gen 3")).toBeInTheDocument();
+    expect(screen.getByText("Session 42")).toBeInTheDocument();
+    expect(screen.getByText("38.5% / 1M")).toBeInTheDocument();
+  });
+
+  it("renders absent orchestrator fields as dashes, never a guess (issue #102)", async () => {
+    // The default run() has no session registered yet: every orchestrator
+    // field is null.
+    mockInvoke({ runs: [run()] });
+    render(<LaunchSection />);
+
+    expect(await screen.findByText("Gen —")).toBeInTheDocument();
+    expect(screen.getByText("Session —")).toBeInTheDocument();
+    // The model slot and the context slot both render a bare dash.
+    expect(screen.getAllByText("—")).toHaveLength(2);
+  });
+
+  it("hides the live context % on a COMPLETED run (issue #102)", async () => {
+    // Even if the backend still reports a frozen reading for a run whose
+    // terminal already tore down, the panel must not present it as live.
+    mockInvoke({
+      runs: [
+        run({
+          epic: "#39",
+          status: "COMPLETED",
+          orchestrator: orchestrator({
+            generation: 2,
+            session_id: 7,
+            model: "claude-opus-4-6",
+            context_window: 200_000,
+            context_percent: 90,
+          }),
+        }),
+      ],
+    });
+    render(<LaunchSection />);
+
+    // The identity facts still show for a finished run…
+    expect(await screen.findByText("claude-opus-4-6")).toBeInTheDocument();
+    expect(screen.getByText("Gen 2")).toBeInTheDocument();
+    expect(screen.getByText("Session 7")).toBeInTheDocument();
+    // …but the live context reading does not.
+    expect(screen.queryByText(/90%/)).not.toBeInTheDocument();
   });
 
   it("never cleans up when the confirm is declined", async () => {

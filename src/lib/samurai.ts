@@ -230,6 +230,34 @@ export interface SamuraiRunConfig {
 }
 
 /**
+ * A run's orchestrator's live details (issue #102) — mirrors the Rust
+ * `SamuraiRunOrchestrator`. `generation`/`session_id` come from the
+ * supervisor's session list; `model`/`context_window`/`context_percent`
+ * come from the same per-session reading the 45% handoff trigger reads.
+ * Every field is `null` when its source has nothing yet — no session
+ * registered, or (for the live reading) no assistant message seen since —
+ * render that as a dash, never a guess.
+ */
+export interface SamuraiRunOrchestrator {
+  generation: number | null;
+  session_id: number | null;
+  model: string | null;
+  /** The model's context window, in tokens. */
+  context_window: number | null;
+  /** `0`–`100`, one decimal. */
+  context_percent: number | null;
+}
+
+/**
+ * One Active Runs row — mirrors the Rust `SamuraiRunListEntry`: every
+ * `SamuraiRunConfig` field (flattened on the wire) plus the live
+ * `orchestrator` details.
+ */
+export interface SamuraiRunListEntry extends SamuraiRunConfig {
+  orchestrator: SamuraiRunOrchestrator;
+}
+
+/**
  * One tick of the launch test-suite gate (issue #90b) — payload of the live
  * `samurai-test-gate-event` channel, emitted while the launch bootstraps the
  * epic worktree and runs `cargo test --workspace` in it. Mirrors the Rust
@@ -321,9 +349,11 @@ export function samuraiDefaultWorkflow(): Promise<SamuraiWorkflowGraph> {
 
 /**
  * Every unarchived run config across all projects — ACTIVE (live) plus
- * COMPLETED (finished-awaiting-cleanup, issue #96) — the runs list.
+ * COMPLETED (finished-awaiting-cleanup, issue #96) — the runs list. Each row
+ * carries its orchestrator's live details (issue #102): model, max context
+ * window, live context %, generation, session id.
  */
-export function samuraiListRuns(): Promise<SamuraiRunConfig[]> {
+export function samuraiListRuns(): Promise<SamuraiRunListEntry[]> {
   return invoke("samurai_list_runs");
 }
 
