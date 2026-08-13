@@ -10,7 +10,11 @@
 //! after every samurai component is constructed) and rebuilds the world from
 //! those four sources: for each ACTIVE run config it either leaves the epic
 //! to an owner that already exists, alerts a human, or spawns the next
-//! generation through the replicator's ritual.
+//! generation through the replicator's ritual. COMPLETED configs (issue #96
+//! — the orchestrator declared completion and Maestro verified it via `gh`)
+//! and ARCHIVED ones never enter the scan at all:
+//! `RunConfigStore::load_active` filters them, so a finished run can never
+//! be respawned into its finished worktree.
 //!
 //! Decision order per epic (first match wins — see [`decide`]):
 //!
@@ -1399,6 +1403,43 @@ mod tests {
             .expect("RESUME row must precede the spawn");
         assert_eq!(resume.generation, 5);
         assert_eq!(resume.details["trigger"], "cold_start");
+    }
+
+    #[tokio::test]
+    async fn test_completed_config_is_skipped_entirely() {
+        // Issue #96: a verified-complete run keeps its config on disk as
+        // COMPLETED until the human's cleanup archives it. Reconciliation
+        // must not touch it — no spawn, no audit row — even though the
+        // handoff evidence WOULD otherwise spawn the next generation into
+        // the finished worktree (the exact regression observed after the
+        // #76–#84 run, when completion did not exist).
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-recon-completed";
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        write_handoff(repo.path(), "#37", 2); // WOULD spawn gen-3 otherwise
+        h.run_configs
+            .save(&SamuraiRunConfig::new(
+                project,
+                "#37",
+                repo.path().to_string_lossy().into_owned(),
+            ))
+            .unwrap();
+        h.run_configs.complete(project, "#37").unwrap();
+
+        run(&h, Vec::new(), None, false).await;
+
+        // Give any (wrong) spawn staging a moment to surface before judging.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            h.spawns.lock().unwrap().is_empty(),
+            "a completed run must never respawn"
+        );
+        assert!(
+            rows(&h.audit, project).await.is_empty(),
+            "no RESUME/ALERT trail for a completed run"
+        );
     }
 
     #[tokio::test]

@@ -235,7 +235,8 @@ pub fn list_files(
         }
     }
 
-    // 2. Run configs, ACTIVE and ARCHIVED. An ACTIVE config is in use by
+    // 2. Run configs, every status. An unarchived config — ACTIVE, or
+    //    COMPLETED awaiting its cleanup (issue #96) — is in use by
     //    definition; an archived one only while a live session or pending
     //    timer still references its epic.
     for (path, config) in configs {
@@ -249,7 +250,7 @@ pub fn list_files(
             modified_at,
             project_path: Some(config.project_path.clone()),
             epic: Some(config.epic.clone()),
-            in_use: config.status == RunConfigStatus::Active
+            in_use: config.status != RunConfigStatus::Archived
                 || live.pair(&config.project_path, &config.epic),
             has_live_session: live.session_pair(&config.project_path, &config.epic),
             fire_at: None,
@@ -417,7 +418,8 @@ pub fn delete_file(
 }
 
 /// The liveness index behind `in_use`: (project, epic-slug) pairs and
-/// projects referenced by an ACTIVE config, a pending timer, or a live
+/// projects referenced by an unarchived (ACTIVE or COMPLETED) config, a
+/// pending timer, or a live
 /// (non-terminal) supervised session. Slug identity, not raw spelling —
 /// `#38` and `38` are the same epic everywhere else (worktree, handoffs,
 /// config lookups), so they must be here too.
@@ -441,7 +443,10 @@ impl Liveness {
             projects: HashSet::new(),
         };
         for (_, config) in configs {
-            if config.status == RunConfigStatus::Active {
+            // COMPLETED counts like ACTIVE (issue #96): the run is finished
+            // but its config still drives the runs list and the cleanup —
+            // its files stay force-guarded until that cleanup archives it.
+            if config.status != RunConfigStatus::Archived {
                 live.insert(&config.project_path, &config.epic);
             }
         }

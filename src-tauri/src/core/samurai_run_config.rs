@@ -17,10 +17,14 @@
 //! `samurai_prompts::epic_slug` — the same slug the handoff files use, so a
 //! run's artifacts are trivially correlated.
 //!
-//! **Lifecycle:** configs are created ACTIVE and flipped to ARCHIVED at epic
-//! completion (PRD §8 row 2 — "Auto: archived at epic completion"). The file
-//! is kept on archive; the Second Brain Files panel (Phase 4) lists and
-//! deletes it.
+//! **Lifecycle:** configs are created ACTIVE, flipped to COMPLETED when the
+//! orchestrator's completion declaration passes Maestro's `gh` verification
+//! (issue #96 — `samurai_completion`; a COMPLETED run is finished and awaits
+//! the manual 🗑 cleanup, and cold-start reconciliation never touches it),
+//! and flipped to ARCHIVED by that cleanup (PRD §5.9/§8 row 2). The file is
+//! kept on archive; the Second Brain Files panel (Phase 4) lists and deletes
+//! it. Configs written before COMPLETED existed carry only ACTIVE/ARCHIVED
+//! and deserialize unchanged.
 //!
 //! **Durability:** every write is atomic — serialize to `<file>.tmp`, then
 //! rename over the target (Rust's `fs::rename` replaces an existing file on
@@ -46,6 +50,11 @@ use super::status_server::StatusServer;
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RunConfigStatus {
     Active,
+    /// Verified complete (issue #96): the orchestrator declared completion
+    /// and Maestro confirmed via `gh` that every batch issue is closed and
+    /// the batch PR is open. Finished-awaiting-cleanup — the manual 🗑
+    /// cleanup (PRD §5.9) flips it on to ARCHIVED.
+    Completed,
     Archived,
 }
 
@@ -151,6 +160,19 @@ impl RunConfigStore {
             .collect()
     }
 
+    /// Every config that still represents a run — ACTIVE plus COMPLETED
+    /// (finished-awaiting-cleanup) — across all projects. The launcher
+    /// panel's runs list (issue #96): a completed run must stay visible
+    /// until the human's 🗑 cleanup archives it.
+    pub fn load_unarchived(&self) -> Vec<SamuraiRunConfig> {
+        let _guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        self.load_all()
+            .into_iter()
+            .filter(|(_, c)| c.status != RunConfigStatus::Archived)
+            .map(|(_, c)| c)
+            .collect()
+    }
+
     /// Every readable config — ACTIVE and ARCHIVED — with its on-disk path.
     /// The Second Brain file inventory (`samurai_files`, issue #65) lists
     /// these; corrupt files are skipped like everywhere else.
@@ -188,6 +210,33 @@ impl RunConfigStore {
             return Ok(());
         }
         config.status = RunConfigStatus::Archived;
+        atomic_write_json(&path, &config)
+    }
+
+    /// Flips an ACTIVE config to COMPLETED (issue #96) — called ONLY after
+    /// the orchestrator's completion declaration passed `gh` verification
+    /// (`samurai_completion`). Keeps the file: the run stays listed as
+    /// finished-awaiting-cleanup until the manual cleanup archives it.
+    /// Idempotent on an already COMPLETED config; an error when no readable
+    /// config exists or the config is already ARCHIVED (a cleaned-up run
+    /// must never be resurrected into the runs list).
+    pub fn complete(&self, project: &str, epic: &str) -> Result<(), String> {
+        let _guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let path = self.config_path(&normalize_project(project), epic);
+        let mut config = read_config(&path).map_err(|e| match e {
+            ReadError::Missing => format!("no run config for epic {epic:?} at {path:?}"),
+            ReadError::Other(e) => e,
+        })?;
+        match config.status {
+            RunConfigStatus::Completed => return Ok(()),
+            RunConfigStatus::Archived => {
+                return Err(format!(
+                    "run config for epic {epic:?} is ARCHIVED — cannot mark it complete"
+                ));
+            }
+            RunConfigStatus::Active => {}
+        }
+        config.status = RunConfigStatus::Completed;
         atomic_write_json(&path, &config)
     }
 
@@ -392,6 +441,88 @@ mod tests {
         store.archive("C:/git/maestro", "#37").unwrap();
         // But an error when nothing exists to archive.
         assert!(store.archive("C:/git/maestro", "#99").is_err());
+    }
+
+    #[test]
+    fn test_complete_flips_active_and_keeps_file() {
+        let dir = tempdir().unwrap();
+        let store = RunConfigStore::new(dir.path().to_path_buf());
+        store.save(&sample("C:/git/maestro", "#37")).unwrap();
+
+        store.complete("C:/git/maestro", "#37").unwrap();
+        let completed = store.get("C:/git/maestro", "#37").unwrap();
+        assert_eq!(completed.status, RunConfigStatus::Completed);
+        assert!(store.config_path("C:/git/maestro", "#37").exists());
+
+        // On the wire: SCREAMING, like the sibling statuses (the frontend
+        // and dependent issues consume this spelling).
+        let raw: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(store.config_path("C:/git/maestro", "#37")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw["status"], "COMPLETED");
+
+        // Idempotent on an already completed config.
+        store.complete("C:/git/maestro", "#37").unwrap();
+        // But an error when nothing exists to complete…
+        assert!(store.complete("C:/git/maestro", "#99").is_err());
+        // …and on an ARCHIVED (cleaned-up) config: never resurrect it.
+        store.archive("C:/git/maestro", "#37").unwrap();
+        assert!(store.complete("C:/git/maestro", "#37").is_err());
+    }
+
+    #[test]
+    fn test_completed_leaves_active_scan_but_stays_unarchived() {
+        // Issue #96: cold-start reconciliation iterates load_active() only —
+        // a COMPLETED run must vanish from that scan (no respawn into a
+        // finished worktree) while staying in the runs list until cleanup.
+        let dir = tempdir().unwrap();
+        let store = RunConfigStore::new(dir.path().to_path_buf());
+        store.save(&sample("C:/git/alpha", "#1")).unwrap();
+        store.save(&sample("C:/git/alpha", "#2")).unwrap();
+        store.save(&sample("C:/git/alpha", "#3")).unwrap();
+        store.complete("C:/git/alpha", "#2").unwrap();
+        store.archive("C:/git/alpha", "#3").unwrap();
+
+        let active: Vec<String> = store.load_active().into_iter().map(|c| c.epic).collect();
+        assert_eq!(active, vec!["#1".to_string()]);
+
+        let mut unarchived: Vec<String> = store
+            .load_unarchived()
+            .into_iter()
+            .map(|c| c.epic)
+            .collect();
+        unarchived.sort();
+        assert_eq!(unarchived, vec!["#1".to_string(), "#2".to_string()]);
+    }
+
+    #[test]
+    fn test_pre_completed_era_config_still_reads_as_active() {
+        // Backward compat (issue #96): a config written before COMPLETED
+        // existed carries only ACTIVE/ARCHIVED — it must deserialize
+        // unchanged and read as ACTIVE.
+        let dir = tempdir().unwrap();
+        let store = RunConfigStore::new(dir.path().to_path_buf());
+        let path = store.config_path("C:/git/maestro", "#37");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r##"{
+              "project_path": "C:/git/maestro",
+              "epic": "#37",
+              "repo_pin": null,
+              "worktree_path": "C:/git/maestro-wt",
+              "model": null,
+              "thresholds": null,
+              "status": "ACTIVE",
+              "created_at": "2026-08-01T00:00:00+00:00"
+            }"##,
+        )
+        .unwrap();
+
+        let loaded = store.get("C:/git/maestro", "#37").unwrap();
+        assert_eq!(loaded.status, RunConfigStatus::Active);
+        assert_eq!(store.load_active().len(), 1);
     }
 
     #[test]

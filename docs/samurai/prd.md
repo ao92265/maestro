@@ -134,9 +134,13 @@ Every successor — after handoff, park, crash, machine reboot, or app auto-upda
 
 Each epic gets its own git worktree (existing `WorktreeManager`) with a **stable path across generations**. This kills the known shared-checkout hazard (agents switching branches under each other / staging foreign files into WIP commits). Epic completion offers one-click cleanup (worktree + branch) — surfaced in the UI, never silent, because deleting git state is destructive.
 
+**Completion is DECLARE + VERIFY** (issue #96): the orchestrator declares completion (`<samurai-run-complete>issues #a #b pr #n</samurai-run-complete>`, instructed in every brief), then Maestro verifies via `gh` that every claimed issue is closed AND the claimed PR is open before flipping the run config ACTIVE → COMPLETED. Neither an unverified declaration nor GitHub state alone ever flips it. A COMPLETED run shows as finished-awaiting-cleanup, cold-start reconciliation skips it, and the manual cleanup above stays the separate step that archives it.
+
 ### 5.10 Audit log
 
 Per-project JSONL in app-data. Events: `SPAWN / HANDOFF / PARK / RESUME / COMPLETE / ALERT` with timestamp, epic, generation, session id, details. **The user deletes audit records manually** (explicit requirement — it is the human oversight surface and the primary testing instrument); a size warning fires when it grows. Orchestrators also comment progress on GitHub issues — a second, human-readable, teammate-visible record.
+
+`COMPLETE` lands at exactly the moment §5.9's verified completion flips the run config ACTIVE → COMPLETED (issue #96). A declaration that fails verification lands an `ALERT` (`completion_verification_failed`) instead and the config stays ACTIVE.
 
 ### 5.11 Second Brain panel (frontend)
 

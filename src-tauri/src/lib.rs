@@ -237,17 +237,28 @@ pub fn run() {
             // supervised session and are safely ignored.
             let samurai_injector: Arc<std::sync::OnceLock<Arc<SamuraiInjector>>> =
                 Arc::new(std::sync::OnceLock::new());
+            // Samurai (issue #96): the run-completion scanner rides the same
+            // tee; same late-bound slot (it needs the run-config store
+            // constructed further down).
+            let samurai_completion: Arc<
+                std::sync::OnceLock<Arc<core::samurai_completion::SamuraiCompletionWatcher>>,
+            > = Arc::new(std::sync::OnceLock::new());
 
             let pending_for_emit = pending_events.clone();
             let data_ready_for_emit = data_ready.clone();
             let flush_now_for_emit = flush_now.clone();
             let samurai_context_for_emit = samurai_context.clone();
             let samurai_injector_for_emit = samurai_injector.clone();
+            let samurai_completion_for_emit = samurai_completion.clone();
             let emit_fn: Arc<dyn Fn(ClaudeEvent) + Send + Sync> = Arc::new(move |event: ClaudeEvent| {
                 samurai_context_for_emit.observe(&event);
                 // Samurai (issue #53): ACK scanning over AssistantMessage.
                 if let Some(injector) = samurai_injector_for_emit.get() {
                     injector.observe(&event);
+                }
+                // Samurai (issue #96): completion-declaration scanning.
+                if let Some(completion) = samurai_completion_for_emit.get() {
+                    completion.observe(&event);
                 }
                 // Recover from a poisoned lock rather than dropping the event —
                 // losing one silently would corrupt the frontend's activity feed.
@@ -640,6 +651,43 @@ pub fn run() {
             // both controllers.
             replicator.set_run_configs(run_configs.clone());
             injector.set_run_configs(run_configs.clone());
+            // Samurai (issue #96): run completion, DECLARE + VERIFY. The
+            // orchestrator's `<samurai-run-complete>` declaration (scanned on
+            // the EventBus tee above) is verified against GitHub — every
+            // claimed issue CLOSED, the claimed PR OPEN — before the run
+            // config flips ACTIVE → COMPLETED and the §5.10 COMPLETE row
+            // lands. The probes shell out via the same `github::GitHub`
+            // runner as the preflight/auth checks; injected (the AuthProbe
+            // pattern) so the module never touches `gh` in tests.
+            let issue_state_probe: core::samurai_completion::IssueStateProbe =
+                Arc::new(|project: String, number: u64| {
+                    Box::pin(async move {
+                        github::GitHub::new(project)
+                            .get_issue(number)
+                            .await
+                            .map(|issue| issue.state)
+                            .map_err(|e| e.to_string())
+                    })
+                });
+            let pr_state_probe: core::samurai_completion::PrStateProbe =
+                Arc::new(|project: String, number: u64| {
+                    Box::pin(async move {
+                        github::GitHub::new(project)
+                            .get_pull_request(number)
+                            .await
+                            .map(|pr| pr.state)
+                            .map_err(|e| e.to_string())
+                    })
+                });
+            let _ = samurai_completion.set(Arc::new(
+                core::samurai_completion::SamuraiCompletionWatcher::new(
+                    supervisor.clone(),
+                    run_configs.clone(),
+                    audit_log.clone(),
+                    issue_state_probe,
+                    pr_state_probe,
+                ),
+            ));
             // Samurai journal (Phase 5, issue #69): the ops-journal store —
             // an app-data JSONL where agents and the user record
             // bottlenecks/errors/improvements/skill gaps/concerns; the

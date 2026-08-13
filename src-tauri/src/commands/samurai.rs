@@ -596,11 +596,12 @@ pub async fn samurai_launch_run(
     .await
 }
 
-/// Every ACTIVE run config across all projects — the launcher panel's
-/// active-runs list.
+/// Every unarchived run config across all projects — the launcher panel's
+/// runs list: ACTIVE (live) plus COMPLETED (issue #96 — verified finished,
+/// awaiting the manual cleanup that archives it).
 #[tauri::command]
 pub fn samurai_list_runs(run_configs: State<'_, Arc<RunConfigStore>>) -> Vec<SamuraiRunConfig> {
-    run_configs.load_active()
+    run_configs.load_unarchived()
 }
 
 /// What one cleanup pass removed (PRD §5.9: surfaced in the UI, never
@@ -674,10 +675,11 @@ pub(crate) async fn cleanup_epic_inner(
     let timer_cancelled = schedule.cancel(project, &epic)?;
 
     // 2. Archive the run config (P3.4: an un-archived ACTIVE config makes
-    //    cold-start reconciliation respawn the epic forever). Missing or
+    //    cold-start reconciliation respawn the epic forever; a COMPLETED one
+    //    — issue #96 — would sit in the runs list forever). Missing or
     //    already ARCHIVED by an earlier pass → reported, not an error.
     let config_archived = match &config {
-        Some(c) if c.status == RunConfigStatus::Active => {
+        Some(c) if c.status != RunConfigStatus::Archived => {
             run_configs.archive(project, &epic)?;
             true
         }
@@ -1337,6 +1339,26 @@ mod tests {
         assert!(!again.worktree_removed);
         assert_eq!(again.worktree_path, None);
         assert!(!again.branch_deleted);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_archives_a_completed_config() {
+        // Issue #96: a verified-complete run sits COMPLETED until the human
+        // cleans it up — that cleanup must archive the config exactly like
+        // an ACTIVE one, or the finished run would stay listed forever.
+        let h = cleanup_harness();
+        h.run_configs
+            .save(&SamuraiRunConfig::new(
+                h.project.clone(),
+                "#38",
+                h.base.path().join("gone").to_string_lossy().into_owned(),
+            ))
+            .unwrap();
+        h.run_configs.complete(&h.project, "#38").unwrap();
+
+        let report = run_cleanup(&h, "#38").await.unwrap();
+        assert!(report.config_archived);
+        assert!(h.run_configs.load_unarchived().is_empty());
     }
 
     #[tokio::test]

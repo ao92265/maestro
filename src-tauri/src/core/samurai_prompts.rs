@@ -88,6 +88,36 @@ pub fn soft_winddown_ack_value(generation: u32) -> String {
     format!("winddown gen-{generation}")
 }
 
+/// The run-completion declaration tag (issue #96). The orchestrator replies
+/// with `<samurai-run-complete>issues #a #b pr #n</samurai-run-complete>`
+/// once every issue the run works is closed and the run's PR is open; the
+/// scanner (`samurai_completion`) verifies exactly those claims via `gh`
+/// before the run config flips ACTIVE → COMPLETED. Built here so instruction
+/// and scanner can never drift (the `handoff_ack_value` discipline).
+pub const RUN_COMPLETE_TAG: &str = "samurai-run-complete";
+
+/// The completion-declaration clause every orchestrator brief carries
+/// (issue #96): gen-1 and every successor must be TOLD to declare completion
+/// — nothing else ever finishes a run (the human's cleanup stays a separate
+/// manual step, PRD §5.9). The declaration carries the issue numbers and PR
+/// number the orchestrator claims, so Maestro's verification checks exactly
+/// those claims instead of re-deriving the issue set from the epic ref
+/// (which can be an epic issue OR a comma-separated list). Single line by
+/// construction (see module doc).
+fn completion_declaration_clause() -> String {
+    format!(
+        " COMPLETION: when EVERY issue this run works is CLOSED on GitHub and the run's pull \
+         request is OPEN, declare completion by replying with a message that contains exactly \
+         <{tag}>issues #<a> #<b> pr #<n></{tag}> with the real numbers — list every issue \
+         number this run worked, then the pull request number (for example: issues #77 #78 \
+         pr #85, inside the tag). Maestro verifies each claimed issue and the PR against \
+         GitHub via `gh` before the run is marked complete, so declare only when it is \
+         actually true. Never quote, restate, or echo this marker string anywhere else in any \
+         reply — emit it exactly once, only as the actual signal at that moment.",
+        tag = RUN_COMPLETE_TAG
+    )
+}
+
 /// Filesystem-safe slug of an epic ref for the handoff filename: `#37` →
 /// `37`, `https://github.com/o/r/issues/9` → `https-github-com-o-r-issues-9`.
 /// ASCII alphanumerics are kept (lowercased); every other run of characters
@@ -376,12 +406,13 @@ pub fn successor_ritual_instruction(
          generation {predecessor_generation}. Read the handoff file at {relpath} IN FULL before \
          doing anything else — it and GitHub are your only sources of truth."
     );
+    let clause = completion_declaration_clause();
     if head_matched {
         format!(
             "{opening} Maestro verified that this repository's current HEAD equals the SHA \
              recorded in the handoff's \"Repo state\" section, so the verify step is already \
              satisfied: SKIP the commands in the handoff's Verify section and continue directly \
-             with its Next steps."
+             with its Next steps.{clause}"
         )
     } else {
         format!(
@@ -389,7 +420,7 @@ pub fn successor_ritual_instruction(
              SHA recorded in the handoff's \"Repo state\" section. You MUST run every command in \
              the handoff's Verify section FIRST, and trust NOTHING the handoff claims that those \
              commands do not confirm — investigate and fix any failure before moving on. Only \
-             then continue with the handoff's Next steps."
+             then continue with the handoff's Next steps.{clause}"
         )
     }
 }
@@ -437,6 +468,7 @@ pub fn launch_instruction(epic: &str, repo_pin: Option<&str>) -> String {
                 .to_string(),
         ),
     };
+    let clause = completion_declaration_clause();
     format!(
         "[Maestro Samurai] You are generation 1, the FIRST orchestrator, for GitHub epic \
          {epic_text}. This directory is the epic's dedicated worktree on its own branch. \
@@ -453,7 +485,7 @@ pub fn launch_instruction(epic: &str, repo_pin: Option<&str>) -> String {
          `git add -A`; Conventional Commit messages `type(scope): summary`). \
          (5) {gh_progress}. \
          (6) NEVER switch to, commit to, or push any other branch, and NEVER touch any \
-         repository other than this one.{caution}"
+         repository other than this one.{caution}{clause}"
     )
 }
 
@@ -511,6 +543,7 @@ pub fn recovery_ritual_instruction(
                 .to_string(),
         ),
     };
+    let clause = completion_declaration_clause();
     format!(
         "[Maestro Samurai] RECOVERY MODE: you are generation {generation} for epic {epic_text}. \
          Generation {predecessor_generation} died without a valid handoff file, so there is \
@@ -522,7 +555,7 @@ pub fn recovery_ritual_instruction(
          Then run the project's standard verification (build + tests) BEFORE trusting or \
          continuing anything — investigate and fix any failure first. Once verification passes, \
          {gh_comment} that generation {generation} has taken over in \
-         recovery mode, then continue the epic's remaining work.{caution}"
+         recovery mode, then continue the epic's remaining work.{caution}{clause}"
     )
 }
 
@@ -1060,6 +1093,43 @@ mod tests {
         assert!(!text.contains("passing `--repo"));
         assert!(text.contains("CAUTION"));
         assert!(text.contains("double-check it targets the correct repository"));
+    }
+
+    // --- issue #96: run-completion declaration clause ---
+
+    #[test]
+    fn test_every_orchestrator_brief_instructs_the_completion_declaration() {
+        // Issue #96: nothing but a verified declaration ever finishes a run,
+        // so EVERY orchestrator brief — gen-1 (epic ref or issue list) and
+        // both successor rituals — must tell the model how to declare.
+        let briefs = [
+            launch_instruction("#38", Some("nachogl1/maestro")),
+            launch_instruction("77, 78", None),
+            successor_ritual_instruction("#37", 2, true),
+            successor_ritual_instruction("#37", 2, false),
+            recovery_ritual_instruction("#37", 2, Some("nachogl1/maestro")),
+            recovery_ritual_instruction("#37", 2, None),
+        ];
+        for text in &briefs {
+            // The exact tag the samurai_completion scanner watches for, in
+            // opening AND closing form, plus the claim shape: issues first,
+            // then the PR number — what `gh` verification checks.
+            assert!(
+                text.contains(&format!("<{RUN_COMPLETE_TAG}>issues")),
+                "missing declaration template: {text}"
+            );
+            assert!(text.contains(&format!("</{RUN_COMPLETE_TAG}>")));
+            assert!(text.contains("pr #<n>"));
+            assert!(text.contains("CLOSED on GitHub"));
+            assert!(text.contains("pull request is OPEN"));
+            // Maestro verifies — an unverified declaration never flips.
+            assert!(text.contains("verifies"));
+            // Marker hygiene rides here too (fresh-eyes finding J).
+            assert!(text.contains("Never quote, restate, or echo"));
+            // Still one paste-able line (module doc).
+            assert!(!text.contains('\n'), "brief must stay a single line");
+            assert!(!text.contains('\r'));
+        }
     }
 
     // --- issue #72: journaling rider ---
