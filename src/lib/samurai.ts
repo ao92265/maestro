@@ -541,38 +541,30 @@ export function samuraiJournalList(): Promise<SamuraiJournalListResult> {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #70: harvest — journal digest via headless claude -p
+// Issue #98: harvest — interactive triage session
 // ---------------------------------------------------------------------------
 
 /**
- * A generated harvest report — mirrors the Rust `HarvestReport`
- * (`src-tauri/src/commands/harvest.rs`). One per date, account-wide, saved
- * as `<app data>/harvest/<date>.md` (the Second Brain's `HARVEST_REPORT`
- * rows).
+ * Arms the interactive harvest triage for a just-launched session (Rust
+ * `samurai_harvest_arm`, issue #98). TerminalGrid calls this right before it
+ * types the CLI command — like the samurai successor registration — so the
+ * backend can inject the journal-triage prompt on the session's first
+ * SessionStarted hook signal. Journal entries flip to consumed AT that
+ * injection, not here. Rejects with "Nothing to harvest…" when the journal
+ * has no unconsumed entries.
  */
-export interface SamuraiHarvestReport {
-  /** Local calendar date the report belongs to (YYYY-MM-DD). */
-  date: string;
-  markdown: string;
-  /** RFC 3339 timestamp of when the report was generated. */
-  generated_at: string;
-}
-
-/**
- * Digests the unconsumed journal entries into today's harvest report via a
- * headless `claude -p` run, then marks them consumed (Rust
- * `samurai_harvest_run`). Rejects with "Nothing to harvest…" when the
- * journal has no unconsumed entries; a failed run never consumes them.
- */
-export function samuraiHarvestRun(): Promise<SamuraiHarvestReport> {
-  return invoke("samurai_harvest_run");
+export function samuraiHarvestArm(sessionId: number): Promise<void> {
+  return invoke("samurai_harvest_arm", { sessionId });
 }
 
 /**
  * Reads one saved harvest report by absolute path — the Second Brain lists
  * `HARVEST_REPORT` rows by path, this serves their content (Rust
- * `samurai_harvest_read`). The backend refuses anything that is not a
- * regular file directly under the harvest directory.
+ * `samurai_harvest_read`). New reports no longer land there (issue #98
+ * moved harvest into an interactive session, whose /insights report goes to
+ * Downloads), but previously generated ones stay readable. The backend
+ * refuses anything that is not a regular file directly under the harvest
+ * directory.
  */
 export function samuraiHarvestRead(path: string): Promise<string> {
   return invoke("samurai_harvest_read", { path });

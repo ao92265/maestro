@@ -243,6 +243,13 @@ pub fn run() {
             let samurai_completion: Arc<
                 std::sync::OnceLock<Arc<core::samurai_completion::SamuraiCompletionWatcher>>,
             > = Arc::new(std::sync::OnceLock::new());
+            // Interactive harvest triage (issue #98): armed sessions get the
+            // journal prompt injected on their first SessionStarted hook
+            // signal. Same late-bound slot pattern (it needs the journal
+            // store constructed further down).
+            let harvest_triage_slot: Arc<
+                std::sync::OnceLock<Arc<commands::harvest::HarvestTriage>>,
+            > = Arc::new(std::sync::OnceLock::new());
 
             let pending_for_emit = pending_events.clone();
             let data_ready_for_emit = data_ready.clone();
@@ -316,12 +323,25 @@ pub fn run() {
             let event_bus_for_hooks = event_bus.clone();
             let transcript_watcher_for_hooks = transcript_watcher.clone();
             let samurai_injector_for_hooks = samurai_injector.clone();
+            let harvest_triage_for_hooks = harvest_triage_slot.clone();
             let hook_emit_fn: Arc<dyn Fn(ClaudeEvent) + Send + Sync> = Arc::new(move |event: ClaudeEvent| {
                 if let ClaudeEvent::SessionStarted { session_id, ref transcript_path, .. } = event {
                     transcript_watcher_for_hooks.start_watching(
                         session_id,
                         std::path::PathBuf::from(transcript_path),
                     );
+                    // Interactive harvest triage (issue #98): an armed
+                    // session's first SessionStarted is the injection gate —
+                    // the same signal the replicator uses for successor
+                    // briefs. The injection reads and commits the journal
+                    // (file IO, Windows rename retries), so it leaves the
+                    // hook chain via the blocking pool.
+                    if let Some(triage) = harvest_triage_for_hooks.get() {
+                        let triage = triage.clone();
+                        tauri::async_runtime::spawn_blocking(move || {
+                            triage.on_session_started(session_id);
+                        });
+                    }
                 }
                 // Samurai (issue #53): idle-gate signal (Stop hook →
                 // SessionEnded reason "stop"). Tapped here, pre-dedup: the
@@ -691,11 +711,35 @@ pub fn run() {
             // Samurai journal (Phase 5, issue #69): the ops-journal store —
             // an app-data JSONL where agents and the user record
             // bottlenecks/errors/improvements/skill gaps/concerns; the
-            // harvest runner (next issue) consumes and archives entries via
+            // interactive harvest consumes and archives entries via
             // markers. Mutex-serialized like the run-config store above.
-            app.manage(Arc::new(core::samurai_journal::JournalStore::new(
+            let journal_store = Arc::new(core::samurai_journal::JournalStore::new(
                 commands::ai_runner::artifact_base_dir("journal"),
-            )));
+            ));
+            app.manage(journal_store.clone());
+            // Interactive harvest triage (issue #98): "Harvest now" opens a
+            // terminal through the pending-launch flow; the grid arms the
+            // session via `samurai_harvest_arm`, and the SessionStarted tap
+            // in hook_emit_fn above injects the journal prompt through the
+            // shared samurai PTY submit (text, gap, lone Enter — issue #103).
+            // Consumption commits AT that injection (pinned #98 decision).
+            let harvest_pm = app.state::<ProcessManager>().inner().clone();
+            let harvest_deliver: commands::harvest::DeliverFn =
+                Arc::new(move |session_id, prompt| {
+                    core::samurai_pty::submit_instruction(
+                        harvest_pm.clone(),
+                        session_id,
+                        prompt,
+                        "harvest",
+                    );
+                });
+            let harvest_triage = Arc::new(commands::harvest::HarvestTriage::new(
+                journal_store.clone(),
+                commands::harvest::downloads_dir_string(),
+                harvest_deliver,
+            ));
+            app.manage(harvest_triage.clone());
+            let _ = harvest_triage_slot.set(harvest_triage);
             // Samurai (issue #61): the resume handler — a fired park timer
             // becomes a FRESH generation spawn (guards → working dir →
             // next generation → RESUME row → replicator.spawn_generation).
@@ -1070,8 +1114,9 @@ pub fn run() {
             // Samurai journal (Phase 5, issue #69)
             commands::samurai::samurai_journal_add,
             commands::samurai::samurai_journal_list,
-            // Samurai harvest (Phase 5, issue #70)
-            commands::harvest::samurai_harvest_run,
+            // Samurai harvest (issue #98: interactive triage session; the
+            // read command keeps serving previously generated reports)
+            commands::harvest::samurai_harvest_arm,
             commands::harvest::samurai_harvest_read,
             // CLI commands
             commands::cli::install_cli,

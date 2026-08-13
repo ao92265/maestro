@@ -7,12 +7,19 @@ import {
   type SamuraiJournalCategory,
   type SamuraiJournalEntry,
   type SamuraiJournalEntryStatus,
-  samuraiHarvestRun,
   samuraiJournalAdd,
   samuraiJournalList,
 } from "@/lib/samurai";
+import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { cardClass, SectionHeader } from "./sectionChrome";
+
+/**
+ * The empty-journal refusal, byte-identical to the backend's pinned
+ * `NOTHING_TO_HARVEST` (`commands/harvest.rs`) — shown before any terminal
+ * opens, so an empty journal never wastes a session.
+ */
+const NOTHING_TO_HARVEST = "Nothing to harvest — no unconsumed journal entries.";
 
 /** How many rows to show — the newest slice, same no-virtualization bar as the audit list. */
 const JOURNAL_TAIL = 50;
@@ -91,10 +98,16 @@ function JournalRow({
  * Ops journal card (issue #71, PRD §5.12): add-entry form, the newest journal
  * entries with their harvest status, and the "Harvest now" trigger. Sits in
  * the Second Brain panel between the audit stream and the Files section.
- * `onHarvested` lets the parent refresh its file inventory after a harvest so
- * the new HARVEST_REPORT row appears.
+ *
+ * "Harvest now" (issue #98) opens an INTERACTIVE terminal session instead of
+ * running a headless report: it queues a pending launch for the active
+ * project's grid (the History-tab mechanism), the grid arms the backend, and
+ * the backend injects the journal-triage prompt — /insights, Downloads
+ * report, keep/file/discard discussion — on the session's first
+ * SessionStarted. Entry statuses flip to CONSUMED at that injection, so this
+ * list updates on the next refresh, not on click.
  */
-export function JournalSection({ onHarvested }: { onHarvested?: () => void }) {
+export function JournalSection() {
   const tabs = useWorkspaceStore((s) => s.tabs);
   const activeTab = tabs.find((t) => t.active);
   const projectPath = activeTab?.projectPath ?? "";
@@ -112,7 +125,6 @@ export function JournalSection({ onHarvested }: { onHarvested?: () => void }) {
   const [category, setCategory] = useState<SamuraiJournalCategory>("BOTTLENECK");
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
-  const [harvestBusy, setHarvestBusy] = useState(false);
 
   // `isCancelled` lets the mount effect drop a result that resolves after
   // unmount (the HarvestReportModal's cancelled-flag pattern); button
@@ -160,22 +172,47 @@ export function JournalSection({ onHarvested }: { onHarvested?: () => void }) {
     }
   };
 
+  /**
+   * Opens the interactive harvest triage session (issue #98). No spinner /
+   * waiting state: the click only checks the journal and queues a launch —
+   * the work happens in the terminal that opens. A double-click is deduped
+   * by the pending-launch store (two identical requests are one launch).
+   * The terminal opens in the active project's MAIN checkout
+   * (workingDirOverride) — the journal is account-wide, so no worktree is
+   * derived; the active tab is simply where the user is working.
+   */
   const handleHarvest = async () => {
-    setHarvestBusy(true);
     setError(null);
     setNotice(null);
+    if (!activeTab) {
+      setError("Open a project tab to start a harvest session.");
+      return;
+    }
     try {
-      const report = await samuraiHarvestRun();
-      setNotice(`Report ${report.date} written — see Files`);
-      // Statuses flip to CONSUMED here; the parent's file list gains the
-      // report row.
-      await refresh();
-      onHarvested?.();
+      const result = await samuraiJournalList();
+      const unconsumed = result.entries.filter((e) => e.status === "UNCONSUMED").length;
+      if (unconsumed === 0) {
+        setError(NOTHING_TO_HARVEST);
+        return;
+      }
+      usePendingLaunchStore.getState().request({
+        tabId: activeTab.id,
+        mode: "Claude",
+        resumeSessionId: null,
+        workingDirOverride: projectPath || null,
+        branch: null,
+        customName: "harvest triage",
+        harvest: true,
+      });
+      // Same as the History tab: make sure the grid is mounted to consume
+      // the request (the project may sit on the idle landing view).
+      useWorkspaceStore.getState().setSessionsLaunched(activeTab.id, true);
+      setNotice(
+        `Triage session opened — ${unconsumed} ${unconsumed === 1 ? "entry" : "entries"} will be injected there`,
+      );
     } catch (err) {
-      // Matter-of-fact: the backend's message (e.g. nothing-to-harvest).
+      // Matter-of-fact: the backend's message.
       setError(String(err));
-    } finally {
-      setHarvestBusy(false);
     }
   };
 
@@ -206,16 +243,11 @@ export function JournalSection({ onHarvested }: { onHarvested?: () => void }) {
             <button
               type="button"
               onClick={handleHarvest}
-              disabled={harvestBusy}
-              className="flex items-center gap-1 rounded border border-maestro-border/60 px-1.5 py-0.5 text-[10px] font-semibold normal-case tracking-normal text-maestro-text transition-colors hover:bg-maestro-surface disabled:opacity-40"
+              className="flex items-center gap-1 rounded border border-maestro-border/60 px-1.5 py-0.5 text-[10px] font-semibold normal-case tracking-normal text-maestro-text transition-colors hover:bg-maestro-surface"
               aria-label="Harvest now"
-              title="Digest the unconsumed entries into today's harvest report (runs headless Claude)"
+              title="Open an interactive terminal session that triages the unconsumed entries with /insights"
             >
-              {harvestBusy ? (
-                <Loader2 size={11} className="animate-spin" />
-              ) : (
-                <Sparkles size={11} />
-              )}
+              <Sparkles size={11} />
               Harvest now
             </button>
           </span>

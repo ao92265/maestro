@@ -410,7 +410,9 @@ export function SecondBrainSection() {
     <div className="space-y-3">
       <AuditSection />
 
-      <JournalSection onHarvested={refresh} />
+      {/* Issue #98: harvest opens an interactive session — no report row
+          lands in this inventory anymore, so no refresh callback. */}
+      <JournalSection />
 
       <div className={cardClass}>
         <SectionHeader

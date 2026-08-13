@@ -41,6 +41,13 @@ export interface PendingLaunch {
   customName?: string | null;
   /** Present only for Samurai successor spawns (issue #55). */
   samurai?: SamuraiSuccessorInfo | null;
+  /**
+   * Interactive harvest triage launch (issue #98): the grid arms the
+   * session via `samurai_harvest_arm` right before the CLI launches, and
+   * the backend injects the journal-triage prompt on its first
+   * SessionStarted. Never set for manually created slots.
+   */
+  harvest?: boolean;
 }
 
 interface PendingLaunchState {
@@ -74,7 +81,8 @@ function sameLaunch(a: PendingLaunch, b: PendingLaunch): boolean {
     (a.customName ?? null) === (b.customName ?? null) &&
     (a.samurai?.project ?? null) === (b.samurai?.project ?? null) &&
     (a.samurai?.epic ?? null) === (b.samurai?.epic ?? null) &&
-    (a.samurai?.generation ?? null) === (b.samurai?.generation ?? null)
+    (a.samurai?.generation ?? null) === (b.samurai?.generation ?? null) &&
+    (a.harvest ?? false) === (b.harvest ?? false)
   );
 }
 

@@ -15,6 +15,7 @@ vi.mock("@tauri-apps/plugin-store", () => ({
 }));
 
 import type { SamuraiJournalEntry, SamuraiJournalEntryStatus } from "@/lib/samurai";
+import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 import { JournalSection } from "../JournalSection";
 
@@ -56,13 +57,11 @@ function journalRow(
 
 /**
  * Routes the global invoke mock. `rows` is mutated by `samurai_journal_add`
- * (newest LAST, like the backend) so a post-add refresh shows the new entry;
- * `harvestError` makes `samurai_harvest_run` reject with that string.
+ * (newest LAST, like the backend) so a post-add refresh shows the new entry.
+ * There is no harvest command here on purpose (issue #98): the click only
+ * lists the journal and queues a pending launch.
  */
-function mockInvoke(
-  rows: JournalRow[],
-  opts: { fileSizeBytes?: number; harvestError?: string } = {},
-) {
+function mockInvoke(rows: JournalRow[], opts: { fileSizeBytes?: number } = {}) {
   invokeMock.mockImplementation(async (cmd: string, args?: unknown) => {
     switch (cmd) {
       case "samurai_journal_list":
@@ -75,13 +74,6 @@ function mockInvoke(
         });
         return undefined;
       }
-      case "samurai_harvest_run":
-        if (opts.harvestError) throw opts.harvestError;
-        return {
-          date: "2026-08-06",
-          markdown: "# Harvest 2026-08-06",
-          generated_at: "2026-08-06T18:00:00Z",
-        };
       default:
         return undefined;
     }
@@ -92,6 +84,7 @@ describe("JournalSection (issue #71)", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     useWorkspaceStore.setState({ tabs: [buildTab()] });
+    usePendingLaunchStore.setState({ pending: [] });
   });
 
   it("renders entries newest-first with category badges and harvest statuses", async () => {
@@ -148,16 +141,34 @@ describe("JournalSection (issue #71)", () => {
     expect(input).toHaveValue("");
   });
 
-  it("runs the harvest, shows the success notice and tells the parent", async () => {
-    const onHarvested = vi.fn();
+  // Issue #98: "Harvest now" opens an interactive triage session instead of
+  // running a headless report — the click queues a pending launch for the
+  // active tab's grid (the History-tab mechanism) and mounts the grid.
+  it("opens a harvest triage session via the pending-launch store", async () => {
     mockInvoke([journalRow()]);
-    render(<JournalSection onHarvested={onHarvested} />);
+    render(<JournalSection />);
     expect(await screen.findByText("CI queue blocked for an hour")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Harvest now" }));
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("samurai_harvest_run"));
-    expect(await screen.findByText("Report 2026-08-06 written — see Files")).toBeInTheDocument();
-    await waitFor(() => expect(onHarvested).toHaveBeenCalledTimes(1));
+
+    await waitFor(() => expect(usePendingLaunchStore.getState().pending).toHaveLength(1));
+    expect(usePendingLaunchStore.getState().pending[0]).toMatchObject({
+      tabId: "tab-1",
+      mode: "Claude",
+      resumeSessionId: null,
+      // The active project's MAIN checkout — the journal is account-wide,
+      // no worktree is derived.
+      workingDirOverride: "C:\\git\\maestro",
+      customName: "harvest triage",
+      harvest: true,
+    });
+    // The grid must be (re)mounted to consume the request.
+    expect(useWorkspaceStore.getState().tabs[0].sessionsLaunched).toBe(true);
+    expect(
+      await screen.findByText("Triage session opened — 1 entry will be injected there"),
+    ).toBeInTheDocument();
+    // No headless run: the only backend calls are journal lists/adds.
+    expect(invokeMock).not.toHaveBeenCalledWith("samurai_harvest_run");
   });
 
   it("keeps the last good rows when a refresh fails", async () => {
@@ -193,19 +204,18 @@ describe("JournalSection (issue #71)", () => {
     expect(screen.getByText("60")).toBeInTheDocument();
   });
 
-  it("surfaces the harvest error string inline, matter-of-fact", async () => {
-    const onHarvested = vi.fn();
-    mockInvoke([], {
-      harvestError: "Nothing to harvest — no unconsumed journal entries.",
-    });
-    render(<JournalSection onHarvested={onHarvested} />);
-    expect(await screen.findByText("No journal entries yet.")).toBeInTheDocument();
+  it("refuses to open a session when nothing is unconsumed", async () => {
+    // Issue #98: an empty (or fully consumed) journal shows the pinned
+    // refusal WITHOUT opening a terminal — no launch is queued.
+    mockInvoke([journalRow({}, "CONSUMED")]);
+    render(<JournalSection />);
+    expect(await screen.findByText("CI queue blocked for an hour")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Harvest now" }));
     expect(
       await screen.findByText("Nothing to harvest — no unconsumed journal entries."),
     ).toBeInTheDocument();
-    expect(screen.queryByText(/written — see Files/)).toBeNull();
-    expect(onHarvested).not.toHaveBeenCalled();
+    expect(usePendingLaunchStore.getState().pending).toHaveLength(0);
+    expect(screen.queryByText(/Triage session opened/)).toBeNull();
   });
 });

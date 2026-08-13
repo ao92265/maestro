@@ -77,6 +77,12 @@ export interface SessionSlot {
    * CLI launches. Never set for manually created slots.
    */
   samurai?: import("@/stores/usePendingLaunchStore").SamuraiSuccessorInfo | null;
+  /**
+   * Interactive harvest triage (issue #98): arms the backend's journal
+   * prompt injection right before the CLI launches. Never set for manually
+   * created slots.
+   */
+  harvest?: boolean;
 }
 
 interface PreLaunchCardProps {

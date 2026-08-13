@@ -54,6 +54,7 @@ import {
   writeSessionPluginConfig,
 } from "@/lib/plugins";
 import { projectColorFor } from "@/lib/projectColor";
+import { samuraiHarvestArm } from "@/lib/samurai";
 import { shellEscapePaths } from "@/lib/shellEscape";
 import {
   registerSamuraiSuccessor,
@@ -1094,6 +1095,19 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
                 }
               }
 
+              // Harvest triage launch (issue #98): arm the backend BEFORE
+              // the CLI launches, so the journal-prompt injection gate is
+              // set strictly ahead of claude's SessionStart hook. Failure is
+              // logged, not fatal — the terminal still opens, just without
+              // the injected prompt.
+              if (slot.harvest) {
+                try {
+                  await samuraiHarvestArm(sessionId);
+                } catch (err) {
+                  console.error("[Harvest] Failed to arm the triage prompt:", err);
+                }
+              }
+
               // Send CLI launch command
               await writeStdin(sessionId, `${cliCommand}\r`);
 
@@ -1819,6 +1833,9 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       // the registration metadata; History launches leave both unset.
       customName: launch.customName ?? base.customName,
       samurai: launch.samurai ?? null,
+      // Harvest triage launches (issue #98) arm the backend's journal
+      // prompt injection right before the CLI launches.
+      harvest: launch.harvest ?? false,
       // The History tab always names the exact directory to run in. Reusing the
       // pristine slot would otherwise inherit its worktreeMode, and any mode but
       // "project" sends launchSlotInner into prepareSessionWorktree — moving the
