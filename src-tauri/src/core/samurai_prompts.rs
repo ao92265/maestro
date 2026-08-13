@@ -118,20 +118,28 @@ fn completion_declaration_clause() -> String {
     )
 }
 
-/// The PR-issue-linking reminder (issue #95; audited across every brief that
-/// can open or update a pull request): a merged Samurai PR only auto-closes
-/// the issues it resolves when its body says so — without this, merging
-/// leaves every fixed issue open until a human notices.
-/// `launch_instruction` states the rule as a hard step inline (its
+/// The PR-issue-linking + PR-title reminder (issues #95 and #92; audited
+/// across every brief that can open or update a pull request): a merged
+/// Samurai PR only auto-closes the issues it resolves when its body says
+/// so, and its scope stays hidden unless the title names every ref number
+/// from the moment it is created — without either, merging leaves fixed
+/// issues open and hides the run's real scope behind a free-form title.
+/// `launch_instruction` states both rules as a hard step inline (its
 /// gh_progress arm already covers PRs); successor and recovery briefs carry
-/// it as a standing reminder here since whether either opens a NEW pull
+/// them as a standing reminder here since whether either opens a NEW pull
 /// request depends on the handoff's Next steps / the run's remaining work,
-/// not on this instruction alone. Single line by construction (see module
-/// doc).
-fn pr_discipline_reminder() -> String {
-    "If you open or update a pull request: its body must contain `Closes #N` (or `Fixes #N`) \
-     for each issue it resolves, so GitHub auto-closes them on merge."
-        .to_string()
+/// not on this instruction alone. `is_list` keeps the #87 no-epic-framing
+/// contract: a comma-separated issue list has no epic number to list, so
+/// the wording says "issue number", never "issue/epic number". Single line
+/// by construction (see module doc).
+fn pr_discipline_reminder(is_list: bool) -> String {
+    let refs = if is_list { "issue" } else { "issue/epic" };
+    format!(
+        "If you open or update a pull request: its body must contain `Closes #N` (or \
+         `Fixes #N`) for each issue it resolves, so GitHub auto-closes them on merge, and its \
+         title must list every {refs} number this run covers, from the moment it is created \
+         (e.g. `feat(samurai): #76 #77 #78 — summary`)."
+    )
 }
 
 /// Filesystem-safe slug of an epic ref for the handoff filename: `#37` →
@@ -430,7 +438,8 @@ pub fn successor_ritual_instruction(
     let generation = predecessor_generation + 1;
     let relpath = handoff_file_relpath(epic, predecessor_generation);
     // Issue #87: a comma-separated issue list is not an epic.
-    let subject = if is_issue_list(&epic_text) {
+    let is_list = is_issue_list(&epic_text);
+    let subject = if is_list {
         format!("the following GitHub issues: {epic_text}")
     } else {
         format!("epic {epic_text}")
@@ -441,7 +450,7 @@ pub fn successor_ritual_instruction(
          doing anything else — it and GitHub are your only sources of truth."
     );
     let clause = completion_declaration_clause();
-    let pr_reminder = pr_discipline_reminder();
+    let pr_reminder = pr_discipline_reminder(is_list);
     if head_matched {
         format!(
             "{opening} Maestro verified that this repository's current HEAD equals the SHA \
@@ -504,9 +513,17 @@ pub fn launch_instruction(epic: &str, repo_pin: Option<&str>) -> String {
         "comment progress on the epic's GitHub issue as issues complete"
     };
     // Issue #95: merging a Samurai PR closes nothing unless its body links
-    // the issues it resolves.
-    let pr_discipline = "every PR body must contain `Closes #N` (or `Fixes #N`) for each issue \
-         it resolves so GitHub auto-closes them on merge";
+    // the issues it resolves. Issue #92: the title must enumerate every ref
+    // number the run covers from the moment the PR is created. `refs`
+    // mirrors pr_discipline_reminder's #87 no-epic-framing contract: a list
+    // has no epic number to list.
+    let refs = if is_list { "issue" } else { "issue/epic" };
+    let pr_discipline = format!(
+        "every PR body must contain `Closes #N` (or `Fixes #N`) for each issue it resolves so \
+         GitHub auto-closes them on merge, and every PR title must list every {refs} number \
+         this run covers, from the moment it is created (e.g. `feat(samurai): #76 #77 #78 — \
+         summary`)"
+    );
     let (gh_read, gh_progress, caution) = match repo_pin {
         Some(pin) => (
             format!(
@@ -627,7 +644,7 @@ pub fn recovery_ritual_instruction(
         ),
     };
     let clause = completion_declaration_clause();
-    let pr_reminder = pr_discipline_reminder();
+    let pr_reminder = pr_discipline_reminder(is_list);
     format!(
         "[Maestro Samurai] RECOVERY MODE: you are generation {generation} for {subject}. \
          Generation {predecessor_generation} died without a valid handoff file, so there is \
@@ -1270,6 +1287,34 @@ mod tests {
         assert!(text.contains("Closes #N"));
         assert!(text.contains("Fixes #N"));
         assert!(text.contains("GitHub auto-closes them on merge"));
+    }
+
+    // --- issue #92: PR titles enumerate every issue/epic number ---
+
+    #[test]
+    fn test_launch_instruction_instructs_pr_title_enumerates_refs() {
+        let text = launch_instruction("#38", None);
+        assert!(
+            text.contains(
+                "every PR title must list every issue/epic number this run covers, from the \
+                 moment it is created"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("`feat(samurai): #76 #77 #78 — summary`"), "{text}");
+    }
+
+    #[test]
+    fn test_successor_ritual_instruction_instructs_pr_title_enumerates_refs() {
+        let text = successor_ritual_instruction("#37", 2, true);
+        assert!(
+            text.contains(
+                "its title must list every issue/epic number this run covers, from the moment \
+                 it is created"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("`feat(samurai): #76 #77 #78 — summary`"), "{text}");
     }
 
     // --- issue #96: run-completion declaration clause ---
