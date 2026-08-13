@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import { projectColorFor, resolveProjectColors } from "../projectColor";
 
 /** Extracts the hue from an `hsl(H 70% 55%)` string. */

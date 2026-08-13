@@ -1,10 +1,9 @@
+import { Placeholder } from "@tiptap/extensions";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
-import { Placeholder } from "@tiptap/extensions";
-import { Markdown } from "tiptap-markdown";
 import { useMemo } from "react";
-
 import type { MarkdownStorage } from "tiptap-markdown";
+import { Markdown } from "tiptap-markdown";
 
 interface NotesEditorProps {
   /**
@@ -28,9 +27,7 @@ interface NotesEditorProps {
  * scanning because TipTap keeps their text verbatim.
  */
 function hasUnsupportedMarkdown(markdown: string): boolean {
-  const withoutCode = markdown
-    .replace(/```[\s\S]*?(```|$)/g, "")
-    .replace(/`[^`\n]*`/g, "");
+  const withoutCode = markdown.replace(/```[\s\S]*?(```|$)/g, "").replace(/`[^`\n]*`/g, "");
   return (
     // GFM table delimiter row, e.g. `| --- | :-: |`
     /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/m.test(withoutCode) ||
@@ -64,11 +61,7 @@ export function NotesEditor(props: NotesEditorProps) {
     () => hasUnsupportedMarkdown(props.initialContent),
     [props.initialContent],
   );
-  return unsupported ? (
-    <PlainMarkdownFallback {...props} />
-  ) : (
-    <RichNotesEditor {...props} />
-  );
+  return unsupported ? <PlainMarkdownFallback {...props} /> : <RichNotesEditor {...props} />;
 }
 
 function RichNotesEditor({
@@ -128,8 +121,8 @@ function PlainMarkdownFallback({
   return (
     <div className={`flex flex-col ${className}`}>
       <p className="mb-1 shrink-0 text-[10px] italic text-maestro-muted">
-        This note uses formatting the rich editor can't preserve (table, image,
-        task list, footnote, or HTML) — editing as plain markdown.
+        This note uses formatting the rich editor can't preserve (table, image, task list, footnote,
+        or HTML) — editing as plain markdown.
       </p>
       <textarea
         defaultValue={initialContent}

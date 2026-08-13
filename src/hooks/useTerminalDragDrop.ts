@@ -1,6 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { useEffect, useMemo, useState } from "react";
 
 import type { SessionSlot } from "@/components/terminal/PreLaunchCard";
 
@@ -106,7 +105,10 @@ export function useTerminalDragDrop({
     function findSlotAtPosition(physX: number, physY: number): string | null {
       // `enter` normally seeds the snapshot; fall back in case a drag starts
       // with an `over`/`drop` (e.g. the tab was switched mid-drag).
-      const rects = slotRects ?? (slotRects = snapshotSlots());
+      if (slotRects === null) {
+        slotRects = snapshotSlots();
+      }
+      const rects = slotRects;
       const scale = window.devicePixelRatio || 1;
       const cssX = physX / scale;
       const cssY = physY / scale;

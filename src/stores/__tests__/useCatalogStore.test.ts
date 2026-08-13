@@ -1,7 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { useCatalogStore, type ProjectCatalog } from "../useCatalogStore";
+import { type ProjectCatalog, useCatalogStore } from "../useCatalogStore";
 
 const invokeMock = vi.mocked(invoke);
 
@@ -11,7 +11,7 @@ const OTHER = "C:/git/other";
 function catalog(
   date = "2026-08-05",
   project_path = PROJECT,
-  markdown = "## Terminals"
+  markdown = "## Terminals",
 ): ProjectCatalog {
   return { project_path, date, markdown, generated_at: `${date}T10:00:00Z` };
 }
@@ -40,7 +40,10 @@ describe("useCatalogStore", () => {
   it("scan shows a scanning state while the run is in flight", async () => {
     let release: (c: ProjectCatalog) => void = () => {};
     invokeMock.mockImplementationOnce(
-      () => new Promise<ProjectCatalog>((resolve) => (release = resolve))
+      () =>
+        new Promise<ProjectCatalog>((resolve) => {
+          release = resolve;
+        }),
     );
     const pending = useCatalogStore.getState().scan(PROJECT);
     expect(useCatalogStore.getState().catalogs[PROJECT].status).toBe("scanning");
@@ -141,7 +144,10 @@ describe("useCatalogStore", () => {
   it("loadLatest never clobbers a scan that started while it was reading", async () => {
     let releaseLoad: (c: ProjectCatalog | null) => void = () => {};
     invokeMock.mockImplementationOnce(
-      () => new Promise<ProjectCatalog | null>((resolve) => (releaseLoad = resolve))
+      () =>
+        new Promise<ProjectCatalog | null>((resolve) => {
+          releaseLoad = resolve;
+        }),
     );
     const loading = useCatalogStore.getState().loadLatest(PROJECT);
     // A scan takes the slot mid-read.
@@ -184,7 +190,10 @@ describe("useCatalogStore", () => {
     // that is the outcome the user asked for, not a failure to report.
     let reject: (e: unknown) => void = () => {};
     invokeMock.mockImplementationOnce(
-      () => new Promise<ProjectCatalog>((_, r) => (reject = r))
+      () =>
+        new Promise<ProjectCatalog>((_, r) => {
+          reject = r;
+        }),
     );
     const pending = useCatalogStore.getState().scan(PROJECT);
     await useCatalogStore.getState().cancel(PROJECT);

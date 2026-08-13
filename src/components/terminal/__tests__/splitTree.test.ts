@@ -1,10 +1,10 @@
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
-  MAX_SESSIONS,
   buildGridTree,
   collectSlotIds,
   createLeaf,
   gridDimensions,
+  MAX_SESSIONS,
   removeLeaf,
   splitLeaf,
   swapSlots,

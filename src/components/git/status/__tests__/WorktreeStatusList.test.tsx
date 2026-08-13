@@ -1,8 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
-import { WorktreeStatusList } from "../WorktreeStatusList";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { WorktreeStatus } from "../../../../lib/git";
+import { WorktreeStatusList } from "../WorktreeStatusList";
 
 const invokeMock = vi.mocked(invoke);
 
@@ -83,10 +83,7 @@ describe("WorktreeStatusList file actions", () => {
     fireEvent.click(screen.getByRole("button", { name: "Restore" }));
 
     // Nothing destructive runs until the user confirms.
-    expect(invokeMock).not.toHaveBeenCalledWith(
-      "git_discard_file",
-      expect.anything()
-    );
+    expect(invokeMock).not.toHaveBeenCalledWith("git_discard_file", expect.anything());
 
     fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
 
@@ -98,9 +95,7 @@ describe("WorktreeStatusList file actions", () => {
       });
     });
     // Refresh polled status again (mount + after-action = 2+ status reads).
-    const statusCalls = invokeMock.mock.calls.filter(
-      (c) => c[0] === "git_worktrees_status"
-    );
+    const statusCalls = invokeMock.mock.calls.filter((c) => c[0] === "git_worktrees_status");
     expect(statusCalls.length).toBeGreaterThanOrEqual(2);
   });
 
@@ -112,10 +107,7 @@ describe("WorktreeStatusList file actions", () => {
     fireEvent.click(screen.getByRole("button", { name: "Remove" }));
     fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
 
-    expect(invokeMock).not.toHaveBeenCalledWith(
-      "git_remove_file",
-      expect.anything()
-    );
+    expect(invokeMock).not.toHaveBeenCalledWith("git_remove_file", expect.anything());
     // Action button is back.
     expect(screen.getByRole("button", { name: "Remove" })).toBeInTheDocument();
   });
@@ -174,9 +166,7 @@ describe("WorktreeStatusList file actions", () => {
     fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
 
     // Error icon carries the message; file stays put.
-    expect(
-      await screen.findByTitle("fatal: discard exploded")
-    ).toBeInTheDocument();
+    expect(await screen.findByTitle("fatal: discard exploded")).toBeInTheDocument();
     expect(screen.getByText("src/foo.ts")).toBeInTheDocument();
   });
 });

@@ -1,6 +1,6 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // The persisted zustand stores hydrate through the Tauri store plugin at
 // import time; happy-dom has no Tauri backend, so stub it out.
@@ -14,12 +14,9 @@ vi.mock("@tauri-apps/plugin-store", () => ({
   },
 }));
 
-import { JournalSection } from "../JournalSection";
-import type {
-  SamuraiJournalEntry,
-  SamuraiJournalEntryStatus,
-} from "@/lib/samurai";
+import type { SamuraiJournalEntry, SamuraiJournalEntryStatus } from "@/lib/samurai";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
+import { JournalSection } from "../JournalSection";
 
 const invokeMock = vi.mocked(invoke);
 
@@ -62,7 +59,10 @@ function journalRow(
  * (newest LAST, like the backend) so a post-add refresh shows the new entry;
  * `harvestError` makes `samurai_harvest_run` reject with that string.
  */
-function mockInvoke(rows: JournalRow[], opts: { fileSizeBytes?: number; harvestError?: string } = {}) {
+function mockInvoke(
+  rows: JournalRow[],
+  opts: { fileSizeBytes?: number; harvestError?: string } = {},
+) {
   invokeMock.mockImplementation(async (cmd: string, args?: unknown) => {
     switch (cmd) {
       case "samurai_journal_list":
@@ -183,9 +183,7 @@ describe("JournalSection (issue #71)", () => {
 
   it("badges the full journal entry count, not the rendered tail", async () => {
     // Fix m6c: 60 entries, only the newest 50 render — the badge says 60.
-    const rows = Array.from({ length: 60 }, (_, i) =>
-      journalRow({ text: `entry ${i}` }),
-    );
+    const rows = Array.from({ length: 60 }, (_, i) => journalRow({ text: `entry ${i}` }));
     mockInvoke(rows);
     render(<JournalSection />);
 

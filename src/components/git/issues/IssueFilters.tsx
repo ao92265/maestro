@@ -1,9 +1,6 @@
 import { Search, X } from "lucide-react";
 import { useEffect, useState } from "react";
-import {
-  useGitHubStore,
-  type IssueFilterState,
-} from "../../../stores/useGitHubStore";
+import { type IssueFilterState, useGitHubStore } from "../../../stores/useGitHubStore";
 
 const STATE_FILTERS: Array<{ value: IssueFilterState; label: string }> = [
   { value: "open", label: "Open" },
@@ -37,8 +34,7 @@ export function IssueFilters({ repoPath }: IssueFiltersProps) {
     fetchIssues(repoPath, filter, searchInput);
   };
 
-  const isChipActive = (clause: string) =>
-    searchInput.toLowerCase().includes(clause.toLowerCase());
+  const isChipActive = (clause: string) => searchInput.toLowerCase().includes(clause.toLowerCase());
 
   const toggleChip = (clause: string) => {
     let next: string;

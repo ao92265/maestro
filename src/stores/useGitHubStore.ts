@@ -171,11 +171,7 @@ interface GitHubState {
 
   // Actions
   checkAuth: (repoPath: string) => Promise<void>;
-  fetchPullRequests: (
-    repoPath: string,
-    state?: PrFilterState,
-    search?: string
-  ) => Promise<void>;
+  fetchPullRequests: (repoPath: string, state?: PrFilterState, search?: string) => Promise<void>;
   fetchPullRequestDetail: (repoPath: string, number: number) => Promise<void>;
   createPullRequest: (
     repoPath: string,
@@ -183,25 +179,17 @@ interface GitHubState {
     body: string,
     base: string,
     head: string,
-    draft: boolean
+    draft: boolean,
   ) => Promise<PullRequestInfo>;
   mergePullRequest: (
     repoPath: string,
     number: number,
     method: MergeMethod,
-    deleteBranch: boolean
+    deleteBranch: boolean,
   ) => Promise<void>;
   closePullRequest: (repoPath: string, number: number) => Promise<void>;
-  commentPullRequest: (
-    repoPath: string,
-    number: number,
-    body: string
-  ) => Promise<void>;
-  fetchIssues: (
-    repoPath: string,
-    state?: IssueFilterState,
-    search?: string
-  ) => Promise<void>;
+  commentPullRequest: (repoPath: string, number: number, body: string) => Promise<void>;
+  fetchIssues: (repoPath: string, state?: IssueFilterState, search?: string) => Promise<void>;
   fetchDiscussions: (repoPath: string) => Promise<void>;
   fetchIssueDetail: (repoPath: string, number: number) => Promise<void>;
   closeIssue: (repoPath: string, number: number) => Promise<void>;
@@ -287,11 +275,7 @@ export const useGitHubStore = create<GitHubState>()((set, get) => ({
     }
   },
 
-  fetchPullRequests: async (
-    repoPath: string,
-    state?: PrFilterState,
-    search?: string
-  ) => {
+  fetchPullRequests: async (repoPath: string, state?: PrFilterState, search?: string) => {
     const filter = state ?? get().prFilter;
     const searchQuery = search !== undefined ? search : get().prSearch;
     const token = ++fetchTokens.prs;
@@ -340,7 +324,7 @@ export const useGitHubStore = create<GitHubState>()((set, get) => ({
     body: string,
     base: string,
     head: string,
-    draft: boolean
+    draft: boolean,
   ) => {
     const pr = await invoke<PullRequestInfo>("github_create_pr", {
       repoPath,
@@ -359,7 +343,7 @@ export const useGitHubStore = create<GitHubState>()((set, get) => ({
     repoPath: string,
     number: number,
     method: MergeMethod,
-    deleteBranch: boolean
+    deleteBranch: boolean,
   ) => {
     await invoke("github_merge_pr", {
       repoPath,
@@ -379,21 +363,13 @@ export const useGitHubStore = create<GitHubState>()((set, get) => ({
     set({ selectedPR: null });
   },
 
-  commentPullRequest: async (
-    repoPath: string,
-    number: number,
-    body: string
-  ) => {
+  commentPullRequest: async (repoPath: string, number: number, body: string) => {
     await invoke("github_comment_pr", { repoPath, number, body });
     // Refresh PR detail to show the new comment
     await get().fetchPullRequestDetail(repoPath, number);
   },
 
-  fetchIssues: async (
-    repoPath: string,
-    state?: IssueFilterState,
-    search?: string
-  ) => {
+  fetchIssues: async (repoPath: string, state?: IssueFilterState, search?: string) => {
     const filter = state ?? get().issueFilter;
     const searchQuery = search !== undefined ? search : get().issueSearch;
     const token = ++fetchTokens.issues;
@@ -423,10 +399,10 @@ export const useGitHubStore = create<GitHubState>()((set, get) => ({
     const token = ++fetchTokens.discussions;
     set({ isDiscussionsLoading: true, discussionsError: null });
     try {
-      const discussions = await invoke<DiscussionInfo[]>(
-        "github_list_discussions",
-        { repoPath, limit: 25 }
-      );
+      const discussions = await invoke<DiscussionInfo[]>("github_list_discussions", {
+        repoPath,
+        limit: 25,
+      });
       if (token !== fetchTokens.discussions) return; // superseded by a newer fetch
       set({ discussions, isDiscussionsLoading: false, discussionsEnabled: true });
     } catch (err) {
@@ -494,10 +470,10 @@ export const useGitHubStore = create<GitHubState>()((set, get) => ({
     const token = ++fetchTokens.discussionDetail;
     set({ isLoadingDiscussionDetail: true });
     try {
-      const selectedDiscussion = await invoke<DiscussionDetail>(
-        "github_get_discussion",
-        { repoPath, number }
-      );
+      const selectedDiscussion = await invoke<DiscussionDetail>("github_get_discussion", {
+        repoPath,
+        number,
+      });
       if (token !== fetchTokens.discussionDetail) return;
       set({ selectedDiscussion, isLoadingDiscussionDetail: false });
     } catch (err) {

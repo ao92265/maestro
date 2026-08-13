@@ -92,9 +92,7 @@ describe("useNotesStore", () => {
     expect(useNotesStore.getState().notes).toHaveLength(0);
     // The store exposes no session-sync API anymore — nothing can bring
     // a deleted note back except the user creating a new one.
-    expect(
-      (useNotesStore.getState() as Record<string, unknown>).syncWithSessions,
-    ).toBeUndefined();
+    expect((useNotesStore.getState() as Record<string, unknown>).syncWithSessions).toBeUndefined();
   });
 
   describe("moveNote", () => {

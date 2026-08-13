@@ -72,7 +72,7 @@ const MAX_TOASTS = 6;
  */
 export function carryForwardErroredLists(
   prev: WatchdogProjectResult | undefined,
-  next: WatchdogProjectResult
+  next: WatchdogProjectResult,
 ): WatchdogProjectResult {
   if (!next.reviewRequestsErrored && !next.assignedIssuesErrored) return next;
   const merged = { ...next };
@@ -98,7 +98,7 @@ export function carryForwardErroredLists(
  */
 export function diffNewItems(
   prev: WatchdogProjectResult | undefined,
-  next: WatchdogProjectResult
+  next: WatchdogProjectResult,
 ): { newPrs: PullRequestInfo[]; newIssues: IssueInfo[] } {
   if (!prev) return { newPrs: [], newIssues: [] };
   const prevPrs = new Set(prev.reviewRequests.map((pr) => pr.number));
@@ -120,7 +120,7 @@ export function diffNewItems(
  * would double the badge counts and duplicate toasts.
  */
 export function watchedProjectsFromTabs(
-  tabs: ReadonlyArray<{ name: string; projectPath: string; selectedRepoPath: string | null }>
+  tabs: ReadonlyArray<{ name: string; projectPath: string; selectedRepoPath: string | null }>,
 ): Array<{ name: string; repoPath: string }> {
   const seen = new Set<string>();
   const projects: Array<{ name: string; repoPath: string }> = [];
@@ -213,16 +213,13 @@ export const useGitHubWatchdogStore = create<WatchdogState & WatchdogActions>()(
         // Errored lists keep the last-known-good data (see the helper docs);
         // the merged results are what gets diffed AND stored.
         const mergedProjects = snapshot.projects.map((project) =>
-          carryForwardErroredLists(prevByPath.get(project.repoPath), project)
+          carryForwardErroredLists(prevByPath.get(project.repoPath), project),
         );
 
         const newToasts: WatchdogToast[] = [];
         if (notificationsEnabled) {
           for (const project of mergedProjects) {
-            const { newPrs, newIssues } = diffNewItems(
-              prevByPath.get(project.repoPath),
-              project
-            );
+            const { newPrs, newIssues } = diffNewItems(prevByPath.get(project.repoPath), project);
             for (const pr of newPrs) {
               newToasts.push({
                 id: `watchdog-${++toastSeq}`,
@@ -286,6 +283,6 @@ export const useGitHubWatchdogStore = create<WatchdogState & WatchdogActions>()(
         notificationsEnabled: state.notificationsEnabled,
       }),
       version: 1,
-    }
-  )
+    },
+  ),
 );

@@ -93,13 +93,9 @@ export function UpdateSettingsSection() {
       <div className="space-y-1 mb-2">
         <div className="flex items-center gap-2 px-1 text-xs">
           <Check size={12} className="shrink-0 text-maestro-green" />
-          <span className="text-maestro-text font-medium">
-            v{appVersion ?? "..."}
-          </span>
+          <span className="text-maestro-text font-medium">v{appVersion ?? "..."}</span>
           <span className="flex-1" />
-          <span className="text-[10px] text-maestro-muted">
-            {formatTimeAgo(lastCheckedAt)}
-          </span>
+          <span className="text-[10px] text-maestro-muted">{formatTimeAgo(lastCheckedAt)}</span>
         </div>
         {status === "checking" && (
           <div className="flex items-center gap-2 px-1 text-[11px] text-maestro-muted">
@@ -158,10 +154,14 @@ export function UpdateSettingsSection() {
 
       {advancedOpen && (
         <div className="px-2 py-1.5 space-y-1.5">
-          <label className="block text-[10px] text-maestro-muted uppercase tracking-wide">
+          <label
+            htmlFor="update-custom-endpoint"
+            className="block text-[10px] text-maestro-muted uppercase tracking-wide"
+          >
             Custom endpoint
           </label>
           <input
+            id="update-custom-endpoint"
             type="text"
             value={endpointInput}
             onChange={(e) => setEndpointInput(e.target.value)}

@@ -34,7 +34,12 @@ function loadPersisted(): Record<string, XY> {
     for (const [id, value] of Object.entries(parsed as Record<string, unknown>)) {
       if (!isProjectNode(id) || !value || typeof value !== "object") continue;
       const { x, y } = value as Partial<XY>;
-      if (typeof x === "number" && typeof y === "number" && Number.isFinite(x) && Number.isFinite(y)) {
+      if (
+        typeof x === "number" &&
+        typeof y === "number" &&
+        Number.isFinite(x) &&
+        Number.isFinite(y)
+      ) {
         out[id] = { x, y };
       }
     }

@@ -1,12 +1,5 @@
 import { Plus, Trash2, X } from "lucide-react";
-import {
-  type KeyboardEvent,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { NotesEditor } from "@/components/notepad/NotesEditor";
 import { useNotesStore } from "@/stores/useNotesStore";
 

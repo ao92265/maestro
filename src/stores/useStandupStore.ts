@@ -222,7 +222,8 @@ export const useStandupStore = create<StandupState>()(
         if (lastRunDate === today) return;
         const [hours, minutes] = scheduleTime.split(":").map(Number);
         if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return;
-        const due = now.getHours() > hours || (now.getHours() === hours && now.getMinutes() >= minutes);
+        const due =
+          now.getHours() > hours || (now.getHours() === hours && now.getMinutes() >= minutes);
         if (!due) return;
         // Gate re-entry with the in-memory flag (set synchronously, before the
         // first await) so the catch-up ticks fired at startup can't race the
@@ -234,7 +235,7 @@ export const useStandupStore = create<StandupState>()(
           // Per project: skip days whose report already exists on disk (e.g.
           // generated manually, or by a previous app run before a restart).
           const done = await Promise.all(
-            repoPaths.map((repoPath) => get().generateIfMissing(repoPath, today))
+            repoPaths.map((repoPath) => get().generateIfMissing(repoPath, today)),
           );
           // A failed existence check leaves the day open so the next minute
           // tick retries it; already-generated projects are skipped by their
@@ -254,6 +255,6 @@ export const useStandupStore = create<StandupState>()(
         lastRunDate: state.lastRunDate,
         promptTemplate: state.promptTemplate,
       }),
-    }
-  )
+    },
+  ),
 );

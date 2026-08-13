@@ -82,7 +82,7 @@ export const usePendingLaunchStore = create<PendingLaunchState>((set, get) => ({
   pending: [],
   request: (launch) =>
     set((s) =>
-      s.pending.some((p) => sameLaunch(p, launch)) ? s : { pending: [...s.pending, launch] }
+      s.pending.some((p) => sameLaunch(p, launch)) ? s : { pending: [...s.pending, launch] },
     ),
   consume: (tabId) => {
     const queue = get().pending;

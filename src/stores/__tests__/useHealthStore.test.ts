@@ -1,5 +1,5 @@
-﻿import { beforeEach, describe, expect, it, vi } from "vitest";
-import { invoke } from "@tauri-apps/api/core";
+﻿import { invoke } from "@tauri-apps/api/core";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // The persisted stores hydrate through the Tauri store plugin at import time;
 // happy-dom has no Tauri backend, so stub it out.

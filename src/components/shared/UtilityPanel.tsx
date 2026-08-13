@@ -1,11 +1,11 @@
-import { Suspense, lazy } from "react";
 import { Activity, Brain, BrainCircuit, Rocket, Sparkles, StickyNote, X } from "lucide-react";
+import { lazy, Suspense } from "react";
+import { AiPanel } from "@/components/ai/AiPanel";
 import {
   PanelResizeHandle,
   RIGHT_PANEL_MAX_WIDTH,
   RIGHT_PANEL_MIN_WIDTH,
 } from "@/components/shared/PanelResizeHandle";
-import { AiPanel } from "@/components/ai/AiPanel";
 import { LaunchSection } from "@/components/sidebar/LaunchSection";
 import { MemorySection } from "@/components/sidebar/MemorySection";
 import { ProcessesSection } from "@/components/sidebar/ProcessesSection";

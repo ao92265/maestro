@@ -1,10 +1,8 @@
-import { useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { Download, Network, Trash2, X } from "lucide-react";
+import { useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
-import { SamuraiBadge } from "@/components/terminal/SamuraiBadge";
-import { ThinkingIndicator } from "@/components/terminal/ThinkingIndicator";
 import {
   AgentExchangeDrawer,
   agentBadge,
@@ -15,7 +13,9 @@ import {
   statsLine,
   ToolStatsRow,
 } from "@/components/session/agentPresentation";
-import { buildAgentTree, type AgentTreeNode } from "@/lib/agentTree";
+import { SamuraiBadge } from "@/components/terminal/SamuraiBadge";
+import { ThinkingIndicator } from "@/components/terminal/ThinkingIndicator";
+import { type AgentTreeNode, buildAgentTree } from "@/lib/agentTree";
 import { useAgentStore } from "@/stores/useAgentStore";
 import { useSessionStore } from "@/stores/useSessionStore";
 
@@ -68,7 +68,7 @@ export function AgentGraph({ sessionId }: AgentGraphProps) {
       agents
         .filter((a) => a.sessionId === sessionId)
         .sort((a, b) => a.spawnedAt.localeCompare(b.spawnedAt)),
-    [agents, sessionId]
+    [agents, sessionId],
   );
 
   const session = useSessionStore(
@@ -82,7 +82,7 @@ export function AgentGraph({ sessionId }: AgentGraphProps) {
         statusMessage: sess.statusMessage,
         needsInputPrompt: sess.needsInputPrompt,
       };
-    })
+    }),
   );
 
   if (!session) {
@@ -299,6 +299,7 @@ export function AgentGraph({ sessionId }: AgentGraphProps) {
                   </span>
                 )}
                 <span className={`${badgeBaseClass} ${badge.cls}`}>{badge.label}</span>
+                {/* biome-ignore lint/a11y/useSemanticElements: can't be a real <button> — this whole card is already a <button>, and nested buttons are invalid HTML that breaks click handling. */}
                 <span
                   role="button"
                   tabIndex={0}
@@ -333,9 +334,7 @@ export function AgentGraph({ sessionId }: AgentGraphProps) {
       </div>
 
       {/* Exchange drawer: the full brief and report for one agent. */}
-      {openAgent && (
-        <AgentExchangeDrawer agent={openAgent} onClose={() => setOpenAgentId(null)} />
-      )}
+      {openAgent && <AgentExchangeDrawer agent={openAgent} onClose={() => setOpenAgentId(null)} />}
     </div>
   );
 }

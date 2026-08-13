@@ -83,6 +83,6 @@ export const useProcessWatchlistStore = create<ProcessWatchlistState>()(
       name: "maestro-process-watchlist",
       storage: createJSONStorage(() => tauriStorage),
       partialize: (state) => ({ watchlist: state.watchlist }),
-    }
-  )
+    },
+  ),
 );

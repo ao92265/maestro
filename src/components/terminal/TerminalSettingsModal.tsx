@@ -243,9 +243,7 @@ function FontFamilySection({
           size={8}
         >
           {/* Always show embedded font first */}
-          <option value={EMBEDDED_FONT}>
-            {EMBEDDED_FONT} (Embedded)
-          </option>
+          <option value={EMBEDDED_FONT}>{EMBEDDED_FONT} (Embedded)</option>
 
           {/* Nerd Fonts group */}
           {availableFonts.some((f) => f.is_nerd_font) && (

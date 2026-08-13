@@ -62,13 +62,12 @@ export function NotificationsSettingsSection() {
       </div>
 
       <p className="px-2 pt-0.5 text-[10px] text-maestro-muted/70">
-        Toasts for new review requests, assigned issues, and health flags
-        (memory, processes, Samurai files). Badges stay on either way.
+        Toasts for new review requests, assigned issues, and health flags (memory, processes,
+        Samurai files). Badges stay on either way.
       </p>
 
       <p className="px-2 pt-1 text-[10px] text-maestro-muted">
-        GitHub checked {formatTimeAgo(lastPolledAt)} · health checked{" "}
-        {formatTimeAgo(lastCheckedAt)}
+        GitHub checked {formatTimeAgo(lastPolledAt)} · health checked {formatTimeAgo(lastCheckedAt)}
       </p>
 
       {status === "gh-missing" && (
@@ -78,7 +77,8 @@ export function NotificationsSettingsSection() {
       )}
       {status === "not-authenticated" && (
         <p className="px-2 pt-1 text-[10px] text-maestro-muted">
-          Not authenticated — run <code className="rounded bg-maestro-border/40 px-1">gh auth login</code>.
+          Not authenticated — run{" "}
+          <code className="rounded bg-maestro-border/40 px-1">gh auth login</code>.
         </p>
       )}
     </div>

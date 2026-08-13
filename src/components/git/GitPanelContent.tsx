@@ -1,10 +1,10 @@
 import type { GraphNode } from "../../lib/graphLayout";
 import { BranchesPanel } from "./branches/BranchesPanel";
 import { CommitGraph } from "./CommitGraph";
-import type { GitPanelTab } from "./GitPanelTabs";
-import { PullRequestList } from "./pulls/PullRequestList";
-import { IssueList } from "./issues/IssueList";
 import { DiscussionList } from "./discussions/DiscussionList";
+import type { GitPanelTab } from "./GitPanelTabs";
+import { IssueList } from "./issues/IssueList";
+import { PullRequestList } from "./pulls/PullRequestList";
 import { WorktreeStatusList } from "./status/WorktreeStatusList";
 
 interface GitPanelContentProps {

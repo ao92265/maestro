@@ -154,11 +154,15 @@ export function describeSessionContext(input: SessionContextInput): string | nul
   }
 
   if (filesModified.length > 0) {
-    const names = filesModified
-      .slice(-3)
-      .map((path) => path.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || path);
+    const names = filesModified.slice(-3).map(
+      (path) =>
+        path
+          .replace(/[\\/]+$/, "")
+          .split(/[\\/]/)
+          .pop() || path,
+    );
     return clamp(
-      `${filesModified.length} file${filesModified.length === 1 ? "" : "s"} touched — ${names.join(", ")}`
+      `${filesModified.length} file${filesModified.length === 1 ? "" : "s"} touched — ${names.join(", ")}`,
     );
   }
 

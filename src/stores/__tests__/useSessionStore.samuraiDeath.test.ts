@@ -11,10 +11,10 @@ vi.mock("@tauri-apps/api/core", () => ({
 import { listen } from "@tauri-apps/api/event";
 
 import {
-  initSamuraiSupervisorListener,
-  useSessionStore,
   type BackendSessionStatus,
+  initSamuraiSupervisorListener,
   type SessionConfig,
+  useSessionStore,
 } from "../useSessionStore";
 
 const listenMock = vi.mocked(listen);
@@ -22,7 +22,7 @@ const listenMock = vi.mocked(listen);
 function session(
   id: number,
   status: BackendSessionStatus = "Working",
-  projectPath = "C:/proj"
+  projectPath = "C:/proj",
 ): SessionConfig {
   return {
     id,

@@ -1,6 +1,6 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // The persisted zustand stores hydrate through the Tauri store plugin at
 // import time; happy-dom has no Tauri backend, so stub it out.
@@ -20,16 +20,16 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import { type ComponentProps, useState } from "react";
+import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
+import { useSessionStore } from "@/stores/useSessionStore";
+import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 import {
   loadSavedSidebarTab,
-  saveSidebarTab,
   Sidebar,
-  sidebarTabShortcutTransition,
   type SidebarTabId,
+  saveSidebarTab,
+  sidebarTabShortcutTransition,
 } from "../Sidebar";
-import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
-import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
-import { useSessionStore } from "@/stores/useSessionStore";
 
 const invokeMock = vi.mocked(invoke);
 

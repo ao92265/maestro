@@ -3,10 +3,10 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { create } from "zustand";
 import { samePath } from "@/lib/path";
 import {
-  samuraiListSessions,
-  samuraiScheduleList,
   type SamuraiScheduleEntry,
   type SamuraiSupervisorState,
+  samuraiListSessions,
+  samuraiScheduleList,
 } from "@/lib/samurai";
 import { useAgentStore } from "@/stores/useAgentStore";
 import type { ClaudeEvent } from "@/types/claude-events";
@@ -42,12 +42,7 @@ const SESSION_STARTUP_TIMEOUT_MS = 30000;
  * `finished` or `error` over MCP never emits NeedsInput afterwards, so a parked
  * session that completed its work used to stay hidden indefinitely.
  */
-const READY_FOR_USER_STATUSES: BackendSessionStatus[] = [
-  "NeedsInput",
-  "Done",
-  "Error",
-  "Timeout",
-];
+const READY_FOR_USER_STATUSES: BackendSessionStatus[] = ["NeedsInput", "Done", "Error", "Timeout"];
 
 /**
  * Mirrors the Rust `SessionConfig` struct returned by `get_sessions`.
@@ -296,11 +291,9 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     set((state) =>
       state.attentionSessionIds.includes(sessionId)
         ? {
-            attentionSessionIds: state.attentionSessionIds.filter(
-              (id) => id !== sessionId
-            ),
+            attentionSessionIds: state.attentionSessionIds.filter((id) => id !== sessionId),
           }
-        : state
+        : state,
     );
   },
 
@@ -314,14 +307,12 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
         sessions,
         isLoading: false,
         // Prune parked/flagged/attention IDs that no longer exist in the fetched list
-        parkedSessionIds: state.parkedSessionIds.filter((id) =>
-          sessions.some((s) => s.id === id)
-        ),
+        parkedSessionIds: state.parkedSessionIds.filter((id) => sessions.some((s) => s.id === id)),
         flaggedSessionIds: state.flaggedSessionIds.filter((id) =>
-          sessions.some((s) => s.id === id)
+          sessions.some((s) => s.id === id),
         ),
         attentionSessionIds: state.attentionSessionIds.filter((id) =>
-          sessions.some((s) => s.id === id)
+          sessions.some((s) => s.id === id),
         ),
       }));
     } catch (err) {
@@ -342,14 +333,12 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
         sessions,
         isLoading: false,
         // Prune parked/flagged/attention IDs that no longer exist in the fetched list
-        parkedSessionIds: state.parkedSessionIds.filter((id) =>
-          sessions.some((s) => s.id === id)
-        ),
+        parkedSessionIds: state.parkedSessionIds.filter((id) => sessions.some((s) => s.id === id)),
         flaggedSessionIds: state.flaggedSessionIds.filter((id) =>
-          sessions.some((s) => s.id === id)
+          sessions.some((s) => s.id === id),
         ),
         attentionSessionIds: state.attentionSessionIds.filter((id) =>
-          sessions.some((s) => s.id === id)
+          sessions.some((s) => s.id === id),
         ),
       }));
     } catch (err) {
@@ -372,8 +361,12 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     const bufferKey = statusBufferKey(session.id, session.project_path);
     const bufferedStatus = pendingStatusUpdates.get(bufferKey);
 
-    console.log(`[SessionStore] addSession id=${session.id} project_path='${session.project_path}'`);
-    console.log(`[SessionStore] Buffer key: '${bufferKey}', has buffered status: ${!!bufferedStatus}`);
+    console.log(
+      `[SessionStore] addSession id=${session.id} project_path='${session.project_path}'`,
+    );
+    console.log(
+      `[SessionStore] Buffer key: '${bufferKey}', has buffered status: ${!!bufferedStatus}`,
+    );
     if (pendingStatusUpdates.size > 0) {
       console.log("[SessionStore] All buffered keys:", Array.from(pendingStatusUpdates.keys()));
     }
@@ -402,7 +395,9 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
         const currentState = get();
         const currentSession = currentState.sessions.find((s) => s.id === session.id);
         if (currentSession && currentSession.status === "Starting") {
-          console.warn(`[SessionStore] Session ${session.id} startup timeout after ${SESSION_STARTUP_TIMEOUT_MS}ms`);
+          console.warn(
+            `[SessionStore] Session ${session.id} startup timeout after ${SESSION_STARTUP_TIMEOUT_MS}ms`,
+          );
           set((state) => ({
             sessions: state.sessions.map((s) =>
               s.id === session.id
@@ -411,7 +406,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
                     status: "Timeout" as BackendSessionStatus,
                     statusMessage: "CLI failed to start - check terminal for errors",
                   }
-                : s
+                : s,
             ),
           }));
         }
@@ -433,9 +428,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
 
   updateSession: (sessionId: number, updates: Partial<SessionConfig>) => {
     set((state) => ({
-      sessions: state.sessions.map((s) =>
-        s.id === sessionId ? { ...s, ...updates } : s
-      ),
+      sessions: state.sessions.map((s) => (s.id === sessionId ? { ...s, ...updates } : s)),
     }));
   },
 
@@ -447,7 +440,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       });
       set((state) => ({
         sessions: state.sessions.map((s) =>
-          s.id === sessionId ? { ...s, name: updated.name } : s
+          s.id === sessionId ? { ...s, name: updated.name } : s,
         ),
       }));
     } catch (err) {
@@ -501,17 +494,15 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
           delete samuraiBySessionId[session.id];
         }
         return {
-          sessions: state.sessions.filter(
-            (s) => !removed.some((r) => r.id === s.id)
-          ),
+          sessions: state.sessions.filter((s) => !removed.some((r) => r.id === s.id)),
           parkedSessionIds: state.parkedSessionIds.filter(
-            (id) => !removed.some((r) => r.id === id)
+            (id) => !removed.some((r) => r.id === id),
           ),
           flaggedSessionIds: state.flaggedSessionIds.filter(
-            (id) => !removed.some((r) => r.id === id)
+            (id) => !removed.some((r) => r.id === id),
           ),
           attentionSessionIds: state.attentionSessionIds.filter(
-            (id) => !removed.some((r) => r.id === id)
+            (id) => !removed.some((r) => r.id === id),
           ),
           samuraiBySessionId,
         };
@@ -542,7 +533,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
             let statusMessage = message;
             if (event.payload.status === "AwaitingInput") {
               const existing = get().sessions.find(
-                (s) => s.id === session_id && s.project_path === project_path
+                (s) => s.id === session_id && s.project_path === project_path,
               );
               if (existing && ["Done", "Error", "Timeout"].includes(existing.status)) {
                 return;
@@ -569,13 +560,15 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
 
             // Check if session exists in store
             const sessionExists = get().sessions.some(
-              (s) => s.id === session_id && s.project_path === project_path
+              (s) => s.id === session_id && s.project_path === project_path,
             );
 
             if (!sessionExists) {
               // Buffer this status update - it will be applied when the session is added
               const bufferKey = statusBufferKey(session_id, project_path);
-              console.log(`[SessionStore] Buffering status for non-existent session. Key: '${bufferKey}'`);
+              console.log(
+                `[SessionStore] Buffering status for non-existent session. Key: '${bufferKey}'`,
+              );
               pendingStatusUpdates.set(bufferKey, {
                 ...event.payload,
                 status,
@@ -598,7 +591,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
               // still-stopped session, repeated events for the same status are
               // not a new transition and must not undo that manual choice.
               const existing = state.sessions.find(
-                (s) => s.id === session_id && s.project_path === project_path
+                (s) => s.id === session_id && s.project_path === project_path,
               );
               const autoUnpark =
                 existing !== undefined &&
@@ -616,16 +609,12 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
                         needsInputPrompt: needs_input_prompt,
                         lastMcpUpdateTime: Date.now(),
                       }
-                    : s
+                    : s,
                 ),
                 ...(autoUnpark
                   ? {
-                      parkedSessionIds: state.parkedSessionIds.filter(
-                        (id) => id !== session_id
-                      ),
-                      attentionSessionIds: state.attentionSessionIds.includes(
-                        session_id
-                      )
+                      parkedSessionIds: state.parkedSessionIds.filter((id) => id !== session_id),
+                      attentionSessionIds: state.attentionSessionIds.includes(session_id)
                         ? state.attentionSessionIds
                         : [...state.attentionSessionIds, session_id],
                     }
@@ -690,10 +679,7 @@ function applyContextUsageEvents(events: ClaudeEvent[]): void {
     let changed = false;
     const sessions = state.sessions.map((s) => {
       const usage = updates.get(s.id);
-      if (
-        !usage ||
-        (s.contextPercent === usage.percent && s.contextTokens === usage.tokens)
-      ) {
+      if (!usage || (s.contextPercent === usage.percent && s.contextTokens === usage.tokens)) {
         return s;
       }
       changed = true;
@@ -797,7 +783,7 @@ function applySamuraiSupervisorEvent(payload: SamuraiSupervisorEvent): void {
     };
     if (payload.state !== "DEAD") return { samuraiBySessionId };
     const session = state.sessions.find(
-      (s) => s.id === payload.session_id && samePath(s.project_path, payload.project)
+      (s) => s.id === payload.session_id && samePath(s.project_path, payload.project),
     );
     if (!session) return { samuraiBySessionId };
     return {
@@ -809,7 +795,7 @@ function applySamuraiSupervisorEvent(payload: SamuraiSupervisorEvent): void {
               status: "Error" as BackendSessionStatus,
               statusMessage: "claude process died (Samurai watchdog)",
             }
-          : s
+          : s,
       ),
       parkedSessionIds: state.parkedSessionIds.filter((id) => id !== payload.session_id),
       attentionSessionIds: state.attentionSessionIds.includes(payload.session_id)
@@ -936,7 +922,10 @@ export async function initSamuraiSupervisorListener(): Promise<void> {
     }),
   ])
     .then((fns) => {
-      const unlistenAll = () => fns.forEach((fn) => fn());
+      const unlistenAll = () =>
+        fns.forEach((fn) => {
+          fn();
+        });
       if (!samuraiActive) {
         unlistenAll();
         return;
@@ -958,4 +947,3 @@ export function stopSamuraiSupervisorListener(): void {
     samuraiUnlisten = null;
   }
 }
-

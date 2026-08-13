@@ -1,14 +1,18 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
+import {
+  type BackendSessionStatus,
+  type SessionConfig,
+  useSessionStore,
+} from "@/stores/useSessionStore";
 import { ThinkingIndicator } from "../ThinkingIndicator";
-import { useSessionStore, type BackendSessionStatus, type SessionConfig } from "@/stores/useSessionStore";
 
 function session(status: BackendSessionStatus): SessionConfig {
   return {

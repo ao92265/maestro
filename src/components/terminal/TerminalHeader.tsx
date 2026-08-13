@@ -1,4 +1,3 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   BrainCircuit,
@@ -14,13 +13,21 @@ import {
   X,
   ZoomIn,
 } from "lucide-react";
-import { OpenCodeIcon, type IconComponent } from "@/components/icons";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { type IconComponent, OpenCodeIcon } from "@/components/icons";
 import { SamuraiBadge } from "@/components/terminal/SamuraiBadge";
 import { ThinkingIndicator } from "@/components/terminal/ThinkingIndicator";
 import type { BranchPullRequest } from "@/lib/github";
 import { altLabel, modLabel, titleWithShortcut } from "@/lib/shortcuts";
 
-export type SessionStatus = "idle" | "starting" | "working" | "needs-input" | "done" | "error" | "timeout";
+export type SessionStatus =
+  | "idle"
+  | "starting"
+  | "working"
+  | "needs-input"
+  | "done"
+  | "error"
+  | "timeout";
 
 export type AIProvider = "claude" | "gemini" | "codex" | "opencode" | "plain";
 
@@ -293,6 +300,8 @@ export const TerminalHeader = memo(function TerminalHeader({
   };
 
   return (
+    // biome-ignore lint/a11y/noStaticElementInteractions: background click-to-flag on a row full of nested interactive controls (buttons/inputs excluded via handleHeaderClick) — not a discrete focusable widget, so there's no sensible single keyboard equivalent.
+    // biome-ignore lint/a11y/useKeyWithClickEvents: see noStaticElementInteractions above.
     <div
       className={`no-select flex ${adaptive.headerHeight} shrink-0 items-center ${adaptive.gapSize} border-b ${statusBorder} ${isFlagged || hasAttention ? "warning-flag" : "bg-maestro-surface"} ${hasMoveHandle ? "pl-6 pr-2" : "px-2"} ${onToggleFlag ? "cursor-pointer" : ""}`}
       onClick={handleHeaderClick}
@@ -321,7 +330,9 @@ export const TerminalHeader = memo(function TerminalHeader({
             strokeWidth={1.5}
             className="text-maestro-accent drop-shadow-[0_0_4px_rgb(var(--maestro-accent)/0.5)]"
           />
-          {!isZoomed && terminalCount <= 4 && <ChevronDown size={9} className="text-maestro-muted/60" />}
+          {!isZoomed && terminalCount <= 4 && (
+            <ChevronDown size={9} className="text-maestro-muted/60" />
+          )}
         </button>
 
         {/* What this terminal is doing, in the one place every zoomed-out view
@@ -354,10 +365,12 @@ export const TerminalHeader = memo(function TerminalHeader({
               if (e.key === "Escape") cancelEditName();
             }}
             className={`shrink-0 rounded border border-maestro-accent bg-maestro-card px-1 py-0 font-medium text-maestro-text outline-none ${adaptive.sessionLabelSize}`}
+            // biome-ignore lint/a11y/noAutofocus: rename field revealed by an explicit user action (click-to-rename) — autofocus is the expected UX here.
             autoFocus
           />
         ) : (
-          <span
+          <button
+            type="button"
             className={`shrink-0 cursor-text font-medium text-maestro-text ${adaptive.sessionLabelSize}`}
             onClick={(e) => {
               // Renaming, not flag-toggling — keep the click off the header.
@@ -366,7 +379,7 @@ export const TerminalHeader = memo(function TerminalHeader({
             }}
           >
             {sessionName || defaultLabel}
-          </span>
+          </button>
         )}
 
         {/* Samurai supervision (issue #46): gen-N · state · context %.
@@ -388,7 +401,9 @@ export const TerminalHeader = memo(function TerminalHeader({
           <GitBranch size={terminalCount <= 4 ? 10 : 8} />
           <span className={`truncate ${adaptive.branchMaxWidth}`}>{branchName}</span>
           {(adaptive.showAllElements || terminalCount <= 6) && (
-            <span className={`ml-0.5 rounded font-medium ${adaptive.badgePadding} ${adaptive.badgeSize} ${isWorktree ? "bg-purple-500/15 text-purple-400" : "bg-maestro-accent/15 text-maestro-accent"}`}>
+            <span
+              className={`ml-0.5 rounded font-medium ${adaptive.badgePadding} ${adaptive.badgeSize} ${isWorktree ? "bg-purple-500/15 text-purple-400" : "bg-maestro-accent/15 text-maestro-accent"}`}
+            >
               {isWorktree ? "worktree" : "checked out"}
             </span>
           )}
@@ -401,9 +416,7 @@ export const TerminalHeader = memo(function TerminalHeader({
           <button
             type="button"
             onClick={() => {
-              openUrl(pullRequest.url).catch((err) =>
-                console.error("Failed to open PR URL:", err),
-              );
+              openUrl(pullRequest.url).catch((err) => console.error("Failed to open PR URL:", err));
             }}
             className={`flex shrink-0 items-center gap-0.5 rounded font-medium transition-opacity hover:opacity-75 ${adaptive.badgePadding} ${adaptive.badgeSize} ${pullRequestBadgeClass(pullRequest)}`}
             title={`${pullRequestStateLabel(pullRequest)} PR #${pullRequest.number}: ${pullRequest.title} — click to open on GitHub`}
@@ -461,7 +474,11 @@ export const TerminalHeader = memo(function TerminalHeader({
             }
             aria-label={isZoomed ? "Restore grid view" : "Zoom terminal"}
           >
-            {isZoomed ? <Minimize size={terminalCount <= 4 ? 14 : 12} /> : <Expand size={terminalCount <= 4 ? 14 : 12} />}
+            {isZoomed ? (
+              <Minimize size={terminalCount <= 4 ? 14 : 12} />
+            ) : (
+              <Expand size={terminalCount <= 4 ? 14 : 12} />
+            )}
           </button>
         )}
 

@@ -91,7 +91,7 @@ async function checkMemory(now: number): Promise<HealthFlag[]> {
     projects.map(async (project) => {
       const files = await listMemoryFiles(project.dirName);
       return evaluateMemory({ dirName: project.dirName, files, now });
-    })
+    }),
   );
   return perProject.flat();
 }

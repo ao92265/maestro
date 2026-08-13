@@ -25,16 +25,14 @@ function keyFor(event: ClaudeEvent): number {
   return key;
 }
 
-export function ActivityFeed({
-  sessionId,
-  maxHeight = "300px",
-}: ActivityFeedProps) {
+export function ActivityFeed({ sessionId, maxHeight = "300px" }: ActivityFeedProps) {
   const session = useActivityStore((state) => state.getSession(sessionId));
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll to the newest event by scrolling ONLY this container.
   // Do not use scrollIntoView here: it scrolls every scrollable ancestor
   // (including overflow-hidden terminal cells), shifting the whole layout up.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: session.events.length isn't read in the body but is the intended trigger — this effect must re-run whenever a new event arrives to scroll to it.
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
@@ -69,9 +67,7 @@ const EventRow = memo(function EventRow({ event }: { event: ClaudeEvent }) {
         <div className="flex gap-2 text-blue-400">
           <span className="text-neutral-600 shrink-0">{time}</span>
           <span className="font-semibold shrink-0">{event.tool_name}</span>
-          <span className="text-neutral-400 truncate">
-            {event.input_summary}
-          </span>
+          <span className="text-neutral-400 truncate">{event.input_summary}</span>
         </div>
       );
     case "FileEdited":
@@ -96,9 +92,7 @@ const EventRow = memo(function EventRow({ event }: { event: ClaudeEvent }) {
           <span className="text-neutral-600 shrink-0">{time}</span>
           <span className="shrink-0">AGENT</span>
           <span className="font-semibold">{event.agent_type}</span>
-          <span className="text-neutral-400 truncate">
-            {event.description}
-          </span>
+          <span className="text-neutral-400 truncate">{event.description}</span>
         </div>
       );
     case "TokenUsageUpdate":
@@ -106,8 +100,7 @@ const EventRow = memo(function EventRow({ event }: { event: ClaudeEvent }) {
         <div className="flex gap-2 text-neutral-500">
           <span className="text-neutral-600 shrink-0">{time}</span>
           <span>
-            {event.input_tokens.toLocaleString()}in /{" "}
-            {event.output_tokens.toLocaleString()}out
+            {event.input_tokens.toLocaleString()}in / {event.output_tokens.toLocaleString()}out
           </span>
         </div>
       );

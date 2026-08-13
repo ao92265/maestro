@@ -12,12 +12,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 import {
-  initSamuraiSupervisorListener,
-  stopSamuraiSupervisorListener,
-  SAMURAI_TILE_CLOSE_STATES,
-  useSessionStore,
   type BackendSessionStatus,
+  initSamuraiSupervisorListener,
+  SAMURAI_TILE_CLOSE_STATES,
   type SessionConfig,
+  stopSamuraiSupervisorListener,
+  useSessionStore,
 } from "../useSessionStore";
 
 const listenMock = vi.mocked(listen);
@@ -26,7 +26,7 @@ const invokeMock = vi.mocked(invoke);
 function session(
   id: number,
   status: BackendSessionStatus = "Working",
-  projectPath = "C:/proj"
+  projectPath = "C:/proj",
 ): SessionConfig {
   return {
     id,
@@ -183,9 +183,9 @@ describe("useSessionStore samurai supervisor tracking (issue #46)", () => {
   it("a park chain lands PARKED in samuraiBySessionId for the tile-close effect", () => {
     useSessionStore.setState({ sessions: [session(1)] });
     emitSupervisorEvent(snapshot(1, { state: "PARK_REQUESTED", previous_state: "WORKING" }));
-    expect(SAMURAI_TILE_CLOSE_STATES.has(useSessionStore.getState().samuraiBySessionId[1].state)).toBe(
-      false
-    );
+    expect(
+      SAMURAI_TILE_CLOSE_STATES.has(useSessionStore.getState().samuraiBySessionId[1].state),
+    ).toBe(false);
 
     emitSupervisorEvent(snapshot(1, { state: "PARKED", previous_state: "PARK_REQUESTED" }));
 

@@ -19,11 +19,7 @@ export function DiscussionList({
     return (
       <div className="flex h-full items-center justify-center px-4 text-center">
         <div className="flex flex-col items-center gap-3">
-          <MessageCircleOff
-            size={32}
-            className="text-maestro-muted/30"
-            strokeWidth={1}
-          />
+          <MessageCircleOff size={32} className="text-maestro-muted/30" strokeWidth={1} />
           <p className="text-xs text-maestro-muted/60">
             Discussions are not enabled for this repository
           </p>
@@ -56,14 +52,8 @@ export function DiscussionList({
       {discussions.length === 0 ? (
         <div className="flex flex-1 items-center justify-center px-4 text-center">
           <div className="flex flex-col items-center gap-3">
-            <MessageCircle
-              size={32}
-              className="text-maestro-muted/30"
-              strokeWidth={1}
-            />
-            <p className="text-xs text-maestro-muted/60">
-              No discussions found
-            </p>
+            <MessageCircle size={32} className="text-maestro-muted/30" strokeWidth={1} />
+            <p className="text-xs text-maestro-muted/60">No discussions found</p>
           </div>
         </div>
       ) : (

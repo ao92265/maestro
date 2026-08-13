@@ -1,5 +1,5 @@
-import { useEffect } from "react";
 import { AlertTriangle, Loader2, ScanSearch, Square } from "lucide-react";
+import { useEffect } from "react";
 
 import { MarkdownBody } from "@/components/git/shared/MarkdownBody";
 import { cardClass } from "@/components/sidebar/sectionChrome";
@@ -21,9 +21,7 @@ import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
  */
 export function CatalogTab() {
   const activeTab = useWorkspaceStore((s) => s.tabs.find((t) => t.active));
-  const repoPath = activeTab
-    ? (activeTab.selectedRepoPath ?? activeTab.projectPath)
-    : null;
+  const repoPath = activeTab ? (activeTab.selectedRepoPath ?? activeTab.projectPath) : null;
   const entry = useCatalogStore((s) => (repoPath ? s.catalogs[repoPath] : undefined));
   const loadLatest = useCatalogStore((s) => s.loadLatest);
   const scan = useCatalogStore((s) => s.scan);
@@ -38,9 +36,7 @@ export function CatalogTab() {
   if (!activeTab || !repoPath) {
     return (
       <div className={cardClass}>
-        <p className="text-[11px] leading-snug text-maestro-muted">
-          Open a project to scan it.
-        </p>
+        <p className="text-[11px] leading-snug text-maestro-muted">Open a project to scan it.</p>
       </div>
     );
   }
@@ -68,11 +64,10 @@ export function CatalogTab() {
           )}
         </div>
         <p className="text-[10px] leading-snug text-maestro-muted">
-          Claude reads this project and writes down every feature it finds — what
-          it does, how to use it, and whether it is done, partial or full of
-          gaps. Nothing runs on a schedule. A scan usually takes a few minutes
-          and is given up to 45 on a big repo; you can stop it at any point. A
-          rescan updates the last catalogue and lists what changed.
+          Claude reads this project and writes down every feature it finds — what it does, how to
+          use it, and whether it is done, partial or full of gaps. Nothing runs on a schedule. A
+          scan usually takes a few minutes and is given up to 45 on a big repo; you can stop it at
+          any point. A rescan updates the last catalogue and lists what changed.
         </p>
         {scanning ? (
           <button
@@ -103,9 +98,8 @@ export function CatalogTab() {
             <p className="mb-1.5 flex items-start gap-1.5 text-[11px] text-maestro-muted">
               <Loader2 size={11} className="mt-0.5 shrink-0 animate-spin" />
               <span className="min-w-0">
-                Claude is reading {activeTab.name}. Usually a few minutes, up to
-                45 on a big repo — you can keep working, and it survives
-                switching tabs.
+                Claude is reading {activeTab.name}. Usually a few minutes, up to 45 on a big repo —
+                you can keep working, and it survives switching tabs.
               </span>
             </p>
           )}

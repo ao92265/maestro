@@ -1,10 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  formatResetTime,
-  getUsageBars,
-  mostCriticalBar,
-  type UsageData,
-} from "../usageParser";
+import { formatResetTime, getUsageBars, mostCriticalBar, type UsageData } from "../usageParser";
 
 describe("formatResetTime", () => {
   // Anchor "now" so relative formatting is deterministic.

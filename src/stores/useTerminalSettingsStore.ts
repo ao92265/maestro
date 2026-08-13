@@ -2,12 +2,7 @@ import { listen } from "@tauri-apps/api/event";
 import { LazyStore } from "@tauri-apps/plugin-store";
 import { create } from "zustand";
 import { createJSONStorage, persist, type StateStorage } from "zustand/middleware";
-import {
-  type AvailableFont,
-  EMBEDDED_FONT,
-  getAvailableFonts,
-  selectBestFont,
-} from "@/lib/fonts";
+import { type AvailableFont, EMBEDDED_FONT, getAvailableFonts, selectBestFont } from "@/lib/fonts";
 
 // --- Types ---
 
@@ -42,10 +37,7 @@ type TerminalSettingsActions = {
   /** Initialize the store by detecting available fonts. */
   initialize: () => Promise<void>;
   /** Update a specific setting. */
-  setSetting: <K extends keyof TerminalSettings>(
-    key: K,
-    value: TerminalSettings[K]
-  ) => void;
+  setSetting: <K extends keyof TerminalSettings>(key: K, value: TerminalSettings[K]) => void;
   /** Reset all settings to defaults. */
   resetToDefaults: () => void;
   /** Get the current font family, falling back to embedded if needed. */
@@ -129,9 +121,7 @@ const tauriStorage: StateStorage = {
  * Manages font family, font size, and line height settings with persistence.
  * Automatically detects available system fonts on initialization.
  */
-export const useTerminalSettingsStore = create<
-  TerminalSettingsState & TerminalSettingsActions
->()(
+export const useTerminalSettingsStore = create<TerminalSettingsState & TerminalSettingsActions>()(
   persist(
     (set, get) => ({
       settings: DEFAULT_SETTINGS,
@@ -164,9 +154,11 @@ export const useTerminalSettingsStore = create<
             isInitialized: true,
             settings: {
               ...currentSettings,
-              fontFamily: currentFontAvailable ?
-                (shouldAutoSelect ? bestFont : currentSettings.fontFamily) :
-                EMBEDDED_FONT,
+              fontFamily: currentFontAvailable
+                ? shouldAutoSelect
+                  ? bestFont
+                  : currentSettings.fontFamily
+                : EMBEDDED_FONT,
             },
           });
         } catch (err) {
@@ -191,9 +183,8 @@ export const useTerminalSettingsStore = create<
       resetToDefaults: () => {
         const { availableFonts } = get();
         // When resetting, auto-select the best font if we have detected fonts
-        const fontFamily = availableFonts.length > 0
-          ? selectBestFont(availableFonts)
-          : DEFAULT_SETTINGS.fontFamily;
+        const fontFamily =
+          availableFonts.length > 0 ? selectBestFont(availableFonts) : DEFAULT_SETTINGS.fontFamily;
 
         set({
           settings: {
@@ -213,9 +204,7 @@ export const useTerminalSettingsStore = create<
         }
 
         // Check if the selected font is available
-        const isAvailable = availableFonts.some(
-          (f) => f.family === settings.fontFamily
-        );
+        const isAvailable = availableFonts.some((f) => f.family === settings.fontFamily);
 
         return isAvailable ? settings.fontFamily : EMBEDDED_FONT;
       },
@@ -245,7 +234,7 @@ export const useTerminalSettingsStore = create<
 
       getEffectiveFontSize: () => {
         const { settings } = get();
-        return Math.round(settings.fontSize * settings.zoomLevel / 100);
+        return Math.round((settings.fontSize * settings.zoomLevel) / 100);
       },
     }),
     {
@@ -263,8 +252,8 @@ export const useTerminalSettingsStore = create<
         }
         return state;
       },
-    }
-  )
+    },
+  ),
 );
 
 // Listen for native menu zoom events (View > Zoom In / Zoom Out / Actual Size)

@@ -53,7 +53,7 @@ function cacheKey(repoPath: string, branch: string): string {
  */
 export async function getBranchPullRequest(
   repoPath: string,
-  branch: string
+  branch: string,
 ): Promise<BranchPullRequest | null> {
   const key = cacheKey(repoPath, branch);
 

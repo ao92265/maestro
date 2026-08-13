@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Tauri APIs must be mocked before importing store modules.
 vi.mock("@tauri-apps/api/event", () => ({
@@ -9,9 +9,9 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn().mockResolvedValue(undefined),
 }));
 
+import { type SubagentInfo, useAgentStore } from "@/stores/useAgentStore";
+import { type SessionConfig, useSessionStore } from "@/stores/useSessionStore";
 import { AgentGraph, buildExportMarkdown } from "../AgentGraph";
-import { useAgentStore, type SubagentInfo } from "@/stores/useAgentStore";
-import { useSessionStore, type SessionConfig } from "@/stores/useSessionStore";
 
 function session(id: number, overrides?: Partial<SessionConfig>): SessionConfig {
   return {
@@ -28,7 +28,7 @@ function session(id: number, overrides?: Partial<SessionConfig>): SessionConfig 
 function agent(
   sessionId: number,
   agentId: string,
-  overrides?: Partial<SubagentInfo>
+  overrides?: Partial<SubagentInfo>,
 ): SubagentInfo {
   return {
     agentId,
@@ -69,7 +69,7 @@ describe("AgentGraph", () => {
     render(<AgentGraph sessionId={1} />);
     expect(screen.getByText("My Session")).toBeInTheDocument();
     expect(
-      screen.getByText("No subagents running — agents spawned via the Task tool will appear here.")
+      screen.getByText("No subagents running — agents spawned via the Task tool will appear here."),
     ).toBeInTheDocument();
   });
 
@@ -221,7 +221,7 @@ describe("AgentGraph", () => {
 
     fireEvent.click(screen.getByTitle("Show the brief sent and the report returned"));
     expect(
-      screen.getByText("Still running — the report arrives when it finishes.")
+      screen.getByText("Still running — the report arrives when it finishes."),
     ).toBeInTheDocument();
   });
 
@@ -312,7 +312,7 @@ describe("buildExportMarkdown", () => {
           },
         }),
       ],
-      "My Session"
+      "My Session",
     );
 
     expect(md).toContain("# Agent run — My Session");

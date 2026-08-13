@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  listDevProcesses,
-  listDockerContainers,
   type DevProcess,
   type DockerContainer,
+  listDevProcesses,
+  listDockerContainers,
 } from "@/lib/processes";
 
 const POLL_INTERVAL_MS = 3_000;

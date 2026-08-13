@@ -3,13 +3,13 @@ import {
   AGENT_H,
   AGENT_W,
   agentNodeId,
+  type LayoutAgent,
+  type LayoutProject,
   layoutLandscape,
   PROJECT_W,
   projectNodeId,
   TERMINAL_W,
   terminalNodeId,
-  type LayoutAgent,
-  type LayoutProject,
 } from "../layout";
 
 const leaf = (id: string): LayoutAgent => ({ id, children: [] });

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { usePendingLaunchStore, type PendingLaunch } from "../usePendingLaunchStore";
+import { type PendingLaunch, usePendingLaunchStore } from "../usePendingLaunchStore";
 
 function launchFor(tabId: string, resumeSessionId?: string): PendingLaunch {
   return {
@@ -75,8 +75,11 @@ describe("usePendingLaunchStore", () => {
   });
 
   it("still queues near-duplicates that differ in samurai generation", () => {
-    const gen2: PendingLaunch = { ...launchFor("tab-1"), resumeSessionId: null,
-      samurai: { project: "C:/p", epic: "#37", generation: 2 } };
+    const gen2: PendingLaunch = {
+      ...launchFor("tab-1"),
+      resumeSessionId: null,
+      samurai: { project: "C:/p", epic: "#37", generation: 2 },
+    };
     const gen3 = { ...gen2, samurai: { ...gen2.samurai!, generation: 3 } };
     usePendingLaunchStore.getState().request(gen2);
     usePendingLaunchStore.getState().request(gen3);

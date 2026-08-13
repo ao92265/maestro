@@ -1,4 +1,3 @@
-import { useCallback, useMemo, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -8,10 +7,10 @@ import {
   Play,
   RotateCcw,
 } from "lucide-react";
-
-import { listClaudeSessions, type ClaudeSessionInfo } from "@/lib/terminal";
-import { listWorktrees, type WorktreeInfo } from "@/lib/worktreeManager";
+import { useCallback, useMemo, useState } from "react";
 import { projectColorFor } from "@/lib/projectColor";
+import { type ClaudeSessionInfo, listClaudeSessions } from "@/lib/terminal";
+import { listWorktrees, type WorktreeInfo } from "@/lib/worktreeManager";
 import { useActivityStore } from "@/stores/useActivityStore";
 import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
 import { useSessionStore } from "@/stores/useSessionStore";
@@ -103,7 +102,7 @@ export function HistorySection({ onLaunch }: HistorySectionProps) {
         .map((w) => w.path),
     ];
     const perPath = await Promise.all(
-      searchPaths.map((path) => listClaudeSessions(path).catch(() => [] as ClaudeSessionInfo[]))
+      searchPaths.map((path) => listClaudeSessions(path).catch(() => [] as ClaudeSessionInfo[])),
     );
 
     // A session resumed in a different directory is written to both, so dedupe
@@ -114,7 +113,7 @@ export function HistorySection({ onLaunch }: HistorySectionProps) {
       if (!seen || conv.last_active > seen.last_active) byId.set(conv.session_id, conv);
     }
     const conversations = [...byId.values()].sort((a, b) =>
-      b.last_active.localeCompare(a.last_active)
+      b.last_active.localeCompare(a.last_active),
     );
 
     setHistory((prev) => ({
@@ -128,7 +127,7 @@ export function HistorySection({ onLaunch }: HistorySectionProps) {
       setExpanded((prev) => ({ ...prev, [tab.id]: !prev[tab.id] }));
       if (!expanded[tab.id]) void loadProject(tab);
     },
-    [expanded, loadProject]
+    [expanded, loadProject],
   );
 
   /** Queue the launch, make sure the project's grid mounts, reveal it. */
@@ -137,7 +136,7 @@ export function HistorySection({ onLaunch }: HistorySectionProps) {
       tab: WorkspaceTab,
       resumeSessionId: string | null,
       workingDir: string | null,
-      branch: string | null
+      branch: string | null,
     ) => {
       requestLaunch({
         tabId: tab.id,
@@ -149,15 +148,15 @@ export function HistorySection({ onLaunch }: HistorySectionProps) {
       setSessionsLaunched(tab.id, true);
       onLaunch?.(tab.id);
     },
-    [requestLaunch, setSessionsLaunched, onLaunch]
+    [requestLaunch, setSessionsLaunched, onLaunch],
   );
 
   return (
     <div>
       <SectionHeader icon={History} label="History" />
       <p className="mb-2 text-[10px] leading-snug text-maestro-muted">
-        Recover past agent conversations and worktrees. Click one to relaunch
-        it in its project — no typing needed.
+        Recover past agent conversations and worktrees. Click one to relaunch it in its project — no
+        typing needed.
       </p>
 
       {tabs.map((tab) => {

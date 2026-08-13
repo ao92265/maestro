@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ContextDocEditorModal } from "@/components/claudemd";
+import { HealthReasonLines } from "@/components/shared/HealthReasonLines";
 import { MarkdownEditor } from "@/components/shared/MarkdownEditor";
 import { type ContextDoc, listContextDocs, readContextDoc } from "@/lib/claudemd";
 import {
@@ -26,7 +27,6 @@ import {
   readMemoryFile,
   writeMemoryFile,
 } from "@/lib/memory";
-import { HealthReasonLines } from "@/components/shared/HealthReasonLines";
 import { flagsByRow, useHealthStore } from "@/stores/useHealthStore";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { cardClass, SectionHeader } from "./sectionChrome";
@@ -336,61 +336,61 @@ export function MemorySection() {
                           const fileReasons = healthRows.get(`${project.dirName}|${file.relPath}`);
                           return (
                             <div key={file.relPath}>
-                            <div
-                              className={`group flex items-center gap-1.5 rounded-md px-1 py-0.5 hover:bg-maestro-border/40 ${
-                                fileReasons ? "bg-maestro-orange/5" : ""
-                              }`}
-                            >
-                              <button
-                                type="button"
-                                onClick={() => handleOpenFile(project.dirName, file)}
-                                title={file.description ?? file.path}
-                                className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                              <div
+                                className={`group flex items-center gap-1.5 rounded-md px-1 py-0.5 hover:bg-maestro-border/40 ${
+                                  fileReasons ? "bg-maestro-orange/5" : ""
+                                }`}
                               >
-                                <FileText
-                                  size={11}
-                                  className={`shrink-0 ${
-                                    file.isIndex ? "text-maestro-accent" : "text-maestro-muted"
-                                  }`}
-                                />
-                                <span className="min-w-0 flex-1">
-                                  <span className="block truncate text-xs text-maestro-text">
-                                    {file.relPath}
-                                  </span>
-                                  {file.description && (
-                                    <span className="block truncate text-[10px] text-maestro-muted">
-                                      {file.description}
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenFile(project.dirName, file)}
+                                  title={file.description ?? file.path}
+                                  className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                                >
+                                  <FileText
+                                    size={11}
+                                    className={`shrink-0 ${
+                                      file.isIndex ? "text-maestro-accent" : "text-maestro-muted"
+                                    }`}
+                                  />
+                                  <span className="min-w-0 flex-1">
+                                    <span className="block truncate text-xs text-maestro-text">
+                                      {file.relPath}
                                     </span>
-                                  )}
-                                </span>
-                              </button>
-                              {file.isIndex ? (
-                                <span className="shrink-0 rounded bg-maestro-accent/20 px-1 text-[9px] font-bold text-maestro-accent">
-                                  INDEX
-                                </span>
-                              ) : (
-                                badgeCls && (
-                                  <span
-                                    className={`shrink-0 rounded px-1 text-[9px] font-medium ${badgeCls}`}
-                                  >
-                                    {file.memType}
+                                    {file.description && (
+                                      <span className="block truncate text-[10px] text-maestro-muted">
+                                        {file.description}
+                                      </span>
+                                    )}
                                   </span>
-                                )
-                              )}
-                              <button
-                                type="button"
-                                onClick={() => void handleDeleteFile(project.dirName, file)}
-                                className="shrink-0 rounded p-0.5 opacity-0 transition-opacity hover:bg-maestro-red/10 group-hover:opacity-100"
-                                title="Delete this memory file"
-                              >
-                                <Trash2 size={10} className="text-maestro-red" />
-                              </button>
-                            </div>
-                            {fileReasons && (
-                              <div className="pb-0.5 pl-5 pr-1">
-                                <HealthReasonLines flags={fileReasons} />
+                                </button>
+                                {file.isIndex ? (
+                                  <span className="shrink-0 rounded bg-maestro-accent/20 px-1 text-[9px] font-bold text-maestro-accent">
+                                    INDEX
+                                  </span>
+                                ) : (
+                                  badgeCls && (
+                                    <span
+                                      className={`shrink-0 rounded px-1 text-[9px] font-medium ${badgeCls}`}
+                                    >
+                                      {file.memType}
+                                    </span>
+                                  )
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => void handleDeleteFile(project.dirName, file)}
+                                  className="shrink-0 rounded p-0.5 opacity-0 transition-opacity hover:bg-maestro-red/10 group-hover:opacity-100"
+                                  title="Delete this memory file"
+                                >
+                                  <Trash2 size={10} className="text-maestro-red" />
+                                </button>
                               </div>
-                            )}
+                              {fileReasons && (
+                                <div className="pb-0.5 pl-5 pr-1">
+                                  <HealthReasonLines flags={fileReasons} />
+                                </div>
+                              )}
                             </div>
                           );
                         })

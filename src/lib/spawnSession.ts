@@ -21,9 +21,9 @@ import { samePath } from "@/lib/path";
 import { samuraiRegisterSession } from "@/lib/samurai";
 import type { CliFlags } from "@/lib/terminal";
 import {
-  usePendingLaunchStore,
   type PendingLaunch,
   type SamuraiSuccessorInfo,
+  usePendingLaunchStore,
 } from "@/stores/usePendingLaunchStore";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 
@@ -55,9 +55,7 @@ export interface SamuraiSpawnSuccessorEvent {
  * backend's `successor_no_start` ALERT then surfaces the stall.
  */
 export function queueSamuraiSuccessorLaunch(event: SamuraiSpawnSuccessorEvent): boolean {
-  const tab = useWorkspaceStore
-    .getState()
-    .tabs.find((t) => samePath(t.projectPath, event.project));
+  const tab = useWorkspaceStore.getState().tabs.find((t) => samePath(t.projectPath, event.project));
   if (!tab) {
     console.error(
       `[Samurai] No open project tab matches ${event.project} — cannot spawn successor gen-${event.generation}`,

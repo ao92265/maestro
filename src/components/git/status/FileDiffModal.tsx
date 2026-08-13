@@ -1,17 +1,13 @@
 import { AlertTriangle, FileCode, Loader2, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import {
-  getFileDiff,
-  type FileDiff,
-  type FileDiffMode,
-} from "../../../lib/git";
-import {
-  parseUnifiedDiff,
-  rowsForUntracked,
   type CellKind,
   type DiffCell,
   type DiffRow,
+  parseUnifiedDiff,
+  rowsForUntracked,
 } from "../../../lib/diffParser";
+import { type FileDiff, type FileDiffMode, getFileDiff } from "../../../lib/git";
 
 /** Diffs above this size are not rendered to keep the UI responsive. */
 const MAX_RENDER_BYTES = 1024 * 1024;
@@ -33,13 +29,7 @@ interface FileDiffModalProps {
  * file: old version on the left, current version on the right. Added lines
  * are green, deleted lines red, and modified lines yellow.
  */
-export function FileDiffModal({
-  worktreePath,
-  path,
-  oldPath,
-  mode,
-  onClose,
-}: FileDiffModalProps) {
+export function FileDiffModal({ worktreePath, path, oldPath, mode, onClose }: FileDiffModalProps) {
   const modalRef = useRef<HTMLDivElement>(null);
   const [diff, setDiff] = useState<FileDiff | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -115,9 +105,7 @@ export function FileDiffModal({
 
         {/* Column titles */}
         <div className="flex border-b border-maestro-border/60 text-[10px] font-medium uppercase tracking-wide text-maestro-muted">
-          <div className="w-1/2 border-r border-maestro-border/60 px-3 py-1.5">
-            Old version
-          </div>
+          <div className="w-1/2 border-r border-maestro-border/60 px-3 py-1.5">Old version</div>
           <div className="w-1/2 px-3 py-1.5">Current version</div>
         </div>
 
@@ -233,13 +221,10 @@ function DiffColumn({
   }
 
   return (
-    <div
-      className={`w-1/2 overflow-x-auto ${
-        isLeft ? "border-r border-maestro-border/60" : ""
-      }`}
-    >
+    <div className={`w-1/2 overflow-x-auto ${isLeft ? "border-r border-maestro-border/60" : ""}`}>
       <div className="w-max min-w-full">
         {rows.map((row, i) => (
+          // biome-ignore lint/suspicious/noArrayIndexKey: rows are a fixed, immutable parse of the diff text (re-parsed wholesale, never reordered/spliced in place); lineNo can't be used as it's null for empty/hunk cells and can repeat across the two sides.
           <DiffLine key={i} cell={isLeft ? row.left : row.right} side={side} />
         ))}
       </div>

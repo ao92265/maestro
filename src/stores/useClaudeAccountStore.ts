@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { getClaudeAccount, type ClaudeAccount } from "@/lib/usageParser";
+import { type ClaudeAccount, getClaudeAccount } from "@/lib/usageParser";
 
 interface ClaudeAccountState {
   account: ClaudeAccount | null;

@@ -1,8 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // The persisted zustand stores hydrate through the Tauri store plugin at
 // import time; happy-dom has no Tauri backend, so stub it out.
@@ -24,9 +24,9 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   ask: vi.fn(),
 }));
 
-import { AuditSection } from "../AuditSection";
 import type { SamuraiAuditEvent, SamuraiAuditEventPayload } from "@/lib/samurai";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
+import { AuditSection } from "../AuditSection";
 
 const invokeMock = vi.mocked(invoke);
 const listenMock = vi.mocked(listen);
@@ -99,9 +99,7 @@ describe("AuditSection (issue #46)", () => {
     render(<AuditSection />);
 
     expect(await screen.findByText("HANDOFF")).toBeInTheDocument();
-    const badges = screen
-      .getAllByText(/^(SPAWN|HANDOFF)$/)
-      .map((el) => el.textContent);
+    const badges = screen.getAllByText(/^(SPAWN|HANDOFF)$/).map((el) => el.textContent);
     expect(badges).toEqual(["HANDOFF", "SPAWN"]);
     expect(screen.getByText("gen-2")).toBeInTheDocument();
     expect(screen.getByText("kind=context_threshold")).toBeInTheDocument();

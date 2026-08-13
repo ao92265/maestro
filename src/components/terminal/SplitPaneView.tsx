@@ -1,4 +1,4 @@
-import { useCallback, useRef, type CSSProperties, type ReactNode } from "react";
+import { type CSSProperties, type ReactNode, useCallback, useRef } from "react";
 
 import type { TreeNode } from "./splitTree";
 
@@ -333,6 +333,7 @@ function Divider({ box, onRatioChange, onDragStateChange }: DividerProps) {
   const isVertical = box.direction === "vertical";
 
   return (
+    // biome-ignore lint/a11y/noStaticElementInteractions: mouse-drag resize divider; a full keyboard-resizable separator (role="separator" + aria-valuenow/min/max + arrow-key handling) is a real feature addition, not a safe lint fix.
     <div
       ref={dividerRef}
       className={`split-divider absolute ${isVertical ? "split-divider-vertical" : "split-divider-horizontal"}`}

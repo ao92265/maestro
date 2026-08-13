@@ -1,16 +1,12 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
-import {
-  earliestEntry,
-  formatFireTime,
-  SamuraiScheduleChip,
-} from "../SamuraiScheduleChip";
-import { useSessionStore, type SamuraiScheduleEntry } from "@/stores/useSessionStore";
+import { type SamuraiScheduleEntry, useSessionStore } from "@/stores/useSessionStore";
+import { earliestEntry, formatFireTime, SamuraiScheduleChip } from "../SamuraiScheduleChip";
 
 function entry(overrides: Partial<SamuraiScheduleEntry> = {}): SamuraiScheduleEntry {
   return {
@@ -34,9 +30,7 @@ describe("SamuraiScheduleChip (issue #61)", () => {
 
     // The exact HH:MM is locale/timezone-dependent — compare against the
     // same formatter the chip uses.
-    expect(
-      screen.getByText(`parked · resumes ${formatFireTime(e.fire_at)}`)
-    ).toBeInTheDocument();
+    expect(screen.getByText(`parked · resumes ${formatFireTime(e.fire_at)}`)).toBeInTheDocument();
   });
 
   it("renders nothing without a pending timer for the project", () => {

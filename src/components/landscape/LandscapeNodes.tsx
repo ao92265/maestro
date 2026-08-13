@@ -1,8 +1,6 @@
-import { createContext, useContext } from "react";
-import { Handle, Position, type NodeProps } from "@xyflow/react";
+import { Handle, type NodeProps, Position } from "@xyflow/react";
 import { ArrowUpRight, Folder, TerminalSquare, X } from "lucide-react";
-import { SamuraiBadge } from "@/components/terminal/SamuraiBadge";
-import { ThinkingIndicator } from "@/components/terminal/ThinkingIndicator";
+import { createContext, useContext } from "react";
 import {
   agentBadge,
   badgeBaseClass,
@@ -10,6 +8,8 @@ import {
   statsLine,
   ToolStatsRow,
 } from "@/components/session/agentPresentation";
+import { SamuraiBadge } from "@/components/terminal/SamuraiBadge";
+import { ThinkingIndicator } from "@/components/terminal/ThinkingIndicator";
 import type { SubagentInfo } from "@/stores/useAgentStore";
 import type { BackendSessionStatus } from "@/stores/useSessionStore";
 import { AGENT_H, AGENT_W, PROJECT_H, PROJECT_W, TERMINAL_H, TERMINAL_W } from "./layout";
@@ -220,6 +220,7 @@ export function AgentNode({ data, selected }: NodeProps) {
   const running = agent.completedAt === null;
   const stats = statsLine(agent);
   return (
+    // biome-ignore lint/a11y/useSemanticElements: can't be a real <button> — it wraps a nested "Dismiss" <button>, and nested buttons are invalid HTML that breaks click handling.
     <div
       style={{ width: AGENT_W, height: AGENT_H }}
       title="Click to read the brief sent and the report returned"

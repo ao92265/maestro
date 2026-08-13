@@ -57,10 +57,9 @@ export function Toast({
   }, [durationMs]);
 
   return (
-    <div
+    <output
       className="pointer-events-auto flex w-80 items-start gap-2 rounded-lg border border-maestro-border bg-maestro-surface p-3 shadow-lg"
       style={accentColor ? { borderLeft: `3px solid ${accentColor}` } : undefined}
-      role="status"
     >
       <button
         type="button"
@@ -89,9 +88,7 @@ export function Toast({
         <span className="line-clamp-2 w-full text-xs font-medium leading-snug text-maestro-text">
           {title}
         </span>
-        {detail && (
-          <span className="truncate w-full text-[11px] text-maestro-muted">{detail}</span>
-        )}
+        {detail && <span className="truncate w-full text-[11px] text-maestro-muted">{detail}</span>}
       </button>
       <button
         type="button"
@@ -101,7 +98,7 @@ export function Toast({
       >
         <X size={12} />
       </button>
-    </div>
+    </output>
   );
 }
 

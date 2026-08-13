@@ -13,9 +13,9 @@ import { listen } from "@tauri-apps/api/event";
 
 import {
   initSamuraiSupervisorListener,
+  type SamuraiScheduleEntry,
   stopSamuraiSupervisorListener,
   useSessionStore,
-  type SamuraiScheduleEntry,
 } from "../useSessionStore";
 
 const listenMock = vi.mocked(listen);

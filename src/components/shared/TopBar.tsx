@@ -16,9 +16,9 @@ import {
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { MAX_SESSIONS } from "@/components/terminal/splitTree";
 import { isMac } from "@/lib/platform";
 import { modLabel, titleWithShortcut } from "@/lib/shortcuts";
-import { MAX_SESSIONS } from "@/components/terminal/splitTree";
 import { GitHubWatchdogBadge } from "./GitHubWatchdogBadge";
 import { HealthAttentionBadge } from "./HealthAttentionBadge";
 

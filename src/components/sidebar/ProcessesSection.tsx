@@ -11,21 +11,18 @@ import {
   Square,
 } from "lucide-react";
 import { useCallback, useMemo, useRef, useState } from "react";
+import { HealthReasonLines } from "@/components/shared/HealthReasonLines";
 import { useDevProcesses } from "@/hooks/useDevProcesses";
+import { type HealthFlag, processKey } from "@/lib/healthRules";
 import {
-  killProcessTree,
-  stopDockerContainer,
   type DevProcess,
   type DockerContainer,
+  killProcessTree,
+  stopDockerContainer,
 } from "@/lib/processes";
-import { HealthReasonLines } from "@/components/shared/HealthReasonLines";
-import { processKey, type HealthFlag } from "@/lib/healthRules";
 import { assessStaleness } from "@/lib/staleProcess";
 import { flagsByRow, useHealthStore } from "@/stores/useHealthStore";
-import {
-  DEFAULT_WATCHLIST,
-  useProcessWatchlistStore,
-} from "@/stores/useProcessWatchlistStore";
+import { DEFAULT_WATCHLIST, useProcessWatchlistStore } from "@/stores/useProcessWatchlistStore";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { cardClass, SectionHeader } from "./sectionChrome";
 
@@ -303,15 +300,13 @@ export function ProcessesSection() {
             <p className="mb-1 flex items-start gap-1 px-1 text-[10px] text-maestro-red">
               <AlertTriangle size={11} className="mt-px shrink-0" />
               <span>
-                {staleCount} likely leftover server{staleCount === 1 ? "" : "s"} holding a port
-                with no open project — {staleCount === 1 ? "it's" : "they're"} flagged below.
+                {staleCount} likely leftover server{staleCount === 1 ? "" : "s"} holding a port with
+                no open project — {staleCount === 1 ? "it's" : "they're"} flagged below.
               </span>
             </p>
           )}
 
-          {editingWatchlist && (
-            <WatchlistEditor onClose={() => setEditingWatchlist(false)} />
-          )}
+          {editingWatchlist && <WatchlistEditor onClose={() => setEditingWatchlist(false)} />}
 
           {(error || actionError) && (
             <p className="break-words px-1 py-0.5 text-[10px] text-maestro-red">
@@ -396,7 +391,9 @@ export function ProcessesSection() {
                       <button
                         type="button"
                         onClick={() =>
-                          void (isMulti ? handleKillGroup(group) : handleKillProcess(group.procs[0]))
+                          void (isMulti
+                            ? handleKillGroup(group)
+                            : handleKillProcess(group.procs[0]))
                         }
                         className="shrink-0 rounded p-0.5 text-maestro-muted opacity-0 transition-opacity hover:bg-red-500/15 hover:text-red-400 group-hover:opacity-100"
                         title={
@@ -465,9 +462,7 @@ export function ProcessesSection() {
                 )}
               </div>
               {containers.length === 0 ? (
-                <p className="px-1 py-0.5 text-[11px] text-maestro-muted">
-                  No running containers
-                </p>
+                <p className="px-1 py-0.5 text-[11px] text-maestro-muted">No running containers</p>
               ) : (
                 <div className="space-y-0.5">
                   {containers.map((c) => (
@@ -525,8 +520,8 @@ function WatchlistEditor({ onClose }: { onClose: () => void }) {
         placeholder={"node\nvite\nuvicorn"}
       />
       <p className="mt-1 text-[10px] text-maestro-muted/70">
-        One tech per line. Entries match the executable name exactly; entries of 4+ characters
-        also match anywhere in the command line (so "vite" finds node running vite).
+        One tech per line. Entries match the executable name exactly; entries of 4+ characters also
+        match anywhere in the command line (so "vite" finds node running vite).
       </p>
       <div className="mt-1.5 flex items-center gap-1.5">
         <button

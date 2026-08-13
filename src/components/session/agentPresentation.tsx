@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
   BookOpen,
@@ -9,6 +8,7 @@ import {
   Terminal as TerminalIcon,
   X,
 } from "lucide-react";
+import { useState } from "react";
 import type { SubagentInfo } from "@/stores/useAgentStore";
 import type { BackendSessionStatus } from "@/stores/useSessionStore";
 
@@ -107,7 +107,12 @@ export function statsLine(agent: SubagentInfo): string {
  */
 export function agentMarkdownLines(agent: SubagentInfo, heading: string): string[] {
   const badge = agentBadge(agent);
-  const lines: string[] = [heading, "", `- Status: ${badge.label}`, `- Tool use id: ${agent.agentId}`];
+  const lines: string[] = [
+    heading,
+    "",
+    `- Status: ${badge.label}`,
+    `- Tool use id: ${agent.agentId}`,
+  ];
   if (agent.agentRunId) lines.push(`- Agent run id: ${agent.agentRunId}`);
   if (agent.model) lines.push(`- Model: ${agent.model}`);
   lines.push(`- Spawned: ${agent.spawnedAt}`);
@@ -126,7 +131,15 @@ export function agentMarkdownLines(agent: SubagentInfo, heading: string): string
         `(+${s.lines_added}/-${s.lines_removed} lines), ${s.other_tool_count} other`,
     );
   }
-  lines.push("", "### Brief sent", "", agent.prompt || "_(none recorded)_", "", "### Report back", "");
+  lines.push(
+    "",
+    "### Brief sent",
+    "",
+    agent.prompt || "_(none recorded)_",
+    "",
+    "### Report back",
+    "",
+  );
   lines.push(agent.report || "_(none recorded)_", "");
   return lines;
 }

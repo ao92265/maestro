@@ -1,7 +1,7 @@
 import { memo } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { samePath } from "@/lib/path";
-import { useSessionStore, type SamuraiScheduleEntry } from "@/stores/useSessionStore";
+import { type SamuraiScheduleEntry, useSessionStore } from "@/stores/useSessionStore";
 
 /**
  * `HH:MM` in the user's locale for an RFC 3339 fire time; null when the
@@ -47,7 +47,7 @@ export const SamuraiScheduleChip = memo(function SamuraiScheduleChip({
   className?: string;
 }) {
   const entries = useSessionStore(
-    useShallow((s) => s.samuraiSchedule.filter((e) => samePath(e.project_path, projectPath)))
+    useShallow((s) => s.samuraiSchedule.filter((e) => samePath(e.project_path, projectPath))),
   );
   const soonest = earliestEntry(entries);
   if (!soonest) return null;

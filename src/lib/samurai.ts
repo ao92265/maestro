@@ -38,13 +38,7 @@ export interface SamuraiSessionSnapshot {
 }
 
 /** Audit row kinds (PRD §5.10). Sub-kinds live in `details.kind`. */
-export type SamuraiAuditEventKind =
-  | "SPAWN"
-  | "HANDOFF"
-  | "PARK"
-  | "RESUME"
-  | "COMPLETE"
-  | "ALERT";
+export type SamuraiAuditEventKind = "SPAWN" | "HANDOFF" | "PARK" | "RESUME" | "COMPLETE" | "ALERT";
 
 /** One audit JSONL row — mirrors the Rust `AuditEvent`. */
 export interface SamuraiAuditEvent {
@@ -364,12 +358,7 @@ export function samuraiGetConfig(): Promise<SamuraiConfig> {
 // ---------------------------------------------------------------------------
 
 /** Journal entry categories (PRD §5.12) — mirrors the Rust `JournalCategory`. */
-export type SamuraiJournalCategory =
-  | "BOTTLENECK"
-  | "ERROR"
-  | "IMPROVEMENT"
-  | "SKILL"
-  | "CONCERN";
+export type SamuraiJournalCategory = "BOTTLENECK" | "ERROR" | "IMPROVEMENT" | "SKILL" | "CONCERN";
 
 /**
  * One ops-journal JSONL line — mirrors the Rust `JournalEntry`

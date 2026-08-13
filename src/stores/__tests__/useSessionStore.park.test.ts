@@ -10,7 +10,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 import { invoke } from "@tauri-apps/api/core";
 
-import { useSessionStore, type SessionConfig } from "../useSessionStore";
+import { type SessionConfig, useSessionStore } from "../useSessionStore";
 
 const invokeMock = vi.mocked(invoke);
 

@@ -1,19 +1,29 @@
 import { ask } from "@tauri-apps/plugin-dialog";
-import { Eraser, Eye, Files, Loader2, RefreshCw, Sparkles, TimerOff, Trash2, X } from "lucide-react";
+import {
+  Eraser,
+  Eye,
+  Files,
+  Loader2,
+  RefreshCw,
+  Sparkles,
+  TimerOff,
+  Trash2,
+  X,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { MarkdownBody } from "@/components/git/shared/MarkdownBody";
+import { HealthReasonLines } from "@/components/shared/HealthReasonLines";
 import type { HealthFlag } from "@/lib/healthRules";
 import {
   isSamuraiInUseError,
+  type SamuraiFileEntry,
+  type SamuraiFileKind,
   samuraiCleanupEpic,
   samuraiFileDelete,
   samuraiFilesList,
   samuraiHarvestRead,
   samuraiTimerCancel,
-  type SamuraiFileEntry,
-  type SamuraiFileKind,
 } from "@/lib/samurai";
-import { MarkdownBody } from "@/components/git/shared/MarkdownBody";
-import { HealthReasonLines } from "@/components/shared/HealthReasonLines";
 import { flagsByRow, useHealthStore } from "@/stores/useHealthStore";
 import { AuditSection } from "./AuditSection";
 import { JournalSection } from "./JournalSection";
@@ -186,13 +196,7 @@ function FileRow({
  * overlay chrome as FileDiffModal, minus the outside-click machinery — close
  * button and Escape only.
  */
-function HarvestReportModal({
-  entry,
-  onClose,
-}: {
-  entry: SamuraiFileEntry;
-  onClose: () => void;
-}) {
+function HarvestReportModal({ entry, onClose }: { entry: SamuraiFileEntry; onClose: () => void }) {
   // null = loading.
   const [markdown, setMarkdown] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -507,9 +511,7 @@ export function SecondBrainSection() {
         )}
       </div>
 
-      {openReport && (
-        <HarvestReportModal entry={openReport} onClose={() => setOpenReport(null)} />
-      )}
+      {openReport && <HarvestReportModal entry={openReport} onClose={() => setOpenReport(null)} />}
     </div>
   );
 }

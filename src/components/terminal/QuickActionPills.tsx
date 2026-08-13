@@ -12,17 +12,18 @@ interface QuickActionPillsProps {
   onAttachClick?: () => void;
 }
 
-export const QuickActionPills = memo(function QuickActionPills({ onAction, onManageClick, onAttachClick }: QuickActionPillsProps) {
+export const QuickActionPills = memo(function QuickActionPills({
+  onAction,
+  onManageClick,
+  onAttachClick,
+}: QuickActionPillsProps) {
   // Select raw actions array (stable reference) instead of calling getSortedActions()
   // which creates a new array on every call and causes infinite re-renders
   const actions = useQuickActionStore((s) => s.actions);
 
   const sortedActions = useMemo(
-    () =>
-      actions
-        .filter((a) => a.isEnabled)
-        .sort((a, b) => a.sortOrder - b.sortOrder),
-    [actions]
+    () => actions.filter((a) => a.isEnabled).sort((a, b) => a.sortOrder - b.sortOrder),
+    [actions],
   );
 
   return (
@@ -35,12 +36,7 @@ export const QuickActionPills = memo(function QuickActionPills({ onAction, onMan
           onClick={() => onAction?.(a.prompt)}
           className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text${!onAction ? " opacity-50 cursor-not-allowed" : ""}`}
         >
-          <DynamicIcon
-            name={a.icon}
-            size={9}
-            style={{ color: a.colorHex }}
-            fill="currentColor"
-          />
+          <DynamicIcon name={a.icon} size={9} style={{ color: a.colorHex }} fill="currentColor" />
           {a.name}
         </button>
       ))}

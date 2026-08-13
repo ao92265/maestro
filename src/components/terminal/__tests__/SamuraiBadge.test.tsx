@@ -1,16 +1,16 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
-import { SamuraiBadge } from "../SamuraiBadge";
 import {
-  useSessionStore,
   type SamuraiSessionInfo,
   type SessionConfig,
+  useSessionStore,
 } from "@/stores/useSessionStore";
+import { SamuraiBadge } from "../SamuraiBadge";
 
 function session(id: number, projectPath = "C:/proj", contextPercent?: number): SessionConfig {
   return {

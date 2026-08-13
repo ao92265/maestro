@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The persisted stores hydrate through the Tauri store plugin at import time;
 // happy-dom has no Tauri backend, so stub it out.
@@ -14,7 +14,7 @@ vi.mock("@tauri-apps/plugin-store", () => ({
   },
 }));
 
-import { MAX_SCHEDULED_ATTEMPTS, usePlanStore, type DailyPlan } from "../usePlanStore";
+import { type DailyPlan, MAX_SCHEDULED_ATTEMPTS, usePlanStore } from "../usePlanStore";
 import { localDateString, useStandupStore } from "../useStandupStore";
 
 const invokeMock = vi.mocked(invoke);
@@ -216,7 +216,10 @@ describe("usePlanStore", () => {
   it("loadLatest does not clobber a state taken while it was reading", async () => {
     let resolveLoad!: (p: DailyPlan | null) => void;
     invokeMock.mockImplementationOnce(
-      () => new Promise<DailyPlan | null>((res) => (resolveLoad = res))
+      () =>
+        new Promise<DailyPlan | null>((res) => {
+          resolveLoad = res;
+        }),
     );
     const pending = usePlanStore.getState().loadLatest();
     // A generation fails and takes the slot while the disk read is in flight.

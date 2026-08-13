@@ -4,11 +4,11 @@ import { Loader2, RefreshCw, ScrollText, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { samePath } from "@/lib/path";
 import {
-  samuraiAuditClear,
-  samuraiAuditRead,
   type SamuraiAuditEvent,
   type SamuraiAuditEventKind,
   type SamuraiAuditEventPayload,
+  samuraiAuditClear,
+  samuraiAuditRead,
 } from "@/lib/samurai";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { cardClass, SectionHeader } from "./sectionChrome";

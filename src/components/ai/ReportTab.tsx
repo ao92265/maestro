@@ -1,4 +1,3 @@
-import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   AlertTriangle,
@@ -9,12 +8,13 @@ import {
   RefreshCw,
   Sunrise,
 } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 
 import { MarkdownBody } from "@/components/git/shared/MarkdownBody";
+import { cardClass } from "@/components/sidebar/sectionChrome";
 import { projectColorFor } from "@/lib/projectColor";
 import { localDateString, useStandupStore } from "@/stores/useStandupStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
-import { cardClass } from "@/components/sidebar/sectionChrome";
 
 /**
  * Report tab of the AI panel: one ADHD-friendly daily standup card per open
@@ -105,9 +105,8 @@ export function ReportTab() {
           </span>
         </label>
         <p className="text-[10px] leading-snug text-maestro-muted">
-          If the app was closed at report time, it catches up on the next
-          launch that day. Each report covers everything since the previous
-          one, so Monday picks up the whole weekend.
+          If the app was closed at report time, it catches up on the next launch that day. Each
+          report covers everything since the previous one, so Monday picks up the whole weekend.
         </p>
         <button
           type="button"
@@ -260,6 +259,9 @@ function PromptEditorModal({ open, onClose }: { open: boolean; onClose: () => vo
   const [draft, setDraft] = useState("");
   const [defaultPrompt, setDefaultPrompt] = useState<string | null>(null);
 
+  // promptTemplate is only read when the modal opens — edits go to `draft`.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  // biome-ignore lint/correctness/useExhaustiveDependencies: promptTemplate is only read when the modal opens; including it would re-run this effect on every store change and clobber `draft`.
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
@@ -273,8 +275,6 @@ function PromptEditorModal({ open, onClose }: { open: boolean; onClose: () => vo
     return () => {
       cancelled = true;
     };
-    // promptTemplate is only read when the modal opens — edits go to `draft`.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
   if (!open) return null;
@@ -290,9 +290,8 @@ function PromptEditorModal({ open, onClose }: { open: boolean; onClose: () => vo
       <div className="flex max-h-[80vh] w-[560px] max-w-[90vw] flex-col gap-2 rounded-lg border border-maestro-border bg-maestro-card p-4">
         <h2 className="text-sm font-semibold text-maestro-text">Standup report prompt</h2>
         <p className="text-[11px] leading-snug text-maestro-muted">
-          This prompt is sent to the headless Claude run together with your
-          material. Available placeholders:{" "}
-          <code>{"{project}"}</code> <code>{"{date}"}</code> <code>{"{since}"}</code>{" "}
+          This prompt is sent to the headless Claude run together with your material. Available
+          placeholders: <code>{"{project}"}</code> <code>{"{date}"}</code> <code>{"{since}"}</code>{" "}
           <code>{"{commits}"}</code> <code>{"{sessions}"}</code> <code>{"{overview}"}</code>.
         </p>
         <textarea

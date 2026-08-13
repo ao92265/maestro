@@ -216,6 +216,6 @@ export const usePlanStore = create<PlanState>()(
         concerns: state.concerns,
         lastRunDate: state.lastRunDate,
       }),
-    }
-  )
+    },
+  ),
 );

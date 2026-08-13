@@ -21,13 +21,7 @@ export interface CommitInfo {
 }
 
 /** File change status enum. */
-export type FileChangeStatus =
-  | "added"
-  | "modified"
-  | "deleted"
-  | "renamed"
-  | "copied"
-  | "unknown";
+export type FileChangeStatus = "added" | "modified" | "deleted" | "renamed" | "copied" | "unknown";
 
 /** File changed in a commit. */
 export interface FileChange {
@@ -111,7 +105,7 @@ interface GitState {
     repoPath: string,
     name: string | null,
     email: string | null,
-    global?: boolean
+    global?: boolean,
   ) => Promise<void>;
   fetchRemotes: (repoPath: string) => Promise<void>;
   addRemote: (repoPath: string, name: string, url: string) => Promise<void>;
@@ -329,7 +323,7 @@ export const useGitStore = create<GitState>()((set, get) => ({
     repoPath: string,
     name: string | null,
     email: string | null,
-    global = false
+    global = false,
   ) => {
     try {
       await invoke("git_set_user_config", {

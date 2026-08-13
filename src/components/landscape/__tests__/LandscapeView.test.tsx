@@ -1,5 +1,5 @@
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The persisted workspace store hydrates through the Tauri store plugin at
 // import time; happy-dom has no Tauri backend, so stub it out.
@@ -17,11 +17,11 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
-import { LandscapeView } from "../LandscapeView";
-import { useAgentStore, type SubagentInfo } from "@/stores/useAgentStore";
+import { type SubagentInfo, useAgentStore } from "@/stores/useAgentStore";
 import { useLandscapeLayoutStore } from "@/stores/useLandscapeLayoutStore";
-import { useSessionStore, type SessionConfig } from "@/stores/useSessionStore";
+import { type SessionConfig, useSessionStore } from "@/stores/useSessionStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
+import { LandscapeView } from "../LandscapeView";
 
 /**
  * React Flow measures its container and nodes through browser APIs happy-dom

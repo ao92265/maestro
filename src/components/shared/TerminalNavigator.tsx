@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
 import { ChevronUp, ParkingSquare, Terminal } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 
 import { projectColorFor } from "@/lib/projectColor";
 import { useSessionStore } from "@/stores/useSessionStore";
@@ -79,9 +79,7 @@ export function TerminalNavigator({ onNavigate }: TerminalNavigatorProps) {
       {open && (
         <div className="absolute bottom-full left-0 z-50 mb-1 max-h-[60vh] w-64 overflow-y-auto rounded-lg border border-maestro-border bg-maestro-card p-1.5 shadow-xl shadow-black/40">
           {total === 0 && (
-            <p className="px-2 py-1.5 text-[11px] text-maestro-muted">
-              No terminals running.
-            </p>
+            <p className="px-2 py-1.5 text-[11px] text-maestro-muted">No terminals running.</p>
           )}
           {groups.map(({ tab, terminals }, index) => {
             const color = projectColorFor(tab.name);
@@ -92,11 +90,7 @@ export function TerminalNavigator({ onNavigate }: TerminalNavigatorProps) {
               // was open.
               <div
                 key={tab.id}
-                className={
-                  index > 0
-                    ? "mt-1.5 border-t border-maestro-border pt-1.5"
-                    : undefined
-                }
+                className={index > 0 ? "mt-1.5 border-t border-maestro-border pt-1.5" : undefined}
               >
                 <div
                   className="mb-0.5 flex items-center gap-1.5 rounded bg-maestro-surface px-2 py-1"
@@ -124,9 +118,7 @@ export function TerminalNavigator({ onNavigate }: TerminalNavigatorProps) {
                         onNavigate(tab.id, sess.id);
                       }}
                       title={
-                        isParked
-                          ? "Parked — click to restore and go to it"
-                          : "Go to this terminal"
+                        isParked ? "Parked — click to restore and go to it" : "Go to this terminal"
                       }
                       className={`flex w-full items-center gap-1.5 rounded px-2 py-1 text-left text-xs text-maestro-text transition-colors hover:bg-maestro-surface ${
                         hasAttention ? "warning-flag" : ""

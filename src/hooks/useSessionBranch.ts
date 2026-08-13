@@ -1,5 +1,5 @@
-import { getDeduplicatedCurrentBranch } from "@/lib/git";
 import { useEffect, useRef, useState } from "react";
+import { getDeduplicatedCurrentBranch } from "@/lib/git";
 
 const POLL_INTERVAL_MS = 15_000;
 
@@ -18,9 +18,7 @@ export function useSessionBranch(
   initialBranch: string | null,
   isActive: boolean = true,
 ): string | null {
-  const [branch, setBranch] = useState<string | null>(
-    isWorktree ? initialBranch : null,
-  );
+  const [branch, setBranch] = useState<string | null>(isWorktree ? initialBranch : null);
   const mountedRef = useRef(true);
 
   // Keep in sync if the store pushes a new initialBranch while mounted
@@ -31,6 +29,7 @@ export function useSessionBranch(
   }, [isWorktree, initialBranch]);
 
   // Non-worktree: fetch immediately + poll
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `branch` is read only as a one-time "haven't fetched yet" guard on (re)mount; adding it as a dependency would re-run this effect (tearing down and restarting the poll interval) every time a fetch inside it calls setBranch.
   useEffect(() => {
     mountedRef.current = true;
 

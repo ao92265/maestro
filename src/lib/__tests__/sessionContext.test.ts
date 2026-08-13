@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
-
-import { describeSessionContext, userIntentFrom } from "../sessionContext";
 import type { ClaudeEvent } from "@/types/claude-events";
+import { describeSessionContext, userIntentFrom } from "../sessionContext";
 
 function userMessage(text: string, uuid = "u1"): ClaudeEvent {
   return {
@@ -79,17 +78,20 @@ describe("describeSessionContext", () => {
   it("skips injected user entries when picking the prompt", () => {
     const line = describeSessionContext({
       ...EMPTY,
-      events: [userMessage("real ask", "u1"), userMessage("<system-reminder>noise</system-reminder>", "u2")],
+      events: [
+        userMessage("real ask", "u1"),
+        userMessage("<system-reminder>noise</system-reminder>", "u2"),
+      ],
     });
     expect(line).toBe("real ask");
   });
 
   it("falls back to the status line, then the tool in flight", () => {
     expect(describeSessionContext({ ...EMPTY, statusMessage: "Running the suite" })).toBe(
-      "Running the suite"
+      "Running the suite",
     );
     expect(describeSessionContext({ ...EMPTY, events: [toolUse("Bash", "npm test")] })).toBe(
-      "Bash: npm test"
+      "Bash: npm test",
     );
   });
 

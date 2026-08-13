@@ -1,9 +1,12 @@
+import { invoke } from "@tauri-apps/api/core";
+import { ask } from "@tauri-apps/plugin-dialog";
 import {
   AlertTriangle,
   Bot,
   Check,
   ChevronDown,
   ChevronRight,
+  Cloud,
   Edit2,
   FileText,
   FolderGit2,
@@ -13,7 +16,6 @@ import {
   Info,
   Keyboard,
   Loader2,
-  Cloud,
   Moon,
   Package,
   Plus,
@@ -31,34 +33,28 @@ import {
   Zap,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { ask } from "@tauri-apps/plugin-dialog";
-import { sessionsForTab } from "@/hooks/useProjectStatus";
-import { samePath } from "@/lib/path";
-import { projectColorFor } from "@/lib/projectColor";
-import { useProjectColors } from "@/lib/useProjectColors";
-import { useAgentStore, type SubagentInfo } from "@/stores/useAgentStore";
-import { useGitStore } from "@/stores/useGitStore";
-import { useMcpStore } from "@/stores/useMcpStore";
-import { usePluginStore } from "@/stores/usePluginStore";
-import { useMarketplaceStore } from "@/stores/useMarketplaceStore";
-import { useSessionStore, type BackendSessionStatus } from "@/stores/useSessionStore";
-import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
+import { ContextDocEditorModal } from "@/components/claudemd";
 import { GitSettingsModal, RemoteStatusIndicator } from "@/components/git";
 import { MarketplaceBrowser } from "@/components/marketplace";
 import { McpServerEditorModal } from "@/components/mcp";
-import { ContextDocEditorModal } from "@/components/claudemd";
+import { MaestroSettingsModal, ShortcutsModal } from "@/components/settings";
 import { CliSettingsModal } from "@/components/terminal/CliSettingsModal";
 import { SamuraiScheduleChip } from "@/components/terminal/SamuraiScheduleChip";
 import { TerminalSettingsModal } from "@/components/terminal/TerminalSettingsModal";
-import { MaestroSettingsModal, ShortcutsModal } from "@/components/settings";
-import type {
-  McpConnector,
-  McpCustomServer,
-  McpManagedServer,
-} from "@/lib/mcp";
-import { listContextDocs, readContextDoc, type ContextDoc } from "@/lib/claudemd";
+import { sessionsForTab } from "@/hooks/useProjectStatus";
+import { type ContextDoc, listContextDocs, readContextDoc } from "@/lib/claudemd";
+import type { McpConnector, McpCustomServer, McpManagedServer } from "@/lib/mcp";
+import { samePath } from "@/lib/path";
+import { projectColorFor } from "@/lib/projectColor";
 import { altLabel, titleWithShortcut } from "@/lib/shortcuts";
+import { useProjectColors } from "@/lib/useProjectColors";
+import { type SubagentInfo, useAgentStore } from "@/stores/useAgentStore";
+import { useGitStore } from "@/stores/useGitStore";
+import { useMarketplaceStore } from "@/stores/useMarketplaceStore";
+import { useMcpStore } from "@/stores/useMcpStore";
+import { usePluginStore } from "@/stores/usePluginStore";
+import { type BackendSessionStatus, useSessionStore } from "@/stores/useSessionStore";
+import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { HistorySection } from "./HistorySection";
 import { NotificationsSettingsSection } from "./NotificationsSettingsSection";
 import { cardClass, divider, SectionHeader } from "./sectionChrome";
@@ -464,10 +460,10 @@ function AgentsSection({
       if (pendingKillIds.current.has(sessionId)) return;
       pendingKillIds.current.add(sessionId);
       try {
-        const confirmed = await ask(
-          `Kill "${name}" and everything running inside it?`,
-          { title: "Kill Terminal", kind: "warning" },
-        ).catch(() => false);
+        const confirmed = await ask(`Kill "${name}" and everything running inside it?`, {
+          title: "Kill Terminal",
+          kind: "warning",
+        }).catch(() => false);
         if (confirmed) onKill?.(tabId, sessionId);
       } finally {
         pendingKillIds.current.delete(sessionId);
@@ -478,7 +474,11 @@ function AgentsSection({
 
   return (
     <div className={cardClass}>
-      <button type="button" onClick={() => setExpanded((v) => !v)} className="block w-full text-left">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="block w-full text-left"
+      >
         <SectionHeader
           icon={Bot}
           label="Agents"
@@ -531,9 +531,16 @@ function AgentsSection({
                   const sessionAgents = agentsBySession.get(session.id) ?? [];
                   return (
                     <div key={session.id} className="ml-2">
+                      {/* biome-ignore lint/a11y/useSemanticElements: can't be a real <button> — it wraps a nested "Kill" <button>, and nested buttons are invalid HTML that breaks click handling. */}
                       <div
                         className="group flex cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 hover:bg-maestro-border/30"
                         onClick={() => onNavigate?.(tab.id, session.id)}
+                        onKeyDown={(e) => {
+                          if (e.key !== "Enter") return;
+                          onNavigate?.(tab.id, session.id);
+                        }}
+                        role="button"
+                        tabIndex={0}
                         title={`${name} — click to zoom into this terminal`}
                       >
                         <span className="flex-1 truncate text-xs text-maestro-text">{name}</span>
@@ -558,10 +565,16 @@ function AgentsSection({
                           {sessionAgents.map((agent) => {
                             const agentBadge =
                               agent.completedAt === null
-                                ? { label: "RUNNING", cls: "bg-maestro-accent/15 text-maestro-accent animate-pulse" }
+                                ? {
+                                    label: "RUNNING",
+                                    cls: "bg-maestro-accent/15 text-maestro-accent animate-pulse",
+                                  }
                                 : agent.success === false
                                   ? { label: "FAILED", cls: "bg-red-500/15 text-red-400" }
-                                  : { label: "DONE", cls: "bg-maestro-green/15 text-maestro-green" };
+                                  : {
+                                      label: "DONE",
+                                      cls: "bg-maestro-green/15 text-maestro-green",
+                                    };
                             return (
                               <div
                                 key={agent.agentId}
@@ -613,7 +626,9 @@ function GitRepositorySection() {
 
   // Fetch default worktree base dir on mount
   useEffect(() => {
-    invoke<string>("get_default_worktree_base_dir").then(setDefaultWorktreeBase).catch(() => {});
+    invoke<string>("get_default_worktree_base_dir")
+      .then(setDefaultWorktreeBase)
+      .catch(() => {});
   }, []);
 
   // Fetch data on mount and when repoPath changes
@@ -657,11 +672,7 @@ function GitRepositorySection() {
   if (!repoPath) {
     return (
       <div className={cardClass}>
-        <SectionHeader
-          icon={GitBranch}
-          label="Git Repository"
-          iconColor="text-maestro-muted"
-        />
+        <SectionHeader icon={GitBranch} label="Git Repository" iconColor="text-maestro-muted" />
         <div className="px-1 py-1 text-xs text-maestro-muted">No project selected</div>
       </div>
     );
@@ -716,7 +727,9 @@ function GitRepositorySection() {
           <div className="mt-2 border-t border-maestro-border/30 pt-2 min-w-0 overflow-hidden">
             <div className="flex items-center gap-2 px-1 py-1 min-w-0">
               <FolderGit2 size={12} className="text-maestro-accent shrink-0" />
-              <span className="text-xs font-semibold text-maestro-text truncate min-w-0">Worktrees</span>
+              <span className="text-xs font-semibold text-maestro-text truncate min-w-0">
+                Worktrees
+              </span>
               {!worktreeBasePath && (
                 <span className="text-[10px] text-maestro-muted/60 shrink-0">(default)</span>
               )}
@@ -732,7 +745,11 @@ function GitRepositorySection() {
       </div>
 
       {showSettings && (
-        <GitSettingsModal repoPath={repoPath} tabId={activeTab?.id ?? ""} onClose={() => setShowSettings(false)} />
+        <GitSettingsModal
+          repoPath={repoPath}
+          tabId={activeTab?.id ?? ""}
+          onClose={() => setShowSettings(false)}
+        />
       )}
     </>
   );
@@ -1030,11 +1047,7 @@ function McpConnectorGroup({
           className="group flex items-center gap-2 rounded-md px-2 py-1 text-xs text-maestro-text hover:bg-maestro-border/40"
         >
           <span
-            title={
-              connector.enabled
-                ? "Enabled for this project"
-                : "Disabled for this project"
-            }
+            title={connector.enabled ? "Enabled for this project" : "Disabled for this project"}
             className={`h-2 w-2 shrink-0 rounded-full ${
               connector.enabled ? "bg-maestro-green" : "bg-maestro-muted"
             }`}
@@ -1052,9 +1065,7 @@ function McpConnectorGroup({
               type="button"
               onClick={() => onToggle(connector)}
               className="rounded p-0.5 hover:bg-maestro-border/40"
-              title={
-                connector.enabled ? "Disable for this project" : "Enable for this project"
-              }
+              title={connector.enabled ? "Disable for this project" : "Enable for this project"}
             >
               <Power
                 size={10}
@@ -1191,7 +1202,10 @@ function MCPServersSection() {
               <ChevronRight size={13} className="text-maestro-muted/80" />
             )}
           </button>
-          <Server size={13} className={totalCount > 0 ? "text-maestro-green" : "text-maestro-muted/80"} />
+          <Server
+            size={13}
+            className={totalCount > 0 ? "text-maestro-green" : "text-maestro-muted/80"}
+          />
           <span className="flex-1">MCP Servers</span>
           {totalCount > 0 && (
             <span className="bg-maestro-green/20 text-maestro-green text-[10px] px-1.5 rounded-full font-bold">
@@ -1205,7 +1219,10 @@ function MCPServersSection() {
               className="rounded p-0.5 hover:bg-maestro-border/40"
               title="Refresh MCP servers"
             >
-              <RefreshCw size={12} className={`text-maestro-muted ${loading ? "animate-spin" : ""}`} />
+              <RefreshCw
+                size={12}
+                className={`text-maestro-muted ${loading ? "animate-spin" : ""}`}
+              />
             </button>
             <button
               type="button"
@@ -1222,9 +1239,7 @@ function MCPServersSection() {
           <div className="space-y-0.5">
             {/* Config write failures (toggle/delete have no modal to show them) */}
             {writeError && (
-              <div className="px-2 py-1 text-[10px] text-maestro-red break-words">
-                {writeError}
-              </div>
+              <div className="px-2 py-1 text-[10px] text-maestro-red break-words">{writeError}</div>
             )}
 
             {/* Managed servers grouped by scope. Project = repo's .mcp.json,
@@ -1253,10 +1268,7 @@ function MCPServersSection() {
             />
 
             {/* claude.ai account connectors (toggle only) */}
-            <McpConnectorGroup
-              connectors={connectors}
-              onToggle={handleToggleConnector}
-            />
+            <McpConnectorGroup connectors={connectors} onToggle={handleToggleConnector} />
 
             {/* Custom servers */}
             {customServers.length > 0 && (
@@ -1351,7 +1363,11 @@ function skillScope(s: SkillConfig): "project" | "user" {
 }
 
 /** Returns badge styling and text for a skill source. */
-function getSkillSourceBadge(source: SkillSource): { text: string; className: string; icon: React.ElementType } {
+function getSkillSourceBadge(source: SkillSource): {
+  text: string;
+  className: string;
+  icon: React.ElementType;
+} {
   switch (source.type) {
     case "project":
       return {
@@ -1388,9 +1404,24 @@ function PluginsSection() {
   const activeTab = tabs.find((t) => t.active);
   const projectPath = activeTab?.projectPath ?? "";
 
-  const { projectSkills, projectPlugins, fetchProjectPlugins, refreshProjectPlugins, isLoading, deleteSkill, deletingSkillId, deletePlugin, deletingPluginId } =
-    usePluginStore();
-  const { uninstallPluginById, uninstallingPluginId, installedPlugins, fetchAll: fetchMarketplace, isLoading: marketplaceLoading } = useMarketplaceStore();
+  const {
+    projectSkills,
+    projectPlugins,
+    fetchProjectPlugins,
+    refreshProjectPlugins,
+    isLoading,
+    deleteSkill,
+    deletingSkillId,
+    deletePlugin,
+    deletingPluginId,
+  } = usePluginStore();
+  const {
+    uninstallPluginById,
+    uninstallingPluginId,
+    installedPlugins,
+    fetchAll: fetchMarketplace,
+    isLoading: marketplaceLoading,
+  } = useMarketplaceStore();
   const [marketplaceFetched, setMarketplaceFetched] = useState(false);
   const skills = projectPath ? (projectSkills[projectPath] ?? []) : [];
   const plugins = projectPath ? (projectPlugins[projectPath] ?? []) : [];
@@ -1464,47 +1495,70 @@ function PluginsSection() {
   }, [projectPath, refreshProjectPlugins]);
 
   // Handle uninstalling a plugin (installed or marketplace)
-  const handleUninstallPlugin = useCallback(async (e: React.MouseEvent, pluginId: string, pluginPath: string | null, pluginSource: string) => {
-    e.stopPropagation();
+  const handleUninstallPlugin = useCallback(
+    async (
+      e: React.MouseEvent,
+      pluginId: string,
+      pluginPath: string | null,
+      pluginSource: string,
+    ) => {
+      e.stopPropagation();
 
-    // For "installed" plugins (manually installed to ~/.claude/plugins/), delete directly
-    if (pluginSource === "installed" && pluginPath && projectPath) {
-      await deletePlugin(pluginId, pluginPath, projectPath);
-      return;
-    }
-
-    // For "marketplace" plugins, use the marketplace uninstall
-    const installedPlugin = installedPlugins.find(
-      (p) => p.path === pluginPath || p.plugin_id === pluginId || p.id === pluginId
-    );
-    if (installedPlugin) {
-      await uninstallPluginById(installedPlugin.id);
-      // Refresh both marketplace and plugins lists
-      await fetchMarketplace();
-      if (projectPath) {
-        await refreshProjectPlugins(projectPath);
+      // For "installed" plugins (manually installed to ~/.claude/plugins/), delete directly
+      if (pluginSource === "installed" && pluginPath && projectPath) {
+        await deletePlugin(pluginId, pluginPath, projectPath);
+        return;
       }
-    } else {
-      console.warn("Could not find installed plugin to uninstall:", { pluginId, pluginPath, pluginSource, installedPlugins });
-    }
-  }, [installedPlugins, uninstallPluginById, fetchMarketplace, projectPath, refreshProjectPlugins, deletePlugin]);
+
+      // For "marketplace" plugins, use the marketplace uninstall
+      const installedPlugin = installedPlugins.find(
+        (p) => p.path === pluginPath || p.plugin_id === pluginId || p.id === pluginId,
+      );
+      if (installedPlugin) {
+        await uninstallPluginById(installedPlugin.id);
+        // Refresh both marketplace and plugins lists
+        await fetchMarketplace();
+        if (projectPath) {
+          await refreshProjectPlugins(projectPath);
+        }
+      } else {
+        console.warn("Could not find installed plugin to uninstall:", {
+          pluginId,
+          pluginPath,
+          pluginSource,
+          installedPlugins,
+        });
+      }
+    },
+    [
+      installedPlugins,
+      uninstallPluginById,
+      fetchMarketplace,
+      projectPath,
+      refreshProjectPlugins,
+      deletePlugin,
+    ],
+  );
 
   // Handle deleting a standalone skill
-  const handleDeleteSkill = useCallback(async (e: React.MouseEvent, skillId: string, skillPath: string | null) => {
-    e.stopPropagation();
-    if (!skillPath || !projectPath) return;
-    // skill.path points to SKILL.md file, we need the parent directory
-    const skillDir = skillPath.replace(/\/[^/]+$/, ""); // Remove filename to get directory
-    await deleteSkill(skillId, skillDir, projectPath);
-  }, [deleteSkill, projectPath]);
+  const handleDeleteSkill = useCallback(
+    async (e: React.MouseEvent, skillId: string, skillPath: string | null) => {
+      e.stopPropagation();
+      if (!skillPath || !projectPath) return;
+      // skill.path points to SKILL.md file, we need the parent directory
+      const skillDir = skillPath.replace(/\/[^/]+$/, ""); // Remove filename to get directory
+      await deleteSkill(skillId, skillDir, projectPath);
+    },
+    [deleteSkill, projectPath],
+  );
 
   // Check if a plugin can be uninstalled (installed or marketplace, not builtin)
-  const canUninstallPlugin = (plugin: typeof plugins[0]) => {
+  const canUninstallPlugin = (plugin: (typeof plugins)[0]) => {
     return plugin.plugin_source === "installed" || plugin.plugin_source === "marketplace";
   };
 
   // Check if a skill can be deleted (project or personal, not plugin-owned or legacy)
-  const canDeleteSkill = (skill: typeof skills[0]) => {
+  const canDeleteSkill = (skill: (typeof skills)[0]) => {
     return (skill.source.type === "project" || skill.source.type === "personal") && skill.path;
   };
 
@@ -1522,7 +1576,10 @@ function PluginsSection() {
             <ChevronRight size={13} className="text-maestro-muted/80" />
           )}
         </button>
-        <Store size={13} className={totalCount > 0 ? "text-maestro-purple" : "text-maestro-muted/80"} />
+        <Store
+          size={13}
+          className={totalCount > 0 ? "text-maestro-purple" : "text-maestro-muted/80"}
+        />
         <span className="flex-1">Plugins & Skills</span>
         {totalCount > 0 && (
           <span className="bg-maestro-purple/20 text-maestro-purple text-[10px] px-1.5 rounded-full font-bold">
@@ -1536,7 +1593,10 @@ function PluginsSection() {
             className="rounded p-0.5 hover:bg-maestro-border/40"
             title="Refresh plugins"
           >
-            <RefreshCw size={12} className={`text-maestro-muted ${loading ? "animate-spin" : ""}`} />
+            <RefreshCw
+              size={12}
+              className={`text-maestro-muted ${loading ? "animate-spin" : ""}`}
+            />
           </button>
           <button
             type="button"
@@ -1555,9 +1615,7 @@ function PluginsSection() {
             <div className="px-2 py-1 text-[11px] text-maestro-muted/60">No project selected</div>
           ) : totalCount === 0 ? (
             <>
-              <div className="px-2 py-1 text-[11px] text-maestro-muted/60">
-                No skills found
-              </div>
+              <div className="px-2 py-1 text-[11px] text-maestro-muted/60">No skills found</div>
               <div className="px-2 text-[10px] text-maestro-muted/40">
                 Add skills to .claude/skills/ or ~/.claude/skills/
               </div>
@@ -1565,25 +1623,27 @@ function PluginsSection() {
           ) : (
             <>
               {/* Plugins grouped by scope (Project / User / Global). */}
-              {plugins.length > 0 && (() => {
-                const buckets: Record<PluginScope, PluginConfig[]> = {
-                  project: [],
-                  user: [],
-                  global: [],
-                };
-                for (const p of plugins) buckets[pluginScope(p)].push(p);
-                const scopeLabel: Record<PluginScope, string> = {
-                  project: "Project Plugins",
-                  user: "User Plugins",
-                  global: "Global Plugins",
-                };
-                const order: PluginScope[] = ["project", "user", "global"];
-                const renderPluginRow = (plugin: PluginConfig) => {
+              {plugins.length > 0 &&
+                (() => {
+                  const buckets: Record<PluginScope, PluginConfig[]> = {
+                    project: [],
+                    user: [],
+                    global: [],
+                  };
+                  for (const p of plugins) buckets[pluginScope(p)].push(p);
+                  const scopeLabel: Record<PluginScope, string> = {
+                    project: "Project Plugins",
+                    user: "User Plugins",
+                    global: "Global Plugins",
+                  };
+                  const order: PluginScope[] = ["project", "user", "global"];
+                  const renderPluginRow = (plugin: PluginConfig) => {
                     const pluginSkills = pluginSkillsMap.get(plugin.name) ?? [];
                     const isPluginExpanded = expandedPlugins.has(plugin.id);
                     // Check if plugin is being uninstalled/deleted
                     const matchingInstalled = installedPlugins.find(
-                      (p) => p.path === plugin.path || p.plugin_id === plugin.id || p.id === plugin.id
+                      (p) =>
+                        p.path === plugin.path || p.plugin_id === plugin.id || p.id === plugin.id,
                     );
                     const isUninstalling =
                       deletingPluginId === plugin.id ||
@@ -1611,23 +1671,38 @@ function PluginsSection() {
                               <span className="w-[10px]" />
                             )}
                             <Package size={12} className="shrink-0 text-maestro-purple" />
-                            <span className="flex-1 truncate font-medium text-left">{plugin.name}</span>
+                            <span className="flex-1 truncate font-medium text-left">
+                              {plugin.name}
+                            </span>
                           </button>
                           {pluginSkills.length > 0 && (
-                            <span className="text-[10px] text-maestro-muted">{pluginSkills.length}</span>
+                            <span className="text-[10px] text-maestro-muted">
+                              {pluginSkills.length}
+                            </span>
                           )}
                           <span className="text-[10px] text-maestro-muted">v{plugin.version}</span>
                           {canUninstallPlugin(plugin) && (
                             <button
                               type="button"
-                              onClick={(e) => handleUninstallPlugin(e, plugin.id, plugin.path, plugin.plugin_source)}
+                              onClick={(e) =>
+                                handleUninstallPlugin(
+                                  e,
+                                  plugin.id,
+                                  plugin.path,
+                                  plugin.plugin_source,
+                                )
+                              }
                               disabled={isUninstalling}
                               className="shrink-0 rounded p-0.5 opacity-0 group-hover:opacity-100 hover:bg-maestro-red/10 transition-opacity"
                               title="Uninstall plugin"
                             >
                               <Trash2
                                 size={10}
-                                className={isUninstalling ? "text-maestro-muted animate-pulse" : "text-maestro-red"}
+                                className={
+                                  isUninstalling
+                                    ? "text-maestro-muted animate-pulse"
+                                    : "text-maestro-red"
+                                }
                               />
                             </button>
                           )}
@@ -1650,73 +1725,76 @@ function PluginsSection() {
                         )}
                       </div>
                     );
-                };
-                return order
-                  .filter((scope) => buckets[scope].length > 0)
-                  .map((scope) => (
-                    <div key={`plugin-scope-${scope}`}>
-                      <div className="px-2 py-0.5 text-[9px] font-medium uppercase tracking-wide text-maestro-muted/60">
-                        {scopeLabel[scope]} ({buckets[scope].length})
+                  };
+                  return order
+                    .filter((scope) => buckets[scope].length > 0)
+                    .map((scope) => (
+                      <div key={`plugin-scope-${scope}`}>
+                        <div className="px-2 py-0.5 text-[9px] font-medium uppercase tracking-wide text-maestro-muted/60">
+                          {scopeLabel[scope]} ({buckets[scope].length})
+                        </div>
+                        {buckets[scope].map(renderPluginRow)}
                       </div>
-                      {buckets[scope].map(renderPluginRow)}
-                    </div>
-                  ));
-              })()}
+                    ));
+                })()}
 
               {/* Standalone Skills grouped by scope (Project / User). */}
-              {standaloneSkills.length > 0 && (() => {
-                const skillBuckets: Record<"project" | "user", SkillConfig[]> = {
-                  project: [],
-                  user: [],
-                };
-                for (const s of standaloneSkills) skillBuckets[skillScope(s)].push(s);
-                const skillOrder: Array<"project" | "user"> = ["project", "user"];
-                const skillLabel: Record<"project" | "user", string> = {
-                  project: "Project Skills",
-                  user: "User Skills",
-                };
-                const renderSkillRow = (skill: SkillConfig) => {
-                  const badge = getSkillSourceBadge(skill.source);
-                  const isDeleting = deletingSkillId === skill.id;
-                  return (
-                    <div
-                      key={skill.id}
-                      className="group flex items-center gap-2 rounded-md px-2 py-1 text-xs text-maestro-text hover:bg-maestro-border/40"
-                      title={skill.description || skill.path || undefined}
-                    >
-                      <Zap size={12} className="shrink-0 text-maestro-orange" />
-                      <span className="flex-1 truncate font-medium">{skill.name}</span>
-                      <span className={`shrink-0 rounded px-1 text-[9px] ${badge.className}`}>
-                        {badge.text}
-                      </span>
-                      {canDeleteSkill(skill) && (
-                        <button
-                          type="button"
-                          onClick={(e) => handleDeleteSkill(e, skill.id, skill.path)}
-                          disabled={isDeleting}
-                          className="shrink-0 rounded p-0.5 opacity-0 group-hover:opacity-100 hover:bg-maestro-red/10 transition-opacity"
-                          title="Delete skill"
-                        >
-                          <Trash2
-                            size={10}
-                            className={isDeleting ? "text-maestro-muted animate-pulse" : "text-maestro-red"}
-                          />
-                        </button>
-                      )}
-                    </div>
-                  );
-                };
-                return skillOrder
-                  .filter((scope) => skillBuckets[scope].length > 0)
-                  .map((scope) => (
-                    <div key={`skill-scope-${scope}`}>
-                      <div className="px-2 py-0.5 text-[9px] font-medium uppercase tracking-wide text-maestro-muted/60">
-                        {skillLabel[scope]} ({skillBuckets[scope].length})
+              {standaloneSkills.length > 0 &&
+                (() => {
+                  const skillBuckets: Record<"project" | "user", SkillConfig[]> = {
+                    project: [],
+                    user: [],
+                  };
+                  for (const s of standaloneSkills) skillBuckets[skillScope(s)].push(s);
+                  const skillOrder: Array<"project" | "user"> = ["project", "user"];
+                  const skillLabel: Record<"project" | "user", string> = {
+                    project: "Project Skills",
+                    user: "User Skills",
+                  };
+                  const renderSkillRow = (skill: SkillConfig) => {
+                    const badge = getSkillSourceBadge(skill.source);
+                    const isDeleting = deletingSkillId === skill.id;
+                    return (
+                      <div
+                        key={skill.id}
+                        className="group flex items-center gap-2 rounded-md px-2 py-1 text-xs text-maestro-text hover:bg-maestro-border/40"
+                        title={skill.description || skill.path || undefined}
+                      >
+                        <Zap size={12} className="shrink-0 text-maestro-orange" />
+                        <span className="flex-1 truncate font-medium">{skill.name}</span>
+                        <span className={`shrink-0 rounded px-1 text-[9px] ${badge.className}`}>
+                          {badge.text}
+                        </span>
+                        {canDeleteSkill(skill) && (
+                          <button
+                            type="button"
+                            onClick={(e) => handleDeleteSkill(e, skill.id, skill.path)}
+                            disabled={isDeleting}
+                            className="shrink-0 rounded p-0.5 opacity-0 group-hover:opacity-100 hover:bg-maestro-red/10 transition-opacity"
+                            title="Delete skill"
+                          >
+                            <Trash2
+                              size={10}
+                              className={
+                                isDeleting ? "text-maestro-muted animate-pulse" : "text-maestro-red"
+                              }
+                            />
+                          </button>
+                        )}
                       </div>
-                      {skillBuckets[scope].map(renderSkillRow)}
-                    </div>
-                  ));
-              })()}
+                    );
+                  };
+                  return skillOrder
+                    .filter((scope) => skillBuckets[scope].length > 0)
+                    .map((scope) => (
+                      <div key={`skill-scope-${scope}`}>
+                        <div className="px-2 py-0.5 text-[9px] font-medium uppercase tracking-wide text-maestro-muted/60">
+                          {skillLabel[scope]} ({skillBuckets[scope].length})
+                        </div>
+                        {skillBuckets[scope].map(renderSkillRow)}
+                      </div>
+                    ));
+                })()}
             </>
           )}
         </div>
@@ -1822,15 +1900,11 @@ function AppearanceSection({
       {showTerminalSettings && (
         <TerminalSettingsModal onClose={() => setShowTerminalSettings(false)} />
       )}
-      {showCliSettings && (
-        <CliSettingsModal onClose={() => setShowCliSettings(false)} />
-      )}
+      {showCliSettings && <CliSettingsModal onClose={() => setShowCliSettings(false)} />}
       {showMaestroSettings && (
         <MaestroSettingsModal onClose={() => setShowMaestroSettings(false)} />
       )}
-      {showShortcuts && (
-        <ShortcutsModal onClose={() => setShowShortcuts(false)} />
-      )}
+      {showShortcuts && <ShortcutsModal onClose={() => setShowShortcuts(false)} />}
     </>
   );
 }

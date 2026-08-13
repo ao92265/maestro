@@ -1,8 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
-  ArrowUp,
   ArrowDown,
+  ArrowUp,
   ChevronDown,
   ChevronRight,
   FileCode,
@@ -16,14 +15,15 @@ import {
   Trash2,
   Undo2,
 } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   discardFile,
-  getWorktreesStatus,
-  isWorktreeAtRisk,
-  removeFile,
   type FileDiffMode,
   type FileStatusEntry,
   type FileStatusKind,
+  getWorktreesStatus,
+  isWorktreeAtRisk,
+  removeFile,
   type WorktreeStatus,
 } from "../../../lib/git";
 import { FileDiffModal } from "./FileDiffModal";
@@ -123,10 +123,7 @@ export function WorktreeStatusList({ repoPath, active = true }: WorktreeStatusLi
           className="rounded p-1 text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
           title="Refresh"
         >
-          <RefreshCw
-            size={12}
-            className={isLoading ? "animate-spin" : undefined}
-          />
+          <RefreshCw size={12} className={isLoading ? "animate-spin" : undefined} />
         </button>
       </div>
       <div className="flex-1 overflow-y-auto">
@@ -180,25 +177,19 @@ function WorktreeCard({
         <FolderGit2
           size={14}
           className={`shrink-0 ${
-            status.is_main_worktree
-              ? "text-maestro-accent"
-              : "text-maestro-muted"
+            status.is_main_worktree ? "text-maestro-accent" : "text-maestro-muted"
           }`}
         />
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5 text-xs">
-            <span className="truncate font-medium text-maestro-text">
-              {branchLabel}
-            </span>
+            <span className="truncate font-medium text-maestro-text">{branchLabel}</span>
             {status.is_main_worktree && (
               <span className="rounded bg-maestro-accent/15 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-maestro-accent">
                 main
               </span>
             )}
           </div>
-          <div className="truncate text-[10px] text-maestro-muted">
-            {status.path}
-          </div>
+          <div className="truncate text-[10px] text-maestro-muted">{status.path}</div>
         </div>
         <UpstreamBadge status={status} />
         {atRisk && (
@@ -227,13 +218,8 @@ function WorktreeCard({
             color="text-maestro-orange"
           >
             {status.unpushed_commits.map((c) => (
-              <li
-                key={c.hash}
-                className="flex items-center gap-2 px-1 py-0.5 text-[11px]"
-              >
-                <span className="font-mono text-maestro-muted">
-                  {c.short_hash}
-                </span>
+              <li key={c.hash} className="flex items-center gap-2 px-1 py-0.5 text-[11px]">
+                <span className="font-mono text-maestro-muted">{c.short_hash}</span>
                 <span className="truncate text-maestro-text">{c.summary}</span>
               </li>
             ))}
@@ -318,13 +304,8 @@ function WorktreeCard({
             color="text-maestro-purple"
           >
             {status.stashes.map((s) => (
-              <li
-                key={s.ref_name}
-                className="flex items-center gap-2 px-1 py-0.5 text-[11px]"
-              >
-                <span className="font-mono text-maestro-muted">
-                  {s.ref_name}
-                </span>
+              <li key={s.ref_name} className="flex items-center gap-2 px-1 py-0.5 text-[11px]">
+                <span className="font-mono text-maestro-muted">{s.ref_name}</span>
                 <span className="truncate text-maestro-text">{s.message}</span>
               </li>
             ))}
