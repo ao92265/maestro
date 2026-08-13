@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
-import { Download, Network, Trash2, X } from "lucide-react";
+import { Download, Eye, Network, Trash2, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import {
@@ -13,6 +13,7 @@ import {
   statsLine,
   ToolStatsRow,
 } from "@/components/session/agentPresentation";
+import { LiveActivityPopover } from "@/components/session/LiveActivityPopover";
 import { SamuraiBadge } from "@/components/terminal/SamuraiBadge";
 import { ThinkingIndicator } from "@/components/terminal/ThinkingIndicator";
 import { type AgentTreeNode, buildAgentTree } from "@/lib/agentTree";
@@ -60,6 +61,7 @@ export function AgentGraph({ sessionId }: AgentGraphProps) {
   const clearFinished = useAgentStore((s) => s.clearFinished);
   const [openAgentId, setOpenAgentId] = useState<string | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [liveOpen, setLiveOpen] = useState(false);
 
   // Sort by spawn timestamp (ISO strings sort lexicographically) so node
   // positions stay stable as new agents append.
@@ -115,15 +117,40 @@ export function AgentGraph({ sessionId }: AgentGraphProps) {
         <span className={`${badgeBaseClass} ${rootBadge.cls}`}>{rootBadge.label}</span>
         {/* Samurai supervision (issue #46) — nothing for non-supervised sessions. */}
         <SamuraiBadge sessionId={sessionId} />
+        {/* Live activity (issue #94): top-level sessions only — a subagent's
+            internals never reach the bus, so its node keeps the brief/report
+            drawer instead. */}
+        {session.status === "Working" && (
+          <button
+            type="button"
+            onClick={() => setLiveOpen((v) => !v)}
+            aria-label="Show live activity"
+            title="What is this agent doing right now?"
+            className="shrink-0 rounded p-0.5 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-text"
+          >
+            <Eye size={11} />
+          </button>
+        )}
       </div>
       <p className="mt-1 truncate text-[11px] text-maestro-muted">{rootDescription}</p>
     </div>
   );
 
+  // Hidden (not just closed) the moment the session stops working, so a stale
+  // "live" summary never outlives the eye that opened it.
+  const showLivePopover = liveOpen && session.status === "Working";
+
   if (sessionAgents.length === 0) {
     return (
       <div className="flex h-full w-full flex-col items-center justify-center gap-3 overflow-auto bg-maestro-bg p-6">
         {rootNode}
+        {showLivePopover && (
+          <LiveActivityPopover
+            sessionId={sessionId}
+            onClose={() => setLiveOpen(false)}
+            className="w-[260px]"
+          />
+        )}
         <p className="max-w-[280px] text-center text-[11px] italic text-maestro-muted">
           No subagents running — agents spawned via the Task tool will appear here.
         </p>
@@ -263,6 +290,17 @@ export function AgentGraph({ sessionId }: AgentGraphProps) {
         <div className="absolute" style={{ left: rootX, top: rootY }}>
           {rootNode}
         </div>
+
+        {/* Live-activity popover, anchored under the root node. Outside the
+            card because the card clips its overflow. */}
+        {showLivePopover && (
+          <div
+            className="absolute z-20"
+            style={{ left: rootX, top: rootY + ROOT_H + 6, width: 260 }}
+          >
+            <LiveActivityPopover sessionId={sessionId} onClose={() => setLiveOpen(false)} />
+          </div>
+        )}
 
         {/* Subagent nodes, one column per nesting depth */}
         {placed.map(({ node, x, y }) => {

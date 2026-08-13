@@ -1,6 +1,6 @@
 import { Handle, type NodeProps, Position } from "@xyflow/react";
-import { ArrowUpRight, Folder, TerminalSquare, X } from "lucide-react";
-import { createContext, useContext } from "react";
+import { ArrowUpRight, Eye, Folder, TerminalSquare, X } from "lucide-react";
+import { createContext, useContext, useState } from "react";
 import {
   agentBadge,
   badgeBaseClass,
@@ -8,6 +8,7 @@ import {
   statsLine,
   ToolStatsRow,
 } from "@/components/session/agentPresentation";
+import { LiveActivityPopover } from "@/components/session/LiveActivityPopover";
 import { SamuraiBadge } from "@/components/terminal/SamuraiBadge";
 import { ThinkingIndicator } from "@/components/terminal/ThinkingIndicator";
 import type { SubagentInfo } from "@/stores/useAgentStore";
@@ -167,12 +168,13 @@ export function ProjectNode({ data, selected }: NodeProps) {
 export function TerminalNode({ data, selected }: NodeProps) {
   const d = data as TerminalNodeData;
   const { openTerminal } = useContext(LandscapeActionsContext);
+  const [liveOpen, setLiveOpen] = useState(false);
   const badge = SESSION_STATUS_BADGES[d.status] ?? SESSION_STATUS_BADGES.Idle;
   return (
     <div
       style={{ width: TERMINAL_W, height: TERMINAL_H }}
       title={d.description}
-      className={`flex flex-col justify-center rounded-lg border bg-maestro-card px-3 py-2 transition-opacity ${statusBorderClass(
+      className={`relative flex flex-col justify-center rounded-lg border bg-maestro-card px-3 py-2 transition-opacity ${statusBorderClass(
         d.status,
       )} ${dimClass(d.dimmed)} ${selected ? "ring-1 ring-maestro-accent" : ""}`}
     >
@@ -185,6 +187,23 @@ export function TerminalNode({ data, selected }: NodeProps) {
         <span className={`${badgeBaseClass} ${badge.cls}`}>{badge.label}</span>
         {/* Samurai supervision (issue #46) — nothing for non-supervised sessions. */}
         <SamuraiBadge sessionId={d.sessionId} />
+        {/* Live activity (issue #94): top-level sessions only — a subagent's
+            internals never reach the bus, so its node keeps the brief/report
+            drawer instead. */}
+        {d.status === "Working" && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setLiveOpen((v) => !v);
+            }}
+            aria-label={`Show live activity for ${d.title}`}
+            title="What is this agent doing right now?"
+            className="nodrag shrink-0 rounded p-0.5 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-text"
+          >
+            <Eye size={12} />
+          </button>
+        )}
         <button
           type="button"
           onClick={(e) => {
@@ -206,6 +225,13 @@ export function TerminalNode({ data, selected }: NodeProps) {
               d.runningAgentCount
             } running`}
       </p>
+      {/* Hidden (not just closed) if the session stops working, so a stale
+          "live" summary never outlives the eye that opened it. */}
+      {liveOpen && d.status === "Working" && (
+        <div className="nodrag nopan absolute left-0 top-full z-10 mt-1.5 w-[260px]">
+          <LiveActivityPopover sessionId={d.sessionId} onClose={() => setLiveOpen(false)} />
+        </div>
+      )}
       <EdgeHandles target source />
     </div>
   );

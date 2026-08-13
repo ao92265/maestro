@@ -9,8 +9,10 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn().mockResolvedValue(undefined),
 }));
 
+import { useActivityStore } from "@/stores/useActivityStore";
 import { type SubagentInfo, useAgentStore } from "@/stores/useAgentStore";
 import { type SessionConfig, useSessionStore } from "@/stores/useSessionStore";
+import type { ClaudeEvent } from "@/types/claude-events";
 import { AgentGraph, buildExportMarkdown } from "../AgentGraph";
 
 function session(id: number, overrides?: Partial<SessionConfig>): SessionConfig {
@@ -53,10 +55,50 @@ function agent(
   };
 }
 
+/** Seed the activity store the way a claude-events batch would. */
+function seedActivity(sessionId: number, events: ClaudeEvent[]) {
+  useActivityStore.setState((state) => ({
+    sessions: {
+      ...state.sessions,
+      [sessionId]: {
+        events,
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+        filesModified: [],
+        conversationUuids: [],
+      },
+    },
+  }));
+}
+
+function toolUseEvent(id: string, name: string, summary: string, timestamp: string): ClaudeEvent {
+  return {
+    event_type: "ToolUseStarted",
+    session_id: 1,
+    tool_name: name,
+    tool_use_id: id,
+    input_summary: summary,
+    timestamp,
+  };
+}
+
+function assistantEvent(uuid: string, text: string, timestamp: string): ClaudeEvent {
+  return {
+    event_type: "AssistantMessage",
+    session_id: 1,
+    uuid,
+    text,
+    model: "claude-fable-5",
+    token_usage: null,
+    timestamp,
+  };
+}
+
 describe("AgentGraph", () => {
   beforeEach(() => {
     useAgentStore.setState({ agents: [] });
     useSessionStore.setState({ sessions: [] });
+    useActivityStore.setState({ sessions: {} });
   });
 
   it("shows the empty state when the session does not exist", () => {
@@ -266,6 +308,74 @@ describe("AgentGraph", () => {
 
     expect(screen.queryByText("Finished")).not.toBeInTheDocument();
     expect(screen.getByText("StillGoing")).toBeInTheDocument();
+  });
+
+  it("shows the eye on a working session root; clicking opens the live popover", () => {
+    useSessionStore.setState({ sessions: [session(1)] });
+    seedActivity(1, [
+      assistantEvent("a1", "Now I run the test suite.", "2026-08-13T10:00:00Z"),
+      toolUseEvent("t1", "Bash", "cargo test --workspace", "2026-08-13T10:00:01Z"),
+    ]);
+    render(<AgentGraph sessionId={1} />);
+
+    fireEvent.click(screen.getByLabelText("Show live activity"));
+
+    expect(screen.getByText("Live activity")).toBeInTheDocument();
+    expect(screen.getByText("Bash")).toBeInTheDocument();
+    expect(screen.getByText("— cargo test --workspace")).toBeInTheDocument();
+    expect(screen.getByText("Now I run the test suite.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("Close live activity"));
+    expect(screen.queryByText("Live activity")).not.toBeInTheDocument();
+  });
+
+  it("the open popover refreshes when a new claude-events batch lands", () => {
+    useSessionStore.setState({ sessions: [session(1)] });
+    seedActivity(1, [toolUseEvent("t1", "Read", "/src/main.rs", "2026-08-13T10:00:00Z")]);
+    render(<AgentGraph sessionId={1} />);
+    fireEvent.click(screen.getByLabelText("Show live activity"));
+    expect(screen.getByText("Read")).toBeInTheDocument();
+
+    act(() => {
+      useActivityStore
+        .getState()
+        .addEvents([toolUseEvent("t2", "Edit", "/src/lib.rs", "2026-08-13T10:00:05Z")]);
+    });
+
+    expect(screen.getByText("Edit")).toBeInTheDocument();
+    expect(screen.getByText("— /src/lib.rs")).toBeInTheDocument();
+  });
+
+  it("shows no eye when the session is not working", () => {
+    useSessionStore.setState({ sessions: [session(1, { status: "Idle" })] });
+    render(<AgentGraph sessionId={1} />);
+    expect(screen.queryByLabelText("Show live activity")).not.toBeInTheDocument();
+  });
+
+  it("the eye is root-only: subagent nodes keep the brief/report drawer as fallback", () => {
+    useSessionStore.setState({ sessions: [session(1)] });
+    useAgentStore.setState({
+      agents: [
+        agent(1, "toolu_run", { agentType: "StillGoing" }),
+        agent(1, "toolu_done", {
+          agentType: "Finished",
+          spawnedAt: "2026-07-30T10:05:00.000Z",
+          completedAt: Date.now(),
+          success: true,
+          report: "all shipped",
+        }),
+      ],
+    });
+    render(<AgentGraph sessionId={1} />);
+
+    // Exactly one eye — the session root's. Subagent internals are not in the
+    // transcript, so their nodes get no live summary.
+    expect(screen.getAllByLabelText("Show live activity")).toHaveLength(1);
+
+    // A finished agent node still opens the existing brief/report drawer.
+    fireEvent.click(screen.getAllByTitle("Show the brief sent and the report returned")[1]);
+    expect(screen.getByText("Report back ↑")).toBeInTheDocument();
+    expect(screen.getByText("all shipped")).toBeInTheDocument();
   });
 
   it("an unrecognised status is shown verbatim rather than as DONE", () => {
