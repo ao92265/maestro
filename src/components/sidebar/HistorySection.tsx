@@ -1,6 +1,8 @@
 import {
+  Ban,
   ChevronDown,
   ChevronRight,
+  Folder,
   FolderGit2,
   GitBranch,
   History,
@@ -24,6 +26,29 @@ interface ProjectHistory {
   loading: boolean;
   conversations: ClaudeSessionInfo[];
   worktrees: WorktreeInfo[];
+}
+
+/** Last path segment — the folder a conversation ran in, without the noise. */
+function dirBasename(path: string): string {
+  return (
+    path
+      .replace(/[\\/]+$/, "")
+      .split(/[\\/]/)
+      .pop() || path
+  );
+}
+
+/**
+ * True when two prompt previews are the same text modulo the truncation
+ * ellipsis each side may carry ("..." from our scan, "…" from Claude Code's
+ * own last-prompt entries), so the row doesn't repeat itself.
+ */
+function samePromptPreview(a: string | null, b: string | null): boolean {
+  if (!a || !b) return false;
+  const norm = (s: string) => s.replace(/(?:\.\.\.|…)$/u, "").trim();
+  const x = norm(a);
+  const y = norm(b);
+  return x.startsWith(y) || y.startsWith(x);
 }
 
 /** Relative time label, mirroring the pre-launch card's session picker. */
@@ -196,46 +221,91 @@ export function HistorySection({ onLaunch }: HistorySectionProps) {
                       Conversations
                     </p>
                     {conversations.length === 0 ? (
-                      <p className="mb-1 px-1 text-[10px] text-maestro-muted">
-                        No resumable conversations
-                      </p>
+                      <p className="mb-1 px-1 text-[10px] text-maestro-muted">No conversations</p>
                     ) : (
                       conversations.map((conv) => {
+                        // Identity: prefer Claude's own title, fall back to the
+                        // first prompt. When the conversation drifted, its
+                        // latest prompt says what it became — show that too.
+                        const title =
+                          conv.summary?.trim() || conv.first_prompt?.trim() || "No prompt recorded";
+                        const subPrompt = conv.summary?.trim()
+                          ? conv.first_prompt?.trim() || null
+                          : conv.last_prompt?.trim() &&
+                              !samePromptPreview(conv.first_prompt, conv.last_prompt)
+                            ? conv.last_prompt.trim()
+                            : null;
                         return (
                           <button
                             key={conv.session_id}
                             type="button"
+                            disabled={!conv.resumable}
                             // Resume in the conversation's own directory —
                             // `claude --resume` cannot find the session from
-                            // anywhere else. Null means the directory is gone,
-                            // so fall back to the project path.
+                            // anywhere else, which is also why rows whose
+                            // directory is gone are disabled outright.
                             onClick={() =>
                               queueLaunch(tab, conv.session_id, conv.cwd, conv.git_branch)
                             }
                             title={
-                              conv.cwd
+                              conv.resumable
                                 ? `Resume this conversation in ${conv.cwd}`
-                                : "Original directory is gone — this conversation may not resume"
+                                : `Not resumable — ${conv.resume_blocked_reason ?? "unknown reason"}${
+                                    conv.cwd ? ` (ran in ${conv.cwd})` : ""
+                                  }`
                             }
-                            className="group mb-0.5 flex w-full items-start gap-1.5 rounded px-1 py-1 text-left transition-colors hover:bg-maestro-surface"
+                            className="group mb-0.5 flex w-full items-start gap-1.5 rounded px-1 py-1 text-left transition-colors enabled:hover:bg-maestro-surface disabled:cursor-not-allowed disabled:opacity-60"
                           >
-                            <RotateCcw
-                              size={11}
-                              className="mt-0.5 shrink-0 text-maestro-muted group-hover:text-maestro-accent"
-                            />
+                            {conv.resumable ? (
+                              <RotateCcw
+                                size={11}
+                                className="mt-0.5 shrink-0 text-maestro-muted group-hover:text-maestro-accent"
+                              />
+                            ) : (
+                              <Ban size={11} className="mt-0.5 shrink-0 text-maestro-red" />
+                            )}
                             <span className="min-w-0 flex-1">
                               <span className="line-clamp-2 block text-[11px] leading-snug text-maestro-text">
-                                {conv.first_prompt?.trim() || "No prompt recorded"}
+                                {title}
                               </span>
+                              {subPrompt && (
+                                <span className="line-clamp-1 block text-[10px] leading-snug text-maestro-muted">
+                                  {subPrompt}
+                                </span>
+                              )}
                               <span className="flex items-center gap-1.5 text-[9px] text-maestro-muted">
-                                <span>{formatRelativeTime(conv.last_active)}</span>
+                                <span
+                                  className="shrink-0"
+                                  title={new Date(conv.last_active).toLocaleString()}
+                                >
+                                  {formatRelativeTime(conv.last_active)}
+                                </span>
                                 {conv.git_branch && (
                                   <span className="flex min-w-0 items-center gap-0.5">
                                     <GitBranch size={8} />
                                     <span className="truncate">{conv.git_branch}</span>
                                   </span>
                                 )}
+                                {conv.cwd && (
+                                  <span
+                                    className="flex min-w-0 items-center gap-0.5"
+                                    title={
+                                      conv.resumable ? `Resume opens in ${conv.cwd}` : conv.cwd
+                                    }
+                                  >
+                                    <Folder size={8} />
+                                    <span className="truncate">{dirBasename(conv.cwd)}</span>
+                                  </span>
+                                )}
                               </span>
+                              {!conv.resumable && (
+                                <span className="mt-0.5 flex items-center gap-1 text-[9px] font-medium text-maestro-red">
+                                  <Ban size={8} className="shrink-0" />
+                                  <span className="truncate">
+                                    Not resumable — {conv.resume_blocked_reason ?? "unknown reason"}
+                                  </span>
+                                </span>
+                              )}
                             </span>
                           </button>
                         );

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // The persisted zustand stores hydrate through the Tauri store plugin at
@@ -113,11 +113,15 @@ function mockInvoke() {
         return [
           {
             session_id: "11111111-2222-3333-4444-555555555555",
+            summary: null,
             first_prompt: "Fix the login bug",
+            last_prompt: "Fix the login bug",
             started_at: "2026-07-29T08:00:00Z",
             last_active: "2026-07-29T09:00:00Z",
             git_branch: "feat/login",
             cwd: WORKTREE_PATH,
+            resumable: true,
+            resume_blocked_reason: null,
           },
         ];
       case "git_worktree_list":
@@ -230,9 +234,11 @@ describe("Sidebar tab bar", () => {
     expect(scanned).toContain(WORKTREE_PATH);
   });
 
-  it("History tab falls back to the project path when the directory is gone", async () => {
+  it("History tab marks a conversation whose directory is gone as not resumable", async () => {
     usePendingLaunchStore.setState({ pending: [] });
-    // A deleted worktree: the backend nulls out cwd so the shell can still spawn.
+    // A deleted worktree: the backend keeps the recorded cwd for display but
+    // flags the session non-resumable — `claude --resume` only works from the
+    // transcript's own directory, which no longer exists.
     // Override only the History reads — other sections feed shared stores that
     // outlive the test, so they must keep their well-formed shapes.
     const base = invokeMock.getMockImplementation()!;
@@ -241,11 +247,15 @@ describe("Sidebar tab bar", () => {
         return [
           {
             session_id: "99999999-8888-7777-6666-555555555555",
+            summary: null,
             first_prompt: "Work in a deleted worktree",
+            last_prompt: "Work in a deleted worktree",
             started_at: "2026-07-29T08:00:00Z",
             last_active: "2026-07-29T09:00:00Z",
             git_branch: "feat/gone",
-            cwd: null,
+            cwd: "C:\\worktrees\\deleted-feat",
+            resumable: false,
+            resume_blocked_reason: "its directory no longer exists",
           },
         ];
       }
@@ -257,12 +267,57 @@ describe("Sidebar tab bar", () => {
     fireEvent.click(screen.getByRole("button", { name: "History" }));
     fireEvent.click(screen.getByRole("button", { name: /maestro/ }));
 
-    fireEvent.click(await screen.findByText("Work in a deleted worktree"));
+    const row = (await screen.findByText("Work in a deleted worktree")).closest("button");
+    expect(row).not.toBeNull();
+    // The marker and its reason are visible on the row, not just a tooltip.
+    expect(screen.getByText(/Not resumable — its directory no longer exists/)).toBeInTheDocument();
+    // Where it ran is still shown (folder name of the recorded cwd).
+    expect(screen.getByText("deleted-feat")).toBeInTheDocument();
 
-    expect(usePendingLaunchStore.getState().pending[0]).toMatchObject({
-      resumeSessionId: "99999999-8888-7777-6666-555555555555",
-      workingDirOverride: null,
+    // Resume is disabled: clicking must not queue a launch.
+    expect(row).toBeDisabled();
+    fireEvent.click(row as HTMLButtonElement);
+    expect(usePendingLaunchStore.getState().pending).toHaveLength(0);
+  });
+
+  it("History tab shows the summary as title, plus branch and folder, on resumable rows", async () => {
+    usePendingLaunchStore.setState({ pending: [] });
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "list_claude_sessions") {
+        if ((args as { projectPath?: string })?.projectPath !== WORKTREE_PATH) return [];
+        return [
+          {
+            session_id: "11111111-2222-3333-4444-555555555555",
+            summary: "Login flow rework",
+            first_prompt: "Fix the login bug",
+            last_prompt: "now fix the flaky login test",
+            started_at: "2026-07-29T08:00:00Z",
+            last_active: "2026-07-29T09:00:00Z",
+            git_branch: "feat/login",
+            cwd: WORKTREE_PATH,
+            resumable: true,
+            resume_blocked_reason: null,
+          },
+        ];
+      }
+      return base(cmd, args);
     });
+
+    render(<ControlledSidebar />);
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    fireEvent.click(screen.getByRole("button", { name: /maestro/ }));
+
+    // Identity: Claude's title leads, the first prompt stays visible below it.
+    const title = await screen.findByText("Login flow rework");
+    const row = title.closest("button") as HTMLButtonElement;
+    expect(within(row).getByText("Fix the login bug")).toBeInTheDocument();
+    // Where it ran: branch and the cwd's folder name.
+    expect(within(row).getByText("feat/login")).toBeInTheDocument();
+    expect(within(row).getByText("feat-login")).toBeInTheDocument();
+    // Where resume opens is spelled out on the row.
+    expect(row).toHaveAttribute("title", `Resume this conversation in ${WORKTREE_PATH}`);
+    expect(row).toBeEnabled();
   });
 
   it("History tab launches an agent into a surviving worktree", async () => {

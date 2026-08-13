@@ -204,16 +204,25 @@ export async function checkCliAvailable(command: string): Promise<boolean> {
 /** Info about a previous Claude Code session that can be resumed. */
 export interface ClaudeSessionInfo {
   session_id: string;
+  /** Conversation title from a transcript summary entry, when Claude wrote one. */
+  summary: string | null;
   first_prompt: string | null;
+  /** Most recent user prompt — where a long conversation left off. */
+  last_prompt: string | null;
   started_at: string;
   last_active: string;
   git_branch: string | null;
   /**
-   * Directory the conversation ran in, or null when it no longer exists.
+   * Directory the conversation ran in, as recorded in the transcript — kept
+   * even when the directory no longer exists so the UI can say where it ran.
    * `claude --resume` only finds a session from this directory, so a resume
-   * launch must use it as the working directory.
+   * launch must use it as the working directory; check `resumable` first.
    */
   cwd: string | null;
+  /** True when the recorded directory still exists, so a resume can spawn there. */
+  resumable: boolean;
+  /** Why the conversation cannot resume, when `resumable` is false. */
+  resume_blocked_reason: string | null;
 }
 
 /** Lists previous Claude Code sessions for a project from Claude's native storage. */
