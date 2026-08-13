@@ -462,6 +462,101 @@ describe("LaunchSection (issue #63)", () => {
     ).toBeInTheDocument();
   });
 
+  it("shows an immediate spinner and dims the row while the delete is in flight, then removes it on success (issue #99)", async () => {
+    let resolveCleanup: (report: unknown) => void = () => {};
+    // The list still reports the run until the cleanup actually lands — the
+    // mock flips to empty only once the cleanup promise resolves, so a
+    // premature refresh (were the component to race one) would not
+    // accidentally make this assertion pass.
+    let listedRuns: SamuraiRunListEntry[] = [run()];
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "samurai_preflight":
+          return passPreflight();
+        case "samurai_list_runs":
+          return listedRuns;
+        case "get_claude_usage":
+          return buildUsage();
+        case "samurai_cleanup_epic":
+          return new Promise((resolve) => {
+            resolveCleanup = resolve;
+          });
+        case "samurai_default_workflow":
+          return workflowGraph();
+        default:
+          return undefined;
+      }
+    });
+    askMock.mockResolvedValue(true);
+    render(<LaunchSection />);
+
+    const trashButton = await screen.findByRole("button", { name: "Clean up epic #38" });
+    fireEvent.click(trashButton);
+    await waitFor(() => expect(askMock).toHaveBeenCalledTimes(1));
+
+    // The cleanup call is still pending (resolveCleanup not called yet), but
+    // the button is already disabled and shows the spinner, and the row
+    // reads as pending — all before the backend answers.
+    await waitFor(() => expect(trashButton).toBeDisabled());
+    expect(trashButton.querySelector("svg.animate-spin")).toBeTruthy();
+    const rowEl = trashButton.parentElement?.parentElement;
+    expect(rowEl).toHaveClass("opacity-60");
+    expect(callsOf("samurai_cleanup_epic")).toHaveLength(1);
+
+    await act(async () => {
+      listedRuns = [];
+      resolveCleanup({
+        epic: "#38",
+        branch: "samurai-38",
+        timer_cancelled: true,
+        config_archived: true,
+        worktree_removed: true,
+        worktree_path: "C:\\data\\worktrees\\maestro-abc\\samurai-38",
+        branch_deleted: true,
+        spawn_cancelled: false,
+      });
+    });
+
+    await waitFor(() => expect(screen.queryByText("#38")).not.toBeInTheDocument());
+  });
+
+  it("surfaces a rejected delete as an inline row error instead of silently reverting (issue #99)", async () => {
+    mockInvoke({ runs: [run()] });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "samurai_preflight":
+          return passPreflight();
+        case "samurai_list_runs":
+          return [run()];
+        case "get_claude_usage":
+          return buildUsage();
+        case "samurai_cleanup_epic":
+          throw "cleanup refused: worktree has uncommitted changes";
+        case "samurai_default_workflow":
+          return workflowGraph();
+        default:
+          return undefined;
+      }
+    });
+    askMock.mockResolvedValue(true);
+    render(<LaunchSection />);
+
+    const trashButton = await screen.findByRole("button", { name: "Clean up epic #38" });
+    fireEvent.click(trashButton);
+
+    // The row survives (the delete failed) and shows the failure in place —
+    // not a bare revert to the pre-click row, and not just the form's
+    // top-level error line.
+    expect(
+      await screen.findByText(/cleanup refused: worktree has uncommitted changes/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("#38")).toBeInTheDocument();
+    expect(trashButton).toBeEnabled();
+    expect(trashButton.querySelector("svg.animate-spin")).toBeFalsy();
+    const rowEl = trashButton.parentElement?.parentElement;
+    expect(rowEl).not.toHaveClass("opacity-60");
+  });
+
   it("shows a COMPLETED run as finished-awaiting-cleanup, distinct from live (issue #96)", async () => {
     mockInvoke({ runs: [run(), run({ epic: "#39", status: "COMPLETED" })] });
     render(<LaunchSection />);

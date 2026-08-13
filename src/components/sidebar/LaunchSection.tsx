@@ -258,20 +258,37 @@ function ModelPicker({
   );
 }
 
+/** Stable per-row identity — project + epic, matching the list `key` (an
+ *  epic name alone is not unique across projects). */
+function runKey(run: SamuraiRunListEntry): string {
+  return `${run.project_path}-${run.epic}`;
+}
+
 /** One listed run (live or finished-awaiting-cleanup) with its cleanup action. */
 function RunRow({
   run,
   onCleanup,
-  busy,
+  pending,
+  otherBusy,
+  error,
 }: {
   run: SamuraiRunListEntry;
   onCleanup: (run: SamuraiRunListEntry) => void;
-  busy: boolean;
+  /** Issue #99: this exact row's cleanup is in flight — spinner + dimmed row
+   *  until the backend answers, so the click reads as "working" immediately
+   *  instead of doing nothing for several seconds. */
+  pending: boolean;
+  /** A different row's cleanup is in flight — this row waits too, so two
+   *  cleanups never race. */
+  otherBusy: boolean;
+  /** The last cleanup attempt for this row failed — shown in place rather
+   *  than silently reverting to the pre-click row (issue #99). */
+  error: string | null;
 }) {
   const isCompleted = run.status === "COMPLETED";
   return (
     <div
-      className="rounded px-1 py-0.5 hover:bg-maestro-surface"
+      className={`rounded px-1 py-0.5 hover:bg-maestro-surface ${pending ? "opacity-60" : ""}`}
       title={`worktree: ${run.worktree_path}\nrepo pin: ${run.repo_pin ?? "none"}\ncreated: ${run.created_at}`}
     >
       <div className="flex items-center gap-1.5 text-[11px]">
@@ -297,17 +314,25 @@ function RunRow({
         <button
           type="button"
           onClick={() => onCleanup(run)}
-          disabled={busy}
+          disabled={pending || otherBusy}
           className="rounded p-1 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-red disabled:opacity-40"
           aria-label={`Clean up epic ${run.epic}`}
           title="Delete this epic's worktree and branch, cancel its timer, archive its run config (asks first)"
         >
-          <Trash2 size={12} />
+          {pending ? <Loader2 size={12} className="animate-spin" /> : <Trash2 size={12} />}
         </button>
       </div>
       {/* Issue #102: the orchestrator's live details — a COMPLETED run's
           context reading is no longer live, so the meter is omitted. */}
       <OrchestratorDetails orchestrator={run.orchestrator} showLiveContext={!isCompleted} />
+      {error && (
+        <p className="mt-0.5 flex items-center gap-1 pl-1 text-[10px] text-maestro-red">
+          <XCircle size={10} className="shrink-0" />
+          <span className="min-w-0 flex-1 truncate" title={error}>
+            {error}
+          </span>
+        </p>
+      )}
     </div>
   );
 }
@@ -394,7 +419,11 @@ export function LaunchSection() {
   const [notice, setNotice] = useState<string | null>(null);
   // null = loading.
   const [runs, setRuns] = useState<SamuraiRunListEntry[] | null>(null);
-  const [cleaningEpic, setCleaningEpic] = useState<string | null>(null);
+  // Issue #99: which row's cleanup is in flight (keyed like the list — an
+  // epic name alone is not unique across projects), plus the last failed
+  // row's error so the row can render it in place.
+  const [deletingKey, setDeletingKey] = useState<string | null>(null);
+  const [rowError, setRowError] = useState<{ key: string; message: string } | null>(null);
 
   const refreshRuns = useCallback(async () => {
     try {
@@ -544,7 +573,12 @@ export function LaunchSection() {
       { title: "Clean Up Epic", kind: "warning" },
     ).catch(() => false);
     if (!confirmed) return;
-    setCleaningEpic(run.epic);
+    const key = runKey(run);
+    // Issue #99: pending lands in the same tick as the confirm, before the
+    // backend call even starts — the row shows a spinner immediately rather
+    // than sitting inert for the several seconds the delete actually takes.
+    setDeletingKey(key);
+    setRowError(null);
     setError(null);
     setNotice(null);
     try {
@@ -563,9 +597,12 @@ export function LaunchSection() {
       );
       await refreshRuns();
     } catch (err) {
-      setError(String(err));
+      // Surfaced on the row itself rather than the form's error line —
+      // reverting to the pre-click row with no explanation would look like
+      // nothing happened (issue #99).
+      setRowError({ key, message: String(err) });
     } finally {
-      setCleaningEpic(null);
+      setDeletingKey(null);
     }
   };
 
@@ -770,14 +807,19 @@ export function LaunchSection() {
           </p>
         ) : (
           <div className="space-y-0.5">
-            {runs.map((run) => (
-              <RunRow
-                key={`${run.project_path}-${run.epic}`}
-                run={run}
-                onCleanup={handleCleanup}
-                busy={cleaningEpic !== null}
-              />
-            ))}
+            {runs.map((run) => {
+              const key = runKey(run);
+              return (
+                <RunRow
+                  key={key}
+                  run={run}
+                  onCleanup={handleCleanup}
+                  pending={deletingKey === key}
+                  otherBusy={deletingKey !== null && deletingKey !== key}
+                  error={rowError?.key === key ? rowError.message : null}
+                />
+              );
+            })}
           </div>
         )}
       </div>
