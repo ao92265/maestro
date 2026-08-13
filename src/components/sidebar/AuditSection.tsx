@@ -1,6 +1,6 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
-import { Loader2, RefreshCw, ScrollText, Trash2 } from "lucide-react";
+import { ChevronRight, Loader2, RefreshCw, ScrollText, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { samePath } from "@/lib/path";
 import {
@@ -24,15 +24,20 @@ const KIND_BADGES: Record<SamuraiAuditEventKind, string> = {
   RESUME: "bg-maestro-accent/20 text-maestro-accent",
   COMPLETE: "bg-maestro-green/20 text-maestro-green",
   ALERT: "bg-red-500/15 text-red-400",
+  INJECT: "bg-maestro-orange/20 text-maestro-orange",
 };
 
-/** `kind=allowance_threshold window=5h …` — flat scalars only, zero polish. */
+/**
+ * `kind=allowance_threshold window=5h …` — flat scalars only, zero polish.
+ * The instruction excerpt (issue #101) is excluded here: it is a long text
+ * block that would drown the one-line summary — the expanded row shows it.
+ */
 function summarizeDetails(details: unknown): string {
   if (details === null || details === undefined) return "";
   if (typeof details === "string") return details;
   if (typeof details === "object") {
     return Object.entries(details as Record<string, unknown>)
-      .filter(([, v]) => v !== null && v !== undefined && typeof v !== "object")
+      .filter(([k, v]) => v !== null && v !== undefined && typeof v !== "object" && k !== "excerpt")
       .map(([k, v]) => `${k}=${String(v)}`)
       .join(" ");
   }
@@ -48,26 +53,99 @@ function formatTs(ts: string): string {
     : d.toLocaleString();
 }
 
+/**
+ * Expanded replay details for one row (issue #101): every scalar detail as a
+ * labelled line, the bounded instruction excerpt as a wrapped block, and the
+ * row's identity (full timestamp, epic, generation, session). Old rows
+ * without the new fields render whatever they do carry — every field is
+ * optional by construction.
+ */
+function AuditRowDetails({ event }: { event: SamuraiAuditEvent }) {
+  const details =
+    event.details && typeof event.details === "object" && !Array.isArray(event.details)
+      ? (event.details as Record<string, unknown>)
+      : null;
+  const excerpt = details && typeof details.excerpt === "string" ? details.excerpt : null;
+  const totalChars =
+    details && typeof details.total_chars === "number" ? details.total_chars : null;
+  const excerptChars = excerpt === null ? 0 : [...excerpt].length;
+  // The excerpt gets its own block below; total_chars rides in its label.
+  const lines = details
+    ? Object.entries(details).filter(
+        ([key, value]) =>
+          key !== "excerpt" && key !== "total_chars" && value !== null && value !== undefined,
+      )
+    : [];
+  return (
+    <div className="mb-0.5 ml-3 space-y-1 rounded border-l-2 border-maestro-border bg-maestro-surface/50 px-2 py-1.5 text-[10px]">
+      <p className="break-words text-maestro-muted/80">
+        {event.ts}
+        {event.epic ? ` · epic ${event.epic}` : ""} · gen-{event.generation} · session{" "}
+        {event.session_id}
+      </p>
+      {lines.length > 0 && (
+        <dl className="space-y-px">
+          {lines.map(([key, value]) => (
+            <div key={key} className="flex gap-1.5">
+              <dt className="shrink-0 font-semibold text-maestro-muted">{key}</dt>
+              <dd className="min-w-0 break-words text-maestro-text">
+                {typeof value === "string" ? value : JSON.stringify(value)}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      )}
+      {details === null && event.details !== null && event.details !== undefined && (
+        <p className="break-words text-maestro-text">{JSON.stringify(event.details)}</p>
+      )}
+      {excerpt !== null && (
+        <div>
+          <p className="font-semibold text-maestro-muted">
+            instruction excerpt
+            {totalChars !== null && totalChars > excerptChars
+              ? ` (first ${excerptChars} of ${totalChars} chars)`
+              : ""}
+          </p>
+          <p className="whitespace-pre-wrap break-words rounded bg-maestro-bg px-1.5 py-1 font-mono text-maestro-text">
+            {excerpt}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AuditRow({ event }: { event: SamuraiAuditEvent }) {
+  const [expanded, setExpanded] = useState(false);
   const badgeCls = KIND_BADGES[event.event] ?? "bg-maestro-muted/15 text-maestro-muted";
   const summary = summarizeDetails(event.details);
   return (
-    <div
-      className="flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] hover:bg-maestro-surface"
-      title={`${event.ts}${event.epic ? `\nepic: ${event.epic}` : ""}\n${JSON.stringify(
-        event.details ?? {},
-        null,
-        2,
-      )}`}
-    >
-      <span
-        className={`shrink-0 whitespace-nowrap rounded px-1 py-px text-[9px] font-bold tracking-wide ${badgeCls}`}
+    <div>
+      <button
+        type="button"
+        onClick={() => setExpanded((open) => !open)}
+        aria-expanded={expanded}
+        className="flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left text-[11px] hover:bg-maestro-surface"
+        title={`${event.ts}${event.epic ? `\nepic: ${event.epic}` : ""}\n${JSON.stringify(
+          event.details ?? {},
+          null,
+          2,
+        )}`}
       >
-        {event.event}
-      </span>
-      <span className="shrink-0 text-maestro-muted">gen-{event.generation}</span>
-      <span className="min-w-0 flex-1 truncate text-maestro-text">{summary}</span>
-      <span className="shrink-0 text-[10px] text-maestro-muted/70">{formatTs(event.ts)}</span>
+        <ChevronRight
+          size={10}
+          className={`shrink-0 text-maestro-muted transition-transform ${expanded ? "rotate-90" : ""}`}
+        />
+        <span
+          className={`shrink-0 whitespace-nowrap rounded px-1 py-px text-[9px] font-bold tracking-wide ${badgeCls}`}
+        >
+          {event.event}
+        </span>
+        <span className="shrink-0 text-maestro-muted">gen-{event.generation}</span>
+        <span className="min-w-0 flex-1 truncate text-maestro-text">{summary}</span>
+        <span className="shrink-0 text-[10px] text-maestro-muted/70">{formatTs(event.ts)}</span>
+      </button>
+      {expanded && <AuditRowDetails event={event} />}
     </div>
   );
 }
@@ -76,8 +154,10 @@ function AuditRow({ event }: { event: SamuraiAuditEvent }) {
  * Minimal Samurai audit stream (issue #46, Phase 1): the active project's
  * audit rows newest-first, live-appended from `samurai-audit-event`, with the
  * manual clear (PRD §5.10: the user deletes audit records — human oversight).
- * Deliberately zero polish — no filters, no virtualization; Phase 4 absorbs
- * this into the Second Brain panel (PRD §5.11).
+ * Issue #101 adds expandable rows: clicking one opens its replay details
+ * (instruction excerpts, ACK results, handoff file + WIP commit, spawn
+ * triggers) as a readable timeline; the raw JSON stays on the row tooltip.
+ * Deliberately zero polish otherwise — no filters, no virtualization.
  */
 export function AuditSection() {
   const tabs = useWorkspaceStore((s) => s.tabs);

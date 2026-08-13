@@ -37,8 +37,19 @@ export interface SamuraiSessionSnapshot {
   ts: string;
 }
 
-/** Audit row kinds (PRD §5.10). Sub-kinds live in `details.kind`. */
-export type SamuraiAuditEventKind = "SPAWN" | "HANDOFF" | "PARK" | "RESUME" | "COMPLETE" | "ALERT";
+/**
+ * Audit row kinds (PRD §5.10). Sub-kinds live in `details.kind`.
+ * `INJECT` (issue #101) records every instruction Maestro typed into an
+ * orchestrator terminal — `details.phase` is `"delivered"` or `"acked"`.
+ */
+export type SamuraiAuditEventKind =
+  | "SPAWN"
+  | "HANDOFF"
+  | "PARK"
+  | "RESUME"
+  | "COMPLETE"
+  | "ALERT"
+  | "INJECT";
 
 /** One audit JSONL row — mirrors the Rust `AuditEvent`. */
 export interface SamuraiAuditEvent {
