@@ -96,6 +96,15 @@ pub fn soft_winddown_ack_value(generation: u32) -> String {
 /// and scanner can never drift (the `handoff_ack_value` discipline).
 pub const RUN_COMPLETE_TAG: &str = "samurai-run-complete";
 
+/// The execution-order deviation alert tag (issue #93). When an orchestrator
+/// disagrees with the user's issue order it replies with
+/// `<samurai-order-alert>original: …; proposed: …; reasoning: …</samurai-order-alert>`
+/// and WAITS in its terminal; the scanner (`samurai_completion`) turns the
+/// tag into an `order_deviation` ALERT audit row — the same surfacing path
+/// every samurai ALERT takes. Built here so instruction and scanner can
+/// never drift (the `handoff_ack_value` discipline).
+pub const ORDER_ALERT_TAG: &str = "samurai-order-alert";
+
 /// The completion-declaration clause every orchestrator brief carries
 /// (issue #96): gen-1 and every successor must be TOLD to declare completion
 /// — nothing else ever finishes a run (the human's cleanup stays a separate
@@ -115,6 +124,61 @@ fn completion_declaration_clause() -> String {
          actually true. Never quote, restate, or echo this marker string anywhere else in any \
          reply — emit it exactly once, only as the actual signal at that moment.",
         tag = RUN_COMPLETE_TAG
+    )
+}
+
+/// The execution-order contract for the gen-1 launch brief (issue #93): the
+/// order the user gave the issues in IS the execution order, worked strictly
+/// sequentially; gen-1's FIRST step — before touching any code — is to
+/// validate that order against the real dependencies it reads, and any
+/// deviation needs the user's explicit confirmation, requested via the
+/// [`ORDER_ALERT_TAG`] marker the `samurai_completion` watcher turns into an
+/// ALERT audit row (the user answers in the terminal — no reply plumbing).
+/// `is_list` keeps the #87 no-epic-framing contract. Single line by
+/// construction (see module doc).
+fn order_contract_clause(is_list: bool) -> String {
+    let listed = if is_list {
+        "the order in which the issues are listed above"
+    } else {
+        "the order in which the epic lists its child issues"
+    };
+    format!(
+        " ORDER: {listed} is the EXECUTION ORDER — work the issues strictly \
+         sequentially, one at a time, in exactly that order by default. Your FIRST step \
+         after reading the issues, before touching ANY code, is to validate that order \
+         against the real dependencies you find. If you agree with it, proceed in that \
+         order without comment. If you believe a different order is required, STOP \
+         before any code and raise an attention alert by replying with a message that \
+         contains <{tag}>original: <the given order>; proposed: <your order>; \
+         reasoning: <why></{tag}> with the real orders and reasoning, then WAIT for the \
+         user's answer in this terminal and proceed only in the order the user confirms \
+         — NEVER silently reorder. Never quote, restate, or echo this marker string \
+         anywhere else in any reply — emit it at most once, only as the actual alert.",
+        tag = ORDER_ALERT_TAG
+    )
+}
+
+/// The execution-order reminder successor and recovery briefs carry (issue
+/// #93): the order was fixed at launch (the user's listed order, plus any
+/// deviation the user explicitly confirmed since) — successors must NOT
+/// re-plan it; a new deviation goes through the same [`ORDER_ALERT_TAG`]
+/// alert and the user's confirmation. Deliberately epic-free wording (the
+/// #87 contract: a comma-separated list has no epic). Single line by
+/// construction (see module doc).
+fn order_contract_reminder() -> String {
+    format!(
+        " ORDER: the execution order for this run was fixed at launch — the order the \
+         user originally listed the issues, plus any deviation the user has explicitly \
+         confirmed since. Do NOT re-plan it: continue strictly sequentially in that \
+         established order. If you believe a deviation is now required, STOP before \
+         touching any code and raise an attention alert by replying with a message \
+         that contains <{tag}>original: <the established order>; proposed: <your \
+         order>; reasoning: <why></{tag}> with the real orders and reasoning, then \
+         WAIT for the user's answer in this terminal and proceed only in the order the \
+         user confirms — NEVER silently reorder. Never quote, restate, or echo this \
+         marker string anywhere else in any reply — emit it at most once, only as the \
+         actual alert.",
+        tag = ORDER_ALERT_TAG
     )
 }
 
@@ -449,6 +513,7 @@ pub fn successor_ritual_instruction(
          generation {predecessor_generation}. Read the handoff file at {relpath} IN FULL before \
          doing anything else — it and GitHub are your only sources of truth."
     );
+    let order = order_contract_reminder();
     let clause = completion_declaration_clause();
     let pr_reminder = pr_discipline_reminder(is_list);
     if head_matched {
@@ -456,7 +521,7 @@ pub fn successor_ritual_instruction(
             "{opening} Maestro verified that this repository's current HEAD equals the SHA \
              recorded in the handoff's \"Repo state\" section, so the verify step is already \
              satisfied: SKIP the commands in the handoff's Verify section and continue directly \
-             with its Next steps.{clause} {pr_reminder}"
+             with its Next steps.{order}{clause} {pr_reminder}"
         )
     } else {
         format!(
@@ -464,7 +529,7 @@ pub fn successor_ritual_instruction(
              SHA recorded in the handoff's \"Repo state\" section. You MUST run every command in \
              the handoff's Verify section FIRST, and trust NOTHING the handoff claims that those \
              commands do not confirm — investigate and fix any failure before moving on. Only \
-             then continue with the handoff's Next steps.{clause} {pr_reminder}"
+             then continue with the handoff's Next steps.{order}{clause} {pr_reminder}"
         )
     }
 }
@@ -547,6 +612,7 @@ pub fn launch_instruction(epic: &str, repo_pin: Option<&str>) -> String {
                 .to_string(),
         ),
     };
+    let order = order_contract_clause(is_list);
     let clause = completion_declaration_clause();
     format!(
         "[Maestro Samurai] You are generation 1, the FIRST orchestrator, for {subject}. This \
@@ -571,7 +637,7 @@ pub fn launch_instruction(epic: &str, repo_pin: Option<&str>) -> String {
          `git add -A`; Conventional Commit messages `type(scope): summary`). \
          (5) {gh_progress}. \
          (6) NEVER switch to, commit to, or push any other branch, and NEVER touch any \
-         repository other than this one.{caution}{clause}"
+         repository other than this one.{caution}{order}{clause}"
     )
 }
 
@@ -650,6 +716,7 @@ pub fn recovery_ritual_instruction(
                 .to_string(),
         ),
     };
+    let order = order_contract_reminder();
     let clause = completion_declaration_clause();
     let pr_reminder = pr_discipline_reminder(is_list);
     format!(
@@ -663,7 +730,7 @@ pub fn recovery_ritual_instruction(
          Then run the project's standard verification (build + tests) BEFORE trusting or \
          continuing anything — investigate and fix any failure first. Once verification passes, \
          {gh_comment} that generation {generation} has taken over in \
-         recovery mode, then continue {remaining_work}.{caution}{clause} {pr_reminder}"
+         recovery mode, then continue {remaining_work}.{caution}{order}{clause} {pr_reminder}"
     )
 }
 
@@ -1398,6 +1465,80 @@ mod tests {
             // Still one paste-able line (module doc).
             assert!(!text.contains('\n'), "brief must stay a single line");
             assert!(!text.contains('\r'));
+        }
+    }
+
+    // --- issue #93: user issue order is the execution order ---
+
+    #[test]
+    fn test_launch_instruction_carries_the_order_contract() {
+        // The user's listed order IS the execution order; gen-1 validates it
+        // FIRST — before any code — and never silently reorders. A deviation
+        // goes through the order-alert marker + the user's answer in the
+        // terminal.
+        let epic = launch_instruction("#38", Some("nachogl1/maestro"));
+        assert!(
+            epic.contains("the order in which the epic lists its child issues"),
+            "{epic}"
+        );
+        // List shape stays epic-free (enforced by
+        // test_launch_instruction_list_shape_has_no_epic_framing).
+        let list = launch_instruction("#76, #77, #78", None);
+        assert!(
+            list.contains("the order in which the issues are listed above"),
+            "{list}"
+        );
+        for text in [epic, list] {
+            assert!(text.contains("EXECUTION ORDER"), "{text}");
+            assert!(text.contains("strictly sequentially"), "{text}");
+            assert!(text.contains("in exactly that order by default"), "{text}");
+            assert!(text.contains("FIRST step"), "{text}");
+            assert!(text.contains("before touching ANY code"), "{text}");
+            assert!(
+                text.contains("validate that order against the real dependencies"),
+                "{text}"
+            );
+            // Agreement is silent; deviation STOPs and alerts with BOTH
+            // orders + reasoning via the exact tag the watcher scans for.
+            assert!(text.contains("proceed in that order without comment"), "{text}");
+            assert!(text.contains("STOP before any code"), "{text}");
+            assert!(
+                text.contains(&format!("<{ORDER_ALERT_TAG}>original:")),
+                "{text}"
+            );
+            assert!(text.contains(&format!("</{ORDER_ALERT_TAG}>")), "{text}");
+            assert!(text.contains("proposed:"), "{text}");
+            assert!(text.contains("reasoning:"), "{text}");
+            assert!(text.contains("WAIT for the user's answer"), "{text}");
+            assert!(text.contains("NEVER silently reorder"), "{text}");
+            // Still one paste-able line (module doc).
+            assert!(!text.contains('\n'));
+        }
+    }
+
+    #[test]
+    fn test_successor_briefs_restate_the_order_contract() {
+        // Successors (normal AND recovery, epic AND list shape) inherit the
+        // order fixed at launch — they must not re-plan it, and a new
+        // deviation goes through the same alert + confirmation.
+        let briefs = [
+            successor_ritual_instruction("#37", 2, true),
+            successor_ritual_instruction("#37", 2, false),
+            successor_ritual_instruction("77, 78", 2, true),
+            recovery_ritual_instruction("#37", 2, Some("nachogl1/maestro")),
+            recovery_ritual_instruction("77, 78", 2, None),
+        ];
+        for text in &briefs {
+            assert!(text.contains("fixed at launch"), "{text}");
+            assert!(text.contains("Do NOT re-plan it"), "{text}");
+            assert!(text.contains("strictly sequentially"), "{text}");
+            assert!(
+                text.contains(&format!("<{ORDER_ALERT_TAG}>original:")),
+                "{text}"
+            );
+            assert!(text.contains("WAIT for the user's answer"), "{text}");
+            assert!(text.contains("NEVER silently reorder"), "{text}");
+            assert!(!text.contains('\n'));
         }
     }
 

@@ -34,6 +34,16 @@
 //! by construction — a replayed claim is re-verified against GitHub before
 //! anything flips — but each (session, claim) pair is processed once so a
 //! replay within one session cannot spam verifications or ALERTs.
+//!
+//! Issue #93 adds a tiny sibling arm on the same tee: the execution-order
+//! deviation alert. When an orchestrator disagrees with the user's issue
+//! order it replies with `<samurai-order-alert>original: …; proposed: …;
+//! reasoning: …</samurai-order-alert>` and WAITS in its terminal; the
+//! watcher turns the tag into an `order_deviation` ALERT audit row — the
+//! same surfacing every samurai ALERT gets (audit append →
+//! `samurai-audit-event` → the audit stream) — and nothing more: no
+//! verification, no config flip, and the user's answer travels back through
+//! the terminal, never through Maestro.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -44,7 +54,7 @@ use serde_json::json;
 
 use super::claude_event::ClaudeEvent;
 use super::samurai_audit::{AuditEvent, AuditEventKind, AuditLog};
-use super::samurai_prompts::RUN_COMPLETE_TAG;
+use super::samurai_prompts::{ORDER_ALERT_TAG, RUN_COMPLETE_TAG};
 use super::samurai_run_config::{RunConfigStatus, RunConfigStore};
 use super::supervisor::{SessionSnapshot, Supervisor};
 
@@ -52,6 +62,9 @@ use super::supervisor::{SessionSnapshot, Supervisor};
 pub const VERIFICATION_FAILED_KIND: &str = "completion_verification_failed";
 /// `details.kind` of the ALERT row an unparseable declaration lands.
 pub const DECLARATION_INVALID_KIND: &str = "completion_declaration_invalid";
+/// `details.kind` of the ALERT row an execution-order deviation lands
+/// (issue #93).
+pub const ORDER_DEVIATION_KIND: &str = "order_deviation";
 
 /// State of one GitHub issue, e.g. `"CLOSED"` — `gh issue view --json state`
 /// via `github::GitHub::get_issue`. Injected so tests never shell out (the
@@ -214,6 +227,10 @@ impl SamuraiCompletionWatcher {
         else {
             return;
         };
+        // Issue #93: the order-deviation arm rides the same scan. It never
+        // returns early, so a (pathological) reply carrying both markers
+        // still reaches the completion path below.
+        self.observe_order_alert(*session_id, text);
         let Some(parsed) = parse_completion_claim(text) else {
             return;
         };
@@ -262,6 +279,60 @@ impl SamuraiCompletionWatcher {
             }
             Ok(claim) => self.spawn_verification(session, claim),
         }
+    }
+
+    /// Issue #93: `<samurai-order-alert>…</samurai-order-alert>` from a
+    /// supervised session lands an ALERT audit row carrying the alert text
+    /// (both orders + reasoning — free prose, nothing to parse or verify),
+    /// which surfaces through the existing samurai alert path
+    /// (`samurai-audit-event` → the audit stream). The run config never
+    /// moves: the orchestrator is WAITING in its terminal and the user's
+    /// answer travels back through that terminal, never through Maestro. A
+    /// tag without its closing half is no marker at all, and a replayed
+    /// alert within one session is deduped exactly like a replayed claim
+    /// (module doc replay note; the `order-alert:` prefix keeps the two
+    /// marker kinds from ever colliding in the seen set).
+    fn observe_order_alert(&self, session_id: u32, text: &str) {
+        let Some(alert) = marker_value(text, ORDER_ALERT_TAG) else {
+            return;
+        };
+        {
+            let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+            if !seen.insert((session_id, format!("order-alert:{alert}"))) {
+                return;
+            }
+        }
+        // Same gate as the completion path: only a SUPERVISED session can
+        // raise the alert — any terminal could type the marker otherwise.
+        let Some(session) = self
+            .supervisor
+            .list_sessions()
+            .into_iter()
+            .find(|s| s.session_id == session_id && !s.state.is_terminal())
+        else {
+            log::warn!(
+                "samurai order alert: marker from session {session_id} with no live supervised session — ignored"
+            );
+            return;
+        };
+        log::warn!(
+            "samurai order alert: session {session_id} (epic {}) proposes an execution-order deviation and is WAITING for the user: {alert}",
+            session.epic
+        );
+        self.audit.append(
+            &session.project,
+            AuditEvent::now(
+                session.epic.clone(),
+                AuditEventKind::Alert,
+                session.generation,
+                session.session_id,
+                json!({
+                    "kind": ORDER_DEVIATION_KIND,
+                    "epic": session.epic,
+                    "alert": alert,
+                }),
+            ),
+        );
     }
 
     /// Runs the `gh` checks off the tee and applies the verdict. The run
@@ -765,6 +836,60 @@ mod tests {
             "one issue probe + one PR probe — the replay is deduped"
         );
         assert_eq!(rows(&h.audit, AuditEventKind::Complete).await.len(), 1);
+    }
+
+    // --- issue #93: execution-order deviation alerts ---
+
+    fn order_alert(value: &str) -> String {
+        format!("stopping here. <{ORDER_ALERT_TAG}>{value}</{ORDER_ALERT_TAG}> waiting")
+    }
+
+    #[tokio::test]
+    async fn test_order_alert_lands_alert_row_and_config_stays_active() {
+        let h = harness(HashMap::new(), HashMap::new());
+        launch_epic(&h, 4, "#38", 1);
+
+        let value = "original: #76 #77; proposed: #77 #76; reasoning: #77 blocks #76";
+        h.watcher.observe(&reply(4, &order_alert(value)));
+
+        let alerts = wait_for_alerts(&h.audit).await;
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].details["kind"], ORDER_DEVIATION_KIND);
+        assert_eq!(alerts[0].details["alert"], value);
+        assert_eq!(alerts[0].epic, "#38");
+        assert_eq!(alerts[0].generation, 1);
+        assert_eq!(alerts[0].session_id, 4);
+        // Surfacing only: no gh probe, no config flip, no COMPLETE row.
+        assert!(h.calls.lock().unwrap().is_empty(), "no gh probe may run");
+        assert_eq!(status(&h, "#38"), RunConfigStatus::Active);
+        assert!(rows(&h.audit, AuditEventKind::Complete).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_order_alert_malformed_unsupervised_and_replayed_are_contained() {
+        let h = harness(HashMap::new(), HashMap::new());
+        launch_epic(&h, 4, "#38", 1);
+
+        // A tag without its closing half is no marker at all — no ALERT,
+        // no flip, no panic.
+        h.watcher
+            .observe(&reply(4, &format!("<{ORDER_ALERT_TAG}>unclosed")));
+        // A session nobody supervises cannot raise the alert.
+        h.watcher
+            .observe(&reply(99, &order_alert("original: 1; proposed: 2; reasoning: x")));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rows(&h.audit, AuditEventKind::Alert).await.is_empty());
+        assert_eq!(status(&h, "#38"), RunConfigStatus::Active);
+
+        // A replayed alert (`claude --resume` re-reads the transcript from
+        // byte 0) lands exactly ONE row.
+        let text = order_alert("original: #1 #2; proposed: #2 #1; reasoning: deps");
+        h.watcher.observe(&reply(4, &text));
+        h.watcher.observe(&reply(4, &text));
+        let alerts = wait_for_alerts(&h.audit).await;
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(status(&h, "#38"), RunConfigStatus::Active);
     }
 
     #[tokio::test]
