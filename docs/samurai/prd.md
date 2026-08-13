@@ -134,6 +134,8 @@ Every successor — after handoff, park, crash, machine reboot, or app auto-upda
 
 Each epic gets its own git worktree (existing `WorktreeManager`) with a **stable path across generations**. This kills the known shared-checkout hazard (agents switching branches under each other / staging foreign files into WIP commits). Epic completion offers one-click cleanup (worktree + branch) — surfaced in the UI, never silent, because deleting git state is destructive.
 
+**Within-epic issue work is sequential by design** (issue #91): the orchestrator works strictly one issue at a time through the run's workflow — implement via small subagent steps → fresh-eyes review of that issue's diff → QA report committed to the branch → push — before taking up the next issue, then a batch phase (whole-branch review for cross-issue defects → batch QA using the committed per-issue reports → the PR readied for the HUMAN merge decision). The workflow is compiled into every orchestrator brief from the graph the run config snapshots at launch (editable in the launcher; default = the canonical chain above). It is instruction, not machinery — Maestro enforces no steps in v1.
+
 **Completion is DECLARE + VERIFY** (issue #96): the orchestrator declares completion (`<samurai-run-complete>issues #a #b pr #n</samurai-run-complete>`, instructed in every brief), then Maestro verifies via `gh` that every claimed issue is closed AND the claimed PR is open before flipping the run config ACTIVE → COMPLETED. Neither an unverified declaration nor GitHub state alone ever flips it. A COMPLETED run shows as finished-awaiting-cleanup, cold-start reconciliation skips it, and the manual cleanup above stays the separate step that archives it.
 
 ### 5.10 Audit log
@@ -272,7 +274,7 @@ On disk but not re-rendered in-app (existing tools own them): Claude Code transc
 
 Epic: 15 issues. You write the run config in the launcher, hit start, walk away.
 
-- **T+0** — Preflight passes (gh auth, windows reported). Maestro creates the epic worktree, spawns **gen-1**, audit: `SPAWN`. Gen-1 reads the GitHub epic, plans, spawns `dev-issue-101`, `dev-issue-102`.
+- **T+0** — Preflight passes (gh auth, windows reported). Maestro creates the epic worktree, spawns **gen-1**, audit: `SPAWN`. Gen-1 reads the GitHub epic, validates the issue order, plans — then works the issues strictly ONE at a time through the run's workflow: `dev-issue-101` is implemented (small subagent steps, per-step commits), fresh-eyes reviewed, QA-reported (report committed to the branch) and pushed before `dev-issue-102` begins (within-epic issue work is sequential by design, §5.9).
 - **T+3h** — context crosses 40%. Watchdog waits for idle, injects "prepare handoff", gets ACK. Gen-1 lets `dev-issue-103` finish its step, writes `epic12-gen1.md`, commits WIP. Audit: `HANDOFF`. Maestro tree-kills gen-1, spawns **gen-2** at 0% context; gen-2 runs verify (HEAD matches → skipped), continues.
 - **T+4.5h** — 5h window hits 78%: soft threshold — no new subagents. At 90%: park. Gen-2 finishes its atomic step, updates the handoff, commits. Audit: `PARK`. Timer armed for reset+5min (persisted to disk).
 - **T+5h** — Windows applies an update and reboots. On next Maestro launch, cold-start reconciliation finds the live epic and the pending timer.
