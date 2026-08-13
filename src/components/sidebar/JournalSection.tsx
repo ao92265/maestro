@@ -1,13 +1,16 @@
+import { ask } from "@tauri-apps/plugin-dialog";
 // The spec asks for NotebookPen, which lucide-react 0.300.0 does not ship —
 // PenLine is the closest journal-writing glyph available.
-import { Loader2, PenLine, Plus, RefreshCw, Sparkles } from "lucide-react";
+import { Loader2, PenLine, Plus, RefreshCw, Sparkles, Trash2 } from "lucide-react";
 import type { FormEvent } from "react";
 import { useCallback, useEffect, useState } from "react";
 import {
   type SamuraiJournalCategory,
   type SamuraiJournalEntry,
   type SamuraiJournalEntryStatus,
+  type SamuraiJournalListEntry,
   samuraiJournalAdd,
+  samuraiJournalDelete,
   samuraiJournalList,
 } from "@/lib/samurai";
 import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
@@ -54,9 +57,14 @@ function formatTs(ts: string): string {
 function JournalRow({
   entry,
   status,
+  busy,
+  onDelete,
 }: {
   entry: SamuraiJournalEntry;
   status: SamuraiJournalEntryStatus;
+  busy: boolean;
+  /** Deletable whether UNCONSUMED, CONSUMED or ARCHIVED (issue #100). */
+  onDelete: () => void;
 }) {
   const badgeCls = CATEGORY_BADGES[entry.category] ?? "bg-maestro-muted/15 text-maestro-muted";
   // CONSUMED/ARCHIVED entries went into a harvest already — muted, labeled.
@@ -90,6 +98,16 @@ function JournalRow({
         </span>
       )}
       <span className="shrink-0 text-[10px] text-maestro-muted/70">{formatTs(entry.ts)}</span>
+      <button
+        type="button"
+        onClick={onDelete}
+        disabled={busy}
+        className="shrink-0 rounded p-1 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-red disabled:opacity-40"
+        aria-label={`Delete journal entry: ${entry.text}`}
+        title="Delete this journal entry (asks first)"
+      >
+        <Trash2 size={12} />
+      </button>
     </div>
   );
 }
@@ -113,9 +131,7 @@ export function JournalSection() {
   const projectPath = activeTab?.projectPath ?? "";
 
   // null = loading; rows are kept newest-first (the backend lists newest LAST).
-  const [rows, setRows] = useState<
-    { entry: SamuraiJournalEntry; status: SamuraiJournalEntryStatus }[] | null
-  >(null);
+  const [rows, setRows] = useState<SamuraiJournalListEntry[] | null>(null);
   // Full entry count from the last good list — the rows above are capped at
   // JOURNAL_TAIL, and the header badge must not lie about the journal's size.
   const [totalEntries, setTotalEntries] = useState(0);
@@ -164,6 +180,32 @@ export function JournalSection() {
     try {
       await samuraiJournalAdd(category, trimmed, projectPath || undefined);
       setText("");
+      await refresh();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /**
+   * Deletes one journal entry (issue #100), guarded confirm first (PRD
+   * §5.11 precedent — destructive, never silent). Consumed/archived entries
+   * are deletable too: harvest status only reflects triage, not whether the
+   * observation is worth keeping.
+   */
+  const handleDelete = async (row: SamuraiJournalListEntry) => {
+    const confirmed = await ask(`Delete this journal entry? "${row.entry.text}"`, {
+      title: "Delete Journal Entry",
+      kind: "warning",
+    }).catch(() => false);
+    if (!confirmed) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await samuraiJournalDelete(row.raw);
+      setNotice("Deleted journal entry.");
       await refresh();
     } catch (err) {
       setError(String(err));
@@ -298,8 +340,14 @@ export function JournalSection() {
         <p className="px-1 py-2 text-[11px] italic text-maestro-muted">No journal entries yet.</p>
       ) : (
         <div className="space-y-0.5">
-          {rows.map(({ entry, status }, i) => (
-            <JournalRow key={`${entry.ts}-${i}`} entry={entry} status={status} />
+          {rows.map((row, i) => (
+            <JournalRow
+              key={`${row.entry.ts}-${i}`}
+              entry={row.entry}
+              status={row.status}
+              busy={busy}
+              onDelete={() => handleDelete(row)}
+            />
           ))}
         </div>
       )}

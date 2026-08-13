@@ -515,11 +515,23 @@ export interface SamuraiJournalEntry {
 export type SamuraiJournalEntryStatus = "UNCONSUMED" | "CONSUMED" | "ARCHIVED";
 
 /**
+ * Mirrors the Rust `JournalEntryWithStatus`. `raw` is the entry's exact
+ * on-disk JSONL text (no trailing newline) — entries carry no id, so this
+ * is the identity `samuraiJournalDelete` matches on; round-trip it
+ * unmodified (issue #100).
+ */
+export interface SamuraiJournalListEntry {
+  entry: SamuraiJournalEntry;
+  status: SamuraiJournalEntryStatus;
+  raw: string;
+}
+
+/**
  * Mirrors the Rust `JournalListResult`: the active file's entries (newest
  * last) with derived status, plus the file size in bytes.
  */
 export interface SamuraiJournalListResult {
-  entries: { entry: SamuraiJournalEntry; status: SamuraiJournalEntryStatus }[];
+  entries: SamuraiJournalListEntry[];
   file_size_bytes: number;
 }
 
@@ -538,6 +550,18 @@ export function samuraiJournalAdd(
 /** The active journal with per-entry consumption status, newest last. */
 export function samuraiJournalList(): Promise<SamuraiJournalListResult> {
   return invoke("samurai_journal_list");
+}
+
+/**
+ * Deletes one journal entry (destructive — confirm before calling), passing
+ * back the exact `raw` text `samuraiJournalList` returned for that row (see
+ * `SamuraiJournalListEntry.raw`). Byte-identical duplicate lines are deleted
+ * together — entries carry no id to distinguish them (issue #100). Resolves
+ * the number of lines removed; rejects when the identity no longer matches
+ * anything (e.g. a stale list from before a harvest changed the file).
+ */
+export function samuraiJournalDelete(raw: string): Promise<number> {
+  return invoke("samurai_journal_delete", { raw });
 }
 
 // ---------------------------------------------------------------------------

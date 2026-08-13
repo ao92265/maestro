@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -14,12 +15,17 @@ vi.mock("@tauri-apps/plugin-store", () => ({
   },
 }));
 
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  ask: vi.fn(),
+}));
+
 import type { SamuraiJournalEntry, SamuraiJournalEntryStatus } from "@/lib/samurai";
 import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 import { JournalSection } from "../JournalSection";
 
 const invokeMock = vi.mocked(invoke);
+const askMock = vi.mocked(ask);
 
 function buildTab(overrides: Partial<WorkspaceTab> = {}): WorkspaceTab {
   return {
@@ -37,29 +43,32 @@ function buildTab(overrides: Partial<WorkspaceTab> = {}): WorkspaceTab {
   };
 }
 
-type JournalRow = { entry: SamuraiJournalEntry; status: SamuraiJournalEntryStatus };
+type JournalRow = { entry: SamuraiJournalEntry; status: SamuraiJournalEntryStatus; raw: string };
 
 function journalRow(
   overrides: Partial<SamuraiJournalEntry> = {},
   status: SamuraiJournalEntryStatus = "UNCONSUMED",
 ): JournalRow {
-  return {
-    entry: {
-      ts: "2026-08-06T10:00:00Z",
-      category: "BOTTLENECK",
-      text: "CI queue blocked for an hour",
-      project: "C:\\git\\maestro",
-      ...overrides,
-    },
-    status,
+  const entry: SamuraiJournalEntry = {
+    ts: "2026-08-06T10:00:00Z",
+    category: "BOTTLENECK",
+    text: "CI queue blocked for an hour",
+    project: "C:\\git\\maestro",
+    ...overrides,
   };
+  // The identity `samurai_journal_delete` matches on — a real backend hands
+  // back the entry's exact on-disk JSONL text; any string unique per entry
+  // is enough to exercise the round trip here.
+  return { entry, status, raw: JSON.stringify(entry) };
 }
 
 /**
  * Routes the global invoke mock. `rows` is mutated by `samurai_journal_add`
- * (newest LAST, like the backend) so a post-add refresh shows the new entry.
- * There is no harvest command here on purpose (issue #98): the click only
- * lists the journal and queues a pending launch.
+ * (newest LAST, like the backend) so a post-add refresh shows the new entry,
+ * and by `samurai_journal_delete` (removes the row whose `raw` matches,
+ * rejecting like the backend when nothing matches). There is no harvest
+ * command here on purpose (issue #98): the click only lists the journal and
+ * queues a pending launch.
  */
 function mockInvoke(rows: JournalRow[], opts: { fileSizeBytes?: number } = {}) {
   invokeMock.mockImplementation(async (cmd: string, args?: unknown) => {
@@ -68,11 +77,23 @@ function mockInvoke(rows: JournalRow[], opts: { fileSizeBytes?: number } = {}) {
         return { entries: rows, file_size_bytes: opts.fileSizeBytes ?? 2048 };
       case "samurai_journal_add": {
         const { category, text, project } = args as SamuraiJournalEntry & { project?: string };
-        rows.push({
-          entry: { ts: new Date().toISOString(), category, text, project },
-          status: "UNCONSUMED",
-        });
+        const entry: SamuraiJournalEntry = {
+          ts: new Date().toISOString(),
+          category,
+          text,
+          project,
+        };
+        rows.push({ entry, status: "UNCONSUMED", raw: JSON.stringify(entry) });
         return undefined;
+      }
+      case "samurai_journal_delete": {
+        const { raw } = args as { raw: string };
+        const remaining = rows.filter((r) => r.raw !== raw);
+        const removed = rows.length - remaining.length;
+        rows.length = 0;
+        rows.push(...remaining);
+        if (removed === 0) throw "journal entry not found";
+        return removed;
       }
       default:
         return undefined;
@@ -83,6 +104,7 @@ function mockInvoke(rows: JournalRow[], opts: { fileSizeBytes?: number } = {}) {
 describe("JournalSection (issue #71)", () => {
   beforeEach(() => {
     invokeMock.mockReset();
+    askMock.mockReset();
     useWorkspaceStore.setState({ tabs: [buildTab()] });
     usePendingLaunchStore.setState({ pending: [] });
   });
@@ -217,5 +239,67 @@ describe("JournalSection (issue #71)", () => {
     ).toBeInTheDocument();
     expect(usePendingLaunchStore.getState().pending).toHaveLength(0);
     expect(screen.queryByText(/Triage session opened/)).toBeNull();
+  });
+
+  // Issue #100: per-entry delete with a guarded confirm.
+  it("deletes an entry only after confirming; cancel does nothing", async () => {
+    const rows = [journalRow({ text: "delete me" })];
+    const raw = rows[0].raw;
+    mockInvoke(rows);
+    render(<JournalSection />);
+    expect(await screen.findByText("delete me")).toBeInTheDocument();
+
+    const deleteBtn = screen.getByRole("button", { name: "Delete journal entry: delete me" });
+
+    // Cancel: the confirm is asked, but nothing is deleted.
+    askMock.mockResolvedValueOnce(false);
+    fireEvent.click(deleteBtn);
+    await waitFor(() => expect(askMock).toHaveBeenCalledTimes(1));
+    expect(invokeMock).not.toHaveBeenCalledWith("samurai_journal_delete", expect.anything());
+    expect(screen.getByText("delete me")).toBeInTheDocument();
+
+    // Confirm: deletes by the row's raw identity and refreshes.
+    askMock.mockResolvedValueOnce(true);
+    fireEvent.click(deleteBtn);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("samurai_journal_delete", { raw }),
+    );
+    expect(await screen.findByText("Deleted journal entry.")).toBeInTheDocument();
+    expect(screen.queryByText("delete me")).toBeNull();
+  });
+
+  it("deletes a CONSUMED entry too — harvest status does not gate the delete control", async () => {
+    mockInvoke([journalRow({ text: "already harvested" }, "CONSUMED")]);
+    render(<JournalSection />);
+    expect(await screen.findByText("already harvested")).toBeInTheDocument();
+
+    askMock.mockResolvedValueOnce(true);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Delete journal entry: already harvested" }),
+    );
+    await waitFor(() => expect(screen.queryByText("already harvested")).toBeNull());
+  });
+
+  it("surfaces the backend error when a delete fails", async () => {
+    const rows = [journalRow({ text: "will fail" })];
+    mockInvoke(rows);
+    render(<JournalSection />);
+    expect(await screen.findByText("will fail")).toBeInTheDocument();
+
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "samurai_journal_list") return { entries: rows, file_size_bytes: 1024 };
+      if (cmd === "samurai_journal_delete") {
+        throw "journal entry not found — it may already be gone, or a harvest changed it";
+      }
+      return undefined;
+    });
+    askMock.mockResolvedValueOnce(true);
+    fireEvent.click(screen.getByRole("button", { name: "Delete journal entry: will fail" }));
+
+    expect(
+      await screen.findByText(/journal entry not found — it may already be gone/),
+    ).toBeInTheDocument();
+    // The failed delete did not remove the row.
+    expect(screen.getByText("will fail")).toBeInTheDocument();
   });
 });
