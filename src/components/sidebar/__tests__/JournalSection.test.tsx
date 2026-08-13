@@ -261,9 +261,7 @@ describe("JournalSection (issue #71)", () => {
     // Confirm: deletes by the row's raw identity and refreshes.
     askMock.mockResolvedValueOnce(true);
     fireEvent.click(deleteBtn);
-    await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith("samurai_journal_delete", { raw }),
-    );
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("samurai_journal_delete", { raw }));
     expect(await screen.findByText("Deleted journal entry.")).toBeInTheDocument();
     expect(screen.queryByText("delete me")).toBeNull();
   });
