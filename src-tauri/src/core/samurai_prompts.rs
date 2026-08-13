@@ -388,6 +388,18 @@ fn find_forty_hex(text: &str) -> Option<String> {
     None
 }
 
+/// True when `epic` holds a comma-separated ISSUE LIST rather than a single
+/// epic reference (issue #87). `normalize_epic_ref` in `commands/samurai.rs`
+/// is the producer: `"77, 78"` for a list (issues joined with `, `), `"#37"`
+/// / `"Epic 12: Auth"` for one ref — a plain ref never contains a comma.
+/// Every builder that phrases wording around "the epic" must branch on this
+/// FIRST: a list has no epic issue to reference or child issues to hunt
+/// for, so epic/child-issue framing sent an orchestrator hunting for a
+/// phantom epic issue (harvest finding from run #76–#84).
+fn is_issue_list(epic_text: &str) -> bool {
+    epic_text.contains(',')
+}
+
 /// The successor's first instruction (PRD §5.6 — one recovery path): read
 /// the predecessor's handoff in full, then either skip or run its Verify
 /// commands depending on the HEAD gate MAESTRO computed. Single line by
@@ -401,8 +413,14 @@ pub fn successor_ritual_instruction(
     let epic_text = epic.split_whitespace().collect::<Vec<_>>().join(" ");
     let generation = predecessor_generation + 1;
     let relpath = handoff_file_relpath(epic, predecessor_generation);
+    // Issue #87: a comma-separated issue list is not an epic.
+    let subject = if is_issue_list(&epic_text) {
+        format!("the following GitHub issues: {epic_text}")
+    } else {
+        format!("epic {epic_text}")
+    };
     let opening = format!(
-        "[Maestro Samurai] You are generation {generation} for epic {epic_text}, successor to \
+        "[Maestro Samurai] You are generation {generation} for {subject}, successor to \
          generation {predecessor_generation}. Read the handoff file at {relpath} IN FULL before \
          doing anything else — it and GitHub are your only sources of truth."
     );
@@ -442,26 +460,47 @@ pub fn successor_ritual_instruction(
 /// the same explicit caution sentence as [`recovery_ritual_instruction`].
 pub fn launch_instruction(epic: &str, repo_pin: Option<&str>) -> String {
     let epic_text = epic.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Issue #87: the Launch panel accepts an epic ref OR a comma-separated
+    // issue list — a list has no epic issue to read or child issues to hunt
+    // for, so every epic-flavored phrase below is branched on this.
+    let is_list = is_issue_list(&epic_text);
+    let subject = if is_list {
+        format!("the following GitHub issues: {epic_text}")
+    } else {
+        format!("GitHub epic {epic_text}")
+    };
+    let worktree_owner = if is_list { "this run's" } else { "the epic's" };
+    let gh_read_subject = if is_list {
+        "EACH listed issue and ALL of its comments".to_string()
+    } else {
+        "the epic's GitHub issue, ALL of its comments, and EVERY child issue it references"
+            .to_string()
+    };
+    let progress_note = if is_list {
+        "your progress comments"
+    } else {
+        "your progress comment on the epic"
+    };
+    let progress_lead = if is_list {
+        "comment progress on each listed issue as it completes"
+    } else {
+        "comment progress on the epic's GitHub issue as issues complete"
+    };
     let (gh_read, gh_progress, caution) = match repo_pin {
         Some(pin) => (
             format!(
-                "read the epic's GitHub issue, ALL of its comments, and EVERY child issue it \
-                 references with the `gh` CLI, passing `--repo {pin}` explicitly on every `gh` \
-                 command"
+                "read {gh_read_subject} with the `gh` CLI, passing `--repo {pin}` explicitly \
+                 on every `gh` command"
             ),
             format!(
-                "comment progress on the epic's GitHub issue as issues complete, and open pull \
-                 requests for finished work (again via `gh` with `--repo {pin}` on every command)"
+                "{progress_lead}, and open pull requests for finished work (again via `gh` \
+                 with `--repo {pin}` on every command)"
             ),
             String::new(),
         ),
         None => (
-            "read the epic's GitHub issue, ALL of its comments, and EVERY child issue it \
-             references with the `gh` CLI, run from this directory"
-                .to_string(),
-            "comment progress on the epic's GitHub issue as issues complete, and open pull \
-             requests for finished work"
-                .to_string(),
+            format!("read {gh_read_subject} with the `gh` CLI, run from this directory"),
+            format!("{progress_lead}, and open pull requests for finished work"),
             " CAUTION: Maestro could not determine this repository's origin remote, so no \
              `--repo` pin is available — before running any `gh` command, double-check it \
              targets the correct repository."
@@ -470,15 +509,15 @@ pub fn launch_instruction(epic: &str, repo_pin: Option<&str>) -> String {
     };
     let clause = completion_declaration_clause();
     format!(
-        "[Maestro Samurai] You are generation 1, the FIRST orchestrator, for GitHub epic \
-         {epic_text}. This directory is the epic's dedicated worktree on its own branch. \
+        "[Maestro Samurai] You are generation 1, the FIRST orchestrator, for {subject}. This \
+         directory is {worktree_owner} dedicated worktree on its own branch. \
          Do the following: \
          (1) {gh_read}. \
          (2) Assess whether each issue is AGENT-READY — scope clear enough to implement, \
          acceptance criteria stated, no open product or design decision that needs a human. \
          Work only the ready ones. For each issue that is NOT ready, comment on it saying \
-         exactly what is missing, and say so in your progress comment on the epic instead of \
-         guessing at the intent. \
+         exactly what is missing, and say so in {progress_note} instead of guessing at the \
+         intent. \
          (3) Plan the work across the agent-ready issues before touching code. \
          (4) Work them via SMALL idempotent subagent tasks, each committing its \
          completed step to THIS branch (stage named paths only, never `git add .` or \
@@ -521,22 +560,43 @@ pub fn recovery_ritual_instruction(
     repo_pin: Option<&str>,
 ) -> String {
     let epic_text = epic.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Issue #87: same phantom-epic-hunt bug as launch_instruction — a list
+    // has no epic issue to read or comment on.
+    let is_list = is_issue_list(&epic_text);
     let generation = predecessor_generation + 1;
     let digest_relpath = recovery_digest_relpath(epic, generation);
+    let subject = if is_list {
+        format!("the following GitHub issues: {epic_text}")
+    } else {
+        format!("epic {epic_text}")
+    };
+    let gh_read_subject = if is_list {
+        "EACH listed issue and ALL of its comments".to_string()
+    } else {
+        "the epic's GitHub issue and ALL of its comments".to_string()
+    };
+    let gh_comment_subject = if is_list {
+        "comment on each listed issue"
+    } else {
+        "comment on the epic's GitHub issue"
+    };
+    let remaining_work = if is_list {
+        "this run's remaining work"
+    } else {
+        "the epic's remaining work"
+    };
     let (gh_read, gh_comment, caution) = match repo_pin {
         Some(pin) => (
             format!(
-                "read the epic's GitHub issue and ALL of its comments with the `gh` CLI, \
-                 passing `--repo {pin}` explicitly on every `gh` command"
+                "read {gh_read_subject} with the `gh` CLI, passing `--repo {pin}` explicitly \
+                 on every `gh` command"
             ),
-            format!("comment on the epic's GitHub issue (again via `gh` with `--repo {pin}`)"),
+            format!("{gh_comment_subject} (again via `gh` with `--repo {pin}`)"),
             String::new(),
         ),
         None => (
-            "read the epic's GitHub issue and ALL of its comments with the `gh` CLI, run from \
-             this directory"
-                .to_string(),
-            "comment on the epic's GitHub issue".to_string(),
+            format!("read {gh_read_subject} with the `gh` CLI, run from this directory"),
+            gh_comment_subject.to_string(),
             " CAUTION: Maestro could not determine this repository's origin remote, so no \
              `--repo` pin is available — before running any `gh` command, double-check it \
              targets the correct repository."
@@ -545,7 +605,7 @@ pub fn recovery_ritual_instruction(
     };
     let clause = completion_declaration_clause();
     format!(
-        "[Maestro Samurai] RECOVERY MODE: you are generation {generation} for epic {epic_text}. \
+        "[Maestro Samurai] RECOVERY MODE: you are generation {generation} for {subject}. \
          Generation {predecessor_generation} died without a valid handoff file, so there is \
          nothing to hand off to you. Reconstruct the state of the work from three sources: \
          (1) run `git log --oneline -20` in this repository; \
@@ -555,7 +615,7 @@ pub fn recovery_ritual_instruction(
          Then run the project's standard verification (build + tests) BEFORE trusting or \
          continuing anything — investigate and fix any failure first. Once verification passes, \
          {gh_comment} that generation {generation} has taken over in \
-         recovery mode, then continue the epic's remaining work.{caution}{clause}"
+         recovery mode, then continue {remaining_work}.{caution}{clause}"
     )
 }
 
@@ -1093,6 +1153,66 @@ mod tests {
         assert!(!text.contains("passing `--repo"));
         assert!(text.contains("CAUTION"));
         assert!(text.contains("double-check it targets the correct repository"));
+    }
+
+    // --- issue #87: comma-separated issue list is not an epic ---
+
+    #[test]
+    fn test_is_issue_list_detects_comma_separated_refs() {
+        assert!(!is_issue_list("#38"));
+        assert!(!is_issue_list("Epic 12: Auth"));
+        assert!(!is_issue_list("https://github.com/o/r/issues/9"));
+        assert!(is_issue_list("77, 78"));
+        assert!(is_issue_list("#76, #77, #78"));
+    }
+
+    #[test]
+    fn test_launch_instruction_list_shape_has_no_epic_framing() {
+        // Given a plain issue list, the brief must not send gen-1 hunting
+        // for a phantom epic issue that "references" the listed issues.
+        let text = launch_instruction("#76, #77, #78", Some("nachogl1/maestro"));
+        assert!(text.contains("the following GitHub issues: #76, #77, #78"));
+        assert!(text.contains("EACH listed issue and ALL of its comments"));
+        assert!(text.contains("comment progress on each listed issue as it completes"));
+        assert!(!text.to_lowercase().contains("epic"));
+        assert!(!text.to_lowercase().contains("child issue"));
+        // The rest of the brief is unaffected.
+        assert!(text.contains("generation 1"));
+        assert!(text.contains("AGENT-READY"));
+        assert!(!text.contains('\n'));
+    }
+
+    #[test]
+    fn test_launch_instruction_single_epic_ref_keeps_todays_wording() {
+        // Acceptance: a single epic ref must be untouched by the #87 fix.
+        let text = launch_instruction("#38", None);
+        assert!(text.contains("for GitHub epic #38"));
+        assert!(text.contains("the epic's dedicated worktree"));
+        assert!(text.contains(
+            "the epic's GitHub issue, ALL of its comments, and EVERY child issue it references"
+        ));
+        assert!(text.contains("comment progress on the epic's GitHub issue as issues complete"));
+        assert!(text.contains("your progress comment on the epic"));
+    }
+
+    #[test]
+    fn test_successor_ritual_instruction_list_shape_has_no_epic_framing() {
+        let text = successor_ritual_instruction("77, 78", 2, true);
+        assert!(text.contains("the following GitHub issues: 77, 78"));
+        assert!(!text.to_lowercase().contains("epic"));
+        assert!(text.contains("generation 3"));
+        assert!(text.contains("successor to generation 2"));
+    }
+
+    #[test]
+    fn test_recovery_ritual_instruction_list_shape_has_no_epic_framing() {
+        let text = recovery_ritual_instruction("77, 78", 2, Some("nachogl1/maestro"));
+        assert!(text.contains("the following GitHub issues: 77, 78"));
+        assert!(text.contains("EACH listed issue and ALL of its comments"));
+        assert!(text.contains("comment on each listed issue"));
+        assert!(text.contains("this run's remaining work"));
+        assert!(!text.to_lowercase().contains("epic"));
+        assert!(text.contains("RECOVERY MODE"));
     }
 
     // --- issue #96: run-completion declaration clause ---
