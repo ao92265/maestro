@@ -168,7 +168,13 @@ export interface SamuraiRunConfig {
   model: string | null;
   /** Per-run threshold overrides; null = the global config applies. */
   thresholds: unknown;
-  status: "ACTIVE" | "ARCHIVED";
+  /**
+   * ACTIVE = live; COMPLETED = verified finished (issue #96 — the
+   * orchestrator declared completion and the backend confirmed via gh that
+   * every batch issue is closed and the batch PR is open), awaiting the
+   * manual cleanup; ARCHIVED = cleaned up.
+   */
+  status: "ACTIVE" | "COMPLETED" | "ARCHIVED";
   /** RFC 3339 UTC creation timestamp. */
   created_at: string;
 }
@@ -247,7 +253,10 @@ export function samuraiLaunchRun(
   });
 }
 
-/** Every ACTIVE run config across all projects — the active-runs list. */
+/**
+ * Every unarchived run config across all projects — ACTIVE (live) plus
+ * COMPLETED (finished-awaiting-cleanup, issue #96) — the runs list.
+ */
 export function samuraiListRuns(): Promise<SamuraiRunConfig[]> {
   return invoke("samurai_list_runs");
 }

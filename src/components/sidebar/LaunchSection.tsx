@@ -191,7 +191,7 @@ function ModelPicker({
   );
 }
 
-/** One active run with its cleanup action. */
+/** One listed run (live or finished-awaiting-cleanup) with its cleanup action. */
 function RunRow({
   run,
   onCleanup,
@@ -206,9 +206,21 @@ function RunRow({
       className="flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] hover:bg-maestro-surface"
       title={`worktree: ${run.worktree_path}\nrepo pin: ${run.repo_pin ?? "none"}\ncreated: ${run.created_at}`}
     >
-      <span className="shrink-0 rounded bg-maestro-green/20 px-1 py-px text-[9px] font-bold tracking-wide text-maestro-green">
-        ACTIVE
-      </span>
+      {/* Issue #96: a COMPLETED run is verified finished (all issues closed,
+          PR open) and only awaits the manual cleanup — visually distinct
+          from a live ACTIVE run. */}
+      {run.status === "COMPLETED" ? (
+        <span
+          className="shrink-0 rounded bg-maestro-accent/20 px-1 py-px text-[9px] font-bold tracking-wide text-maestro-accent"
+          title="Run verified complete — every issue closed, PR open. Awaiting cleanup."
+        >
+          FINISHED
+        </span>
+      ) : (
+        <span className="shrink-0 rounded bg-maestro-green/20 px-1 py-px text-[9px] font-bold tracking-wide text-maestro-green">
+          ACTIVE
+        </span>
+      )}
       <span className="min-w-0 flex-1 truncate text-maestro-text">
         {run.epic}
         <span className="text-maestro-muted"> · {baseName(run.project_path)}</span>

@@ -368,6 +368,19 @@ describe("LaunchSection (issue #63)", () => {
     ).toBeInTheDocument();
   });
 
+  it("shows a COMPLETED run as finished-awaiting-cleanup, distinct from live (issue #96)", async () => {
+    mockInvoke({ runs: [run(), run({ epic: "#39", status: "COMPLETED" })] });
+    render(<LaunchSection />);
+
+    // The live run keeps its ACTIVE badge; the verified-complete one gets
+    // the distinct FINISHED badge naming the awaiting-cleanup state.
+    expect(await screen.findByText("FINISHED")).toBeInTheDocument();
+    expect(screen.getByText("ACTIVE")).toBeInTheDocument();
+    expect(screen.getByText("FINISHED").getAttribute("title")).toContain("Awaiting cleanup");
+    // Cleanup stays the separate manual step (PRD §5.9) — still offered.
+    expect(screen.getByRole("button", { name: "Clean up epic #39" })).toBeInTheDocument();
+  });
+
   it("never cleans up when the confirm is declined", async () => {
     mockInvoke({ runs: [run()] });
     askMock.mockResolvedValue(false);
