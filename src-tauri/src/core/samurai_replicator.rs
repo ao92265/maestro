@@ -86,6 +86,7 @@ use super::samurai_config::SharedSamuraiConfig;
 use super::samurai_injector::{strip_extended_prefix, AgeableInstant, SessionDirResolver};
 use super::samurai_journal::default_journal_file;
 use super::samurai_prompts;
+use super::samurai_workflow;
 use super::supervisor::{SessionSnapshot, Supervisor, SupervisorState};
 use super::transcript_parser;
 use super::windows_process::StdCommandExt;
@@ -691,6 +692,21 @@ impl SamuraiReplicator {
         self.run_configs.get()?.get(project, epic)?.model
     }
 
+    /// The epic's compiled workflow section (issue #91): the graph its run
+    /// config snapshotted at launch, or the default template when the
+    /// config predates workflows — or no store/config exists at all.
+    /// Resolved at brief-build time like [`Self::model_for`], so successor
+    /// and recovery briefs always recompile the SAME workflow the run
+    /// launched with.
+    fn workflow_for(&self, project: &str, epic: &str) -> String {
+        let stored = self
+            .run_configs
+            .get()
+            .and_then(|s| s.get(project, epic))
+            .and_then(|c| c.workflow);
+        samurai_workflow::compiled_for_run(stored.as_ref())
+    }
+
     /// One `successor_spawn_failed` ALERT (P2.4 pattern): the successor for
     /// `snapshot` cannot be spawned, a human has to step in.
     fn alert_spawn_failed(&self, snapshot: &SessionSnapshot, failure: &str) {
@@ -844,6 +860,9 @@ impl SamuraiReplicator {
         }
 
         let generation = snapshot.generation + 1;
+        // Issue #91: the run's workflow, recompiled from the graph its
+        // config snapshotted at launch — rides both ritual variants.
+        let workflow = self.workflow_for(&snapshot.project, &snapshot.epic);
         let (instruction, recovery) = match head_gate {
             Some(head_matched) => {
                 log::info!(
@@ -862,6 +881,7 @@ impl SamuraiReplicator {
                             &snapshot.epic,
                             snapshot.generation,
                             head_matched,
+                            &workflow,
                         ),
                         samurai_prompts::journal_instruction(&default_journal_file()),
                     ),
@@ -899,6 +919,7 @@ impl SamuraiReplicator {
                             &snapshot.epic,
                             snapshot.generation,
                             repo_pin.as_deref(),
+                            &workflow,
                         ),
                         samurai_prompts::journal_instruction(&default_journal_file()),
                     ),
@@ -979,6 +1000,9 @@ impl SamuraiReplicator {
         };
         let working_dir = strip_extended_prefix(&dir).to_string();
         let generation = snapshot.generation + 1;
+        // Issue #91: resolved before the lock (one small JSON read, same
+        // budget as model_for below) — never file I/O under the mutex.
+        let workflow = self.workflow_for(&snapshot.project, &snapshot.epic);
         // Stage synchronously, under the one lock, so a second DEAD
         // notification for the same generation can never double-stage.
         {
@@ -1016,6 +1040,7 @@ impl SamuraiReplicator {
                         &snapshot.epic,
                         snapshot.generation,
                         None,
+                        &workflow,
                     ),
                     samurai_prompts::journal_instruction(&default_journal_file()),
                 ),
@@ -1050,6 +1075,8 @@ impl SamuraiReplicator {
                 .await
                 .unwrap_or(None);
             if let Some(pin) = repo_pin {
+                // Issue #91: resolved before the lock, like the staging path.
+                let workflow = this.workflow_for(&snapshot.project, &snapshot.epic);
                 let mut pending = this.lock_pending();
                 if let Some(p) = pending.iter_mut().find(|p| {
                     p.generation == generation
@@ -1064,6 +1091,7 @@ impl SamuraiReplicator {
                             &snapshot.epic,
                             snapshot.generation,
                             Some(&pin),
+                            &workflow,
                         ),
                         samurai_prompts::journal_instruction(&default_journal_file()),
                     );
@@ -1144,6 +1172,10 @@ impl SamuraiReplicator {
             );
         }
         let working_dir = strip_extended_prefix(working_dir).to_string();
+        // Issue #91: the run's workflow, recompiled from the launch
+        // snapshot — resolved once here (same JSON read budget as
+        // model_for), used by the placeholder and the real ritual alike.
+        let workflow = self.workflow_for(project, epic);
         let spawn = SuccessorSpawn {
             project: project.to_string(),
             epic: epic.to_string(),
@@ -1210,7 +1242,7 @@ impl SamuraiReplicator {
                 // / fix M4: the journaling rider rides every version.
                 instruction: format!(
                     "{} {}",
-                    samurai_prompts::recovery_ritual_instruction(epic, prior, None),
+                    samurai_prompts::recovery_ritual_instruction(epic, prior, None, &workflow),
                     samurai_prompts::journal_instruction(&default_journal_file()),
                 ),
                 predecessor_session_id: 0,
@@ -1269,6 +1301,7 @@ impl SamuraiReplicator {
                                 &epic,
                                 prior,
                                 head_matched,
+                                &workflow,
                             ),
                             samurai_prompts::journal_instruction(&default_journal_file()),
                         ),
@@ -1302,6 +1335,7 @@ impl SamuraiReplicator {
                                 &epic,
                                 prior,
                                 repo_pin.as_deref(),
+                                &workflow,
                             ),
                             samurai_prompts::journal_instruction(&default_journal_file()),
                         ),
@@ -3334,6 +3368,87 @@ mod tests {
         assert_eq!(h.spawns.lock().unwrap()[1].model, None);
     }
 
+    #[tokio::test]
+    async fn test_staged_briefs_recompile_the_stored_workflow_graph() {
+        // Issue #91: the run config snapshots the workflow graph at launch;
+        // every successor brief must recompile THAT graph — never the
+        // default — and a config without a graph falls back to the default
+        // template (backward compat).
+        use crate::core::samurai_run_config::{RunConfigStore, SamuraiRunConfig};
+        use crate::core::samurai_workflow::{WorkflowEdge, WorkflowGraph, WorkflowNode};
+
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-rep-workflow";
+        let store = Arc::new(RunConfigStore::new(dir.path().join("runs")));
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        let head = read_repo_head(repo.path()).unwrap();
+        write_handoff(repo.path(), "epic-9", 3, &head);
+        let working_dir = repo.path().to_string_lossy().into_owned();
+
+        let mut config = SamuraiRunConfig::new(project, "epic-9", working_dir.clone());
+        config.workflow = Some(WorkflowGraph {
+            nodes: vec![
+                WorkflowNode {
+                    id: "a".to_string(),
+                    text: "custom implement ritual".to_string(),
+                },
+                WorkflowNode {
+                    id: "b".to_string(),
+                    text: "custom ship ritual".to_string(),
+                },
+            ],
+            edges: vec![WorkflowEdge {
+                from: "a".to_string(),
+                to: "b".to_string(),
+            }],
+            start: "a".to_string(),
+        });
+        store.save(&config).unwrap();
+        // A second run whose config predates workflows (no graph stored).
+        store
+            .save(&SamuraiRunConfig::new(
+                project,
+                "epic-88",
+                working_dir.clone(),
+            ))
+            .unwrap();
+        h.replicator.set_run_configs(store);
+
+        // The successor ritual (handoff present) carries the STORED graph.
+        h.replicator
+            .spawn_generation(project, "epic-9", &working_dir, 4, Some(3));
+        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
+        let (_, instruction) = h.replicator.pending_view(4).unwrap();
+        assert!(
+            instruction.contains("Step 1: custom implement ritual"),
+            "{instruction}"
+        );
+        assert!(
+            instruction.contains("Step 2: custom ship ritual"),
+            "{instruction}"
+        );
+        assert!(
+            !instruction.contains("fresh-eyes review"),
+            "the stored graph replaces the default: {instruction}"
+        );
+
+        // The graph-less config compiles the DEFAULT template (its spawn
+        // takes the recovery ritual — no epic-88 handoff exists — which
+        // must carry the workflow too).
+        h.replicator
+            .spawn_generation(project, "epic-88", &working_dir, 6, Some(5));
+        wait_until(|| h.spawns.lock().unwrap().len() >= 2).await;
+        let (_, instruction) = h.replicator.pending_view(6).unwrap();
+        assert!(instruction.contains("RECOVERY MODE"), "{instruction}");
+        assert!(
+            instruction.contains("Step 2: Run a fresh-eyes review"),
+            "no stored graph → the default workflow: {instruction}"
+        );
+        assert!(instruction.contains("END OF WORKFLOW"), "{instruction}");
+    }
+
     // --- issue #61: spawn_generation (fresh spawns) + spawn retry ---
 
     #[tokio::test]
@@ -3443,7 +3558,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         let project = "C:/git/proj-launch";
-        let brief = samurai_prompts::launch_instruction("#38", Some("nachogl1/maestro"));
+        let brief = samurai_prompts::launch_instruction(
+            "#38",
+            Some("nachogl1/maestro"),
+            &samurai_workflow::compiled_for_run(None),
+        );
 
         h.replicator
             .spawn_first_generation(project, "#38", "C:/tmp/wt-38", brief.clone());
@@ -3483,7 +3602,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         let project = "C:/git/proj-launch-retry";
-        let brief = samurai_prompts::launch_instruction("#38", None);
+        let brief = samurai_prompts::launch_instruction(
+            "#38",
+            None,
+            &samurai_workflow::compiled_for_run(None),
+        );
 
         h.replicator
             .spawn_first_generation(project, "#38", "C:/tmp/wt", brief.clone());
@@ -3579,7 +3702,11 @@ mod tests {
     /// its first SessionStarted — the armed-watch state every delivery-watch
     /// test starts from.
     fn deliver_launch_brief(h: &Harness, project: &str) {
-        let brief = samurai_prompts::launch_instruction("#38", Some("nachogl1/maestro"));
+        let brief = samurai_prompts::launch_instruction(
+            "#38",
+            Some("nachogl1/maestro"),
+            &samurai_workflow::compiled_for_run(None),
+        );
         h.replicator
             .spawn_first_generation(project, "#38", "C:/tmp/wt-103", brief);
         let details = h.replicator.spawn_details(project, "#38", 1).unwrap();
@@ -3625,7 +3752,11 @@ mod tests {
         h.replicator.tick();
         assert_eq!(h.replicator.delivered_count(), 0);
         h.replicator.tick();
-        assert_eq!(h.resends.lock().unwrap().len(), 2, "no resend after give-up");
+        assert_eq!(
+            h.resends.lock().unwrap().len(),
+            2,
+            "no resend after give-up"
+        );
 
         // Audit trail: one submit_retry per resend, one final
         // submit_unconfirmed, all naming the launch.
@@ -3680,10 +3811,8 @@ mod tests {
         assert!(h.resends.lock().unwrap().is_empty());
         let rows = h.audit.read(project, None, None).await.unwrap().events;
         assert!(
-            !rows
-                .iter()
-                .any(|r| r.details["kind"] == "submit_retry"
-                    || r.details["kind"] == "submit_unconfirmed"),
+            !rows.iter().any(|r| r.details["kind"] == "submit_retry"
+                || r.details["kind"] == "submit_unconfirmed"),
             "no retry bookkeeping once the submit is confirmed"
         );
     }
@@ -3707,7 +3836,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         let project = "C:/git/proj-launch-dropped";
-        let brief = samurai_prompts::launch_instruction("#38", None);
+        let brief = samurai_prompts::launch_instruction(
+            "#38",
+            None,
+            &samurai_workflow::compiled_for_run(None),
+        );
 
         h.replicator
             .spawn_first_generation(project, "#38", "C:/tmp/wt", brief.clone());

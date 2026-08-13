@@ -26,15 +26,15 @@ fn take_pending_cli_path(state: State<'_, PendingCliPath>) -> Option<String> {
 use core::marketplace_manager::MarketplaceManager;
 use core::mcp_manager::McpManager;
 use core::plugin_manager::PluginManager;
-use core::status_server::StatusServer;
 use core::samurai_audit::{AuditEvent, AuditLog};
 use core::samurai_context::SamuraiContextStore;
 use core::samurai_injector::SamuraiInjector;
-use core::supervisor::{SessionSnapshot, Supervisor, SupervisorState};
-use core::{ClaudeEvent, EventBus, TranscriptWatcher};
-use core::ProcessManager;
 use core::session_manager::SessionManager;
+use core::status_server::StatusServer;
+use core::supervisor::{SessionSnapshot, Supervisor, SupervisorState};
 use core::worktree_manager::WorktreeManager;
+use core::ProcessManager;
+use core::{ClaudeEvent, EventBus, TranscriptWatcher};
 
 /// Entry point for the Tauri application.
 ///
@@ -1057,9 +1057,10 @@ pub fn run() {
             commands::samurai::samurai_schedule_list,
             commands::samurai::samurai_get_config,
             commands::samurai::samurai_set_config,
-            // Samurai run launcher (issue #63)
+            // Samurai run launcher (issue #63) + workflow graph (issue #91)
             commands::samurai::samurai_preflight,
             commands::samurai::samurai_launch_run,
+            commands::samurai::samurai_default_workflow,
             commands::samurai::samurai_list_runs,
             commands::samurai::samurai_cleanup_epic,
             // Samurai Second Brain file inventory (issue #65)

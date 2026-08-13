@@ -28,6 +28,7 @@ use crate::core::samurai_replicator::{derive_repo_pin, SamuraiReplicator};
 use crate::core::samurai_run_config::{RunConfigStatus, RunConfigStore, SamuraiRunConfig};
 use crate::core::samurai_schedule::{SamuraiSchedule, ScheduleEntry};
 use crate::core::samurai_test_gate::{self, SamuraiTestGate, TestGateProgress};
+use crate::core::samurai_workflow::{self, WorkflowGraph};
 use crate::core::supervisor::{SessionSnapshot, Supervisor, SupervisorState};
 use crate::core::worktree_manager::WorktreeManager;
 use crate::git::{Git, GitError};
@@ -377,16 +378,16 @@ pub struct SamuraiLaunchResult {
     pub stale_timer_cancelled: bool,
 }
 
-/// The gen-1 opening brief: the launch instruction plus the issue-#72
-/// journaling rider, so the first orchestrator records its own friction in
-/// the ops journal (PRD §5.12). The journal path is resolved at this call
-/// site per the P5.1 contract (`default_journal_file`); a single space
-/// joins the two single-line instructions, keeping the brief one
-/// paste-able line.
-fn launch_brief(epic: &str, repo_pin: Option<&str>) -> String {
+/// The gen-1 opening brief: the launch instruction (carrying the run's
+/// compiled workflow section, issue #91) plus the issue-#72 journaling
+/// rider, so the first orchestrator records its own friction in the ops
+/// journal (PRD §5.12). The journal path is resolved at this call site per
+/// the P5.1 contract (`default_journal_file`); a single space joins the two
+/// single-line instructions, keeping the brief one paste-able line.
+fn launch_brief(epic: &str, repo_pin: Option<&str>, workflow: &WorkflowGraph) -> String {
     format!(
         "{} {}",
-        samurai_prompts::launch_instruction(epic, repo_pin),
+        samurai_prompts::launch_instruction(epic, repo_pin, &samurai_workflow::compile(workflow)),
         samurai_prompts::journal_instruction(&default_journal_file()),
     )
 }
@@ -411,6 +412,7 @@ pub(crate) async fn launch_run_inner(
     epic: &str,
     model: Option<String>,
     handoff_context_pct: Option<f64>,
+    workflow: Option<WorkflowGraph>,
     worktree_base: Option<&Path>,
 ) -> Result<SamuraiLaunchResult, String> {
     let epic = normalize_epic_ref(epic);
@@ -514,14 +516,20 @@ pub(crate) async fn launch_run_inner(
     // persists nothing. A crash between the write and the spawn leaves a
     // config cold-start reconciliation flags as reconcile_unstartable — the
     // human relaunches (accepted).
+    // Issue #91: the run's workflow graph — the UI's edited graph, or the
+    // default template when the launch names none — SNAPSHOTTED into the
+    // run config, so successor and recovery briefs recompile exactly this
+    // workflow after every handoff.
+    let workflow = workflow.unwrap_or_default();
     let mut config =
         SamuraiRunConfig::new(project.to_string(), epic.clone(), worktree_path.clone());
     config.repo_pin = repo_pin.clone();
     config.model = model;
     config.thresholds = thresholds;
+    config.workflow = Some(workflow.clone());
     run_configs.save(&config)?;
 
-    let instruction = launch_brief(&epic, repo_pin.as_deref());
+    let instruction = launch_brief(&epic, repo_pin.as_deref(), &workflow);
     replicator.spawn_first_generation(project, &epic, &worktree_path, instruction);
 
     log::info!(
@@ -561,6 +569,7 @@ pub async fn samurai_launch_run(
     model: Option<String>,
     handoff_context_pct: Option<f64>,
     skip_test_gate: Option<bool>,
+    workflow: Option<WorkflowGraph>,
 ) -> Result<SamuraiLaunchResult, String> {
     let project = canonical_project_path(&project_path);
     let preflight = run_preflight(&project).await;
@@ -591,9 +600,18 @@ pub async fn samurai_launch_run(
         &epic,
         model,
         handoff_context_pct,
+        workflow,
         None,
     )
     .await
+}
+
+/// The DEFAULT workflow graph (issue #91) — the single source of truth for
+/// the launcher UI's reset-to-default, and the exact template a launch
+/// without an explicit graph snapshots into its run config. Pure data.
+#[tauri::command]
+pub fn samurai_default_workflow() -> WorkflowGraph {
+    WorkflowGraph::default()
 }
 
 /// Every unarchived run config across all projects — the launcher panel's
@@ -1012,7 +1030,11 @@ mod tests {
         // Every spelling of the same list lands on one identity — otherwise
         // the same two issues could be launched twice as two separate runs.
         for spelling in ["77,78", "77, 78", " 77 ,  78 ", "77,,78", "77, 78,"] {
-            assert_eq!(normalize_epic_ref(spelling), "77, 78", "spelling: {spelling}");
+            assert_eq!(
+                normalize_epic_ref(spelling),
+                "77, 78",
+                "spelling: {spelling}"
+            );
         }
         // Empty stays empty so the caller's "epic required" check still fires.
         assert_eq!(normalize_epic_ref("   ,  , "), "");
@@ -1022,8 +1044,13 @@ mod tests {
     fn test_launch_brief_is_launch_instruction_plus_journal_rider() {
         // Issue #72: the composed gen-1 brief = the unmodified launch
         // instruction, then the journaling rider, one paste-able line.
-        let brief = launch_brief("#38", Some("nachogl1/maestro"));
-        let launch = samurai_prompts::launch_instruction("#38", Some("nachogl1/maestro"));
+        let workflow = WorkflowGraph::default();
+        let brief = launch_brief("#38", Some("nachogl1/maestro"), &workflow);
+        let launch = samurai_prompts::launch_instruction(
+            "#38",
+            Some("nachogl1/maestro"),
+            &samurai_workflow::compile(&workflow),
+        );
         assert!(
             brief.starts_with(&launch),
             "launch text must ride first, unmodified"
@@ -1037,6 +1064,33 @@ mod tests {
         }
         assert!(brief.contains("NEVER rewrite or delete existing lines"));
         assert!(!brief.contains('\n'), "brief must stay a single line");
+    }
+
+    #[test]
+    fn test_launch_brief_carries_the_compiled_workflow_section() {
+        // Issue #91: the gen-1 brief embeds the graph it is launched with —
+        // an edited node text reaches the compiled section verbatim.
+        let mut workflow = WorkflowGraph::default();
+        workflow
+            .nodes
+            .iter_mut()
+            .find(|n| n.id == "review")
+            .unwrap()
+            .text = "Custom review ritual".to_string();
+        let brief = launch_brief("#38", None, &workflow);
+        assert!(
+            brief.contains("WORKFLOW — the process for this run"),
+            "{brief}"
+        );
+        assert!(brief.contains("Step 2: Custom review ritual"), "{brief}");
+        assert!(brief.contains("END OF WORKFLOW"), "{brief}");
+        assert!(!brief.contains('\n'), "brief must stay a single line");
+    }
+
+    #[test]
+    fn test_default_workflow_command_returns_the_template() {
+        // The UI's reset-to-default has ONE source of truth.
+        assert_eq!(samurai_default_workflow(), WorkflowGraph::default());
     }
 
     // --- worktree + cleanup (tempfile git fixtures) ---
@@ -1098,11 +1152,13 @@ mod tests {
     /// succeed with empty output. Progress emission is discarded — the
     /// event payloads have their own suite in `core::samurai_test_gate`.
     fn recording_gate(
-        script: Vec<(&'static str, crate::core::samurai_test_gate::GateCommandOutput)>,
+        script: Vec<(
+            &'static str,
+            crate::core::samurai_test_gate::GateCommandOutput,
+        )>,
     ) -> (SamuraiTestGate, Arc<std::sync::Mutex<Vec<String>>>) {
         use crate::core::samurai_test_gate::{GateCommandOutput, GateCommandRunner};
-        let calls: Arc<std::sync::Mutex<Vec<String>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let calls_rec = calls.clone();
         let runner: GateCommandRunner = Arc::new(move |_cwd, program, args| {
             let call = format!("{program} {}", args.join(" "));
@@ -1250,6 +1306,7 @@ mod tests {
             SamuraiConfig::default(),
             &h.project,
             epic,
+            None,
             None,
             None,
             Some(h.base.path()),
@@ -1444,6 +1501,7 @@ mod tests {
             "38",
             Some("opus".to_string()),
             Some(30.0),
+            None,
             Some(base.path()),
         )
         .await
@@ -1489,12 +1547,58 @@ mod tests {
             "#38",
             None,
             None,
+            None,
             Some(base.path()),
         )
         .await
         .unwrap();
         assert!(!again.stale_timer_cancelled);
         assert_eq!(run_configs.get(&project, "#38").unwrap().thresholds, None);
+    }
+
+    #[tokio::test]
+    async fn test_launch_snapshots_the_workflow_graph_into_the_run_config() {
+        // Issue #91: the launch stores the graph it ran with — the caller's
+        // edited graph, or the default template when none is given — so
+        // successor briefs recompile the SAME workflow after handoffs.
+        let h = cleanup_harness();
+        let (gate, _calls) = recording_gate(vec![]);
+
+        // No explicit graph → the default template is snapshotted.
+        run_launch(&h, &gate, true, "#38").await.unwrap();
+        let config = h.run_configs.get(&h.project, "#38").unwrap();
+        assert_eq!(config.workflow, Some(WorkflowGraph::default()));
+
+        // An explicit (edited) graph is stored verbatim.
+        let mut custom = WorkflowGraph::default();
+        custom
+            .nodes
+            .iter_mut()
+            .find(|n| n.id == "review")
+            .unwrap()
+            .text = "Custom review ritual".to_string();
+        launch_run_inner(
+            &h.supervisor,
+            &h.schedule,
+            &h.worktrees,
+            &h.run_configs,
+            &h.replicator,
+            &h.audit,
+            &gate,
+            true,
+            &preflight(true, true),
+            SamuraiConfig::default(),
+            &h.project,
+            "#39",
+            None,
+            None,
+            Some(custom.clone()),
+            Some(h.base.path()),
+        )
+        .await
+        .unwrap();
+        let config = h.run_configs.get(&h.project, "#39").unwrap();
+        assert_eq!(config.workflow, Some(custom));
     }
 
     // --- issue #90b: the launch test-suite gate ---
@@ -1532,7 +1636,10 @@ mod tests {
     #[tokio::test]
     async fn test_launch_gate_red_blocks_spawn_config_and_alerts() {
         let h = cleanup_harness();
-        commit_fixture_files(h.repo.path(), &[("Cargo.toml", "[workspace]\nmembers = []\n")]);
+        commit_fixture_files(
+            h.repo.path(),
+            &[("Cargo.toml", "[workspace]\nmembers = []\n")],
+        );
         let (gate, calls) = recording_gate(vec![(
             "cargo test",
             crate::core::samurai_test_gate::GateCommandOutput {
@@ -1696,7 +1803,11 @@ mod tests {
             &worktree.to_string_lossy(),
             "opening brief".to_string(),
         );
-        assert_eq!(h.spawns.lock().unwrap().len(), 1, "gen-1 staged and emitted");
+        assert_eq!(
+            h.spawns.lock().unwrap().len(),
+            1,
+            "gen-1 staged and emitted"
+        );
 
         // Cleaned up under a DIFFERENT spelling than it was staged with: the
         // cancel matches by slug, like every other surface.

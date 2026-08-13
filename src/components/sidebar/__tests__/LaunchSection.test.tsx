@@ -198,6 +198,9 @@ describe("LaunchSection (issue #63)", () => {
       model: null,
       handoffContextPct: null,
       skipTestGate: false,
+      // Issue #91: no workflow editor input on this panel yet — the backend
+      // falls back to (and snapshots) the default template.
+      workflow: null,
     });
     expect(await screen.findByText(/Run launched: #38 on samurai-38/)).toBeInTheDocument();
   });
@@ -250,6 +253,7 @@ describe("LaunchSection (issue #63)", () => {
       model: null,
       handoffContextPct: 30,
       skipTestGate: false,
+      workflow: null,
     });
     // The field clears with the rest of the form after a launch.
     await screen.findByText(/Run launched: #38/);

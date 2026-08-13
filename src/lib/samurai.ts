@@ -156,6 +156,39 @@ export interface SamuraiPreflight {
   windows_reported: boolean;
 }
 
+/**
+ * One workflow step box — mirrors the Rust `WorkflowNode`
+ * (`core/samurai_workflow.rs`). `id` is the stable identity edits preserve;
+ * step numbers are assigned at compile time, never stored.
+ */
+export interface SamuraiWorkflowNode {
+  id: string;
+  /** The step's instruction text (editable in the workflow editor). */
+  text: string;
+}
+
+/** One directed edge between two node ids — mirrors the Rust `WorkflowEdge`. */
+export interface SamuraiWorkflowEdge {
+  from: string;
+  to: string;
+}
+
+/**
+ * The run workflow graph (issue #91) — mirrors the Rust `WorkflowGraph`.
+ * The backend compiles the path reachable from `start` (following the FIRST
+ * outgoing edge per node, in edge-list order; cycles stop before a repeat;
+ * unreachable nodes are excluded) into the numbered WORKFLOW section of
+ * every orchestrator brief. The graph is instruction, not machinery — v1
+ * has no step enforcement. Snapshotted into the run config at launch, so
+ * successor briefs recompile the same workflow after handoffs.
+ */
+export interface SamuraiWorkflowGraph {
+  nodes: SamuraiWorkflowNode[];
+  edges: SamuraiWorkflowEdge[];
+  /** Node id the compile walk starts from. */
+  start: string;
+}
+
 /** One epic's run config — mirrors the Rust `SamuraiRunConfig` (P3.1). */
 export interface SamuraiRunConfig {
   /** Canonical project path (Windows `\\?\` prefix already stripped). */
@@ -168,6 +201,12 @@ export interface SamuraiRunConfig {
   model: string | null;
   /** Per-run threshold overrides; null = the global config applies. */
   thresholds: unknown;
+  /**
+   * The workflow graph snapshotted at launch (issue #91); null on configs
+   * written before workflows existed — the backend then compiles the
+   * default template.
+   */
+  workflow: SamuraiWorkflowGraph | null;
   /**
    * ACTIVE = live; COMPLETED = verified finished (issue #96 — the
    * orchestrator declared completion and the backend confirmed via gh that
@@ -236,6 +275,11 @@ export function samuraiPreflight(projectPath: string): Promise<SamuraiPreflight>
  *
  * `epic` accepts an epic ref, one issue, or a comma-separated list — the
  * backend normalizes the spelling so `#77,78` and `#77 , 78` are one run.
+ *
+ * `workflow` (issue #91) is the run's workflow graph — the editor's edited
+ * graph, or omitted/null for the default template. Whatever the run
+ * launches with is snapshotted into its run config, so successor briefs
+ * recompile the same workflow after handoffs.
  */
 export function samuraiLaunchRun(
   projectPath: string,
@@ -243,6 +287,7 @@ export function samuraiLaunchRun(
   model: string | null,
   handoffContextPct: number | null,
   skipTestGate: boolean,
+  workflow?: SamuraiWorkflowGraph | null,
 ): Promise<SamuraiLaunchResult> {
   return invoke("samurai_launch_run", {
     projectPath,
@@ -250,7 +295,17 @@ export function samuraiLaunchRun(
     model,
     handoffContextPct,
     skipTestGate,
+    workflow: workflow ?? null,
   });
+}
+
+/**
+ * The DEFAULT workflow graph (issue #91) — the single source of truth for
+ * the workflow editor's reset-to-default, identical to what a launch
+ * without an explicit graph runs with.
+ */
+export function samuraiDefaultWorkflow(): Promise<SamuraiWorkflowGraph> {
+  return invoke("samurai_default_workflow");
 }
 
 /**

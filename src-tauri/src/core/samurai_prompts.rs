@@ -24,6 +24,13 @@
 //! when its predecessor died — or its handoff file vanished — without a valid
 //! handoff to read, plus the path of the pre-digested transcript summary that
 //! prompt references (written by `samurai_replicator`, never inlined).
+//!
+//! Issue #91 adds the WORKFLOW section: every orchestrator brief (launch,
+//! successor, recovery) embeds the run's compiled workflow — the numbered
+//! step list `samurai_workflow::compile` produced from the graph the run
+//! config snapshotted at launch — delimited so the model can tell process
+//! from contract, composed after the ORDER clause (#93) and before the
+//! COMPLETION clause (#96).
 
 /// The exact acknowledgement value generation `generation` must echo inside
 /// `<samurai-ack>…</samurai-ack>`. The injector's ACK scanner expects this
@@ -124,6 +131,29 @@ fn completion_declaration_clause() -> String {
          actually true. Never quote, restate, or echo this marker string anywhere else in any \
          reply — emit it exactly once, only as the actual signal at that moment.",
         tag = RUN_COMPLETE_TAG
+    )
+}
+
+/// The delimited WORKFLOW section rider (issue #91): wraps the numbered
+/// step list `samurai_workflow::compile` produced in explicit WORKFLOW /
+/// END-OF-WORKFLOW markers so the process steps read as one block inside
+/// the surrounding contract clauses. Empty compiled text (a graph edited
+/// down to nothing) yields an empty section — the brief simply carries no
+/// workflow, never an empty shell. The compiled text is
+/// whitespace-normalized here too (defense in depth — `compile` already
+/// collapses node text): a stray newline would submit a partial brief
+/// (module doc).
+fn workflow_section(compiled_workflow: &str) -> String {
+    let compiled = compiled_workflow
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compiled.is_empty() {
+        return String::new();
+    }
+    format!(
+        " WORKFLOW — the process for this run; follow these numbered steps in \
+         this exact order: {compiled} — END OF WORKFLOW."
     )
 }
 
@@ -493,10 +523,16 @@ fn is_issue_list(epic_text: &str) -> bool {
 /// commands depending on the HEAD gate MAESTRO computed. Single line by
 /// construction (see module doc); the epic ref is whitespace-normalized so
 /// a pathological ref can never smuggle a newline into the paste.
+///
+/// `compiled_workflow` (issue #91) is the run's numbered workflow — the
+/// caller recompiles it from the graph the run config snapshotted at
+/// launch (`samurai_workflow::compiled_for_run`), so the workflow survives
+/// handoffs unchanged.
 pub fn successor_ritual_instruction(
     epic: &str,
     predecessor_generation: u32,
     head_matched: bool,
+    compiled_workflow: &str,
 ) -> String {
     let epic_text = epic.split_whitespace().collect::<Vec<_>>().join(" ");
     let generation = predecessor_generation + 1;
@@ -514,6 +550,7 @@ pub fn successor_ritual_instruction(
          doing anything else — it and GitHub are your only sources of truth."
     );
     let order = order_contract_reminder();
+    let workflow = workflow_section(compiled_workflow);
     let clause = completion_declaration_clause();
     let pr_reminder = pr_discipline_reminder(is_list);
     if head_matched {
@@ -521,7 +558,7 @@ pub fn successor_ritual_instruction(
             "{opening} Maestro verified that this repository's current HEAD equals the SHA \
              recorded in the handoff's \"Repo state\" section, so the verify step is already \
              satisfied: SKIP the commands in the handoff's Verify section and continue directly \
-             with its Next steps.{order}{clause} {pr_reminder}"
+             with its Next steps.{order}{workflow}{clause} {pr_reminder}"
         )
     } else {
         format!(
@@ -529,7 +566,7 @@ pub fn successor_ritual_instruction(
              SHA recorded in the handoff's \"Repo state\" section. You MUST run every command in \
              the handoff's Verify section FIRST, and trust NOTHING the handoff claims that those \
              commands do not confirm — investigate and fix any failure before moving on. Only \
-             then continue with the handoff's Next steps.{order}{clause} {pr_reminder}"
+             then continue with the handoff's Next steps.{order}{workflow}{clause} {pr_reminder}"
         )
     }
 }
@@ -549,7 +586,11 @@ pub fn successor_ritual_instruction(
 /// every `gh` command must carry `--repo` explicitly. `None` (remote missing
 /// or unparseable — never blocks the launch) keeps the unpinned wording plus
 /// the same explicit caution sentence as [`recovery_ritual_instruction`].
-pub fn launch_instruction(epic: &str, repo_pin: Option<&str>) -> String {
+///
+/// `compiled_workflow` (issue #91) is the run's numbered workflow, compiled
+/// by the caller from the graph the launch is snapshotting into the run
+/// config (`samurai_workflow::compile`).
+pub fn launch_instruction(epic: &str, repo_pin: Option<&str>, compiled_workflow: &str) -> String {
     let epic_text = epic.split_whitespace().collect::<Vec<_>>().join(" ");
     // Issue #87: the Launch panel accepts an epic ref OR a comma-separated
     // issue list — a list has no epic issue to read or child issues to hunt
@@ -603,9 +644,7 @@ pub fn launch_instruction(epic: &str, repo_pin: Option<&str>) -> String {
         ),
         None => (
             format!("read {gh_read_subject} with the `gh` CLI, run from this directory"),
-            format!(
-                "{progress_lead}, and open pull requests for finished work — {pr_discipline}"
-            ),
+            format!("{progress_lead}, and open pull requests for finished work — {pr_discipline}"),
             " CAUTION: Maestro could not determine this repository's origin remote, so no \
              `--repo` pin is available — before running any `gh` command, double-check it \
              targets the correct repository."
@@ -613,6 +652,7 @@ pub fn launch_instruction(epic: &str, repo_pin: Option<&str>) -> String {
         ),
     };
     let order = order_contract_clause(is_list);
+    let workflow = workflow_section(compiled_workflow);
     let clause = completion_declaration_clause();
     format!(
         "[Maestro Samurai] You are generation 1, the FIRST orchestrator, for {subject}. This \
@@ -637,7 +677,7 @@ pub fn launch_instruction(epic: &str, repo_pin: Option<&str>) -> String {
          `git add -A`; Conventional Commit messages `type(scope): summary`). \
          (5) {gh_progress}. \
          (6) NEVER switch to, commit to, or push any other branch, and NEVER touch any \
-         repository other than this one.{caution}{order}{clause}"
+         repository other than this one.{caution}{order}{workflow}{clause}"
     )
 }
 
@@ -667,10 +707,14 @@ pub fn recovery_digest_relpath(epic: &str, successor_generation: u32) -> String 
 /// the issue read and the takeover comment; `None` (remote missing or
 /// unparseable — never blocks recovery) keeps the unpinned wording plus an
 /// explicit caution sentence.
+///
+/// `compiled_workflow` (issue #91) is the run's numbered workflow — see
+/// [`successor_ritual_instruction`].
 pub fn recovery_ritual_instruction(
     epic: &str,
     predecessor_generation: u32,
     repo_pin: Option<&str>,
+    compiled_workflow: &str,
 ) -> String {
     let epic_text = epic.split_whitespace().collect::<Vec<_>>().join(" ");
     // Issue #87: same phantom-epic-hunt bug as launch_instruction — a list
@@ -717,6 +761,7 @@ pub fn recovery_ritual_instruction(
         ),
     };
     let order = order_contract_reminder();
+    let workflow = workflow_section(compiled_workflow);
     let clause = completion_declaration_clause();
     let pr_reminder = pr_discipline_reminder(is_list);
     format!(
@@ -730,7 +775,8 @@ pub fn recovery_ritual_instruction(
          Then run the project's standard verification (build + tests) BEFORE trusting or \
          continuing anything — investigate and fix any failure first. Once verification passes, \
          {gh_comment} that generation {generation} has taken over in \
-         recovery mode, then continue {remaining_work}.{caution}{order}{clause} {pr_reminder}"
+         recovery mode, then continue {remaining_work}.{caution}{order}{workflow}{clause} \
+         {pr_reminder}"
     )
 }
 
@@ -762,6 +808,13 @@ pub fn journal_instruction(journal_file: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::samurai_workflow;
+
+    /// The DEFAULT compiled workflow (issue #91) — what production callers
+    /// pass when the run config carries no custom graph.
+    fn wf() -> String {
+        samurai_workflow::compile(&samurai_workflow::WorkflowGraph::default())
+    }
 
     #[test]
     fn test_instruction_is_a_single_pasteable_line() {
@@ -1077,19 +1130,19 @@ mod tests {
     #[test]
     fn test_ritual_instruction_is_single_line_both_branches() {
         for head_matched in [true, false] {
-            let text = successor_ritual_instruction("#37", 2, head_matched);
+            let text = successor_ritual_instruction("#37", 2, head_matched, &wf());
             assert!(!text.contains('\n'), "ritual must not contain \\n");
             assert!(!text.contains('\r'), "ritual must not contain \\r");
         }
         // A pathological epic ref cannot smuggle a newline into the paste.
-        let text = successor_ritual_instruction("epic\nwith newline", 2, true);
+        let text = successor_ritual_instruction("epic\nwith newline", 2, true, &wf());
         assert!(!text.contains('\n'));
         assert!(text.contains("epic with newline"));
     }
 
     #[test]
     fn test_ritual_instruction_head_match_branch_skips_verify() {
-        let text = successor_ritual_instruction("#37", 2, true);
+        let text = successor_ritual_instruction("#37", 2, true, &wf());
         // Identity: generation, epic, predecessor.
         assert!(text.contains("generation 3"));
         assert!(text.contains("epic #37"));
@@ -1108,7 +1161,7 @@ mod tests {
 
     #[test]
     fn test_ritual_instruction_mismatch_branch_requires_verify() {
-        let text = successor_ritual_instruction("#37", 2, false);
+        let text = successor_ritual_instruction("#37", 2, false, &wf());
         assert!(text.contains("generation 3"));
         assert!(text.contains("successor to generation 2"));
         assert!(text.contains(".maestro/handoffs/37-gen2.md"));
@@ -1138,19 +1191,19 @@ mod tests {
     #[test]
     fn test_recovery_instruction_is_single_line() {
         for pin in [None, Some("owner/repo")] {
-            let text = recovery_ritual_instruction("#37", 2, pin);
+            let text = recovery_ritual_instruction("#37", 2, pin, &wf());
             assert!(!text.contains('\n'), "recovery must not contain \\n");
             assert!(!text.contains('\r'), "recovery must not contain \\r");
         }
         // A pathological epic ref cannot smuggle a newline into the paste.
-        let text = recovery_ritual_instruction("epic\nwith newline", 2, None);
+        let text = recovery_ritual_instruction("epic\nwith newline", 2, None, &wf());
         assert!(!text.contains('\n'));
         assert!(text.contains("epic with newline"));
     }
 
     #[test]
     fn test_recovery_instruction_content() {
-        let text = recovery_ritual_instruction("#37", 2, None);
+        let text = recovery_ritual_instruction("#37", 2, None, &wf());
         // Identity: what happened and who the successor is.
         assert!(text.contains("RECOVERY MODE"));
         assert!(text.contains("generation 3"));
@@ -1176,7 +1229,7 @@ mod tests {
     fn test_recovery_instruction_pins_the_repo_when_known() {
         // Fresh-eyes finding D (PRD §10): with the origin remote parsed, BOTH
         // the issue read and the takeover comment carry --repo explicitly.
-        let text = recovery_ritual_instruction("#37", 2, Some("nachogl1/maestro"));
+        let text = recovery_ritual_instruction("#37", 2, Some("nachogl1/maestro"), &wf());
         assert_eq!(
             text.matches("--repo nachogl1/maestro").count(),
             2,
@@ -1193,7 +1246,7 @@ mod tests {
 
     #[test]
     fn test_recovery_instruction_without_pin_carries_a_caution() {
-        let text = recovery_ritual_instruction("#37", 2, None);
+        let text = recovery_ritual_instruction("#37", 2, None, &wf());
         // No pinned `gh` usage (the caution itself mentions the missing pin).
         assert!(!text.contains("passing `--repo"));
         assert!(!text.contains("again via `gh`"));
@@ -1206,19 +1259,19 @@ mod tests {
     #[test]
     fn test_launch_instruction_is_single_line() {
         for pin in [None, Some("owner/repo")] {
-            let text = launch_instruction("#38", pin);
+            let text = launch_instruction("#38", pin, &wf());
             assert!(!text.contains('\n'), "launch brief must not contain \\n");
             assert!(!text.contains('\r'), "launch brief must not contain \\r");
         }
         // A pathological epic ref cannot smuggle a newline into the paste.
-        let text = launch_instruction("epic\nwith newline", None);
+        let text = launch_instruction("epic\nwith newline", None, &wf());
         assert!(!text.contains('\n'));
         assert!(text.contains("epic with newline"));
     }
 
     #[test]
     fn test_launch_instruction_content() {
-        let text = launch_instruction("#38", None);
+        let text = launch_instruction("#38", None, &wf());
         // Identity: gen-1, the epic, its dedicated worktree.
         assert!(text.contains("generation 1"));
         assert!(text.contains("epic #38"));
@@ -1252,7 +1305,7 @@ mod tests {
         // PRD §10: gen-1 runs with --dangerously-skip-permissions, so BOTH
         // the issue reads and the progress/PR clause carry --repo explicitly
         // (mirrors recovery_ritual_instruction's pinning language).
-        let text = launch_instruction("#38", Some("nachogl1/maestro"));
+        let text = launch_instruction("#38", Some("nachogl1/maestro"), &wf());
         assert_eq!(
             text.matches("--repo nachogl1/maestro").count(),
             2,
@@ -1264,7 +1317,7 @@ mod tests {
 
     #[test]
     fn test_launch_instruction_without_pin_carries_a_caution() {
-        let text = launch_instruction("#38", None);
+        let text = launch_instruction("#38", None, &wf());
         assert!(!text.contains("passing `--repo"));
         assert!(text.contains("CAUTION"));
         assert!(text.contains("double-check it targets the correct repository"));
@@ -1285,7 +1338,7 @@ mod tests {
     fn test_launch_instruction_list_shape_has_no_epic_framing() {
         // Given a plain issue list, the brief must not send gen-1 hunting
         // for a phantom epic issue that "references" the listed issues.
-        let text = launch_instruction("#76, #77, #78", Some("nachogl1/maestro"));
+        let text = launch_instruction("#76, #77, #78", Some("nachogl1/maestro"), &wf());
         assert!(text.contains("the following GitHub issues: #76, #77, #78"));
         assert!(text.contains("EACH listed issue and ALL of its comments"));
         assert!(text.contains("comment progress on each listed issue as it completes"));
@@ -1300,7 +1353,7 @@ mod tests {
     #[test]
     fn test_launch_instruction_single_epic_ref_keeps_todays_wording() {
         // Acceptance: a single epic ref must be untouched by the #87 fix.
-        let text = launch_instruction("#38", None);
+        let text = launch_instruction("#38", None, &wf());
         assert!(text.contains("for GitHub epic #38"));
         assert!(text.contains("the epic's dedicated worktree"));
         assert!(text.contains(
@@ -1312,7 +1365,7 @@ mod tests {
 
     #[test]
     fn test_successor_ritual_instruction_list_shape_has_no_epic_framing() {
-        let text = successor_ritual_instruction("77, 78", 2, true);
+        let text = successor_ritual_instruction("77, 78", 2, true, &wf());
         assert!(text.contains("the following GitHub issues: 77, 78"));
         assert!(!text.to_lowercase().contains("epic"));
         assert!(text.contains("generation 3"));
@@ -1321,7 +1374,7 @@ mod tests {
 
     #[test]
     fn test_recovery_ritual_instruction_list_shape_has_no_epic_framing() {
-        let text = recovery_ritual_instruction("77, 78", 2, Some("nachogl1/maestro"));
+        let text = recovery_ritual_instruction("77, 78", 2, Some("nachogl1/maestro"), &wf());
         assert!(text.contains("the following GitHub issues: 77, 78"));
         assert!(text.contains("EACH listed issue and ALL of its comments"));
         assert!(text.contains("comment on each listed issue"));
@@ -1339,8 +1392,8 @@ mod tests {
         // must demand VERIFIED runnability, not assumption — for the epic
         // shape AND the list shape.
         for text in [
-            launch_instruction("#38", Some("nachogl1/maestro")),
-            launch_instruction("#76, #77, #78", None),
+            launch_instruction("#38", Some("nachogl1/maestro"), &wf()),
+            launch_instruction("#76, #77, #78", None, &wf()),
         ] {
             // Runnability is part of the agent-ready bar…
             assert!(
@@ -1351,7 +1404,10 @@ mod tests {
             );
             // …and it is VERIFIED against the repo, never assumed.
             assert!(text.contains("VERIFY runnability"), "{text}");
-            assert!(text.contains("check the repo instead of assuming"), "{text}");
+            assert!(
+                text.contains("check the repo instead of assuming"),
+                "{text}"
+            );
             assert!(text.contains("package.json"), "{text}");
             assert!(text.contains("`--version`/`--help` probe"), "{text}");
             // A missing command disqualifies the issue…
@@ -1377,7 +1433,7 @@ mod tests {
         // Merging a Samurai PR must close the issues it resolves — GitHub
         // only does that when the PR body says so.
         for pin in [None, Some("nachogl1/maestro")] {
-            let text = launch_instruction("#38", pin);
+            let text = launch_instruction("#38", pin, &wf());
             assert!(text.contains("Closes #N"), "{text}");
             assert!(text.contains("Fixes #N"), "{text}");
             assert!(text.contains("GitHub auto-closes them on merge"), "{text}");
@@ -1387,7 +1443,7 @@ mod tests {
     #[test]
     fn test_successor_ritual_instruction_instructs_pr_issue_linking() {
         for head_matched in [true, false] {
-            let text = successor_ritual_instruction("#37", 2, head_matched);
+            let text = successor_ritual_instruction("#37", 2, head_matched, &wf());
             assert!(text.contains("Closes #N"), "{text}");
             assert!(text.contains("Fixes #N"), "{text}");
             assert!(text.contains("GitHub auto-closes them on merge"), "{text}");
@@ -1397,7 +1453,7 @@ mod tests {
     #[test]
     fn test_recovery_ritual_instruction_instructs_pr_issue_linking() {
         // Audited per issue #95: recovery briefs can open PRs too.
-        let text = recovery_ritual_instruction("#37", 2, None);
+        let text = recovery_ritual_instruction("#37", 2, None, &wf());
         assert!(text.contains("Closes #N"));
         assert!(text.contains("Fixes #N"));
         assert!(text.contains("GitHub auto-closes them on merge"));
@@ -1407,7 +1463,7 @@ mod tests {
 
     #[test]
     fn test_launch_instruction_instructs_pr_title_enumerates_refs() {
-        let text = launch_instruction("#38", None);
+        let text = launch_instruction("#38", None, &wf());
         assert!(
             text.contains(
                 "every PR title must list every issue/epic number this run covers, from the \
@@ -1415,12 +1471,15 @@ mod tests {
             ),
             "{text}"
         );
-        assert!(text.contains("`feat(samurai): #76 #77 #78 — summary`"), "{text}");
+        assert!(
+            text.contains("`feat(samurai): #76 #77 #78 — summary`"),
+            "{text}"
+        );
     }
 
     #[test]
     fn test_successor_ritual_instruction_instructs_pr_title_enumerates_refs() {
-        let text = successor_ritual_instruction("#37", 2, true);
+        let text = successor_ritual_instruction("#37", 2, true, &wf());
         assert!(
             text.contains(
                 "its title must list every issue/epic number this run covers, from the moment \
@@ -1428,7 +1487,10 @@ mod tests {
             ),
             "{text}"
         );
-        assert!(text.contains("`feat(samurai): #76 #77 #78 — summary`"), "{text}");
+        assert!(
+            text.contains("`feat(samurai): #76 #77 #78 — summary`"),
+            "{text}"
+        );
     }
 
     // --- issue #96: run-completion declaration clause ---
@@ -1439,12 +1501,12 @@ mod tests {
         // so EVERY orchestrator brief — gen-1 (epic ref or issue list) and
         // both successor rituals — must tell the model how to declare.
         let briefs = [
-            launch_instruction("#38", Some("nachogl1/maestro")),
-            launch_instruction("77, 78", None),
-            successor_ritual_instruction("#37", 2, true),
-            successor_ritual_instruction("#37", 2, false),
-            recovery_ritual_instruction("#37", 2, Some("nachogl1/maestro")),
-            recovery_ritual_instruction("#37", 2, None),
+            launch_instruction("#38", Some("nachogl1/maestro"), &wf()),
+            launch_instruction("77, 78", None, &wf()),
+            successor_ritual_instruction("#37", 2, true, &wf()),
+            successor_ritual_instruction("#37", 2, false, &wf()),
+            recovery_ritual_instruction("#37", 2, Some("nachogl1/maestro"), &wf()),
+            recovery_ritual_instruction("#37", 2, None, &wf()),
         ];
         for text in &briefs {
             // The exact tag the samurai_completion scanner watches for, in
@@ -1476,14 +1538,14 @@ mod tests {
         // FIRST — before any code — and never silently reorders. A deviation
         // goes through the order-alert marker + the user's answer in the
         // terminal.
-        let epic = launch_instruction("#38", Some("nachogl1/maestro"));
+        let epic = launch_instruction("#38", Some("nachogl1/maestro"), &wf());
         assert!(
             epic.contains("the order in which the epic lists its child issues"),
             "{epic}"
         );
         // List shape stays epic-free (enforced by
         // test_launch_instruction_list_shape_has_no_epic_framing).
-        let list = launch_instruction("#76, #77, #78", None);
+        let list = launch_instruction("#76, #77, #78", None, &wf());
         assert!(
             list.contains("the order in which the issues are listed above"),
             "{list}"
@@ -1500,7 +1562,10 @@ mod tests {
             );
             // Agreement is silent; deviation STOPs and alerts with BOTH
             // orders + reasoning via the exact tag the watcher scans for.
-            assert!(text.contains("proceed in that order without comment"), "{text}");
+            assert!(
+                text.contains("proceed in that order without comment"),
+                "{text}"
+            );
             assert!(text.contains("STOP before any code"), "{text}");
             assert!(
                 text.contains(&format!("<{ORDER_ALERT_TAG}>original:")),
@@ -1522,11 +1587,11 @@ mod tests {
         // order fixed at launch — they must not re-plan it, and a new
         // deviation goes through the same alert + confirmation.
         let briefs = [
-            successor_ritual_instruction("#37", 2, true),
-            successor_ritual_instruction("#37", 2, false),
-            successor_ritual_instruction("77, 78", 2, true),
-            recovery_ritual_instruction("#37", 2, Some("nachogl1/maestro")),
-            recovery_ritual_instruction("77, 78", 2, None),
+            successor_ritual_instruction("#37", 2, true, &wf()),
+            successor_ritual_instruction("#37", 2, false, &wf()),
+            successor_ritual_instruction("77, 78", 2, true, &wf()),
+            recovery_ritual_instruction("#37", 2, Some("nachogl1/maestro"), &wf()),
+            recovery_ritual_instruction("77, 78", 2, None, &wf()),
         ];
         for text in &briefs {
             assert!(text.contains("fixed at launch"), "{text}");
@@ -1540,6 +1605,113 @@ mod tests {
             assert!(text.contains("NEVER silently reorder"), "{text}");
             assert!(!text.contains('\n'));
         }
+    }
+
+    // --- issue #91: the compiled WORKFLOW section ---
+
+    #[test]
+    fn test_every_orchestrator_brief_carries_the_delimited_workflow_section() {
+        // Launch (epic ref AND issue list), successor (both HEAD-gate
+        // branches) and recovery briefs all embed the compiled workflow,
+        // clearly delimited, still one paste-able line.
+        let briefs = [
+            launch_instruction("#38", Some("nachogl1/maestro"), &wf()),
+            launch_instruction("#76, #77, #78", None, &wf()),
+            successor_ritual_instruction("#37", 2, true, &wf()),
+            successor_ritual_instruction("#37", 2, false, &wf()),
+            recovery_ritual_instruction("#37", 2, Some("nachogl1/maestro"), &wf()),
+            recovery_ritual_instruction("#37", 2, None, &wf()),
+        ];
+        for text in &briefs {
+            assert!(
+                text.contains("WORKFLOW — the process for this run"),
+                "{text}"
+            );
+            assert!(text.contains("— END OF WORKFLOW."), "{text}");
+            // The canonical steps, in canonical order (issue #91: implement
+            // → review → committed QA report → push per issue, then batch
+            // review → batch QA from the reports → PR for the human).
+            let positions: Vec<usize> = [
+                "Step 1: Work the run's issues strictly ONE at a time",
+                "Step 2: Run a fresh-eyes review",
+                "Step 3: Write a QA report",
+                "Step 4: Push the branch",
+                "Step 5: After ALL issues are done",
+                "Step 6: Run a batch QA pass using the committed per-issue QA reports",
+                "Step 7: Open or finalize the run's pull request",
+            ]
+            .iter()
+            .map(|marker| {
+                text.find(marker)
+                    .unwrap_or_else(|| panic!("missing {marker:?}: {text}"))
+            })
+            .collect();
+            assert!(
+                positions.windows(2).all(|w| w[0] < w[1]),
+                "steps out of order: {text}"
+            );
+            assert!(text.contains("HUMAN merge decision"), "{text}");
+            // Composition contract: the section sits AFTER the #93 ORDER
+            // clause and BEFORE the #96 COMPLETION clause — none of which
+            // may regress.
+            let order = text.find("ORDER:").expect("ORDER clause present");
+            let workflow = text.find("WORKFLOW —").unwrap();
+            let completion = text.find("COMPLETION:").expect("COMPLETION clause present");
+            assert!(
+                order < workflow && workflow < completion,
+                "clause order broke: {text}"
+            );
+            // The #92/#95 PR-discipline wording still rides every brief.
+            assert!(text.contains("Closes #N"), "{text}");
+            // Still one paste-able line (module doc).
+            assert!(!text.contains('\n'), "brief must stay a single line");
+            assert!(!text.contains('\r'));
+        }
+    }
+
+    #[test]
+    fn test_briefs_embed_the_workflow_they_are_given_not_a_default() {
+        // Successors recompile from the graph the run config snapshotted at
+        // launch — whatever compiled text arrives is what must ride.
+        let custom = "Step 1: custom implement Step 2: custom ship";
+        for text in [
+            launch_instruction("#38", None, custom),
+            successor_ritual_instruction("#37", 2, true, custom),
+            recovery_ritual_instruction("#37", 2, None, custom),
+        ] {
+            assert!(text.contains("Step 1: custom implement"), "{text}");
+            assert!(text.contains("Step 2: custom ship"), "{text}");
+            assert!(!text.contains("fresh-eyes review"), "{text}");
+        }
+    }
+
+    #[test]
+    fn test_empty_compiled_workflow_omits_the_section_entirely() {
+        // A graph edited down to nothing yields no WORKFLOW shell — and a
+        // pathological compiled string cannot smuggle a newline in.
+        for text in [
+            launch_instruction("#38", None, ""),
+            successor_ritual_instruction("#37", 2, false, "  "),
+            recovery_ritual_instruction("#37", 2, None, ""),
+        ] {
+            assert!(!text.contains("WORKFLOW"), "{text}");
+            assert!(!text.contains("END OF"), "{text}");
+        }
+        let text = launch_instruction("#38", None, "Step 1: a\nStep 2: b");
+        assert!(!text.contains('\n'), "workflow text must be normalized");
+        assert!(text.contains("Step 1: a Step 2: b"));
+    }
+
+    #[test]
+    fn test_workflow_section_keeps_the_list_shape_epic_free() {
+        // The #87 contract survives the new section: a comma-separated list
+        // brief must stay free of epic framing even WITH the workflow.
+        let text = launch_instruction("#76, #77, #78", None, &wf());
+        assert!(!text.to_lowercase().contains("epic"), "{text}");
+        let text = successor_ritual_instruction("77, 78", 2, true, &wf());
+        assert!(!text.to_lowercase().contains("epic"), "{text}");
+        let text = recovery_ritual_instruction("77, 78", 2, None, &wf());
+        assert!(!text.to_lowercase().contains("epic"), "{text}");
     }
 
     // --- issue #72: journaling rider ---

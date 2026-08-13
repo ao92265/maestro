@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use super::samurai_config::SamuraiConfig;
 use super::samurai_prompts::epic_slug;
+use super::samurai_workflow::WorkflowGraph;
 use super::status_server::StatusServer;
 
 /// Run config lifecycle state. SCREAMING on the wire like the audit event
@@ -87,6 +88,13 @@ pub struct SamuraiRunConfig {
     /// (the launcher UI seeds the struct from the global config and tweaks).
     #[serde(default)]
     pub thresholds: Option<SamuraiConfig>,
+    /// The workflow graph snapshotted at launch (issue #91) — successor
+    /// briefs recompile THIS graph after handoffs, so the run's process
+    /// never drifts mid-run. `None` (configs written before workflows
+    /// existed) reads as the default template
+    /// (`samurai_workflow::compiled_for_run`).
+    #[serde(default)]
+    pub workflow: Option<WorkflowGraph>,
     pub status: RunConfigStatus,
     /// RFC 3339 UTC creation timestamp.
     pub created_at: String,
@@ -107,6 +115,7 @@ impl SamuraiRunConfig {
             worktree_path: worktree_path.into(),
             model: None,
             thresholds: None,
+            workflow: None,
             status: RunConfigStatus::Active,
             created_at: chrono::Utc::now().to_rfc3339(),
         }
@@ -382,6 +391,7 @@ mod tests {
             "worktree_path",
             "model",
             "thresholds",
+            "workflow",
             "status",
             "created_at",
         ] {
@@ -523,6 +533,32 @@ mod tests {
         let loaded = store.get("C:/git/maestro", "#37").unwrap();
         assert_eq!(loaded.status, RunConfigStatus::Active);
         assert_eq!(store.load_active().len(), 1);
+        // Issue #91 backward compat: no `workflow` key on disk → None,
+        // which `samurai_workflow::compiled_for_run` reads as the default
+        // template.
+        assert_eq!(loaded.workflow, None);
+    }
+
+    #[test]
+    fn test_workflow_snapshot_roundtrips() {
+        // Issue #91: the graph snapshotted at launch survives the save/get
+        // roundtrip byte-identically, so successor briefs recompile exactly
+        // the workflow the run launched with.
+        let dir = tempdir().unwrap();
+        let store = RunConfigStore::new(dir.path().to_path_buf());
+        let mut config = sample("C:/git/maestro", "#37");
+        let mut graph = WorkflowGraph::default();
+        graph
+            .nodes
+            .iter_mut()
+            .find(|n| n.id == "review")
+            .unwrap()
+            .text = "Custom review ritual".to_string();
+        config.workflow = Some(graph.clone());
+
+        store.save(&config).unwrap();
+        let loaded = store.get("C:/git/maestro", "#37").unwrap();
+        assert_eq!(loaded.workflow, Some(graph));
     }
 
     #[test]
