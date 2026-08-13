@@ -104,6 +104,8 @@ fn build_router(state: Arc<ServerState>) -> Router {
         .route("/hook/session-end", post(handle_hook_session_end))
         .route("/hook/pre-tool", post(handle_hook_pre_tool))
         .route("/hook/stop", post(handle_hook_stop))
+        .route("/hook/notification", post(handle_hook_notification))
+        .route("/hook/user-prompt", post(handle_hook_user_prompt_submit))
         .with_state(state)
 }
 
@@ -394,6 +396,42 @@ fn is_within_claude_projects(transcript_path: &str) -> bool {
     path.starts_with(&projects)
 }
 
+/// Look up a registered session's project and emit a status payload for it.
+///
+/// Hook-sourced statuses are moment-in-time signals: for a session that is
+/// not registered (yet, or any more) they are logged and dropped rather than
+/// buffered — replaying "was asking a question 30s ago" at registration time
+/// would be wrong more often than right.
+async fn emit_hook_status(
+    state: &Arc<ServerState>,
+    session_id: u32,
+    status: &str,
+    message: &str,
+    needs_input_prompt: Option<String>,
+) {
+    let project_path = {
+        let projects = state.session_projects.read().await;
+        projects.get(&session_id).cloned()
+    };
+    match project_path {
+        Some(project_path) => {
+            (state.emit_fn)(SessionStatusPayload {
+                session_id,
+                project_path,
+                status: status.to_string(),
+                message: message.to_string(),
+                needs_input_prompt,
+            });
+        }
+        None => {
+            info!(
+                "[HOOK] status '{}': session {} not registered, skipping status emit",
+                status, session_id
+            );
+        }
+    }
+}
+
 // ── Hook handlers ────────────────────────────────────────────────────
 
 /// Handle the SessionStart hook callback.
@@ -441,22 +479,12 @@ async fn handle_hook_session_start(
         (hook_emit)(event);
     }
 
-    // Also emit a regular status update so the UI shows "Working"
-    let project_path = {
-        let projects = state.session_projects.read().await;
-        projects.get(&maestro_session_id).cloned()
-    };
-
-    if let Some(project_path) = project_path {
-        let status_payload = SessionStatusPayload {
-            session_id: maestro_session_id,
-            project_path,
-            status: "Working".to_string(),
-            message: "Session started".to_string(),
-            needs_input_prompt: None,
-        };
-        (state.emit_fn)(status_payload);
-    }
+    // A freshly (re)started CLI sits at its input prompt — it is NOT working
+    // (issue #105 class 1/2: this used to emit "Working", which stuck until
+    // some other signal arrived). The UserPromptSubmit hook flips the session
+    // to Working the moment a prompt (typed or injected) is actually
+    // submitted.
+    emit_hook_status(&state, maestro_session_id, "Idle", "Session started", None).await;
 
     StatusCode::OK
 }
@@ -501,6 +529,21 @@ async fn handle_hook_session_end(
     if let Some(ref hook_emit) = state.hook_emit_fn {
         (hook_emit)(event);
     }
+
+    // The claude process is gone — whatever status the session showed
+    // (Working, NeedsInput, …) is stale the instant this hook fires (issue
+    // #105 class 2: previously nothing was emitted here, so the last status
+    // stuck forever). "SessionEnded" is a wire-only signal: the frontend
+    // normalizes it to Idle unless the agent already reported a terminal
+    // Done/Error, which stays visible.
+    emit_hook_status(
+        &state,
+        maestro_session_id,
+        "SessionEnded",
+        "Claude session ended",
+        None,
+    )
+    .await;
 
     StatusCode::OK
 }
@@ -563,7 +606,7 @@ async fn handle_hook_pre_tool(
 
     let event = ClaudeEvent::ToolUseStarted {
         session_id: maestro_session_id,
-        tool_name,
+        tool_name: tool_name.clone(),
         tool_use_id,
         input_summary: tool_input,
         timestamp: Utc::now().to_rfc3339(),
@@ -572,6 +615,133 @@ async fn handle_hook_pre_tool(
     if let Some(ref hook_emit) = state.hook_emit_fn {
         (hook_emit)(event);
     }
+
+    // A tool call is hard evidence of what the CLI is doing right now, so
+    // surface it as a status too (the ClaudeEvent above only feeds the
+    // activity feed, not the status indicator):
+    // - AskUserQuestion renders an interactive question dialog and blocks on
+    //   the user → NeedsInput (issue #105 classes 1/3: mid-turn questions
+    //   previously produced no needs-input signal at all — only PTY output,
+    //   which the frontend heuristic read as "Working").
+    // - Any other tool means the agent is actively working → Working. This
+    //   also repairs the status after a permission prompt is approved via a
+    //   digit shortcut (no Enter keypress for the frontend to observe), and
+    //   keeps the PTY heuristic inside its "authoritative signal is fresh"
+    //   grace window during tool-dense turns.
+    if tool_name == "AskUserQuestion" {
+        emit_hook_status(
+            &state,
+            maestro_session_id,
+            "NeedsInput",
+            "Waiting for you to answer a question",
+            Some("The agent asked a question in the terminal".to_string()),
+        )
+        .await;
+    } else {
+        emit_hook_status(
+            &state,
+            maestro_session_id,
+            "Working",
+            &format!("Running {}", tool_name),
+            None,
+        )
+        .await;
+    }
+
+    StatusCode::OK
+}
+
+/// Handle the Notification hook callback.
+///
+/// Claude Code fires Notification precisely when it is waiting on the human:
+/// permission prompts ("Claude needs your permission to use Bash") and the
+/// idle-prompt reminder (input sat unanswered for 60+ seconds). Both mean
+/// NeedsInput. This is the reliable mid-turn needs-input signal issue #105
+/// classes 1 and 3 were missing: a permission prompt produces PTY output
+/// (which the frontend heuristic read as "Working") but, before this hook,
+/// no event at all.
+async fn handle_hook_notification(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<HookGenericRequest>,
+) -> StatusCode {
+    if !instance_id_matches(&headers, &state.instance_id) {
+        eprintln!("[HOOK] notification: rejected - missing/invalid X-Maestro-Instance");
+        return StatusCode::FORBIDDEN;
+    }
+
+    let maestro_session_id = match extract_maestro_session_id(&headers) {
+        Some(id) => id,
+        None => {
+            eprintln!("[HOOK] notification: missing or invalid X-Maestro-Session header");
+            return StatusCode::BAD_REQUEST;
+        }
+    };
+
+    let message = payload
+        .extra
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Claude is waiting for your input")
+        .to_string();
+
+    info!(
+        "[HOOK] notification: maestro_session={}, message={}",
+        maestro_session_id, message
+    );
+
+    emit_hook_status(
+        &state,
+        maestro_session_id,
+        "NeedsInput",
+        &message,
+        Some(message.clone()),
+    )
+    .await;
+
+    StatusCode::OK
+}
+
+/// Handle the UserPromptSubmit hook callback.
+///
+/// Fires the moment a prompt is submitted to the CLI — typed by the human or
+/// injected by Maestro (samurai launches type the brief into the PTY). This
+/// is the authoritative "a turn started, the agent is working" signal: it
+/// replaces the old reliance on the PTY-output heuristic (≥500ms of output)
+/// and, crucially, it is the only signal that moves a session out of a
+/// terminal Done/Error once a NEW turn begins (issue #105 class 2: a session
+/// that once reported Done used to stay Done forever).
+async fn handle_hook_user_prompt_submit(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<HookGenericRequest>,
+) -> StatusCode {
+    if !instance_id_matches(&headers, &state.instance_id) {
+        eprintln!("[HOOK] user-prompt: rejected - missing/invalid X-Maestro-Instance");
+        return StatusCode::FORBIDDEN;
+    }
+
+    let maestro_session_id = match extract_maestro_session_id(&headers) {
+        Some(id) => id,
+        None => {
+            eprintln!("[HOOK] user-prompt: missing or invalid X-Maestro-Session header");
+            return StatusCode::BAD_REQUEST;
+        }
+    };
+
+    info!(
+        "[HOOK] user-prompt: maestro_session={}, claude_session={}",
+        maestro_session_id, payload.session_id
+    );
+
+    emit_hook_status(
+        &state,
+        maestro_session_id,
+        "Working",
+        "Processing your request",
+        None,
+    )
+    .await;
 
     StatusCode::OK
 }
@@ -614,25 +784,15 @@ async fn handle_hook_stop(
     // the user. Surface that as an "AwaitingInput" status so the UI can flag
     // the terminal as waiting for a reply. The frontend normalizes it to
     // NeedsInput unless the agent already reported a terminal state
-    // (Done/Error) via MCP.
-    let project_path = {
-        let projects = state.session_projects.read().await;
-        projects.get(&maestro_session_id).cloned()
-    };
-    if let Some(project_path) = project_path {
-        (state.emit_fn)(SessionStatusPayload {
-            session_id: maestro_session_id,
-            project_path,
-            status: "AwaitingInput".to_string(),
-            message: "Waiting for your input".to_string(),
-            needs_input_prompt: None,
-        });
-    } else {
-        info!(
-            "[HOOK] stop: session {} not registered, skipping status emit",
-            maestro_session_id
-        );
-    }
+    // (Done/Error) via MCP, or it handed work off to running subagents.
+    emit_hook_status(
+        &state,
+        maestro_session_id,
+        "AwaitingInput",
+        "Waiting for your input",
+        None,
+    )
+    .await;
 
     StatusCode::OK
 }
@@ -778,6 +938,8 @@ mod tests {
         assert_eq!(post_hook(addr, "/hook/session-start", None, body.clone()).await, 403);
         assert_eq!(post_hook(addr, "/hook/session-end", None, body.clone()).await, 403);
         assert_eq!(post_hook(addr, "/hook/pre-tool", None, body.clone()).await, 403);
+        assert_eq!(post_hook(addr, "/hook/notification", None, body.clone()).await, 403);
+        assert_eq!(post_hook(addr, "/hook/user-prompt", None, body.clone()).await, 403);
         assert_eq!(post_hook(addr, "/hook/stop", None, body).await, 403);
     }
 
@@ -819,6 +981,199 @@ mod tests {
         assert_eq!(emitted[0].project_path, "/path/project");
         assert_eq!(emitted[0].status, "AwaitingInput");
         assert_eq!(emitted[0].needs_input_prompt, None);
+    }
+
+    // ── Hook → status mapping tests (issue #105) ────────────────────
+
+    #[tokio::test]
+    async fn session_start_hook_emits_idle_for_registered_session() {
+        let (emit_fn, events) = test_emit_fn();
+        let (addr, projects, _pend) = start_test_http_server("inst-secret", emit_fn).await;
+        projects.write().await.insert(1, "/path/project".to_string());
+
+        // Must be inside ~/.claude/projects to pass the confinement check.
+        let base = directories::BaseDirs::new().unwrap();
+        let transcript = base.home_dir().join(".claude/projects/enc/t.jsonl");
+        let body = serde_json::json!({
+            "session_id": "claude-uuid",
+            "transcript_path": transcript.to_string_lossy(),
+            "cwd": "/tmp",
+            "hook_event_name": "SessionStart",
+        });
+        assert_eq!(
+            post_hook(addr, "/hook/session-start", Some("inst-secret"), body).await,
+            200
+        );
+
+        let emitted = events.lock().unwrap();
+        assert_eq!(emitted.len(), 1);
+        // A freshly started CLI sits at its prompt: Idle, not Working.
+        assert_eq!(emitted[0].status, "Idle");
+        assert_eq!(emitted[0].message, "Session started");
+    }
+
+    #[tokio::test]
+    async fn session_end_hook_emits_session_ended_for_registered_session() {
+        let (emit_fn, events) = test_emit_fn();
+        let (addr, projects, _pend) = start_test_http_server("inst-secret", emit_fn).await;
+        projects.write().await.insert(1, "/path/project".to_string());
+
+        let body = serde_json::json!({
+            "session_id": "claude-uuid",
+            "hook_event_name": "SessionEnd",
+            "exit_reason": "prompt_input_exit",
+        });
+        assert_eq!(
+            post_hook(addr, "/hook/session-end", Some("inst-secret"), body).await,
+            200
+        );
+
+        let emitted = events.lock().unwrap();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].status, "SessionEnded");
+        assert_eq!(emitted[0].needs_input_prompt, None);
+    }
+
+    #[tokio::test]
+    async fn pre_tool_hook_emits_working_for_ordinary_tools() {
+        let (emit_fn, events) = test_emit_fn();
+        let (addr, projects, _pend) = start_test_http_server("inst-secret", emit_fn).await;
+        projects.write().await.insert(1, "/path/project".to_string());
+
+        let body = serde_json::json!({
+            "session_id": "claude-uuid",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_use_id": "tu-1",
+            "tool_input": {"command": "ls"},
+        });
+        assert_eq!(post_hook(addr, "/hook/pre-tool", Some("inst-secret"), body).await, 200);
+
+        let emitted = events.lock().unwrap();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].status, "Working");
+        assert_eq!(emitted[0].message, "Running Bash");
+        assert_eq!(emitted[0].needs_input_prompt, None);
+    }
+
+    #[tokio::test]
+    async fn pre_tool_hook_emits_needs_input_for_ask_user_question() {
+        let (emit_fn, events) = test_emit_fn();
+        let (addr, projects, _pend) = start_test_http_server("inst-secret", emit_fn).await;
+        projects.write().await.insert(1, "/path/project".to_string());
+
+        let body = serde_json::json!({
+            "session_id": "claude-uuid",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "AskUserQuestion",
+            "tool_use_id": "tu-2",
+            "tool_input": {"questions": []},
+        });
+        assert_eq!(post_hook(addr, "/hook/pre-tool", Some("inst-secret"), body).await, 200);
+
+        let emitted = events.lock().unwrap();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].status, "NeedsInput");
+        assert!(emitted[0].needs_input_prompt.is_some());
+    }
+
+    #[tokio::test]
+    async fn notification_hook_emits_needs_input_with_message_as_prompt() {
+        let (emit_fn, events) = test_emit_fn();
+        let (addr, projects, _pend) = start_test_http_server("inst-secret", emit_fn).await;
+        projects.write().await.insert(1, "/path/project".to_string());
+
+        let body = serde_json::json!({
+            "session_id": "claude-uuid",
+            "hook_event_name": "Notification",
+            "message": "Claude needs your permission to use Bash",
+        });
+        assert_eq!(
+            post_hook(addr, "/hook/notification", Some("inst-secret"), body).await,
+            200
+        );
+
+        let emitted = events.lock().unwrap();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].status, "NeedsInput");
+        assert_eq!(emitted[0].message, "Claude needs your permission to use Bash");
+        assert_eq!(
+            emitted[0].needs_input_prompt.as_deref(),
+            Some("Claude needs your permission to use Bash")
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_hook_defaults_message_when_absent() {
+        let (emit_fn, events) = test_emit_fn();
+        let (addr, projects, _pend) = start_test_http_server("inst-secret", emit_fn).await;
+        projects.write().await.insert(1, "/path/project".to_string());
+
+        let body = serde_json::json!({
+            "session_id": "claude-uuid",
+            "hook_event_name": "Notification",
+        });
+        assert_eq!(
+            post_hook(addr, "/hook/notification", Some("inst-secret"), body).await,
+            200
+        );
+
+        let emitted = events.lock().unwrap();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].status, "NeedsInput");
+        assert_eq!(emitted[0].message, "Claude is waiting for your input");
+    }
+
+    #[tokio::test]
+    async fn user_prompt_hook_emits_working() {
+        let (emit_fn, events) = test_emit_fn();
+        let (addr, projects, _pend) = start_test_http_server("inst-secret", emit_fn).await;
+        projects.write().await.insert(1, "/path/project".to_string());
+
+        let body = serde_json::json!({
+            "session_id": "claude-uuid",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "do the thing",
+        });
+        assert_eq!(
+            post_hook(addr, "/hook/user-prompt", Some("inst-secret"), body).await,
+            200
+        );
+
+        let emitted = events.lock().unwrap();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].status, "Working");
+        assert_eq!(emitted[0].message, "Processing your request");
+    }
+
+    #[tokio::test]
+    async fn hook_status_emits_skip_unregistered_sessions() {
+        let (emit_fn, events) = test_emit_fn();
+        let (addr, _p, _pend) = start_test_http_server("inst-secret", emit_fn).await;
+        // Session 1 NOT registered.
+
+        for (route, body) in [
+            (
+                "/hook/notification",
+                serde_json::json!({"session_id": "u", "hook_event_name": "Notification", "message": "m"}),
+            ),
+            (
+                "/hook/user-prompt",
+                serde_json::json!({"session_id": "u", "hook_event_name": "UserPromptSubmit"}),
+            ),
+            (
+                "/hook/session-end",
+                serde_json::json!({"session_id": "u", "hook_event_name": "SessionEnd"}),
+            ),
+            (
+                "/hook/pre-tool",
+                serde_json::json!({"session_id": "u", "hook_event_name": "PreToolUse", "tool_name": "Bash"}),
+            ),
+        ] {
+            assert_eq!(post_hook(addr, route, Some("inst-secret"), body).await, 200);
+        }
+
+        assert!(events.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
