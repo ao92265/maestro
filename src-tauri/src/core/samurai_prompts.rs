@@ -118,6 +118,22 @@ fn completion_declaration_clause() -> String {
     )
 }
 
+/// The PR-issue-linking reminder (issue #95; audited across every brief that
+/// can open or update a pull request): a merged Samurai PR only auto-closes
+/// the issues it resolves when its body says so — without this, merging
+/// leaves every fixed issue open until a human notices.
+/// `launch_instruction` states the rule as a hard step inline (its
+/// gh_progress arm already covers PRs); successor and recovery briefs carry
+/// it as a standing reminder here since whether either opens a NEW pull
+/// request depends on the handoff's Next steps / the run's remaining work,
+/// not on this instruction alone. Single line by construction (see module
+/// doc).
+fn pr_discipline_reminder() -> String {
+    "If you open or update a pull request: its body must contain `Closes #N` (or `Fixes #N`) \
+     for each issue it resolves, so GitHub auto-closes them on merge."
+        .to_string()
+}
+
 /// Filesystem-safe slug of an epic ref for the handoff filename: `#37` →
 /// `37`, `https://github.com/o/r/issues/9` → `https-github-com-o-r-issues-9`.
 /// ASCII alphanumerics are kept (lowercased); every other run of characters
@@ -425,12 +441,13 @@ pub fn successor_ritual_instruction(
          doing anything else — it and GitHub are your only sources of truth."
     );
     let clause = completion_declaration_clause();
+    let pr_reminder = pr_discipline_reminder();
     if head_matched {
         format!(
             "{opening} Maestro verified that this repository's current HEAD equals the SHA \
              recorded in the handoff's \"Repo state\" section, so the verify step is already \
              satisfied: SKIP the commands in the handoff's Verify section and continue directly \
-             with its Next steps.{clause}"
+             with its Next steps.{clause} {pr_reminder}"
         )
     } else {
         format!(
@@ -438,7 +455,7 @@ pub fn successor_ritual_instruction(
              SHA recorded in the handoff's \"Repo state\" section. You MUST run every command in \
              the handoff's Verify section FIRST, and trust NOTHING the handoff claims that those \
              commands do not confirm — investigate and fix any failure before moving on. Only \
-             then continue with the handoff's Next steps.{clause}"
+             then continue with the handoff's Next steps.{clause} {pr_reminder}"
         )
     }
 }
@@ -486,6 +503,10 @@ pub fn launch_instruction(epic: &str, repo_pin: Option<&str>) -> String {
     } else {
         "comment progress on the epic's GitHub issue as issues complete"
     };
+    // Issue #95: merging a Samurai PR closes nothing unless its body links
+    // the issues it resolves.
+    let pr_discipline = "every PR body must contain `Closes #N` (or `Fixes #N`) for each issue \
+         it resolves so GitHub auto-closes them on merge";
     let (gh_read, gh_progress, caution) = match repo_pin {
         Some(pin) => (
             format!(
@@ -493,14 +514,16 @@ pub fn launch_instruction(epic: &str, repo_pin: Option<&str>) -> String {
                  on every `gh` command"
             ),
             format!(
-                "{progress_lead}, and open pull requests for finished work (again via `gh` \
-                 with `--repo {pin}` on every command)"
+                "{progress_lead}, and open pull requests for finished work — {pr_discipline} \
+                 (again via `gh` with `--repo {pin}` on every command)"
             ),
             String::new(),
         ),
         None => (
             format!("read {gh_read_subject} with the `gh` CLI, run from this directory"),
-            format!("{progress_lead}, and open pull requests for finished work"),
+            format!(
+                "{progress_lead}, and open pull requests for finished work — {pr_discipline}"
+            ),
             " CAUTION: Maestro could not determine this repository's origin remote, so no \
              `--repo` pin is available — before running any `gh` command, double-check it \
              targets the correct repository."
@@ -604,6 +627,7 @@ pub fn recovery_ritual_instruction(
         ),
     };
     let clause = completion_declaration_clause();
+    let pr_reminder = pr_discipline_reminder();
     format!(
         "[Maestro Samurai] RECOVERY MODE: you are generation {generation} for {subject}. \
          Generation {predecessor_generation} died without a valid handoff file, so there is \
@@ -615,7 +639,7 @@ pub fn recovery_ritual_instruction(
          Then run the project's standard verification (build + tests) BEFORE trusting or \
          continuing anything — investigate and fix any failure first. Once verification passes, \
          {gh_comment} that generation {generation} has taken over in \
-         recovery mode, then continue {remaining_work}.{caution}{clause}"
+         recovery mode, then continue {remaining_work}.{caution}{clause} {pr_reminder}"
     )
 }
 
@@ -1213,6 +1237,39 @@ mod tests {
         assert!(text.contains("this run's remaining work"));
         assert!(!text.to_lowercase().contains("epic"));
         assert!(text.contains("RECOVERY MODE"));
+    }
+
+    // --- issue #95: PR-issue linking (Closes/Fixes) ---
+
+    #[test]
+    fn test_launch_instruction_instructs_pr_issue_linking() {
+        // Merging a Samurai PR must close the issues it resolves — GitHub
+        // only does that when the PR body says so.
+        for pin in [None, Some("nachogl1/maestro")] {
+            let text = launch_instruction("#38", pin);
+            assert!(text.contains("Closes #N"), "{text}");
+            assert!(text.contains("Fixes #N"), "{text}");
+            assert!(text.contains("GitHub auto-closes them on merge"), "{text}");
+        }
+    }
+
+    #[test]
+    fn test_successor_ritual_instruction_instructs_pr_issue_linking() {
+        for head_matched in [true, false] {
+            let text = successor_ritual_instruction("#37", 2, head_matched);
+            assert!(text.contains("Closes #N"), "{text}");
+            assert!(text.contains("Fixes #N"), "{text}");
+            assert!(text.contains("GitHub auto-closes them on merge"), "{text}");
+        }
+    }
+
+    #[test]
+    fn test_recovery_ritual_instruction_instructs_pr_issue_linking() {
+        // Audited per issue #95: recovery briefs can open PRs too.
+        let text = recovery_ritual_instruction("#37", 2, None);
+        assert!(text.contains("Closes #N"));
+        assert!(text.contains("Fixes #N"));
+        assert!(text.contains("GitHub auto-closes them on merge"));
     }
 
     // --- issue #96: run-completion declaration clause ---
