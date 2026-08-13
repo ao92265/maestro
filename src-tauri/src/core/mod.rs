@@ -33,6 +33,7 @@ pub mod samurai_replicator;
 pub mod samurai_resumer;
 pub mod samurai_run_config;
 pub mod samurai_schedule;
+pub mod samurai_test_gate;
 pub mod samurai_watchdog;
 pub mod session_manager;
 pub mod status_server;

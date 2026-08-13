@@ -10,12 +10,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
-use tauri::{AppHandle, State};
+use serde_json::json;
+use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_store::StoreExt;
 
 use crate::commands::ai_runner::{artifact_base_dir, canonical_project_path};
 use crate::commands::usage::{get_claude_usage, UsageData};
-use crate::core::samurai_audit::{AuditLog, AuditReadResult};
+use crate::core::samurai_audit::{AuditEvent, AuditEventKind, AuditLog, AuditReadResult};
 use crate::core::samurai_config::{SamuraiConfig, SharedSamuraiConfig};
 use crate::core::samurai_files::{self, SamuraiFileEntry, SamuraiFilesRoots};
 use crate::core::samurai_injector::strip_extended_prefix;
@@ -26,6 +27,7 @@ use crate::core::samurai_prompts::{self, epic_slug};
 use crate::core::samurai_replicator::{derive_repo_pin, SamuraiReplicator};
 use crate::core::samurai_run_config::{RunConfigStatus, RunConfigStore, SamuraiRunConfig};
 use crate::core::samurai_schedule::{SamuraiSchedule, ScheduleEntry};
+use crate::core::samurai_test_gate::{self, SamuraiTestGate, TestGateProgress};
 use crate::core::supervisor::{SessionSnapshot, Supervisor, SupervisorState};
 use crate::core::worktree_manager::WorktreeManager;
 use crate::git::{Git, GitError};
@@ -400,6 +402,9 @@ pub(crate) async fn launch_run_inner(
     worktrees: &WorktreeManager,
     run_configs: &RunConfigStore,
     replicator: &Arc<SamuraiReplicator>,
+    audit: &AuditLog,
+    test_gate: &SamuraiTestGate,
+    skip_test_gate: bool,
     preflight: &SamuraiPreflight,
     global_config: SamuraiConfig,
     project: &str,
@@ -460,6 +465,41 @@ pub(crate) async fn launch_run_inner(
     let worktree = ensure_epic_worktree(worktrees, project, &branch, worktree_base).await?;
     let worktree_path = strip_extended_prefix(&worktree.to_string_lossy()).to_string();
 
+    // Issue #90b: the test-suite gate — bootstrap the epic worktree, then
+    // `cargo test --workspace` inside it; red = launch blocked (the skip
+    // toggle is the explicit override, and it bypasses the bootstrap too).
+    // ORDERING IS THE CRASH-SAFETY: the gate runs BEFORE the ACTIVE run
+    // config reaches disk, and cold-start reconciliation only iterates
+    // ACTIVE configs — so a red gate or a crash mid-gate leaves nothing for
+    // reconciliation to respawn into a half-bootstrapped worktree. The
+    // leftover worktree itself is the launcher's existing
+    // crash-before-config-write case: cleanup removes it by stable path.
+    if skip_test_gate {
+        log::info!("samurai launch: test-suite gate SKIPPED by user for epic {epic} in {project}");
+    } else if let Err(failure) = test_gate
+        .run(project, &epic, Path::new(&worktree_path))
+        .await
+    {
+        // The block is a durable audit fact (ALERT, the reconciler's
+        // account-wide convention: generation 0, session 0), not just a
+        // transient UI error.
+        audit.append(
+            project,
+            AuditEvent::now(
+                &epic,
+                AuditEventKind::Alert,
+                0,
+                0,
+                json!({
+                    "kind": "launch_test_gate",
+                    "phase": failure.kind.as_str(),
+                    "error": failure.message,
+                }),
+            ),
+        );
+        return Err(failure.message);
+    }
+
     // The `--repo` pin from the worktree's origin remote (PRD §10: gen-1
     // runs with --dangerously-skip-permissions). Blocking git → blocking
     // pool; an unparseable remote yields None and the brief carries its
@@ -469,10 +509,11 @@ pub(crate) async fn launch_run_inner(
         .await
         .unwrap_or(None);
 
-    // P3.4 contract: the ACTIVE config reaches disk BEFORE gen-1 spawns. A
-    // crash between the write and the spawn leaves a config cold-start
-    // reconciliation flags as reconcile_unstartable — the human relaunches
-    // (accepted).
+    // P3.4 contract: the ACTIVE config reaches disk BEFORE gen-1 spawns —
+    // but only AFTER the test gate passed (issue #90b), so a blocked launch
+    // persists nothing. A crash between the write and the spawn leaves a
+    // config cold-start reconciliation flags as reconcile_unstartable — the
+    // human relaunches (accepted).
     let mut config =
         SamuraiRunConfig::new(project.to_string(), epic.clone(), worktree_path.clone());
     config.repo_pin = repo_pin.clone();
@@ -496,25 +537,30 @@ pub(crate) async fn launch_run_inner(
 }
 
 /// Launches an epic run (PRD §5.8, §12 T+0): server-side preflight →
-/// create/reuse the epic worktree → derive the `--repo` pin → write the
-/// ACTIVE run config → spawn gen-1 with its opening brief. The SPAWN audit
-/// row lands via the existing registration path with
+/// create/reuse the epic worktree → test-suite gate in that worktree
+/// (issue #90b; `skip_test_gate` is the user's explicit override, progress
+/// streams as `samurai-test-gate-event`) → derive the `--repo` pin → write
+/// the ACTIVE run config → spawn gen-1 with its opening brief. The SPAWN
+/// audit row lands via the existing registration path with
 /// `details.trigger: "launch"`.
 // Every `State` parameter is Tauri's dependency injection: the macro resolves
 // them by type, so they cannot be bundled into one struct without losing it.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn samurai_launch_run(
+    app: AppHandle,
     supervisor: State<'_, Arc<Supervisor>>,
     schedule: State<'_, Arc<SamuraiSchedule>>,
     worktrees: State<'_, WorktreeManager>,
     run_configs: State<'_, Arc<RunConfigStore>>,
     replicator: State<'_, Arc<SamuraiReplicator>>,
+    audit: State<'_, AuditLog>,
     config: State<'_, SharedSamuraiConfig>,
     project_path: String,
     epic: String,
     model: Option<String>,
     handoff_context_pct: Option<f64>,
+    skip_test_gate: Option<bool>,
 ) -> Result<SamuraiLaunchResult, String> {
     let project = canonical_project_path(&project_path);
     let preflight = run_preflight(&project).await;
@@ -522,12 +568,23 @@ pub async fn samurai_launch_run(
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
+    // The real gate: system processes, progress mirrored to the frontend.
+    let gate_app = app.clone();
+    let test_gate = SamuraiTestGate::new(
+        samurai_test_gate::system_runner(),
+        Arc::new(move |p: &TestGateProgress| {
+            let _ = gate_app.emit("samurai-test-gate-event", p);
+        }),
+    );
     launch_run_inner(
         &supervisor,
         &schedule,
         &worktrees,
         &run_configs,
         &replicator,
+        &audit,
+        &test_gate,
+        skip_test_gate.unwrap_or(false),
         &preflight,
         global_config,
         &project,
@@ -1006,6 +1063,62 @@ mod tests {
         run(&["commit", "-q", "-m", "init"]);
     }
 
+    /// Commits extra fixture files (paths may be nested) so the launched
+    /// epic worktree contains them — the test gate detects its bootstrap
+    /// steps from files in the WORKTREE, not the repo.
+    fn commit_fixture_files(dir: &Path, files: &[(&str, &str)]) {
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .hide_console_window()
+                .output()
+                .expect("git must be runnable in tests");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        for (name, content) in files {
+            let path = dir.join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, content).unwrap();
+            run(&["add", name]);
+        }
+        run(&["commit", "-q", "-m", "fixture files"]);
+    }
+
+    /// A test gate whose runner records `"program args…"` per call and
+    /// answers from a per-command-prefix script; unscripted commands
+    /// succeed with empty output. Progress emission is discarded — the
+    /// event payloads have their own suite in `core::samurai_test_gate`.
+    fn recording_gate(
+        script: Vec<(&'static str, crate::core::samurai_test_gate::GateCommandOutput)>,
+    ) -> (SamuraiTestGate, Arc<std::sync::Mutex<Vec<String>>>) {
+        use crate::core::samurai_test_gate::{GateCommandOutput, GateCommandRunner};
+        let calls: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_rec = calls.clone();
+        let runner: GateCommandRunner = Arc::new(move |_cwd, program, args| {
+            let call = format!("{program} {}", args.join(" "));
+            calls_rec.lock().unwrap().push(call.clone());
+            for (prefix, out) in &script {
+                if call.starts_with(prefix) {
+                    return Ok(out.clone());
+                }
+            }
+            Ok(GateCommandOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+        (SamuraiTestGate::new(runner, Arc::new(|_| {})), calls)
+    }
+
     #[tokio::test]
     async fn test_ensure_epic_worktree_creates_then_reuses_the_stable_path() {
         let repo = tempdir().unwrap();
@@ -1030,7 +1143,7 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    /// Everything cleanup needs, rooted in tempdirs.
+    /// Everything cleanup (and the gated launch) needs, rooted in tempdirs.
     struct CleanupHarness {
         supervisor: Arc<Supervisor>,
         schedule: Arc<SamuraiSchedule>,
@@ -1038,6 +1151,7 @@ mod tests {
         spawns: Arc<std::sync::Mutex<Vec<crate::core::samurai_replicator::SuccessorSpawn>>>,
         run_configs: RunConfigStore,
         worktrees: WorktreeManager,
+        audit: AuditLog,
         project: String,
         _dirs: (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir),
         base: tempfile::TempDir,
@@ -1094,7 +1208,7 @@ mod tests {
             SamuraiSchedule::new(schedule_dir.path().to_path_buf(), Arc::new(|_| {}), None);
         let project = repo.path().to_string_lossy().into_owned();
         let supervisor = Arc::new(Supervisor::new(audit.clone(), None));
-        let (replicator, spawns) = test_replicator(supervisor.clone(), audit);
+        let (replicator, spawns) = test_replicator(supervisor.clone(), audit.clone());
         CleanupHarness {
             supervisor,
             schedule,
@@ -1102,11 +1216,40 @@ mod tests {
             spawns,
             run_configs: RunConfigStore::new(runs_dir.path().to_path_buf()),
             worktrees: WorktreeManager::new(),
+            audit,
             project,
             _dirs: (audit_dir, schedule_dir, runs_dir),
             base: tempdir().unwrap(),
             repo,
         }
+    }
+
+    /// Launch through the harness with an all-green preflight and the
+    /// global default config — the gate and skip flag are what varies.
+    async fn run_launch(
+        h: &CleanupHarness,
+        gate: &SamuraiTestGate,
+        skip_test_gate: bool,
+        epic: &str,
+    ) -> Result<SamuraiLaunchResult, String> {
+        launch_run_inner(
+            &h.supervisor,
+            &h.schedule,
+            &h.worktrees,
+            &h.run_configs,
+            &h.replicator,
+            &h.audit,
+            gate,
+            skip_test_gate,
+            &preflight(true, true),
+            SamuraiConfig::default(),
+            &h.project,
+            epic,
+            None,
+            None,
+            Some(h.base.path()),
+        )
+        .await
     }
 
     async fn run_cleanup(h: &CleanupHarness, epic: &str) -> Result<SamuraiCleanupReport, String> {
@@ -1254,6 +1397,9 @@ mod tests {
             })
             .unwrap();
 
+        // The fixture repo has no Cargo.toml, so the gate is skipped here —
+        // its own launch behavior has dedicated tests below.
+        let (gate, _calls) = recording_gate(vec![]);
         let global = SamuraiConfig::default();
         let result = launch_run_inner(
             &supervisor,
@@ -1261,6 +1407,9 @@ mod tests {
             &worktrees,
             &run_configs,
             &replicator,
+            &audit,
+            &gate,
+            true,
             &preflight(true, true),
             global.clone(),
             &project,
@@ -1303,6 +1452,9 @@ mod tests {
             &worktrees,
             &run_configs,
             &replicator,
+            &audit,
+            &gate,
+            true,
             &preflight(true, true),
             global,
             &project,
@@ -1315,6 +1467,138 @@ mod tests {
         .unwrap();
         assert!(!again.stale_timer_cancelled);
         assert_eq!(run_configs.get(&project, "#38").unwrap().thresholds, None);
+    }
+
+    // --- issue #90b: the launch test-suite gate ---
+
+    #[tokio::test]
+    async fn test_launch_gate_green_bootstraps_then_spawns() {
+        // The full maestro-shaped worktree: npm install → mcp build →
+        // cargo test, in that order, then the launch proceeds normally.
+        let h = cleanup_harness();
+        commit_fixture_files(
+            h.repo.path(),
+            &[
+                ("Cargo.toml", "[workspace]\nmembers = []\n"),
+                ("package.json", "{}"),
+                ("maestro-mcp-server/Cargo.toml", "[package]\n"),
+            ],
+        );
+        let (gate, calls) = recording_gate(vec![]);
+
+        let result = run_launch(&h, &gate, false, "#38").await.unwrap();
+        assert_eq!(result.branch, "samurai-38");
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "npm install".to_string(),
+                "cargo build --release -p maestro-mcp-server".to_string(),
+                "cargo test --workspace".to_string(),
+            ]
+        );
+        assert_eq!(h.spawns.lock().unwrap().len(), 1, "gen-1 spawned");
+        assert_eq!(h.run_configs.load_active().len(), 1, "ACTIVE config saved");
+    }
+
+    #[tokio::test]
+    async fn test_launch_gate_red_blocks_spawn_config_and_alerts() {
+        let h = cleanup_harness();
+        commit_fixture_files(h.repo.path(), &[("Cargo.toml", "[workspace]\nmembers = []\n")]);
+        let (gate, calls) = recording_gate(vec![(
+            "cargo test",
+            crate::core::samurai_test_gate::GateCommandOutput {
+                success: false,
+                stdout: "test result: FAILED. 40 passed; 2 failed; 0 ignored\n".to_string(),
+                stderr: String::new(),
+            },
+        )]);
+
+        let err = run_launch(&h, &gate, false, "#38").await.unwrap_err();
+        assert!(err.contains("launch blocked"), "{err}");
+        assert!(
+            err.contains("test result: FAILED. 40 passed; 2 failed"),
+            "the failing summary line must surface: {err}"
+        );
+
+        // Blocked means BLOCKED: no gen-1 spawn, and no ACTIVE config for
+        // cold-start reconciliation to respawn into the worktree (the
+        // config write is ordered AFTER the gate on purpose).
+        assert!(h.spawns.lock().unwrap().is_empty(), "no gen-1 spawn");
+        assert!(h.run_configs.load_active().is_empty(), "no ACTIVE config");
+
+        // …and the block is a durable ALERT audit row.
+        let read = h.audit.read(&h.project, None, None).await.unwrap();
+        let alert = read
+            .events
+            .iter()
+            .find(|e| e.event == AuditEventKind::Alert)
+            .expect("an ALERT row records the block");
+        assert_eq!(alert.epic, "#38");
+        assert_eq!(alert.details["kind"], "launch_test_gate");
+        assert_eq!(alert.details["phase"], "red_suite");
+
+        // No package.json in the fixture → the suite was the only command.
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["cargo test --workspace".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_launch_gate_skip_bypasses_gate_and_bootstrap_entirely() {
+        // No Cargo.toml anywhere — an armed gate would block this repo.
+        // Skip must not even probe: no bootstrap, no commands at all.
+        let h = cleanup_harness();
+        let (gate, calls) = recording_gate(vec![]);
+
+        let result = run_launch(&h, &gate, true, "#38").await.unwrap();
+        assert_eq!(result.epic, "#38");
+        assert!(calls.lock().unwrap().is_empty(), "no gate command ran");
+        assert_eq!(h.spawns.lock().unwrap().len(), 1, "gen-1 spawned");
+        assert_eq!(h.run_configs.load_active().len(), 1, "ACTIVE config saved");
+    }
+
+    #[tokio::test]
+    async fn test_launch_gate_bootstrap_failure_blocks_with_distinct_error() {
+        let h = cleanup_harness();
+        commit_fixture_files(
+            h.repo.path(),
+            &[
+                ("Cargo.toml", "[workspace]\nmembers = []\n"),
+                ("package.json", "{}"),
+            ],
+        );
+        let (gate, calls) = recording_gate(vec![(
+            "npm install",
+            crate::core::samurai_test_gate::GateCommandOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "npm ERR! network timeout\n".to_string(),
+            },
+        )]);
+
+        let err = run_launch(&h, &gate, false, "#38").await.unwrap_err();
+        assert!(
+            err.contains("bootstrap failed at `npm install`"),
+            "a broken bootstrap is its own error, not a red suite: {err}"
+        );
+        assert!(err.contains("npm ERR! network timeout"), "{err}");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["npm install".to_string()],
+            "the suite never ran"
+        );
+        assert!(h.spawns.lock().unwrap().is_empty());
+        assert!(h.run_configs.load_active().is_empty());
+        let read = h.audit.read(&h.project, None, None).await.unwrap();
+        let alert = read
+            .events
+            .iter()
+            .find(|e| e.event == AuditEventKind::Alert)
+            .expect("an ALERT row records the block");
+        assert_eq!(alert.details["kind"], "launch_test_gate");
+        assert_eq!(alert.details["phase"], "bootstrap");
     }
 
     #[test]
