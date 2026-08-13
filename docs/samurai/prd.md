@@ -36,7 +36,7 @@ Maestro becomes the **supervisor brain** of development work. You hand it a GitH
 - **Statusline / hooks / transcripts** — Claude Code mechanisms Maestro already integrates with (see §4).
 - **Worktree** — a separate git checkout of the same repo, so parallel work never collides on branches.
 - **Circuit breaker** — a hard rule that stops an agent that is burning tokens without producing progress.
-- **Harvest** — a periodic report generated from the ops journal to improve our processes, skills, and Maestro itself.
+- **Harvest** — the interactive triage of unconsumed ops-journal entries (issue #98): a terminal session Maestro opens with the entries injected, which runs `/insights`, saves the report to Downloads, and discusses keep/file/discard — to improve our processes, skills, and Maestro itself.
 
 ---
 
@@ -60,7 +60,7 @@ The design deliberately builds on sensors and mechanisms that already exist in t
 - **Transcript watcher** (`src-tauri/src/core/transcript_watcher.rs`, `transcript_parser.rs`): tails Claude Code session transcripts, emits per-session token usage (→ context % is derivable) and subagent spawn/complete events.
 - **Hooks → status server** (`core/hook_config_writer.rs`, `core/status_server.rs`): SessionStart/SessionEnd/Stop hooks POST to a local HTTP server — Maestro knows when an agent finishes a turn (idle signal).
 - **Terminal injection** (`write_stdin` in `core/process_manager.rs`): Maestro can type into a session's terminal. (Blind — hence the idle-gate + ACK protocol, §5.3.)
-- **Headless runner** (`commands/ai_runner.rs`): spawns `claude -p` — already used for standup reports; reused for harvest.
+- **Headless runner** (`commands/ai_runner.rs`): spawns `claude -p` — already used for standup reports and the daily plan. (Harvest no longer uses it: issue #98 moved harvest into an interactive terminal session, §5.12.)
 - **Worktree manager** (`core/worktree_manager.rs`), **process kill/scan** (`commands/processes.rs`), **UtilityPanel UI pattern**, **attention mechanism** (`src/lib/healthRules.ts`), **gh runner** (`src-tauri/src/github/runner.rs`).
 
 **Consequence:** the originally-proposed sensor layer (statusline script + telemetry JSONL file + Python pollers) is **deleted from the design** — fully redundant, and it added the worst file-race risks.
@@ -156,9 +156,8 @@ v1 is deliberately minimal: list, delete, warn. No file-manager ambitions.
 ### 5.12 Journal & harvest (Phase 5 — in scope)
 
 - **Ops journal** (app-data JSONL): bottlenecks, errors, improvements, skills gaps, concerns — recorded by agents (instructed in orchestrator prompts) and by the user, tagged by category and project.
-- **Harvest:** periodically, a headless `claude -p` run (same pattern as existing standup reports) digests unharvested entries into a markdown report with concrete recommendations — improving Maestro, our skills, and our processes (e.g. "QA runs tests 3×; run once at the end"). Reports land in app-data and are readable from the Files section.
-- `/insights` (Claude Code's session-analysis command) is terminal-only per docs — it is a **manual** step you can run and paste in, not automated.
-- Journal entries are marked consumed by a harvest and auto-archived after the next one; reports are deliverables you delete when read.
+- **Harvest (interactive, issue #98):** "Harvest now" opens a real terminal session in the active project's main checkout and injects one prompt carrying ALL unconsumed journal entries, framed as "investigate whether each is worth acting on and what it is about". The prompt instructs the session to run `/insights` (terminal-only — exactly why the interactive design works where headless could not), save the `/insights` report to the user's Downloads folder named with the run date (`maestro-harvest-insights-<YYYY-MM-DD>.md`), read it back in the same session, and then discuss journal entries and insights together so the user decides keep/file/discard in the terminal. The prior headless `claude -p` report path is retired; previously generated reports stay listed and readable in the Files section.
+- Journal entries flip to consumed **at injection** — the moment the prompt lands in the terminal session. A session abandoned mid-triage does NOT restore the undiscussed entries (accepted trade-off). Consumed entries auto-archive after the next harvest, as before.
 
 ---
 
@@ -293,7 +292,7 @@ Audit trail you slept through: `SPAWN → HANDOFF → PARK → RESUME → … �
 | **2 — Self-healing** | Injection+ACK, handoff protocol, kill + successor spawn, verify ritual, circuit breaker | With threshold at 5%, a full handoff completes hands-off; successor continues real work; churn alert fires when starved |
 | **3 — Park & resume** | Soft/hard thresholds, sequential parking, persisted timers, cold-start reconciliation, worktree-per-epic, run config + launcher + preflight | With park at 2%, park→timer→fresh-spawn cycle survives an app restart in between |
 | **4 — Second Brain panel** | Audit + Files sections, delete/confirm, size warnings, clean-this-epic | All §8 files manageable in-app; warnings fire at thresholds |
-| **5 — Journal & harvest** | Ops journal, harvest via headless `claude -p`, reports in panel | A harvest produces a report from real journal entries |
+| **5 — Journal & harvest** | Ops journal, interactive harvest triage session (issue #98; originally headless `claude -p`), prior reports in panel | A harvest injects real journal entries into a live triage session |
 
 Each phase ships and is testable alone. Verification per project rules: run in `npm run tauri dev`, small commits, conventional commits, CI green before merge consideration.
 
