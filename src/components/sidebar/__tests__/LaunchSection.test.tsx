@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // The persisted zustand stores hydrate through the Tauri store plugin at
 // import time; happy-dom has no Tauri backend, so stub it out.
@@ -39,46 +39,9 @@ import type { UsageData } from "@/lib/usageParser";
 import { stopSamuraiGateListener, useSamuraiGateStore } from "@/stores/useSamuraiGateStore";
 import { useSamuraiWorkflowStore } from "@/stores/useSamuraiWorkflowStore";
 import { type SamuraiSessionInfo, useSessionStore } from "@/stores/useSessionStore";
+import { useWorkflowsViewStore } from "@/stores/useWorkflowsViewStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 import { LaunchSection } from "../LaunchSection";
-
-/**
- * The section now embeds the React Flow workflow editor (issue #91), which
- * measures through browser APIs happy-dom lacks — the LandscapeView test's
- * stub block.
- */
-beforeAll(() => {
-  class ResizeObserverStub {
-    observe() {}
-    unobserve() {}
-    disconnect() {}
-  }
-  vi.stubGlobal("ResizeObserver", ResizeObserverStub);
-  vi.stubGlobal(
-    "DOMMatrixReadOnly",
-    class {
-      m22 = 1;
-    },
-  );
-  Object.defineProperty(HTMLElement.prototype, "getBoundingClientRect", {
-    configurable: true,
-    value: () => ({
-      x: 0,
-      y: 0,
-      width: 1200,
-      height: 800,
-      top: 0,
-      left: 0,
-      right: 1200,
-      bottom: 800,
-      toJSON: () => {},
-    }),
-  });
-  Object.defineProperty(SVGElement.prototype, "getBBox", {
-    configurable: true,
-    value: () => ({ x: 0, y: 0, width: 0, height: 0 }),
-  });
-});
 
 const invokeMock = vi.mocked(invoke);
 const askMock = vi.mocked(ask);
@@ -155,7 +118,7 @@ function run(overrides: Partial<SamuraiRunListEntry> = {}): SamuraiRunListEntry 
     epics: [],
     issues: [],
     repo_pin: "nachogl1/maestro",
-    worktree_path: "C:\\data\\worktrees\\maestro-abc\\samurai-38",
+    worktree_path: "C:\\data\\worktrees\\maestro-abc\\maestro-38",
     model: null,
     thresholds: null,
     workflow: null,
@@ -197,19 +160,19 @@ function mockInvoke({
         // the branch/worktree carry the combined slug built from it.
         return {
           epic: "epic #38",
-          branch: "samurai-epic-38",
-          worktree_path: "C:\\data\\worktrees\\maestro-abc\\samurai-epic-38",
+          branch: "maestro-epic-38",
+          worktree_path: "C:\\data\\worktrees\\maestro-abc\\maestro-epic-38",
           repo_pin: "nachogl1/maestro",
           stale_timer_cancelled: false,
         };
       case "samurai_cleanup_epic":
         return {
           epic: "#38",
-          branch: "samurai-38",
+          branch: "maestro-38",
           timer_cancelled: true,
           config_archived: true,
           worktree_removed: true,
-          worktree_path: "C:\\data\\worktrees\\maestro-abc\\samurai-38",
+          worktree_path: "C:\\data\\worktrees\\maestro-abc\\maestro-38",
           branch_deleted: true,
         };
       // The embedded workflow editor's display fallback (issue #91).
@@ -264,6 +227,9 @@ describe("LaunchSection (issue #63)", () => {
     // captures a fresh handler from ITS listen mock.
     stopSamuraiGateListener();
     useSamuraiGateStore.setState({ gates: {} });
+    // Issue #91 (full-screen follow-up): the overlay's open state is a
+    // module-level store — reset between tests like the others above.
+    useWorkflowsViewStore.setState({ isOpen: false });
   });
 
   it("renders the form with the active project and a disabled Launch button", async () => {
@@ -285,6 +251,22 @@ describe("LaunchSection (issue #63)", () => {
     // Nothing to work yet → Launch stays disabled.
     expect(screen.getByRole("button", { name: "Launch" })).toBeDisabled();
     expect(await screen.findByText("No active runs. Launch one above.")).toBeInTheDocument();
+  });
+
+  it("renders a workflow card with a button that opens the full-screen editor (issue #91)", async () => {
+    render(<LaunchSection />);
+    await screen.findByText("No active runs. Launch one above.");
+
+    expect(screen.getByText("Workflow")).toBeInTheDocument();
+    const button = screen.getByRole("button", { name: "Open workflow editor" });
+    expect(useWorkflowsViewStore.getState().isOpen).toBe(false);
+
+    fireEvent.click(button);
+
+    // The inline editor is gone — LaunchSection only flips the shared
+    // open-state store; `WorkflowsView` itself renders elsewhere (App).
+    expect(useWorkflowsViewStore.getState().isOpen).toBe(true);
+    expect(screen.queryByLabelText("Edit step implement")).not.toBeInTheDocument();
   });
 
   it("keeps Launch disabled while both ref fields are empty", async () => {
@@ -336,7 +318,7 @@ describe("LaunchSection (issue #63)", () => {
       workflow: null,
     });
     expect(
-      await screen.findByText(/Run launched: epic #38 on samurai-epic-38/),
+      await screen.findByText(/Run launched: epic #38 on maestro-epic-38/),
     ).toBeInTheDocument();
   });
 
@@ -536,8 +518,8 @@ describe("LaunchSection (issue #63)", () => {
     await act(async () => {
       resolveLaunch({
         epic: "#38",
-        branch: "samurai-38",
-        worktree_path: "C:\\data\\worktrees\\maestro-abc\\samurai-38",
+        branch: "maestro-38",
+        worktree_path: "C:\\data\\worktrees\\maestro-abc\\maestro-38",
         repo_pin: null,
         stale_timer_cancelled: false,
       });
@@ -686,7 +668,7 @@ describe("LaunchSection (issue #63)", () => {
       epic: "#38",
     });
     expect(
-      await screen.findByText(/Cleaned up run #38: removed worktree, branch samurai-38/),
+      await screen.findByText(/Cleaned up run #38: removed worktree, branch maestro-38/),
     ).toBeInTheDocument();
   });
 
@@ -735,11 +717,11 @@ describe("LaunchSection (issue #63)", () => {
       listedRuns = [];
       resolveCleanup({
         epic: "#38",
-        branch: "samurai-38",
+        branch: "maestro-38",
         timer_cancelled: true,
         config_archived: true,
         worktree_removed: true,
-        worktree_path: "C:\\data\\worktrees\\maestro-abc\\samurai-38",
+        worktree_path: "C:\\data\\worktrees\\maestro-abc\\maestro-38",
         branch_deleted: true,
         spawn_cancelled: false,
       });

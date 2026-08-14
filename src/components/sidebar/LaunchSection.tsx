@@ -9,6 +9,7 @@ import {
   Rocket,
   TerminalSquare,
   Trash2,
+  Workflow,
   XCircle,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -37,9 +38,9 @@ import {
   useSessionStore,
 } from "@/stores/useSessionStore";
 import { useUsageStore } from "@/stores/useUsageStore";
+import { useWorkflowsViewStore } from "@/stores/useWorkflowsViewStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 import { cardClass, SectionHeader } from "./sectionChrome";
-import { WorkflowGraphEditor } from "./WorkflowGraphEditor";
 
 /** Last path segment, for compact project display. */
 function baseName(path: string): string {
@@ -537,6 +538,10 @@ export function LaunchSection({
   // this remount re-reads the current step (or the failure) below.
   const gates = useSamuraiGateStore((s) => s.gates);
   const clearGates = useSamuraiGateStore((s) => s.clearProject);
+  // Issue #91 (full-screen follow-up): the run workflow now opens as a
+  // full-screen overlay (`WorkflowsView`, rendered by App) instead of
+  // embedding a cramped editor here.
+  const openWorkflowsView = useWorkflowsViewStore((s) => s.open);
   // 1 Hz re-render while the gate line is showing (drives the elapsed time).
   const [, setGateTick] = useState(0);
   const [preflight, setPreflight] = useState<SamuraiPreflight | null>(null);
@@ -1019,9 +1024,22 @@ export function LaunchSection({
         )}
       </div>
 
-      {/* Issue #91: the run workflow the briefs compile from — edited here,
-          persisted across restarts, sent with the launch above. */}
-      <WorkflowGraphEditor />
+      {/* Issue #91: the run workflow the briefs compile from — persisted
+          across restarts, sent with the launch above. Edited in a
+          full-screen overlay now (WorkflowsView) rather than inline. */}
+      <div className={cardClass}>
+        <SectionHeader icon={Workflow} label="Workflow" iconColor="text-maestro-accent" />
+        <p className="mb-2 text-[11px] leading-snug text-maestro-muted">
+          The step-by-step process every run follows, compiled into each orchestrator brief.
+        </p>
+        <button
+          type="button"
+          onClick={openWorkflowsView}
+          className="w-full rounded bg-maestro-accent/20 px-2 py-1 text-[11px] font-semibold text-maestro-accent transition-colors hover:bg-maestro-accent/30"
+        >
+          Open workflow editor
+        </button>
+      </div>
     </div>
   );
 }

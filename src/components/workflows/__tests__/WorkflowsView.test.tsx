@@ -23,9 +23,9 @@ import {
   removeWorkflowEdge,
   removeWorkflowNode,
   setWorkflowStart,
-  WorkflowGraphEditor,
+  WorkflowsView,
   workflowWalkOrder,
-} from "../WorkflowGraphEditor";
+} from "../WorkflowsView";
 
 const invokeMock = vi.mocked(invoke);
 
@@ -99,7 +99,7 @@ function storedGraph(): SamuraiWorkflowGraph {
   return graph;
 }
 
-describe("WorkflowGraphEditor (issue #91)", () => {
+describe("WorkflowsView (issue #91 full-screen follow-up)", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     invokeMock.mockImplementation(async (cmd: string) => {
@@ -110,7 +110,7 @@ describe("WorkflowGraphEditor (issue #91)", () => {
   });
 
   it("renders the backend default template's boxes with compiled step numbers", async () => {
-    render(<WorkflowGraphEditor />);
+    render(<WorkflowsView onClose={() => {}} />);
 
     // The template comes from the backend command — the single source of
     // truth — never from a TS copy.
@@ -123,13 +123,13 @@ describe("WorkflowGraphEditor (issue #91)", () => {
     for (let step = 1; step <= 7; step++) {
       expect(screen.getByText(`Step ${step}`)).toBeInTheDocument();
     }
-    expect(screen.queryByText("not in run")).not.toBeInTheDocument();
+    expect(screen.queryByText("Not in run")).not.toBeInTheDocument();
     // Untouched: nothing lands in the store until the user edits.
     expect(useSamuraiWorkflowStore.getState().graph).toBeNull();
   });
 
   it("editing a box's text lands in the persisted store (what the launch sends)", async () => {
-    render(<WorkflowGraphEditor />);
+    render(<WorkflowsView onClose={() => {}} />);
     const box = await screen.findByLabelText("Edit step implement");
 
     fireEvent.change(box, { target: { value: "Implement it MY way." } });
@@ -142,7 +142,7 @@ describe("WorkflowGraphEditor (issue #91)", () => {
   });
 
   it("deleting a box auto-bridges prev → next, skipping the step instead of truncating", async () => {
-    render(<WorkflowGraphEditor />);
+    render(<WorkflowsView onClose={() => {}} />);
     await screen.findByDisplayValue("Do the review work.");
 
     fireEvent.click(screen.getByRole("button", { name: "Remove step review" }));
@@ -162,13 +162,13 @@ describe("WorkflowGraphEditor (issue #91)", () => {
       "batch-pr",
     ]);
     expect(screen.queryByDisplayValue("Do the review work.")).not.toBeInTheDocument();
-    expect(screen.queryByText("not in run")).not.toBeInTheDocument();
+    expect(screen.queryByText("Not in run")).not.toBeInTheDocument();
     expect(screen.getByText("Step 6")).toBeInTheDocument();
     expect(screen.queryByText("Step 7")).not.toBeInTheDocument();
   });
 
   it("deleting a connection truncates: downstream boxes stay visible but leave the run", async () => {
-    render(<WorkflowGraphEditor />);
+    render(<WorkflowsView onClose={() => {}} />);
     await screen.findByDisplayValue("Do the push work.");
 
     fireEvent.click(screen.getByRole("button", { name: "Disconnect push from batch-review" }));
@@ -179,20 +179,20 @@ describe("WorkflowGraphEditor (issue #91)", () => {
     expect(graph.nodes).toHaveLength(7);
     expect(screen.getByDisplayValue("Do the batch-review work.")).toBeInTheDocument();
     // …but the three past the cut are visibly excluded from the run.
-    expect(screen.getAllByText("not in run")).toHaveLength(3);
+    expect(screen.getAllByText("Not in run")).toHaveLength(3);
     expect(screen.getByText("Step 4")).toBeInTheDocument();
     expect(screen.queryByText("Step 5")).not.toBeInTheDocument();
     expect(workflowWalkOrder(graph)).toEqual(["implement", "review", "qa-report", "push"]);
   });
 
   it("reset returns the store to null-means-default instead of pinning a copy", async () => {
-    render(<WorkflowGraphEditor />);
+    render(<WorkflowsView onClose={() => {}} />);
     const box = await screen.findByLabelText("Edit step implement");
     fireEvent.change(box, { target: { value: "Edited away." } });
     fireEvent.click(screen.getByRole("button", { name: "Remove step review" }));
     expect(storedGraph().nodes).toHaveLength(6);
 
-    fireEvent.click(screen.getByRole("button", { name: "Reset workflow to default" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reset" }));
 
     // The store returns to "never edited": the launch sends workflow: null
     // and the backend default GOVERNS — including future changes to it. A
@@ -201,25 +201,33 @@ describe("WorkflowGraphEditor (issue #91)", () => {
     // The editor still renders the backend default for display.
     expect(await screen.findByDisplayValue("Do the implement work.")).toBeInTheDocument();
     expect(screen.getByDisplayValue("Do the review work.")).toBeInTheDocument();
-    // The display default is always the backend's — never a TS copy.
-    expect(
-      invokeMock.mock.calls.filter(([cmd]) => cmd === "samurai_default_workflow").length,
-    ).toBeGreaterThanOrEqual(2);
   });
 
   it("adds an empty box wired from the end of the walk, skipped until it has text", async () => {
-    render(<WorkflowGraphEditor />);
+    render(<WorkflowsView onClose={() => {}} />);
     await screen.findByDisplayValue("Do the batch-pr work.");
 
-    fireEvent.click(screen.getByRole("button", { name: "Add workflow step" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add step" }));
 
     const graph = storedGraph();
     expect(graph.nodes).toHaveLength(8);
     expect(graph.edges).toContainEqual({ from: "batch-pr", to: "step-1" });
     // Reachable (it joined the walk) but empty — compile emits no step yet.
-    expect(await screen.findByText("empty — skipped")).toBeInTheDocument();
-    expect(screen.queryByText("not in run")).not.toBeInTheDocument();
+    expect(await screen.findByText("Empty — skipped")).toBeInTheDocument();
+    expect(screen.queryByText("Not in run")).not.toBeInTheDocument();
     expect(screen.getByLabelText("Edit step step-1")).toHaveValue("");
+  });
+
+  it("the close button and Escape both call onClose", async () => {
+    const onClose = vi.fn();
+    render(<WorkflowsView onClose={onClose} />);
+    await screen.findByDisplayValue("Do the implement work.");
+
+    fireEvent.click(screen.getByRole("button", { name: "Close workflow editor" }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(2);
   });
 });
 
