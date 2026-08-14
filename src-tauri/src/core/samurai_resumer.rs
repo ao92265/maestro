@@ -4,7 +4,15 @@
 //! a due park timer into a FRESH generation spawn (PRD decision #6: every
 //! wake-up is a fresh spawn from the handoff file, never `claude --resume`):
 //!
-//! - **Guard rails first:** while a hard park sweep is still engaged, or a
+//! - **Run gate first (review F2 — the #96 regression, timer edition):** a
+//!   resume timer can outlive its run: completion verification can flip the
+//!   config ACTIVE → COMPLETED (or the manual cleanup can archive it)
+//!   between park and fire. Only an ACTIVE run config may spawn a successor
+//!   — a COMPLETED/ARCHIVED/missing config drops the timer (the fired entry
+//!   self-cleans) with an `ALERT (resume_run_not_active)` audit note
+//!   instead of spawning into a finished worktree, mirroring the guarantee
+//!   cold-start reconciliation gets from `RunConfigStore::load_active`.
+//! - **Guard rails next:** while a hard park sweep is still engaged, or a
 //!   non-terminal supervised session already exists for the (project, epic),
 //!   spawning would fight the parker or duplicate a live orchestrator — the
 //!   timer is re-armed [`DEFER_DELAY_SECS`] out with a
@@ -15,12 +23,9 @@
 //!   already registered is a non-terminal session, so the re-fire defers
 //!   (and the replicator's per-(project, epic, generation) staging guard
 //!   backstops the window before registration).
-//! - **Working dir:** the run config's `worktree_path` (PRD §5.8) — absent
-//!   for epics parked before the P3.5 launcher exists — then any supervised
-//!   session for the epic whose directory still resolves (terminal by now;
-//!   non-terminal ones deferred above). Nothing resolvable →
-//!   `ALERT (resume_no_worktree)` and NO re-arm: paths are never invented,
-//!   a human re-launches.
+//! - **Working dir:** the run config's `worktree_path` (PRD §5.8) — the
+//!   gate above guarantees the config exists, so nothing is ever resolved
+//!   from session directories and no path is ever invented.
 //! - **Next generation:** highest generation across the supervisor registry
 //!   and the handoff files on disk, plus one. The highest is also the
 //!   `prior_generation` handed to the replicator, which picks the ritual by
@@ -52,11 +57,11 @@ use chrono::Utc;
 use serde_json::json;
 
 use super::samurai_audit::{AuditEvent, AuditEventKind, AuditLog};
-use super::samurai_injector::{strip_extended_prefix, SessionDirResolver};
+use super::samurai_injector::strip_extended_prefix;
 use super::samurai_parker::SamuraiParker;
 use super::samurai_prompts::{epic_slug, parse_handoff_generation};
 use super::samurai_replicator::SamuraiReplicator;
-use super::samurai_run_config::RunConfigStore;
+use super::samurai_run_config::{RunConfigStatus, RunConfigStore};
 use super::samurai_schedule::{SamuraiSchedule, ScheduleEntry};
 use super::supervisor::{SessionSnapshot, Supervisor};
 
@@ -130,7 +135,6 @@ pub struct SamuraiResumer {
     replicator: Arc<SamuraiReplicator>,
     run_configs: Arc<RunConfigStore>,
     audit: AuditLog,
-    session_dirs: SessionDirResolver,
     /// Late-bound (module doc: circular construction order). Unset only
     /// before setup finishes — a fire that early is dropped with an error.
     schedule: OnceLock<Arc<SamuraiSchedule>>,
@@ -143,14 +147,12 @@ impl SamuraiResumer {
         replicator: Arc<SamuraiReplicator>,
         run_configs: Arc<RunConfigStore>,
         audit: AuditLog,
-        session_dirs: SessionDirResolver,
     ) -> Arc<Self> {
         Arc::new(Self {
             supervisor,
             replicator,
             run_configs,
             audit,
-            session_dirs,
             schedule: OnceLock::new(),
             parker: OnceLock::new(),
         })
@@ -185,6 +187,35 @@ impl SamuraiResumer {
             return;
         };
 
+        // Review F2 (the #96 regression, timer edition): a resume timer can
+        // outlive its run — completion verification can flip the config
+        // COMPLETED, or the manual cleanup can archive/remove it, between
+        // park and fire. Anything but an ACTIVE config drops the timer (the
+        // fired entry self-cleans, nothing re-arms) with an audit note
+        // instead of spawning a successor into a finished worktree.
+        let config = self.run_configs.get(&entry.project_path, &entry.epic);
+        let status = config.as_ref().map(|c| c.status);
+        let Some(config) = config.filter(|c| c.status == RunConfigStatus::Active) else {
+            let status_value = match status {
+                Some(s) => serde_json::to_value(s).unwrap_or_else(|_| json!("UNKNOWN")),
+                None => json!("MISSING"),
+            };
+            log::warn!(
+                "samurai resumer: timer for epic {} in {} fired but its run config is {status_value} — timer dropped, no successor spawned",
+                entry.epic,
+                entry.project_path,
+            );
+            self.append_alert(
+                &entry,
+                json!({
+                    "kind": "resume_run_not_active",
+                    "epic": entry.epic,
+                    "status": status_value,
+                }),
+            );
+            return;
+        };
+
         let sessions = self.supervisor.list_sessions();
         if should_defer(
             parker.parking_engaged(),
@@ -196,18 +227,9 @@ impl SamuraiResumer {
             return;
         }
 
-        let Some(working_dir) = self.resolve_working_dir(&entry, &sessions) else {
-            log::error!(
-                "samurai resumer: no worktree known for epic {} in {} (no run config, no resolvable session) — ALERT, human attention",
-                entry.epic,
-                entry.project_path,
-            );
-            self.append_alert(
-                &entry,
-                json!({ "kind": "resume_no_worktree", "epic": entry.epic }),
-            );
-            return;
-        };
+        // Always `\\?\`-stripped (fork convention); the gate above
+        // guarantees the config exists, so no path is ever invented.
+        let working_dir = strip_extended_prefix(&config.worktree_path).to_string();
 
         let registry_max = sessions
             .iter()
@@ -296,27 +318,11 @@ impl SamuraiResumer {
         );
     }
 
-    /// Fallback order (module doc): run config's worktree, then any
-    /// supervised session for the epic whose directory still resolves.
-    /// Always `\\?\`-stripped (fork convention).
-    fn resolve_working_dir(
-        &self,
-        entry: &ScheduleEntry,
-        sessions: &[SessionSnapshot],
-    ) -> Option<String> {
-        if let Some(config) = self.run_configs.get(&entry.project_path, &entry.epic) {
-            return Some(strip_extended_prefix(&config.worktree_path).to_string());
-        }
-        sessions
-            .iter()
-            .filter(|s| s.project == entry.project_path && s.epic == entry.epic)
-            .find_map(|s| (self.session_dirs)(s.session_id))
-            .map(|dir| strip_extended_prefix(&dir).to_string())
-    }
-
     /// Epic-level ALERT row (generation/session 0, like the parker's
-    /// `park_no_reset_time`). Deliberately NOT re-armed: both alert paths
-    /// need a human, and a rearmed timer would alert again forever.
+    /// `park_no_reset_time`). Deliberately NOT re-armed: every alert path
+    /// here either needs a human (`resume_no_handoff`) or documents a stale
+    /// timer for a run that is over (`resume_run_not_active`) — a rearmed
+    /// timer would alert again forever.
     fn append_alert(&self, entry: &ScheduleEntry, details: serde_json::Value) {
         self.audit.append(
             &entry.project_path,
@@ -336,11 +342,11 @@ mod tests {
         EnterResender, SessionTeardown, StdinWriter, SuccessorEmitter, SuccessorSpawn,
         TranscriptPathResolver,
     };
+    use crate::core::samurai_injector::SessionDirResolver;
     use crate::core::samurai_run_config::SamuraiRunConfig;
     use crate::core::supervisor::SupervisorState;
     use crate::core::windows_process::StdCommandExt;
     use chrono::DateTime;
-    use std::collections::HashMap;
     use std::sync::{Mutex, RwLock};
     use std::time::Duration;
     use tempfile::tempdir;
@@ -459,7 +465,6 @@ mod tests {
         run_configs: Arc<RunConfigStore>,
         schedule: Arc<SamuraiSchedule>,
         audit: AuditLog,
-        dirs: Arc<Mutex<HashMap<u32, String>>>,
         spawns: Arc<Mutex<Vec<SuccessorSpawn>>>,
     }
 
@@ -469,10 +474,10 @@ mod tests {
         let supervisor = Arc::new(Supervisor::new(audit.clone(), None));
         let config: SharedSamuraiConfig = Arc::new(RwLock::new(SamuraiConfig::default()));
         let context = Arc::new(SamuraiContextStore::new());
-        let dirs: Arc<Mutex<HashMap<u32, String>>> = Arc::new(Mutex::new(HashMap::new()));
-        let dirs_for_resolver = dirs.clone();
-        let session_dirs: SessionDirResolver =
-            Arc::new(move |id| dirs_for_resolver.lock().unwrap().get(&id).cloned());
+        // The replicator/injector still resolve session dirs; the resumer no
+        // longer does (review F2 — the working dir comes from the gated run
+        // config alone).
+        let session_dirs: SessionDirResolver = Arc::new(|_| None);
         let transcript_paths: TranscriptPathResolver = Arc::new(|_| None);
         let teardown: SessionTeardown = Arc::new(|_| Box::pin(async {}));
         let spawns: Arc<Mutex<Vec<SuccessorSpawn>>> = Arc::new(Mutex::new(Vec::new()));
@@ -508,7 +513,6 @@ mod tests {
             replicator.clone(),
             run_configs.clone(),
             audit.clone(),
-            session_dirs,
         );
         let resumer_for_fire = resumer.clone();
         let (schedule, _task) = SamuraiSchedule::new(
@@ -533,7 +537,6 @@ mod tests {
             run_configs,
             schedule,
             audit,
-            dirs,
             spawns,
         }
     }
@@ -666,8 +669,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         let project = "C:/git/proj-res-defer";
-        // A WORKING session for the epic — e.g. the crash-refire case where
+        // An ACTIVE run config (the F2 gate lets only these through) plus a
+        // WORKING session for the epic — e.g. the crash-refire case where
         // the resumed successor already registered.
+        h.run_configs
+            .save(&SamuraiRunConfig::new(
+                project,
+                "#37",
+                format!("{project}-wt"),
+            ))
+            .unwrap();
         h.supervisor
             .register_session(1, project.into(), "#37".into(), 3)
             .unwrap();
@@ -696,15 +707,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fire_proceeds_past_terminal_leftovers_and_uses_their_dir() {
-        // No run config (parked before P3.5 exists) — fallback (b): a
-        // PARKED session still in the registry resolves the working dir,
-        // and its generation drives the next one.
+    async fn test_fire_proceeds_past_terminal_leftovers_using_registry_generation() {
+        // A PARKED leftover in the registry does not defer, and its
+        // generation drives the next one; the working dir always comes from
+        // the run config (review F2 — session-dir fallbacks are gone).
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
-        let project = "C:/git/proj-res-fallback";
+        let project = "C:/git/proj-res-leftover";
         let repo = tempdir().unwrap();
         init_repo(repo.path()); // no handoff files
+        h.run_configs
+            .save(&SamuraiRunConfig::new(
+                project,
+                "#37",
+                repo.path().to_string_lossy().into_owned(),
+            ))
+            .unwrap();
         h.supervisor
             .register_session(5, project.into(), "#37".into(), 4)
             .unwrap();
@@ -712,10 +730,6 @@ mod tests {
             .transition(5, SupervisorState::ParkRequested)
             .unwrap();
         h.supervisor.transition(5, SupervisorState::Parked).unwrap();
-        h.dirs
-            .lock()
-            .unwrap()
-            .insert(5, repo.path().to_string_lossy().into_owned());
 
         h.resumer.on_fire(entry(project, "#37"));
 
@@ -732,28 +746,81 @@ mod tests {
         assert_eq!(details["predecessor_generation"], 4);
     }
 
-    #[tokio::test]
-    async fn test_fire_without_any_worktree_alerts_and_does_not_rearm() {
+    /// Review F2 (the #96 regression, timer edition): a fired timer whose
+    /// run config is COMPLETED, ARCHIVED or missing must never spawn a
+    /// successor into the finished worktree — it drops with an
+    /// `ALERT (resume_run_not_active)` note and never re-arms.
+    async fn assert_fire_dropped_as_not_active(
+        prepare: impl FnOnce(&Harness, &str),
+        project: &str,
+        expected_status: &str,
+    ) {
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
-        let project = "C:/git/proj-res-nowt";
+        prepare(&h, project);
 
         h.resumer.on_fire(entry(project, "#37"));
 
         let rows = wait_for_row(&h.audit, project, |r| {
-            r.details["kind"] == "resume_no_worktree"
+            r.details["kind"] == "resume_run_not_active"
         })
         .await;
         let alert = rows
             .iter()
-            .find(|r| r.details["kind"] == "resume_no_worktree")
+            .find(|r| r.details["kind"] == "resume_run_not_active")
             .unwrap();
         assert_eq!(alert.event, AuditEventKind::Alert);
         assert_eq!(alert.details["epic"], "#37");
-        // Human attention: no re-arm, no spawn, no RESUME row.
+        assert_eq!(alert.details["status"], expected_status);
+        // Stale timer: no re-arm, no spawn, no RESUME row.
         assert!(h.schedule.list().is_empty());
         assert!(h.spawns.lock().unwrap().is_empty());
         assert!(!rows.iter().any(|r| r.event == AuditEventKind::Resume));
+    }
+
+    #[tokio::test]
+    async fn test_fire_for_completed_run_is_dropped_with_audit_note() {
+        assert_fire_dropped_as_not_active(
+            |h, project| {
+                h.run_configs
+                    .save(&SamuraiRunConfig::new(
+                        project,
+                        "#37",
+                        format!("{project}-wt"),
+                    ))
+                    .unwrap();
+                h.run_configs.complete(project, "#37").unwrap();
+            },
+            "C:/git/proj-res-completed",
+            "COMPLETED",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_fire_for_archived_run_is_dropped_with_audit_note() {
+        assert_fire_dropped_as_not_active(
+            |h, project| {
+                h.run_configs
+                    .save(&SamuraiRunConfig::new(
+                        project,
+                        "#37",
+                        format!("{project}-wt"),
+                    ))
+                    .unwrap();
+                h.run_configs.archive(project, "#37").unwrap();
+            },
+            "C:/git/proj-res-archived",
+            "ARCHIVED",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_fire_without_any_run_config_is_dropped_with_audit_note() {
+        // A cleanup can delete the config outright; a timer without a run
+        // is stale by definition.
+        assert_fire_dropped_as_not_active(|_, _| {}, "C:/git/proj-res-noconfig", "MISSING").await;
     }
 
     #[tokio::test]
