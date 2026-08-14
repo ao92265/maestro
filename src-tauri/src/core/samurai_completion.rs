@@ -8,7 +8,7 @@
 //!
 //! 1. **Declare** — every orchestrator brief instructs the model to reply
 //!    with `<samurai-run-complete>issues #a #b pr #n</samurai-run-complete>`
-//!    once every issue the run works is closed and the run's PR is open
+//!    once the run reaches its finished state
 //!    (`samurai_prompts::RUN_COMPLETE_TAG` — the injector's marker idiom).
 //!    The declaration carries the CLAIMED issue numbers and PR number, so
 //!    verification checks exactly those claims instead of re-deriving the
@@ -17,8 +17,17 @@
 //! 2. **Verify** — [`SamuraiCompletionWatcher`] scans assistant replies on
 //!    the same EventBus tee as the injector, and on a declaration from a
 //!    supervised session probes `gh` (injected closures, the
-//!    `samurai_auth_watch::AuthProbe` pattern): every claimed issue must be
-//!    CLOSED and the claimed PR must be OPEN.
+//!    `samurai_auth_watch::AuthProbe` pattern). The run's own process closes
+//!    issues via `Closes #N` links fired by the HUMAN merge (PRD §5.9), so
+//!    "everything closed while the PR is open" is unreachable by design —
+//!    the accepted matrix (review F3) is instead: the claimed PR is OPEN and
+//!    every claimed issue is CLOSED **or** linked for close by that PR
+//!    (`gh pr view --json closingIssuesReferences`), OR the PR is already
+//!    MERGED and every claimed issue is CLOSED (a merged PR fired its links
+//!    — anything still open was not closed by it). Every probe passes the
+//!    run config's `--repo` pin when one is stored (review F1: cwd-based
+//!    resolution on a fork-with-upstream checkout can answer for the wrong
+//!    repo); a run without a pin keeps cwd resolution, logged.
 //! 3. **Flip** — only a verified declaration flips the run config
 //!    ACTIVE → COMPLETED ([`super::samurai_run_config::RunConfigStore::complete`])
 //!    and lands the PRD §5.10 `COMPLETE` audit row. Verification failure
@@ -33,7 +42,14 @@
 //! is read from byte 0, so an old declaration can re-surface. That is safe
 //! by construction — a replayed claim is re-verified against GitHub before
 //! anything flips — but each (session, claim) pair is processed once so a
-//! replay within one session cannot spam verifications or ALERTs.
+//! replay within one session cannot spam verifications or ALERTs. Two
+//! deliberate edges of that dedupe (review F4/F5): a marker seen while the
+//! session is not yet supervised is NOT consumed — the seen-set insert
+//! happens only after the supervised gate passes, so the registration
+//! window cannot swallow a declaration or an order alert for good; and a
+//! FAILED verification releases its claim again, so a transient `gh` blip
+//! never permanently consumes the only spelling the orchestrator would
+//! retry with.
 //!
 //! Issue #93 adds a tiny sibling arm on the same tee: the execution-order
 //! deviation alert. When an orchestrator disagrees with the user's issue
@@ -67,19 +83,33 @@ pub const DECLARATION_INVALID_KIND: &str = "completion_declaration_invalid";
 pub const ORDER_DEVIATION_KIND: &str = "order_deviation";
 
 /// State of one GitHub issue, e.g. `"CLOSED"` — `gh issue view --json state`
-/// via `github::GitHub::get_issue`. Injected so tests never shell out (the
-/// `samurai_auth_watch::AuthProbe` pattern); `Err` is a probe failure (gh
-/// missing, network), which verification treats as "not confirmed".
+/// via `github::GitHub::get_issue_state`. Args are (project path, the run's
+/// `--repo` pin if stored — review F1, issue number). Injected so tests
+/// never shell out (the `samurai_auth_watch::AuthProbe` pattern); `Err` is a
+/// probe failure (gh missing, network), which verification treats as "not
+/// confirmed".
 pub type IssueStateProbe = Arc<
-    dyn Fn(String, u64) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
+    dyn Fn(String, Option<String>, u64) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
         + Send
         + Sync,
 >;
 
-/// State of one pull request, e.g. `"OPEN"` — same seam as
-/// [`IssueStateProbe`], wired to `github::GitHub::get_pull_request`.
+/// What the PR probe reads for one pull request (review F3): its state plus
+/// the numbers of the issues its body links for auto-close —
+/// `gh pr view --json state,closingIssuesReferences` via
+/// `github::GitHub::get_pull_request_completion`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PrProbe {
+    /// `OPEN` / `MERGED` / `CLOSED`, as `gh` reports it.
+    pub state: String,
+    /// Issue numbers from `closingIssuesReferences`.
+    pub closing_issues: Vec<u64>,
+}
+
+/// Probe for the claimed pull request — same seam and arg shape as
+/// [`IssueStateProbe`].
 pub type PrStateProbe = Arc<
-    dyn Fn(String, u64) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
+    dyn Fn(String, Option<String>, u64) -> Pin<Box<dyn Future<Output = Result<PrProbe, String>> + Send>>
         + Send
         + Sync,
 >;
@@ -160,27 +190,49 @@ fn parse_claim_value(value: &str) -> Result<CompletionClaim, String> {
 }
 
 /// Folds the probed GitHub states into the list of failed checks (empty =
-/// verified). Pure, so the verdict is table-testable without `gh`: an issue
-/// passes only when its state reads CLOSED, the PR only when it reads OPEN
-/// (a MERGED or CLOSED PR is NOT the pinned "batch PR open" condition — the
-/// human decides), and a probe error is "not confirmed", never a pass.
+/// verified). Pure, so the verdict is table-testable without `gh`. The
+/// matrix (review F3 — the run's own process closes issues via `Closes #N`
+/// on the HUMAN merge, so "all closed while the PR is open" is unreachable
+/// by design):
+///
+/// - PR **OPEN**: each claimed issue passes when CLOSED **or** listed in
+///   the PR's `closingIssuesReferences` (the merge will close it).
+/// - PR **MERGED**: each claimed issue must be CLOSED — a merged PR already
+///   fired its links, so anything still open was not closed by it.
+/// - Any other PR state, or a PR probe error: a failure (and no issue can
+///   pass by link — a CLOSED-unmerged PR will never fire them).
+/// - An issue probe error is "not confirmed", never a pass — unless the
+///   successfully-probed OPEN PR links that issue for close, which is
+///   itself `gh`-verified evidence.
 fn claim_failures(
     issue_states: &[(u64, Result<String, String>)],
     pr: u64,
-    pr_state: &Result<String, String>,
+    pr_state: &Result<PrProbe, String>,
 ) -> Vec<String> {
     let mut failures = Vec::new();
+    let (links, pr_failure): (&[u64], Option<String>) = match pr_state {
+        Ok(p) if p.state.eq_ignore_ascii_case("open") => (&p.closing_issues, None),
+        Ok(p) if p.state.eq_ignore_ascii_case("merged") => (&[], None),
+        Ok(p) => (
+            &[],
+            Some(format!("PR #{pr} is {} (expected OPEN or MERGED)", p.state)),
+        ),
+        Err(e) => (&[], Some(format!("PR #{pr} state could not be read: {e}"))),
+    };
     for (number, state) in issue_states {
+        if links.contains(number) {
+            continue; // linked for close by the OPEN claimed PR — verified via gh
+        }
         match state {
             Ok(s) if s.eq_ignore_ascii_case("closed") => {}
-            Ok(s) => failures.push(format!("issue #{number} is {s} (expected CLOSED)")),
+            Ok(s) => failures.push(format!(
+                "issue #{number} is {s} (expected CLOSED or linked for close by PR #{pr})"
+            )),
             Err(e) => failures.push(format!("issue #{number} state could not be read: {e}")),
         }
     }
-    match pr_state {
-        Ok(s) if s.eq_ignore_ascii_case("open") => {}
-        Ok(s) => failures.push(format!("PR #{pr} is {s} (expected OPEN)")),
-        Err(e) => failures.push(format!("PR #{pr} state could not be read: {e}")),
+    if let Some(failure) = pr_failure {
+        failures.push(failure);
     }
     failures
 }
@@ -195,8 +247,11 @@ pub struct SamuraiCompletionWatcher {
     issue_state: IssueStateProbe,
     pr_state: PrStateProbe,
     /// (session, claim) pairs already handled — a transcript replay must not
-    /// re-run a verification or duplicate an ALERT (module doc).
-    seen: Mutex<HashSet<(u32, String)>>,
+    /// re-run a verification or duplicate an ALERT (module doc). `Arc`ed so
+    /// the spawned verification task can RELEASE a claim again when its
+    /// verification fails (review F5 — a transient `gh` blip must not
+    /// permanently consume the claim).
+    seen: Arc<Mutex<HashSet<(u32, String)>>>,
 }
 
 impl SamuraiCompletionWatcher {
@@ -213,7 +268,7 @@ impl SamuraiCompletionWatcher {
             audit,
             issue_state,
             pr_state,
-            seen: Mutex::new(HashSet::new()),
+            seen: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -234,17 +289,13 @@ impl SamuraiCompletionWatcher {
         let Some(parsed) = parse_completion_claim(text) else {
             return;
         };
-        // One verification per (session, claim) — see the replay note.
         let raw = marker_value(text, RUN_COMPLETE_TAG).unwrap_or_default();
-        {
-            let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-            if !seen.insert((*session_id, raw)) {
-                return;
-            }
-        }
         // Only a SUPERVISED session can finish a run — the snapshot names
         // the (project, epic, generation) the config lookup and the audit
-        // rows need.
+        // rows need. Gated BEFORE the seen-set insert (review F4): a
+        // declaration observed during the registration window must not be
+        // consumed for good — the transcript replay after registration is
+        // its retry.
         let Some(session) = self
             .supervisor
             .list_sessions()
@@ -256,6 +307,13 @@ impl SamuraiCompletionWatcher {
             );
             return;
         };
+        // One verification per (session, claim) — see the replay note.
+        {
+            let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+            if !seen.insert((*session_id, raw.clone())) {
+                return;
+            }
+        }
         match parsed {
             Err(reason) => {
                 log::warn!(
@@ -277,7 +335,7 @@ impl SamuraiCompletionWatcher {
                     ),
                 );
             }
-            Ok(claim) => self.spawn_verification(session, claim),
+            Ok(claim) => self.spawn_verification(session, claim, raw),
         }
     }
 
@@ -296,14 +354,11 @@ impl SamuraiCompletionWatcher {
         let Some(alert) = marker_value(text, ORDER_ALERT_TAG) else {
             return;
         };
-        {
-            let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-            if !seen.insert((session_id, format!("order-alert:{alert}"))) {
-                return;
-            }
-        }
         // Same gate as the completion path: only a SUPERVISED session can
         // raise the alert — any terminal could type the marker otherwise.
+        // Gated BEFORE the seen-set insert (review F4): an alert raised
+        // during the registration window must not be consumed for good — a
+        // lost order alert leaves the orchestrator WAITING forever.
         let Some(session) = self
             .supervisor
             .list_sessions()
@@ -315,6 +370,12 @@ impl SamuraiCompletionWatcher {
             );
             return;
         };
+        {
+            let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+            if !seen.insert((session_id, format!("order-alert:{alert}"))) {
+                return;
+            }
+        }
         log::warn!(
             "samurai order alert: session {session_id} (epic {}) proposes an execution-order deviation and is WAITING for the user: {alert}",
             session.epic
@@ -336,20 +397,20 @@ impl SamuraiCompletionWatcher {
     }
 
     /// Runs the `gh` checks off the tee and applies the verdict. The run
-    /// config's status is re-read inside the task (file IO), so a duplicate
-    /// declaration for an already COMPLETED run is a logged no-op and a
-    /// cleanup racing the verification loses nothing —
-    /// [`RunConfigStore::complete`] only ever flips ACTIVE.
-    fn spawn_verification(&self, session: SessionSnapshot, claim: CompletionClaim) {
+    /// config is re-read inside the task (file IO) for its status — a
+    /// duplicate declaration for an already COMPLETED run is a logged no-op
+    /// and a cleanup racing the verification loses nothing —
+    /// [`RunConfigStore::complete`] only ever flips ACTIVE — and for its
+    /// `--repo` pin, which every probe passes through to `gh` (review F1).
+    fn spawn_verification(&self, session: SessionSnapshot, claim: CompletionClaim, raw: String) {
         let run_configs = self.run_configs.clone();
         let audit = self.audit.clone();
         let issue_state = self.issue_state.clone();
         let pr_state = self.pr_state.clone();
+        let seen = self.seen.clone();
         tauri::async_runtime::spawn(async move {
-            match run_configs
-                .get(&session.project, &session.epic)
-                .map(|c| c.status)
-            {
+            let config = run_configs.get(&session.project, &session.epic);
+            match config.as_ref().map(|c| c.status) {
                 Some(RunConfigStatus::Active) => {}
                 Some(RunConfigStatus::Completed) => {
                     log::info!(
@@ -369,8 +430,21 @@ impl SamuraiCompletionWatcher {
                     return;
                 }
             }
+            // Review F1: the launch flow stores the run's `--repo` pin (PRD
+            // §5.8); every probe carries it so `gh` can never resolve the
+            // WRONG repo from the cwd on a fork-with-upstream checkout. No
+            // pin stored → cwd resolution stands, logged so a mis-resolved
+            // probe is explainable.
+            let repo_pin = config.and_then(|c| c.repo_pin);
+            if repo_pin.is_none() {
+                log::warn!(
+                    "samurai completion: run config for epic {} in {} stores no --repo pin — gh probes fall back to cwd repo resolution",
+                    session.epic,
+                    session.project
+                );
+            }
             log::info!(
-                "samurai completion: verifying epic {} in {} — issues {:?} closed, PR #{} open",
+                "samurai completion: verifying epic {} in {} — issues {:?} closed or close-linked, PR #{} open or merged",
                 session.epic,
                 session.project,
                 claim.issues,
@@ -378,10 +452,21 @@ impl SamuraiCompletionWatcher {
             );
             let mut issue_states = Vec::with_capacity(claim.issues.len());
             for number in &claim.issues {
-                issue_states.push((*number, issue_state(session.project.clone(), *number).await));
+                issue_states.push((
+                    *number,
+                    issue_state(session.project.clone(), repo_pin.clone(), *number).await,
+                ));
             }
-            let pr_result = pr_state(session.project.clone(), claim.pr).await;
+            let pr_result = pr_state(session.project.clone(), repo_pin.clone(), claim.pr).await;
             let failures = claim_failures(&issue_states, claim.pr, &pr_result);
+            // Review F5: a FAILED verification releases the claim from the
+            // replay dedupe — an identical re-declaration after a transient
+            // `gh` blip must verify again instead of being swallowed.
+            if !failures.is_empty() {
+                seen.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&(session.session_id, raw));
+            }
             apply_verdict(&run_configs, &audit, &session, &claim, failures);
         });
     }
@@ -545,30 +630,55 @@ mod tests {
 
     // --- verdict fold (pure) ---
 
+    fn pr_probe(state: &str, links: &[u64]) -> Result<PrProbe, String> {
+        Ok(PrProbe {
+            state: state.to_string(),
+            closing_issues: links.to_vec(),
+        })
+    }
+
     #[test]
     fn test_claim_failures_table() {
         let ok = |s: &str| Ok::<String, String>(s.to_string());
         let err = |s: &str| Err::<String, String>(s.to_string());
-        // Everything confirmed (case-insensitive states).
+        // Everything closed, PR open (case-insensitive states).
         assert!(claim_failures(
             &[(1, ok("CLOSED")), (2, ok("closed"))],
             9,
-            &ok("OPEN")
+            &pr_probe("OPEN", &[])
         )
         .is_empty());
-        // An open issue fails.
-        let failures = claim_failures(&[(1, ok("OPEN"))], 9, &ok("OPEN"));
+        // Review F3 — links-satisfied: open issues covered by the OPEN PR's
+        // close links pass, even when the issue's own probe errored (the
+        // link is gh-verified evidence from the PR probe).
+        assert!(claim_failures(
+            &[(1, ok("OPEN")), (2, err("boom"))],
+            9,
+            &pr_probe("open", &[1, 2])
+        )
+        .is_empty());
+        // Review F3 — merged + everything closed passes.
+        assert!(claim_failures(&[(1, ok("CLOSED"))], 9, &pr_probe("MERGED", &[])).is_empty());
+        // An open issue with no link fails.
+        let failures = claim_failures(&[(1, ok("OPEN"))], 9, &pr_probe("OPEN", &[]));
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("issue #1 is OPEN"));
-        // A merged or closed PR is NOT "batch PR open".
-        let failures = claim_failures(&[(1, ok("CLOSED"))], 9, &ok("MERGED"));
+        assert!(failures[0].contains("linked for close by PR #9"));
+        // A MERGED PR's links no longer count — the merge already fired
+        // them, so an issue still open was NOT closed by this PR.
+        let failures = claim_failures(&[(1, ok("OPEN"))], 9, &pr_probe("MERGED", &[1]));
         assert_eq!(failures.len(), 1);
-        assert!(failures[0].contains("PR #9 is MERGED"));
+        assert!(failures[0].contains("issue #1 is OPEN"));
+        // A CLOSED (unmerged) PR is neither open nor merged — and its links
+        // will never fire.
+        let failures = claim_failures(&[(1, ok("CLOSED"))], 9, &pr_probe("CLOSED", &[1]));
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("PR #9 is CLOSED (expected OPEN or MERGED)"));
         // Probe errors are "not confirmed", never a pass — and they stack.
         let failures = claim_failures(
             &[(1, err("gh not found")), (2, ok("OPEN"))],
             9,
-            &err("timeout"),
+            &Err("timeout".to_string()),
         );
         assert_eq!(failures.len(), 3);
         assert!(failures[0].contains("issue #1 state could not be read"));
@@ -582,40 +692,26 @@ mod tests {
         supervisor: Arc<Supervisor>,
         run_configs: Arc<RunConfigStore>,
         audit: AuditLog,
-        /// Every (kind, number) probe call, for count assertions.
-        calls: Arc<Mutex<Vec<(&'static str, u64)>>>,
+        /// Every (kind, number, repo pin) probe call, for count and
+        /// pin-threading assertions (review F1).
+        calls: Arc<Mutex<Vec<(&'static str, u64, Option<String>)>>>,
         _dir: tempfile::TempDir,
     }
 
-    /// Probes answer from the given state maps; anything unscripted errors.
-    fn harness(
-        issue_states: HashMap<u64, Result<String, String>>,
-        pr_states: HashMap<u64, Result<String, String>>,
+    type ProbeCalls = Arc<Mutex<Vec<(&'static str, u64, Option<String>)>>>;
+
+    /// The common watcher/store/audit scaffolding around a pair of probes —
+    /// tests needing stateful probes (review F5) build their own closures.
+    fn harness_from_probes(
+        issue_state: IssueStateProbe,
+        pr_state: PrStateProbe,
+        calls: ProbeCalls,
     ) -> Harness {
         let dir = tempdir().unwrap();
         let (audit, task) = AuditLog::new(dir.path().join("audit"), None);
         tokio::spawn(task);
         let supervisor = Arc::new(Supervisor::new(audit.clone(), None));
         let run_configs = Arc::new(RunConfigStore::new(dir.path().join("runs")));
-        let calls: Arc<Mutex<Vec<(&'static str, u64)>>> = Arc::new(Mutex::new(Vec::new()));
-        let issue_calls = calls.clone();
-        let issue_state: IssueStateProbe = Arc::new(move |_project, number| {
-            issue_calls.lock().unwrap().push(("issue", number));
-            let result = issue_states
-                .get(&number)
-                .cloned()
-                .unwrap_or_else(|| Err(format!("unscripted issue #{number}")));
-            Box::pin(async move { result })
-        });
-        let pr_calls = calls.clone();
-        let pr_state: PrStateProbe = Arc::new(move |_project, number| {
-            pr_calls.lock().unwrap().push(("pr", number));
-            let result = pr_states
-                .get(&number)
-                .cloned()
-                .unwrap_or_else(|| Err(format!("unscripted PR #{number}")));
-            Box::pin(async move { result })
-        });
         let watcher = SamuraiCompletionWatcher::new(
             supervisor.clone(),
             run_configs.clone(),
@@ -631,6 +727,33 @@ mod tests {
             calls,
             _dir: dir,
         }
+    }
+
+    /// Probes answer from the given state maps; anything unscripted errors.
+    fn harness(
+        issue_states: HashMap<u64, Result<String, String>>,
+        pr_states: HashMap<u64, Result<PrProbe, String>>,
+    ) -> Harness {
+        let calls: ProbeCalls = Arc::new(Mutex::new(Vec::new()));
+        let issue_calls = calls.clone();
+        let issue_state: IssueStateProbe = Arc::new(move |_project, repo_pin, number| {
+            issue_calls.lock().unwrap().push(("issue", number, repo_pin));
+            let result = issue_states
+                .get(&number)
+                .cloned()
+                .unwrap_or_else(|| Err(format!("unscripted issue #{number}")));
+            Box::pin(async move { result })
+        });
+        let pr_calls = calls.clone();
+        let pr_state: PrStateProbe = Arc::new(move |_project, repo_pin, number| {
+            pr_calls.lock().unwrap().push(("pr", number, repo_pin));
+            let result = pr_states
+                .get(&number)
+                .cloned()
+                .unwrap_or_else(|| Err(format!("unscripted PR #{number}")));
+            Box::pin(async move { result })
+        });
+        harness_from_probes(issue_state, pr_state, calls)
     }
 
     const PROJECT: &str = "C:/git/proj-complete";
@@ -707,7 +830,7 @@ mod tests {
                 (77, Ok("CLOSED".to_string())),
                 (78, Ok("CLOSED".to_string())),
             ]),
-            HashMap::from([(85, Ok("OPEN".to_string()))]),
+            HashMap::from([(85, pr_probe("OPEN", &[]))]),
         );
         launch_epic(&h, 4, "#38", 3);
 
@@ -724,6 +847,111 @@ mod tests {
         assert_eq!(complete[0].details["issues"], json!([77, 78]));
         assert_eq!(complete[0].details["pr"], 85);
         assert!(rows(&h.audit, AuditEventKind::Alert).await.is_empty());
+        // No pin stored on this run config → the probes receive None and
+        // gh falls back to cwd resolution (review F1, logged fallback).
+        assert!(h
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, _, pin)| pin.is_none()));
+    }
+
+    #[tokio::test]
+    async fn test_probes_carry_the_runs_repo_pin() {
+        // Review F1: the launch flow stores a `--repo` pin in the run
+        // config; every completion probe must pass it through so gh can
+        // never resolve the WRONG repo from the cwd (fork-with-upstream).
+        let h = harness(
+            HashMap::from([(77, Ok("CLOSED".to_string()))]),
+            HashMap::from([(85, pr_probe("OPEN", &[]))]),
+        );
+        let mut config = SamuraiRunConfig::new(PROJECT, "#38", format!("{PROJECT}-wt"));
+        config.repo_pin = Some("nachogl1/maestro".to_string());
+        h.run_configs.save(&config).unwrap();
+        h.supervisor
+            .register_session(4, PROJECT.into(), "#38".into(), 1)
+            .unwrap();
+
+        h.watcher.observe(&reply(4, &declared("issues #77 pr #85")));
+
+        wait_until(|| status(&h, "#38") == RunConfigStatus::Completed).await;
+        let calls = h.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2, "one issue probe + one PR probe");
+        assert!(
+            calls
+                .iter()
+                .all(|(_, _, pin)| pin.as_deref() == Some("nachogl1/maestro")),
+            "every gh probe must carry the run's pin: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open_pr_with_close_links_satisfies_open_issues() {
+        // Review F3: the briefs' own process closes issues via `Closes #N`
+        // fired by the HUMAN merge, so the declarable end state is the OPEN
+        // batch PR whose links cover every still-open claimed issue.
+        let h = harness(
+            HashMap::from([
+                (77, Ok("CLOSED".to_string())),
+                (78, Ok("OPEN".to_string())),
+            ]),
+            HashMap::from([(85, pr_probe("OPEN", &[78]))]),
+        );
+        launch_epic(&h, 4, "#38", 1);
+
+        h.watcher
+            .observe(&reply(4, &declared("issues #77 #78 pr #85")));
+
+        wait_until(|| status(&h, "#38") == RunConfigStatus::Completed).await;
+        assert_eq!(rows(&h.audit, AuditEventKind::Complete).await.len(), 1);
+        assert!(rows(&h.audit, AuditEventKind::Alert).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_merged_pr_with_all_issues_closed_completes() {
+        // Review F3: a PR the human already merged (which closed the linked
+        // issues) is equally verifiable — the run must not strand ACTIVE.
+        let h = harness(
+            HashMap::from([
+                (77, Ok("CLOSED".to_string())),
+                (78, Ok("CLOSED".to_string())),
+            ]),
+            HashMap::from([(85, pr_probe("MERGED", &[]))]),
+        );
+        launch_epic(&h, 4, "#38", 1);
+
+        h.watcher
+            .observe(&reply(4, &declared("issues #77 #78 pr #85")));
+
+        wait_until(|| status(&h, "#38") == RunConfigStatus::Completed).await;
+        assert!(rows(&h.audit, AuditEventKind::Alert).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_merged_pr_with_open_issue_alerts() {
+        // Review F3: a merged PR already fired its close links — an issue
+        // still open was NOT closed by it, even if the (stale) links name
+        // it. The run stays ACTIVE with an ALERT.
+        let h = harness(
+            HashMap::from([
+                (77, Ok("CLOSED".to_string())),
+                (78, Ok("OPEN".to_string())),
+            ]),
+            HashMap::from([(85, pr_probe("MERGED", &[78]))]),
+        );
+        launch_epic(&h, 4, "#38", 1);
+
+        h.watcher
+            .observe(&reply(4, &declared("issues #77 #78 pr #85")));
+
+        let alerts = wait_for_alerts(&h.audit).await;
+        assert_eq!(alerts[0].details["kind"], VERIFICATION_FAILED_KIND);
+        let failures = alerts[0].details["failures"].as_array().unwrap();
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].as_str().unwrap().contains("issue #78 is OPEN"));
+        assert_eq!(status(&h, "#38"), RunConfigStatus::Active);
+        assert!(rows(&h.audit, AuditEventKind::Complete).await.is_empty());
     }
 
     #[tokio::test]
@@ -733,7 +961,7 @@ mod tests {
                 (77, Ok("CLOSED".to_string())),
                 (78, Ok("OPEN".to_string())),
             ]),
-            HashMap::from([(85, Ok("OPEN".to_string()))]),
+            HashMap::from([(85, pr_probe("OPEN", &[]))]),
         );
         launch_epic(&h, 4, "#38", 2);
 
@@ -820,7 +1048,7 @@ mod tests {
         // declaration message can be observed again — one verification.
         let h = harness(
             HashMap::from([(77, Ok("CLOSED".to_string()))]),
-            HashMap::from([(85, Ok("OPEN".to_string()))]),
+            HashMap::from([(85, pr_probe("OPEN", &[]))]),
         );
         launch_epic(&h, 4, "#38", 1);
 
@@ -836,6 +1064,102 @@ mod tests {
             "one issue probe + one PR probe — the replay is deduped"
         );
         assert_eq!(rows(&h.audit, AuditEventKind::Complete).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_declaration_during_registration_window_is_not_consumed() {
+        // Review F4: a declaration observed BEFORE the session registers
+        // (the launch registration window) is ignored — but must not be
+        // consumed by the replay dedupe, because the transcript replay
+        // after registration is its only retry.
+        let h = harness(
+            HashMap::from([(77, Ok("CLOSED".to_string()))]),
+            HashMap::from([(85, pr_probe("OPEN", &[]))]),
+        );
+        h.run_configs
+            .save(&SamuraiRunConfig::new(
+                PROJECT,
+                "#38",
+                format!("{PROJECT}-wt"),
+            ))
+            .unwrap();
+        let text = declared("issues #77 pr #85");
+
+        h.watcher.observe(&reply(4, &text));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(h.calls.lock().unwrap().is_empty(), "gate must hold");
+        assert_eq!(status(&h, "#38"), RunConfigStatus::Active);
+
+        // Registration lands; the SAME text re-surfaces and must verify.
+        h.supervisor
+            .register_session(4, PROJECT.into(), "#38".into(), 1)
+            .unwrap();
+        h.watcher.observe(&reply(4, &text));
+        wait_until(|| status(&h, "#38") == RunConfigStatus::Completed).await;
+        assert_eq!(rows(&h.audit, AuditEventKind::Complete).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_order_alert_during_registration_window_is_not_consumed() {
+        // Review F4, order-alert arm: a lost order alert leaves the
+        // orchestrator WAITING forever, so the registration window must not
+        // swallow it either.
+        let h = harness(HashMap::new(), HashMap::new());
+        let text = order_alert("original: #1 #2; proposed: #2 #1; reasoning: deps");
+
+        h.watcher.observe(&reply(4, &text));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rows(&h.audit, AuditEventKind::Alert).await.is_empty());
+
+        launch_epic(&h, 4, "#38", 1);
+        h.watcher.observe(&reply(4, &text));
+        let alerts = wait_for_alerts(&h.audit).await;
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].details["kind"], ORDER_DEVIATION_KIND);
+    }
+
+    #[tokio::test]
+    async fn test_failed_verification_releases_the_claim_for_retry() {
+        // Review F5: a verification FAILURE (e.g. a transient gh blip) must
+        // not permanently dedupe the identical re-declaration — fail, then
+        // succeed on the same text, and the run flips COMPLETED.
+        let calls: ProbeCalls = Arc::new(Mutex::new(Vec::new()));
+        let issue_calls = calls.clone();
+        let issue_state: IssueStateProbe = Arc::new(move |_project, repo_pin, number| {
+            issue_calls.lock().unwrap().push(("issue", number, repo_pin));
+            Box::pin(async { Ok("CLOSED".to_string()) })
+        });
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pr_calls = calls.clone();
+        let pr_state: PrStateProbe = Arc::new(move |_project, repo_pin, number| {
+            pr_calls.lock().unwrap().push(("pr", number, repo_pin));
+            let first = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                if first {
+                    Err("gh timed out".to_string())
+                } else {
+                    Ok(PrProbe {
+                        state: "OPEN".to_string(),
+                        closing_issues: Vec::new(),
+                    })
+                }
+            })
+        });
+        let h = harness_from_probes(issue_state, pr_state, calls);
+        launch_epic(&h, 4, "#38", 1);
+        let text = declared("issues #77 pr #85");
+
+        h.watcher.observe(&reply(4, &text));
+        let alerts = wait_for_alerts(&h.audit).await;
+        assert_eq!(alerts[0].details["kind"], VERIFICATION_FAILED_KIND);
+        assert_eq!(status(&h, "#38"), RunConfigStatus::Active);
+
+        // The IDENTICAL text again — the failed claim was released, so this
+        // verifies (and now succeeds).
+        h.watcher.observe(&reply(4, &text));
+        wait_until(|| status(&h, "#38") == RunConfigStatus::Completed).await;
+        assert_eq!(rows(&h.audit, AuditEventKind::Complete).await.len(), 1);
+        assert_eq!(h.calls.lock().unwrap().len(), 4, "two full verifications");
     }
 
     // --- issue #93: execution-order deviation alerts ---
@@ -899,7 +1223,7 @@ mod tests {
         // gate must make it a logged no-op, not a second COMPLETE row.
         let h = harness(
             HashMap::from([(77, Ok("CLOSED".to_string()))]),
-            HashMap::from([(85, Ok("OPEN".to_string()))]),
+            HashMap::from([(85, pr_probe("OPEN", &[]))]),
         );
         launch_epic(&h, 4, "#38", 1);
         h.run_configs.complete(PROJECT, "#38").unwrap();

@@ -673,29 +673,36 @@ pub fn run() {
             injector.set_run_configs(run_configs.clone());
             // Samurai (issue #96): run completion, DECLARE + VERIFY. The
             // orchestrator's `<samurai-run-complete>` declaration (scanned on
-            // the EventBus tee above) is verified against GitHub — every
-            // claimed issue CLOSED, the claimed PR OPEN — before the run
-            // config flips ACTIVE → COMPLETED and the §5.10 COMPLETE row
-            // lands. The probes shell out via the same `github::GitHub`
-            // runner as the preflight/auth checks; injected (the AuthProbe
-            // pattern) so the module never touches `gh` in tests.
+            // the EventBus tee above) is verified against GitHub — the
+            // claimed PR OPEN with every claimed issue CLOSED or linked for
+            // close by it, or the PR MERGED with every claimed issue CLOSED
+            // (review F3) — before the run config flips ACTIVE → COMPLETED
+            // and the §5.10 COMPLETE row lands. The probes shell out via the
+            // same `github::GitHub` runner as the preflight/auth checks and
+            // carry the run's `--repo` pin when one is stored (review F1);
+            // injected (the AuthProbe pattern) so the module never touches
+            // `gh` in tests.
             let issue_state_probe: core::samurai_completion::IssueStateProbe =
-                Arc::new(|project: String, number: u64| {
+                Arc::new(|project: String, repo_pin: Option<String>, number: u64| {
                     Box::pin(async move {
                         github::GitHub::new(project)
-                            .get_issue(number)
+                            .get_issue_state(number, repo_pin.as_deref())
                             .await
-                            .map(|issue| issue.state)
                             .map_err(|e| e.to_string())
                     })
                 });
             let pr_state_probe: core::samurai_completion::PrStateProbe =
-                Arc::new(|project: String, number: u64| {
+                Arc::new(|project: String, repo_pin: Option<String>, number: u64| {
                     Box::pin(async move {
                         github::GitHub::new(project)
-                            .get_pull_request(number)
+                            .get_pull_request_completion(number, repo_pin.as_deref())
                             .await
-                            .map(|pr| pr.state)
+                            .map(
+                                |(state, closing_issues)| core::samurai_completion::PrProbe {
+                                    state,
+                                    closing_issues,
+                                },
+                            )
                             .map_err(|e| e.to_string())
                     })
                 });
@@ -741,8 +748,9 @@ pub fn run() {
             app.manage(harvest_triage.clone());
             let _ = harvest_triage_slot.set(harvest_triage);
             // Samurai (issue #61): the resume handler — a fired park timer
-            // becomes a FRESH generation spawn (guards → working dir →
-            // next generation → RESUME row → replicator.spawn_generation).
+            // becomes a FRESH generation spawn (ACTIVE-run gate → guards →
+            // working dir → next generation → RESUME row →
+            // replicator.spawn_generation).
             // Constructed before the schedule because it IS the fire
             // callback; the schedule and parker are late-bound below (the
             // construction order is circular: schedule → resumer → parker →
@@ -752,7 +760,6 @@ pub fn run() {
                 replicator.clone(),
                 run_configs.clone(),
                 audit_log.clone(),
-                session_dirs,
             );
             let resumer_for_fire = samurai_resumer.clone();
             // Issue #61: every schedule mutation (arm/cancel/fire) pushes

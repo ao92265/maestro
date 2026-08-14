@@ -96,6 +96,35 @@ fn pick_branch_pull_request(rows: Vec<BranchPrRow>) -> Option<BranchPullRequest>
         })
 }
 
+/// Args for [`GitHub::get_issue_state`] — pure so the `--repo` pin
+/// composition is unit-testable without shelling out (review F1: without a
+/// pin, `gh` resolves the repo from the cwd, which on a fork-with-upstream
+/// checkout can be the wrong one).
+fn issue_state_args<'a>(number: &'a str, repo_pin: Option<&'a str>) -> Vec<&'a str> {
+    let mut args = vec!["issue", "view", number, "--json", "state"];
+    if let Some(pin) = repo_pin {
+        args.extend_from_slice(&["--repo", pin]);
+    }
+    args
+}
+
+/// Args for [`GitHub::get_pull_request_completion`] — same pin discipline as
+/// [`issue_state_args`]; `closingIssuesReferences` carries the issues the PR
+/// body links for auto-close (review F3).
+fn pr_completion_args<'a>(number: &'a str, repo_pin: Option<&'a str>) -> Vec<&'a str> {
+    let mut args = vec![
+        "pr",
+        "view",
+        number,
+        "--json",
+        "state,closingIssuesReferences",
+    ];
+    if let Some(pin) = repo_pin {
+        args.extend_from_slice(&["--repo", pin]);
+    }
+    args
+}
+
 /// Detailed pull request info including body and review info.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -506,6 +535,66 @@ impl GitHub {
             review_decision: response.review_decision,
             comments,
         })
+    }
+
+    /// State of one issue (`OPEN`/`CLOSED`), optionally pinned to a repo —
+    /// the samurai completion verifier's probe (issue #96, review F1). The
+    /// `--repo` pin bypasses cwd-based repo resolution, which on a
+    /// fork-with-upstream checkout can answer for the WRONG repo.
+    pub async fn get_issue_state(
+        &self,
+        number: u64,
+        repo_pin: Option<&str>,
+    ) -> Result<String, GitHubError> {
+        let number_str = number.to_string();
+
+        #[derive(Deserialize)]
+        struct StateOnly {
+            state: String,
+        }
+
+        let response: StateOnly = self
+            .run_json(&issue_state_args(&number_str, repo_pin))
+            .await?;
+        Ok(response.state)
+    }
+
+    /// State of one pull request plus the numbers of the issues its body
+    /// links for auto-close (`closingIssuesReferences`), optionally pinned
+    /// to a repo — the samurai completion verifier's probe (issue #96,
+    /// review F1/F3: an OPEN batch PR whose links cover the claimed issues
+    /// is a verifiable completion state).
+    pub async fn get_pull_request_completion(
+        &self,
+        number: u64,
+        repo_pin: Option<&str>,
+    ) -> Result<(String, Vec<u64>), GitHubError> {
+        let number_str = number.to_string();
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PrCompletionResponse {
+            state: String,
+            #[serde(default)]
+            closing_issues_references: Vec<ClosingIssueRef>,
+        }
+
+        #[derive(Deserialize)]
+        struct ClosingIssueRef {
+            number: u64,
+        }
+
+        let response: PrCompletionResponse = self
+            .run_json(&pr_completion_args(&number_str, repo_pin))
+            .await?;
+        Ok((
+            response.state,
+            response
+                .closing_issues_references
+                .into_iter()
+                .map(|r| r.number)
+                .collect(),
+        ))
     }
 
     /// Creates a new pull request.
@@ -1081,6 +1170,51 @@ mod tests {
         assert_eq!(MergeMethod::Merge.as_flag(), "--merge");
         assert_eq!(MergeMethod::Squash.as_flag(), "--squash");
         assert_eq!(MergeMethod::Rebase.as_flag(), "--rebase");
+    }
+
+    #[test]
+    fn test_completion_probe_args_pin_the_repo_when_known() {
+        // Review F1: with a stored pin, EVERY completion probe carries
+        // `--repo` explicitly — cwd-based resolution on a fork-with-upstream
+        // checkout can answer for the wrong repo.
+        assert_eq!(
+            issue_state_args("77", Some("nachogl1/maestro")),
+            vec![
+                "issue",
+                "view",
+                "77",
+                "--json",
+                "state",
+                "--repo",
+                "nachogl1/maestro"
+            ]
+        );
+        assert_eq!(
+            pr_completion_args("85", Some("nachogl1/maestro")),
+            vec![
+                "pr",
+                "view",
+                "85",
+                "--json",
+                "state,closingIssuesReferences",
+                "--repo",
+                "nachogl1/maestro"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_completion_probe_args_without_pin_keep_cwd_resolution() {
+        // No pin stored (remote never parsed): the args carry no `--repo`
+        // and gh resolves from the working directory — the caller logs it.
+        assert_eq!(
+            issue_state_args("77", None),
+            vec!["issue", "view", "77", "--json", "state"]
+        );
+        assert_eq!(
+            pr_completion_args("85", None),
+            vec!["pr", "view", "85", "--json", "state,closingIssuesReferences"]
+        );
     }
 
     #[test]
