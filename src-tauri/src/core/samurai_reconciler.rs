@@ -812,7 +812,7 @@ mod tests {
         let emit_spawn: SuccessorEmitter = Arc::new(move |s| {
             spawns_rec.lock().unwrap().push(s.clone());
         });
-        let write_stdin: StdinWriter = Arc::new(|_, _| {});
+        let write_stdin: StdinWriter = Arc::new(|_, _, outcome| outcome(Ok(())));
         let resend_enter: EnterResender = Arc::new(|_| {});
         let replicator = Arc::new(SamuraiReplicator::new(
             supervisor.clone(),

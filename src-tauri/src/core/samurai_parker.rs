@@ -575,7 +575,6 @@ impl SamuraiParker {
 mod tests {
     use super::*;
     use crate::core::claude_event::ClaudeEvent;
-    use crate::core::process_manager::ProcessManager;
     use crate::core::samurai_config::{SamuraiConfig, SharedSamuraiConfig};
     use crate::core::samurai_injector::SessionDirResolver;
     use crate::core::windows_process::StdCommandExt;
@@ -734,7 +733,9 @@ mod tests {
             supervisor.clone(),
             context.clone(),
             config,
-            ProcessManager::new(),
+            // Issue #109: the injected writer confirms every body write, so
+            // delivered rows behave as production's post-write verdict.
+            Arc::new(|_, _, outcome: crate::core::samurai_pty::DeliveryOutcome| outcome(Ok(()))),
             audit.clone(),
             resolver,
             None,

@@ -1679,7 +1679,7 @@ mod tests {
         let session_dirs: SessionDirResolver = Arc::new(|_| None);
         let transcript_paths: TranscriptPathResolver = Arc::new(|_| None);
         let teardown: SessionTeardown = Arc::new(|_| Box::pin(async {}));
-        let write_stdin: StdinWriter = Arc::new(|_, _| {});
+        let write_stdin: StdinWriter = Arc::new(|_, _, outcome| outcome(Ok(())));
         let resend_enter: EnterResender = Arc::new(|_| {});
         let shared: SharedSamuraiConfig = Arc::new(RwLock::new(SamuraiConfig::default()));
         let replicator = Arc::new(SamuraiReplicator::new(
@@ -1899,7 +1899,7 @@ mod tests {
         let session_dirs: SessionDirResolver = Arc::new(|_| None);
         let transcript_paths: TranscriptPathResolver = Arc::new(|_| None);
         let teardown: SessionTeardown = Arc::new(|_| Box::pin(async {}));
-        let write_stdin: StdinWriter = Arc::new(|_, _| {});
+        let write_stdin: StdinWriter = Arc::new(|_, _, outcome| outcome(Ok(())));
         let resend_enter: EnterResender = Arc::new(|_| {});
         let shared: SharedSamuraiConfig = Arc::new(RwLock::new(SamuraiConfig::default()));
         let replicator = Arc::new(SamuraiReplicator::new(

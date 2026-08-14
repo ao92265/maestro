@@ -587,15 +587,19 @@ pub fn run() {
                 });
             let ritual_pm = app.state::<ProcessManager>().inner().clone();
             let ritual_writer: core::samurai_replicator::StdinWriter =
-                Arc::new(move |session_id, data| {
+                Arc::new(move |session_id, data, outcome| {
                     // Text, then a separate Enter (samurai_pty) — one
                     // text-plus-CR write is read as a paste and never
-                    // submits. Both frames go to the blocking pool.
+                    // submits. Both frames go to the blocking pool. The
+                    // outcome callback (issue #109) reports whether the body
+                    // write landed — the replicator's delivered row and
+                    // Enter-resend watch hang off it.
                     core::samurai_pty::submit_instruction(
                         ritual_pm.clone(),
                         session_id,
                         data,
                         "replicator",
+                        outcome,
                     );
                 });
             // Issue #103: the Enter-only resend for the post-delivery watch
@@ -626,11 +630,25 @@ pub fn run() {
             // Arms the DEAD → recovery chain in the supervisor callback.
             let _ = samurai_replicator_slot.set(replicator.clone());
 
+            // The injector delivers through the same writer contract as the
+            // replicator (issue #109): body write + separate Enter, with the
+            // delivered row and Enter-resend watch riding the verdict.
+            let injector_pm = app.state::<ProcessManager>().inner().clone();
+            let injector_writer: core::samurai_replicator::StdinWriter =
+                Arc::new(move |session_id, data, outcome| {
+                    core::samurai_pty::submit_instruction(
+                        injector_pm.clone(),
+                        session_id,
+                        data,
+                        "injector",
+                        outcome,
+                    );
+                });
             let injector = Arc::new(SamuraiInjector::new(
                 supervisor.clone(),
                 samurai_context.clone(),
                 samurai_config.clone(),
-                app.state::<ProcessManager>().inner().clone(),
+                injector_writer,
                 audit_log.clone(),
                 session_dirs.clone(),
                 Some(replicator.clone()),

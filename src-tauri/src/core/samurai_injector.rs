@@ -58,14 +58,13 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use super::claude_event::ClaudeEvent;
-use super::process_manager::ProcessManager;
 use super::samurai_audit::{AuditEvent, AuditEventKind, AuditLog};
 use super::samurai_config::SharedSamuraiConfig;
 use super::samurai_context::SamuraiContextStore;
 use super::samurai_parker::SamuraiParker;
 use super::samurai_prompts;
-use super::samurai_pty;
-use super::samurai_replicator::SamuraiReplicator;
+use super::samurai_pty::DeliveryOutcome;
+use super::samurai_replicator::{SamuraiReplicator, StdinWriter};
 use super::supervisor::{SessionSnapshot, Supervisor, SupervisorState};
 use super::windows_process::StdCommandExt;
 
@@ -881,7 +880,12 @@ pub struct SamuraiInjector {
     supervisor: Arc<Supervisor>,
     context: Arc<SamuraiContextStore>,
     config: SharedSamuraiConfig,
-    processes: ProcessManager,
+    /// Delivers one instruction into a session's PTY — the replicator's
+    /// exact writer contract (issue #109): text without a submit key, and a
+    /// verdict callback fired once the body write lands (or fails). The
+    /// production closure (lib.rs) wraps `samurai_pty::submit_instruction`
+    /// with ctx `"injector"`; tests inject a recorder.
+    deliver: StdinWriter,
     audit: AuditLog,
     session_dirs: SessionDirResolver,
     /// `Arc` so the spawned validation task can reach the map after the
@@ -912,7 +916,7 @@ impl SamuraiInjector {
         supervisor: Arc<Supervisor>,
         context: Arc<SamuraiContextStore>,
         config: SharedSamuraiConfig,
-        processes: ProcessManager,
+        deliver: StdinWriter,
         audit: AuditLog,
         session_dirs: SessionDirResolver,
         replicator: Option<Arc<SamuraiReplicator>>,
@@ -921,7 +925,7 @@ impl SamuraiInjector {
             supervisor,
             context,
             config,
-            processes,
+            deliver,
             audit,
             session_dirs,
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -1336,48 +1340,102 @@ impl SamuraiInjector {
     /// INJECT audit row so the trail shows WHY Maestro typed at that moment.
     fn on_idle(&self, session_id: u32, gate: &'static str) {
         if let Some(data) = self.arm_injection_on_idle(session_id) {
-            self.record_injection(session_id, gate, &data);
             // The injection submits a prompt — the session is working again.
             self.idle_now
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&session_id);
-            self.spawn_write(session_id, data);
+            self.spawn_write(session_id, gate, data);
         }
     }
 
-    /// Issue #101: one `INJECT phase=delivered` audit row per injection —
-    /// the instruction kind, a bounded excerpt, the attempt number, the
-    /// corrective flag and the idle gate. Reads the entry back under its own
-    /// short lock (the row is written right after the arm decision, so the
-    /// entry is still present); a raced removal simply skips the row.
-    fn record_injection(&self, session_id: u32, gate: &'static str, instruction: &str) {
-        let row = {
-            let pending = self.lock_pending();
+    /// Issue #109: everything that must only describe a REAL delivery,
+    /// invoked by the writer's verdict callback. On `Ok` (the instruction
+    /// body reached the PTY) it writes the one `INJECT phase=delivered`
+    /// audit row per injection (issue #101 — instruction kind, bounded
+    /// excerpt, attempt number, corrective flag, idle gate) and arms the
+    /// replicator's Enter-resend watch (issue #103 — injector deliveries
+    /// used to have none, so a swallowed Enter degraded to an ack_timeout).
+    /// On `Err` it records a distinct `delivery_failed` ALERT instead — the
+    /// pending entry stays, so the ACK ladder still times out and retries.
+    ///
+    /// Reads the entry back under its own short lock (the outcome fires
+    /// right after the arm decision); a raced removal simply skips the rows.
+    fn record_delivery_outcome(
+        pending: &Mutex<HashMap<u32, PendingInstruction>>,
+        audit: &AuditLog,
+        replicator: Option<&Arc<SamuraiReplicator>>,
+        session_id: u32,
+        gate: &'static str,
+        instruction: &str,
+        result: Result<(), String>,
+    ) {
+        let entry = {
+            let pending = pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             pending.get(&session_id).map(|p| {
-                let (excerpt, total_chars) = super::samurai_audit::instruction_excerpt(instruction);
                 (
                     p.project.clone(),
+                    p.epic.clone(),
+                    p.generation,
+                    p.kind,
+                    p.attempts,
+                    p.corrective,
+                )
+            })
+        };
+        let Some((project, epic, generation, kind, attempts, corrective)) = entry else {
+            return;
+        };
+        match result {
+            Ok(()) => {
+                let (excerpt, total_chars) =
+                    super::samurai_audit::instruction_excerpt(instruction);
+                audit.append(
+                    &project,
                     AuditEvent::now(
-                        p.epic.clone(),
+                        epic.clone(),
                         AuditEventKind::Inject,
-                        p.generation,
+                        generation,
                         session_id,
                         json!({
                             "phase": "delivered",
-                            "instruction": p.kind.as_str(),
-                            "attempt": p.attempts,
-                            "corrective": p.corrective,
+                            "instruction": kind.as_str(),
+                            "attempt": attempts,
+                            "corrective": corrective,
                             "gate": gate,
                             "excerpt": excerpt,
                             "total_chars": total_chars,
                         }),
                     ),
-                )
-            })
-        };
-        if let Some((project, event)) = row {
-            self.audit.append(&project, event);
+                );
+                if let Some(replicator) = replicator {
+                    replicator.watch_delivery(&project, &epic, generation, session_id);
+                }
+            }
+            Err(error) => {
+                log::error!(
+                    "samurai injector: {} instruction for session {session_id} never reached the PTY ({error}) — ALERT",
+                    kind.as_str()
+                );
+                audit.append(
+                    &project,
+                    AuditEvent::now(
+                        epic,
+                        AuditEventKind::Alert,
+                        generation,
+                        session_id,
+                        json!({
+                            "kind": "delivery_failed",
+                            "instruction": kind.as_str(),
+                            "attempt": attempts,
+                            "source": "injector",
+                            "error": error,
+                        }),
+                    ),
+                );
+            }
         }
     }
 
@@ -1414,11 +1472,29 @@ impl SamuraiInjector {
         Some(p.instruction.clone())
     }
 
-    /// Write the instruction into the session's PTY, then submit it with a
-    /// separate Enter (`samurai_pty::submit_instruction` — a single
-    /// text-plus-CR write is read as a paste and never submits).
-    fn spawn_write(&self, session_id: u32, data: String) {
-        samurai_pty::submit_instruction(self.processes.clone(), session_id, data, "injector");
+    /// Write the instruction into the session's PTY through the injected
+    /// writer (production: `samurai_pty::submit_instruction`, which submits
+    /// with a separate Enter — a single text-plus-CR write is read as a
+    /// paste and never submits). The `delivered` audit row and the
+    /// Enter-resend watch ride the writer's verdict callback (issue #109),
+    /// never the mere attempt.
+    fn spawn_write(&self, session_id: u32, gate: &'static str, data: String) {
+        let pending = self.pending.clone();
+        let audit = self.audit.clone();
+        let replicator = self.replicator.clone();
+        let instruction = data.clone();
+        let outcome: DeliveryOutcome = Box::new(move |result| {
+            Self::record_delivery_outcome(
+                &pending,
+                &audit,
+                replicator.as_ref(),
+                session_id,
+                gate,
+                &instruction,
+                result,
+            );
+        });
+        (self.deliver)(session_id, data, outcome);
     }
 
     /// ACK scan for one assistant reply. Only the session's own expected
@@ -2195,9 +2271,10 @@ mod tests {
     // --- controller against a real supervisor + audit log ---
 
     /// An injector wired to a real supervisor and audit log in a temp dir.
-    /// The ProcessManager holds no sessions — tests drive the decision paths
-    /// (`tick` / `arm_injection_on_idle` / `observe`) and a PTY write for an
-    /// unknown session is a logged no-op. The dir resolver serves
+    /// The injected writer confirms every body write synchronously (issue
+    /// #109) — tests drive the decision paths (`tick` /
+    /// `arm_injection_on_idle` / `observe`) and the delivered rows behave
+    /// exactly as production's post-write verdict. The dir resolver serves
     /// `dirs`: session id → working dir (insert a tempdir repo per test).
     type DirMap = Arc<Mutex<HashMap<u32, String>>>;
 
@@ -2219,11 +2296,12 @@ mod tests {
         let dirs_for_resolver = dirs.clone();
         let resolver: SessionDirResolver =
             Arc::new(move |session_id| dirs_for_resolver.lock().unwrap().get(&session_id).cloned());
+        let deliver: StdinWriter = Arc::new(|_, _, outcome: DeliveryOutcome| outcome(Ok(())));
         let injector = SamuraiInjector::new(
             supervisor.clone(),
             context.clone(),
             config,
-            ProcessManager::new(),
+            deliver,
             audit.clone(),
             resolver,
             // The injector alone: the P2.3 → P2.4 chain has its own

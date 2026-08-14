@@ -110,7 +110,13 @@ pub type SuccessorEmitter = Arc<dyn Fn(&SuccessorSpawn) + Send + Sync>;
 /// a lone `\r` a moment later — a single text-plus-CR write is read by the
 /// CLI as a paste and leaves the instruction sitting in the input box,
 /// unsubmitted.
-pub type StdinWriter = Arc<dyn Fn(u32, String) + Send + Sync>;
+///
+/// Issue #109: the third argument is the writer's verdict channel — invoked
+/// with `Ok` once the instruction BODY actually reached the PTY, `Err` when
+/// the write failed. The `delivered` audit row and the Enter-resend watch
+/// hang off that verdict, so neither can ever describe a write that did not
+/// happen. The injector's deliveries share this exact contract.
+pub type StdinWriter = Arc<dyn Fn(u32, String, super::samurai_pty::DeliveryOutcome) + Send + Sync>;
 
 /// Issue #103: re-sends ONLY the lone Enter into a session's PTY. Used by
 /// the post-delivery watch when a typed-in instruction shows no evidence of
@@ -279,6 +285,11 @@ struct DeliveredWatch {
     /// Gen-1 LAUNCH flag, carried into the audit rows: the launch brief is
     /// the longest paste and the reason this watch exists (issue #103).
     launch: bool,
+    /// Who delivered the watched instruction (issue #109): `"replicator"`
+    /// for staged rituals/briefs, `"injector"` for handoff/park/wind-down
+    /// instructions. Rides the `submit_retry`/`submit_unconfirmed` audit
+    /// rows so the two delivery paths stay distinguishable in the trail.
+    source: &'static str,
     /// Delivery time, re-stamped on each resend so every attempt gets a
     /// full window.
     delivered_at: AgeableInstant,
@@ -631,7 +642,9 @@ pub struct SamuraiReplicator {
     resend_enter: EnterResender,
     pending: Mutex<Vec<PendingRitual>>,
     /// Issue #103: instructions typed in but not yet proven submitted.
-    delivered: Mutex<Vec<DeliveredWatch>>,
+    /// `Arc` so the delivery-outcome callback (issue #109) can arm a watch
+    /// after the call that spawned the write returned.
+    delivered: Arc<Mutex<Vec<DeliveredWatch>>>,
     /// Issue #60: the parking-engaged check (see [`HandoffAbsorber`]).
     /// Unset (tests without a parker, or before setup finishes) = never
     /// absorb — successors spawn as in Phase 2.
@@ -669,7 +682,7 @@ impl SamuraiReplicator {
             write_stdin,
             resend_enter,
             pending: Mutex::new(Vec::new()),
-            delivered: Mutex::new(Vec::new()),
+            delivered: Arc::new(Mutex::new(Vec::new())),
             absorber: std::sync::OnceLock::new(),
             run_configs: std::sync::OnceLock::new(),
         }
@@ -1636,47 +1649,118 @@ impl SamuraiReplicator {
                 "samurai replicator: successor session {session_id} started — delivering the gen-{} verify ritual",
                 p.generation
             );
-            // Text only — the writer submits it (see [`StdinWriter`]).
-            (self.write_stdin)(*session_id, p.instruction.clone());
-            // Issue #101: the brief Maestro typed into the fresh terminal is
-            // an injection like any other — record what was said (bounded
-            // excerpt) and what let it through (the first SessionStarted).
-            // No ACK ladder exists here; submission is watched below and
-            // failures land as submit_retry / submit_unconfirmed ALERTs.
-            let (excerpt, total_chars) =
-                super::samurai_audit::instruction_excerpt(&p.instruction);
-            self.audit.append(
-                &p.project,
-                AuditEvent::now(
-                    p.epic.clone(),
-                    AuditEventKind::Inject,
-                    p.generation,
-                    *session_id,
-                    json!({
-                        "phase": "delivered",
-                        "instruction": if p.launch {
-                            "launch_brief"
-                        } else if p.recovery {
-                            "recovery_ritual"
-                        } else {
-                            "successor_ritual"
-                        },
-                        "gate": "session_started",
-                        "excerpt": excerpt,
-                        "total_chars": total_chars,
-                    }),
-                ),
-            );
-            self.lock_delivered().push(DeliveredWatch {
-                project: p.project.clone(),
-                epic: p.epic.clone(),
-                generation: p.generation,
-                session_id: *session_id,
-                launch: p.launch,
-                delivered_at: AgeableInstant::now(),
-                resends: 0,
+            let session_id = *session_id;
+            let instruction_kind = if p.launch {
+                "launch_brief"
+            } else if p.recovery {
+                "recovery_ritual"
+            } else {
+                "successor_ritual"
+            };
+            let PendingRitual {
+                project,
+                epic,
+                generation,
+                instruction,
+                launch,
+                ..
+            } = p;
+            // Issue #109: the `delivered` audit row and the Enter-resend
+            // watch (issue #103) both hang off the writer's verdict — the
+            // row used to be written before the async PTY write completed,
+            // so a failed write left a false 'delivered' trail. The
+            // callback only queue-pushes (audit is a channel send, the
+            // watch a mutex push), the DeliveryOutcome contract.
+            let audit = self.audit.clone();
+            let delivered = self.delivered.clone();
+            let (excerpt, total_chars) = super::samurai_audit::instruction_excerpt(&instruction);
+            let outcome: super::samurai_pty::DeliveryOutcome = Box::new(move |result| {
+                match result {
+                    Ok(()) => {
+                        // Issue #101: the brief Maestro typed into the fresh
+                        // terminal is an injection like any other — record
+                        // what was said (bounded excerpt) and what let it
+                        // through (the first SessionStarted). No ACK ladder
+                        // exists here; submission is watched and failures
+                        // land as submit_retry / submit_unconfirmed ALERTs.
+                        audit.append(
+                            &project,
+                            AuditEvent::now(
+                                epic.clone(),
+                                AuditEventKind::Inject,
+                                generation,
+                                session_id,
+                                json!({
+                                    "phase": "delivered",
+                                    "instruction": instruction_kind,
+                                    "gate": "session_started",
+                                    "excerpt": excerpt,
+                                    "total_chars": total_chars,
+                                }),
+                            ),
+                        );
+                        delivered
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(DeliveredWatch {
+                                project,
+                                epic,
+                                generation,
+                                session_id,
+                                launch,
+                                source: "replicator",
+                                delivered_at: AgeableInstant::now(),
+                                resends: 0,
+                            });
+                    }
+                    Err(error) => {
+                        // The body never reached the PTY: a distinct ALERT
+                        // instead of a false 'delivered' row, and no watch —
+                        // there is nothing in the input box to re-submit.
+                        log::error!(
+                            "samurai replicator: {instruction_kind} for session {session_id} never reached the PTY ({error}) — ALERT"
+                        );
+                        audit.append(
+                            &project,
+                            AuditEvent::now(
+                                epic,
+                                AuditEventKind::Alert,
+                                generation,
+                                session_id,
+                                json!({
+                                    "kind": "delivery_failed",
+                                    "instruction": instruction_kind,
+                                    "source": "replicator",
+                                    "error": error,
+                                }),
+                            ),
+                        );
+                    }
+                }
             });
+            // Text only — the writer submits it (see [`StdinWriter`]).
+            (self.write_stdin)(session_id, instruction, outcome);
         }
+    }
+
+    /// Arms the issue-#103 Enter-resend watch for an instruction the
+    /// INJECTOR just delivered (issue #109: handoff/park/wind-down used to
+    /// have no watch at all, so a swallowed Enter degraded to an ack_timeout
+    /// instead of auto-recovery). Called from the injector's delivery-outcome
+    /// callback, i.e. only after the instruction body actually reached the
+    /// PTY. Same release evidence, resend budget and tick as every other
+    /// watch; the audit rows carry `source: "injector"`.
+    pub fn watch_delivery(&self, project: &str, epic: &str, generation: u32, session_id: u32) {
+        self.lock_delivered().push(DeliveredWatch {
+            project: project.to_string(),
+            epic: epic.to_string(),
+            generation,
+            session_id,
+            launch: false,
+            source: "injector",
+            delivered_at: AgeableInstant::now(),
+            resends: 0,
+        });
     }
 
     /// EventBus tap (forwarded by the injector's `observe`, the same tee the
@@ -1917,6 +2001,7 @@ impl SamuraiReplicator {
                                     "kind": "submit_retry",
                                     "attempt": d.resends,
                                     "launch": d.launch,
+                                    "source": d.source,
                                 }),
                             ),
                         ));
@@ -1934,6 +2019,7 @@ impl SamuraiReplicator {
                                     "kind": "submit_unconfirmed",
                                     "resends": d.resends,
                                     "launch": d.launch,
+                                    "source": d.source,
                                 }),
                             ),
                         ));
@@ -2027,7 +2113,6 @@ impl SamuraiReplicator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::process_manager::ProcessManager;
     use crate::core::samurai_config::SamuraiConfig;
     use crate::core::samurai_context::SamuraiContextStore;
     use crate::core::samurai_injector::SamuraiInjector;
@@ -2054,6 +2139,12 @@ mod tests {
     }
 
     fn harness(dir: &Path) -> Harness {
+        harness_with_writer(dir, None)
+    }
+
+    /// `writer`: `None` = the default recorder that confirms every body
+    /// write; `Some` = a failure-path writer (issue #109 tests).
+    fn harness_with_writer(dir: &Path, writer: Option<StdinWriter>) -> Harness {
         let (audit, task) = AuditLog::new(dir.to_path_buf(), None);
         tokio::spawn(task);
         let supervisor = Arc::new(Supervisor::new(audit.clone(), None));
@@ -2084,8 +2175,15 @@ mod tests {
 
         let writes: Arc<Mutex<Vec<(u32, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let writes_rec = writes.clone();
-        let write_stdin: StdinWriter = Arc::new(move |id, data| {
-            writes_rec.lock().unwrap().push((id, data));
+        // Default: confirms every body write synchronously (issue #109) —
+        // the delivered row and the armed watch then behave exactly as
+        // production's post-write verdict. Failure-path tests inject their
+        // own writer.
+        let write_stdin: StdinWriter = writer.unwrap_or_else(|| {
+            Arc::new(move |id, data, outcome| {
+                writes_rec.lock().unwrap().push((id, data));
+                outcome(Ok(()));
+            })
         });
 
         let resends: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2782,7 +2880,7 @@ mod tests {
             h.supervisor.clone(),
             context.clone(),
             h.config.clone(),
-            ProcessManager::new(),
+            Arc::new(|_, _, outcome: crate::core::samurai_pty::DeliveryOutcome| outcome(Ok(()))),
             h.audit.clone(),
             session_dirs,
             Some(h.replicator.clone()),
@@ -3956,6 +4054,237 @@ mod tests {
         assert_eq!(h.replicator.delivered_count(), 0);
         h.replicator.tick();
         assert!(h.resends.lock().unwrap().is_empty());
+    }
+
+    // --- issue #109: delivered rows reflect write reality; injector
+    //     deliveries get the same Enter-resend watch ---
+
+    #[tokio::test]
+    async fn test_failed_body_write_alerts_instead_of_false_delivered() {
+        // Issue #109 (I2): the writer reports the body write FAILED — no
+        // 'delivered' row may exist, no watch may arm (there is nothing in
+        // the input box to re-submit), and a distinct ALERT names the error.
+        let dir = tempdir().unwrap();
+        let attempts: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let attempts_rec = attempts.clone();
+        let failing: StdinWriter = Arc::new(move |id, _data, outcome| {
+            attempts_rec.lock().unwrap().push(id);
+            outcome(Err("pty gone".to_string()));
+        });
+        let h = harness_with_writer(dir.path(), Some(failing));
+        let project = "C:/git/proj-109-failed-write";
+        stage_successor(&h, project).await;
+        let details = h.replicator.spawn_details(project, "epic-9", 3).unwrap();
+        let snapshot = h
+            .supervisor
+            .register_session_with_details(2, project.into(), "epic-9".into(), 3, details)
+            .unwrap();
+        h.replicator.on_registered(&snapshot);
+
+        h.replicator.observe_hook(&session_started(2));
+
+        // The write was attempted, but nothing downstream may claim success.
+        assert_eq!(*attempts.lock().unwrap(), vec![2]);
+        assert_eq!(h.replicator.delivered_count(), 0, "no watch on a failed write");
+        let mut rows = Vec::new();
+        for _ in 0..200 {
+            rows = h.audit.read(project, None, None).await.unwrap().events;
+            if rows.iter().any(|r| r.details["kind"] == "delivery_failed") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let alert = rows
+            .iter()
+            .find(|r| r.details["kind"] == "delivery_failed")
+            .expect("delivery_failed ALERT");
+        assert_eq!(alert.event, AuditEventKind::Alert);
+        assert_eq!(alert.session_id, 2);
+        assert_eq!(alert.details["instruction"], "successor_ritual");
+        assert_eq!(alert.details["source"], "replicator");
+        assert_eq!(alert.details["error"], "pty gone");
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.event == AuditEventKind::Inject && r.details["phase"] == "delivered"),
+            "a failed write must never leave a 'delivered' row"
+        );
+    }
+
+    /// Wires a real injector to the harness replicator and walks session 1
+    /// (gen-2, epic-9) through the idle-gated handoff injection — the state
+    /// every injector-delivery watch test starts from. Returns the injector
+    /// and the writes its own writer recorded.
+    fn inject_handoff_via_injector(
+        h: &Harness,
+        project: &str,
+        writer: Option<StdinWriter>,
+    ) -> (SamuraiInjector, Arc<Mutex<Vec<(u32, String)>>>) {
+        let dirs_for_resolver = h.dirs.clone();
+        let session_dirs: SessionDirResolver =
+            Arc::new(move |id| dirs_for_resolver.lock().unwrap().get(&id).cloned());
+        let context = Arc::new(SamuraiContextStore::new());
+        let writes: Arc<Mutex<Vec<(u32, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let writes_rec = writes.clone();
+        let deliver: StdinWriter = writer.unwrap_or_else(|| {
+            Arc::new(move |id, data, outcome| {
+                writes_rec.lock().unwrap().push((id, data));
+                outcome(Ok(()));
+            })
+        });
+        let injector = SamuraiInjector::new(
+            h.supervisor.clone(),
+            context.clone(),
+            h.config.clone(),
+            deliver,
+            h.audit.clone(),
+            session_dirs,
+            Some(h.replicator.clone()),
+        );
+        h.supervisor
+            .register_session(1, project.into(), "epic-9".into(), 2)
+            .unwrap();
+        context.observe(&ClaudeEvent::ContextUsageUpdate {
+            session_id: 1,
+            model: "claude-opus-4".into(),
+            context_tokens: 90_000,
+            context_window: 200_000,
+            percent: 50.0,
+            timestamp: "t".into(),
+        });
+        // Idle first (Stop hook), then the trigger tick: the armed handoff
+        // injects immediately through the already-idle path.
+        injector.observe_hook(&ClaudeEvent::SessionEnded {
+            session_id: 1,
+            reason: "stop".into(),
+            timestamp: "t".into(),
+        });
+        injector.tick();
+        (injector, writes)
+    }
+
+    #[tokio::test]
+    async fn test_injector_delivery_arms_the_watch_and_resends_like_a_ritual() {
+        // Issue #109 (I1): an injector-delivered instruction (here: the
+        // handoff request) gets the SAME issue-#103 Enter-resend watch as
+        // replicator-staged rituals — mirrored on
+        // test_swallowed_enter_resends_only_the_submit_key_and_is_bounded,
+        // with the audit rows carrying source: "injector".
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-109-inj-resend";
+        let (_injector, writes) = inject_handoff_via_injector(&h, project, None);
+
+        // Delivered once (no submit key in the body) and the watch is armed.
+        assert_eq!(writes.lock().unwrap().len(), 1);
+        assert!(!writes.lock().unwrap()[0].1.contains('\r'));
+        assert_eq!(h.replicator.delivered_count(), 1, "delivery arms the watch");
+
+        // Inside the window: quiet.
+        h.replicator.tick();
+        assert!(h.resends.lock().unwrap().is_empty());
+
+        // First and second expiry: the lone Enter — never the body.
+        h.replicator
+            .backdate_delivered(1, ENTER_RESEND_WINDOW + Duration::from_secs(1));
+        h.replicator.tick();
+        assert_eq!(h.resends.lock().unwrap().clone(), vec![1]);
+        assert_eq!(writes.lock().unwrap().len(), 1, "body never re-sent");
+        h.replicator
+            .backdate_delivered(1, ENTER_RESEND_WINDOW + Duration::from_secs(1));
+        h.replicator.tick();
+        assert_eq!(h.resends.lock().unwrap().clone(), vec![1, 1]);
+
+        // Third expiry: budget spent — final ALERT, watch gone.
+        h.replicator
+            .backdate_delivered(1, ENTER_RESEND_WINDOW + Duration::from_secs(1));
+        h.replicator.tick();
+        assert_eq!(h.replicator.delivered_count(), 0);
+
+        // Audit trail: delivered row first, then injector-tagged retries.
+        let mut rows = Vec::new();
+        for _ in 0..200 {
+            rows = h.audit.read(project, None, None).await.unwrap().events;
+            if rows.iter().any(|r| r.details["kind"] == "submit_unconfirmed") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let delivered: Vec<_> = rows
+            .iter()
+            .filter(|r| r.event == AuditEventKind::Inject && r.details["phase"] == "delivered")
+            .collect();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].details["instruction"], "handoff");
+        let retries: Vec<_> = rows
+            .iter()
+            .filter(|r| r.details["kind"] == "submit_retry")
+            .collect();
+        assert_eq!(retries.len(), 2);
+        assert_eq!(retries[0].session_id, 1);
+        assert_eq!(retries[0].generation, 2);
+        assert_eq!(retries[0].details["attempt"], 1);
+        assert_eq!(retries[0].details["launch"], false);
+        assert_eq!(retries[0].details["source"], "injector");
+        let unconfirmed: Vec<_> = rows
+            .iter()
+            .filter(|r| r.details["kind"] == "submit_unconfirmed")
+            .collect();
+        assert_eq!(unconfirmed.len(), 1);
+        assert_eq!(unconfirmed[0].details["resends"], 2);
+        assert_eq!(unconfirmed[0].details["source"], "injector");
+    }
+
+    #[tokio::test]
+    async fn test_turn_evidence_releases_an_injector_armed_watch() {
+        // The UserMessage the CLI writes at prompt submission releases an
+        // injector-armed watch exactly like a ritual's (issue #109).
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-109-inj-release";
+        inject_handoff_via_injector(&h, project, None);
+        assert_eq!(h.replicator.delivered_count(), 1);
+
+        h.replicator.observe(&user_message(1));
+        assert_eq!(h.replicator.delivered_count(), 0);
+        h.replicator.tick();
+        assert!(h.resends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_injector_failed_write_alerts_and_never_arms_the_watch() {
+        // Issue #109 (I2, injector side): a failed body write records the
+        // distinct ALERT — no false 'delivered' row, no watch.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-109-inj-failed";
+        let failing: StdinWriter =
+            Arc::new(move |_id, _data, outcome| outcome(Err("pty gone".to_string())));
+        inject_handoff_via_injector(&h, project, Some(failing));
+
+        assert_eq!(h.replicator.delivered_count(), 0, "no watch on a failed write");
+        let mut rows = Vec::new();
+        for _ in 0..200 {
+            rows = h.audit.read(project, None, None).await.unwrap().events;
+            if rows.iter().any(|r| r.details["kind"] == "delivery_failed") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let alert = rows
+            .iter()
+            .find(|r| r.details["kind"] == "delivery_failed")
+            .expect("delivery_failed ALERT");
+        assert_eq!(alert.session_id, 1);
+        assert_eq!(alert.details["instruction"], "handoff");
+        assert_eq!(alert.details["source"], "injector");
+        assert_eq!(alert.details["error"], "pty gone");
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.event == AuditEventKind::Inject && r.details["phase"] == "delivered"),
+            "a failed write must never leave a 'delivered' row"
+        );
     }
 
     #[tokio::test]

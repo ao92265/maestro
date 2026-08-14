@@ -334,7 +334,6 @@ impl SamuraiResumer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::process_manager::ProcessManager;
     use crate::core::samurai_config::{SamuraiConfig, SharedSamuraiConfig};
     use crate::core::samurai_context::SamuraiContextStore;
     use crate::core::samurai_injector::SamuraiInjector;
@@ -485,7 +484,7 @@ mod tests {
         let emit_spawn: SuccessorEmitter = Arc::new(move |s| {
             spawns_rec.lock().unwrap().push(s.clone());
         });
-        let write_stdin: StdinWriter = Arc::new(|_, _| {});
+        let write_stdin: StdinWriter = Arc::new(|_, _, outcome| outcome(Ok(())));
         let resend_enter: EnterResender = Arc::new(|_| {});
         let replicator = Arc::new(SamuraiReplicator::new(
             supervisor.clone(),
@@ -502,7 +501,9 @@ mod tests {
             supervisor.clone(),
             context.clone(),
             config,
-            ProcessManager::new(),
+            // Issue #109: the injected writer confirms every body write, so
+            // delivered rows behave as production's post-write verdict.
+            Arc::new(|_, _, outcome: crate::core::samurai_pty::DeliveryOutcome| outcome(Ok(()))),
             audit.clone(),
             session_dirs.clone(),
             Some(replicator.clone()),

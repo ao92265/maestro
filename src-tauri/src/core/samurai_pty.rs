@@ -67,6 +67,12 @@ pub fn submit_frames(text: &str) -> [String; 2] {
     [text.to_string(), SUBMIT_KEY.to_string()]
 }
 
+/// Verdict callback for one submitted instruction (issue #109): invoked with
+/// `Ok` the moment the instruction BODY write lands in the PTY, `Err` when it
+/// never reached it. Runs on the async runtime, so it must only do queue-push
+/// work (audit appends are a channel send, watch arming is a mutex push).
+pub type DeliveryOutcome = Box<dyn FnOnce(Result<(), String>) + Send + 'static>;
+
 /// Types `text` into a session's PTY and submits it as a separate write
 /// [`submit_delay`]`(text.len())` later.
 ///
@@ -77,25 +83,33 @@ pub fn submit_frames(text: &str) -> [String; 2] {
 /// instruction (text in, Enter lost) looks exactly like the bug this module
 /// exists to fix and must be attributable.
 ///
-/// Fire-and-forget by design: the caller has already recorded the attempt in
-/// its own pending state, and both delivery ladders (the injector's ACK
-/// retry, the replicator's `successor_no_start`) alert on a non-response.
+/// The write itself stays fire-and-forget (the caller has already recorded
+/// the attempt in its own pending state), but `outcome` reports the body
+/// write's reality back (issue #109): the caller writes its `delivered`
+/// audit row — and arms its Enter-resend watch — only on `Ok`, so a failed
+/// write can never leave a false 'delivered' trail. Only the BODY write is
+/// reported: a swallowed Enter is what the delivery watches recover.
 pub fn submit_instruction(
     processes: ProcessManager,
     session_id: u32,
     text: String,
     ctx: &'static str,
+    outcome: DeliveryOutcome,
 ) {
     tauri::async_runtime::spawn(async move {
         let delay = submit_delay(text.len());
         let [body, submit] = submit_frames(&text);
-        if !write_frame(&processes, session_id, body, ctx, "instruction").await {
+        if let Err(e) = write_frame(&processes, session_id, body, ctx, "instruction").await {
             // The text never landed — sending a bare Enter now would submit
             // whatever the user happened to have typed in that box.
+            outcome(Err(e));
             return;
         }
+        outcome(Ok(()));
         tokio::time::sleep(delay).await;
-        write_frame(&processes, session_id, submit, ctx, "submit").await;
+        // Enter-frame failures are logged only: the delivery watches (and,
+        // for harvest, the user) recover a submit that never landed.
+        let _ = write_frame(&processes, session_id, submit, ctx, "submit").await;
     });
 }
 
@@ -131,7 +145,7 @@ pub fn submit_instruction_confirmed(
     // user-recoverable).
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(delay).await;
-        write_frame(&processes, session_id, submit, ctx, "submit").await;
+        let _ = write_frame(&processes, session_id, submit, ctx, "submit").await;
     });
     Ok(())
 }
@@ -143,7 +157,7 @@ pub fn submit_instruction_confirmed(
 /// harmless when the first one did land (an empty input box ignores it).
 pub fn resend_submit(processes: ProcessManager, session_id: u32, ctx: &'static str) {
     tauri::async_runtime::spawn(async move {
-        write_frame(
+        let _ = write_frame(
             &processes,
             session_id,
             SUBMIT_KEY.to_string(),
@@ -154,26 +168,25 @@ pub fn resend_submit(processes: ProcessManager, session_id: u32, ctx: &'static s
     });
 }
 
-/// One frame onto the blocking pool. `false` = it did not reach the PTY.
+/// One frame onto the blocking pool. `Err` = it did not reach the PTY (the
+/// failure is logged here either way; the message also travels back so the
+/// instruction-body caller can audit it — issue #109).
 async fn write_frame(
     processes: &ProcessManager,
     session_id: u32,
     data: String,
     ctx: &'static str,
     frame: &'static str,
-) -> bool {
+) -> Result<(), String> {
     let pm = processes.clone();
-    match tokio::task::spawn_blocking(move || pm.write_stdin(session_id, &data)).await {
-        Ok(Ok(())) => true,
-        Ok(Err(e)) => {
-            log::warn!("samurai {ctx}: writing {frame} to session {session_id} failed: {e}");
-            false
-        }
-        Err(e) => {
-            log::warn!("samurai {ctx}: {frame} write task for session {session_id} failed: {e}");
-            false
-        }
-    }
+    let failure = match tokio::task::spawn_blocking(move || pm.write_stdin(session_id, &data)).await
+    {
+        Ok(Ok(())) => return Ok(()),
+        Ok(Err(e)) => format!("writing {frame} to session {session_id} failed: {e}"),
+        Err(e) => format!("{frame} write task for session {session_id} failed: {e}"),
+    };
+    log::warn!("samurai {ctx}: {failure}");
+    Err(failure)
 }
 
 #[cfg(test)]
