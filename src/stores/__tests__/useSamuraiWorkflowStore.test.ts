@@ -23,7 +23,7 @@ vi.mock("@tauri-apps/plugin-store", () => ({
 }));
 
 import type { SamuraiWorkflowGraph } from "@/lib/samurai";
-import { useSamuraiWorkflowStore } from "../useSamuraiWorkflowStore";
+import { useSamuraiWorkflowStore, workflowGraphForLaunch } from "../useSamuraiWorkflowStore";
 
 const STORAGE_KEY = "maestro-samurai-workflow";
 
@@ -65,5 +65,63 @@ describe("useSamuraiWorkflowStore (issue #91 persistence)", () => {
     await useSamuraiWorkflowStore.persist.rehydrate();
 
     expect(useSamuraiWorkflowStore.getState().graph).toEqual(edited);
+  });
+
+  it("resetGraph returns to null-means-default and persists the reset", async () => {
+    useSamuraiWorkflowStore.getState().setGraph(graph());
+    await vi.waitFor(() => expect(backing.has(STORAGE_KEY)).toBe(true));
+
+    useSamuraiWorkflowStore.getState().resetGraph();
+
+    expect(useSamuraiWorkflowStore.getState().graph).toBeNull();
+    await vi.waitFor(() => {
+      const raw = backing.get(STORAGE_KEY);
+      expect(raw).toBeDefined();
+      expect(JSON.parse(raw as string).state.graph).toBeNull();
+    });
+  });
+
+  // --- hydration gate: the LazyStore read is async, so a startup window
+  // exists where edits and launch reads race the rehydration ---------------
+
+  it("an edit made during the rehydration window survives hydration", async () => {
+    backing.set(STORAGE_KEY, JSON.stringify({ state: { graph: graph() }, version: 0 }));
+    const edited = { ...graph(), start: "b" };
+
+    // Kick a rehydrate but do NOT await it — then edit inside the window.
+    const hydration = useSamuraiWorkflowStore.persist.rehydrate();
+    expect(useSamuraiWorkflowStore.persist.hasHydrated()).toBe(false);
+    useSamuraiWorkflowStore.getState().setGraph(edited);
+    await hydration;
+
+    // Rehydration merged the disk state over the store, then the gate
+    // re-applied the edit on top — the edit is not clobbered.
+    expect(useSamuraiWorkflowStore.getState().graph).toEqual(edited);
+    await vi.waitFor(() => {
+      const raw = backing.get(STORAGE_KEY);
+      expect(raw).toBeDefined();
+      expect(JSON.parse(raw as string).state.graph).toEqual(edited);
+    });
+  });
+
+  it("workflowGraphForLaunch waits for hydration before reporting the graph", async () => {
+    const persisted = { ...graph(), start: "b" };
+    backing.set(STORAGE_KEY, JSON.stringify({ state: { graph: persisted }, version: 0 }));
+
+    // Read immediately after kicking a rehydrate — an ungated read here
+    // raced to `null` and made the launch snapshot the wrong workflow.
+    const hydration = useSamuraiWorkflowStore.persist.rehydrate();
+    const read = workflowGraphForLaunch();
+
+    expect(await read).toEqual(persisted);
+    await hydration;
+  });
+
+  it("workflowGraphForLaunch resolves the current graph once hydrated", async () => {
+    expect(useSamuraiWorkflowStore.persist.hasHydrated()).toBe(true);
+    expect(await workflowGraphForLaunch()).toBeNull();
+
+    useSamuraiWorkflowStore.getState().setGraph(graph());
+    expect(await workflowGraphForLaunch()).toEqual(graph());
   });
 });

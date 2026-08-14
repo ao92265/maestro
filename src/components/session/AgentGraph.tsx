@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { Download, Eye, Network, Trash2, X } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import {
   AgentExchangeDrawer,
@@ -86,6 +86,14 @@ export function AgentGraph({ sessionId }: AgentGraphProps) {
       };
     }),
   );
+
+  // Leaving Working closes the popover FOR REAL (`showLivePopover` below only
+  // hides it) — otherwise Working→NeedsInput→Working would reopen it
+  // uninvited with the stale `liveOpen` still true.
+  const working = session?.status === "Working";
+  useEffect(() => {
+    if (!working) setLiveOpen(false);
+  }, [working]);
 
   if (!session) {
     return (

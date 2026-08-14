@@ -329,6 +329,27 @@ describe("AgentGraph", () => {
     expect(screen.queryByText("Live activity")).not.toBeInTheDocument();
   });
 
+  it("the popover stays closed after Working→NeedsInput→Working (no uninvited reopen)", () => {
+    useSessionStore.setState({ sessions: [session(1)] });
+    seedActivity(1, [toolUseEvent("t1", "Bash", "cargo test", "2026-08-13T10:00:00Z")]);
+    render(<AgentGraph sessionId={1} />);
+    fireEvent.click(screen.getByLabelText("Show live activity"));
+    expect(screen.getByText("Live activity")).toBeInTheDocument();
+
+    act(() => {
+      useSessionStore.setState({ sessions: [session(1, { status: "NeedsInput" })] });
+    });
+    expect(screen.queryByText("Live activity")).not.toBeInTheDocument();
+
+    act(() => {
+      useSessionStore.setState({ sessions: [session(1)] });
+    });
+    // Back to Working: the eye is offered again, but the popover only
+    // reopens on an explicit click — leaving Working reset the open state.
+    expect(screen.queryByText("Live activity")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Show live activity")).toBeInTheDocument();
+  });
+
   it("the open popover refreshes when a new claude-events batch lands", () => {
     useSessionStore.setState({ sessions: [session(1)] });
     seedActivity(1, [toolUseEvent("t1", "Read", "/src/main.rs", "2026-08-13T10:00:00Z")]);

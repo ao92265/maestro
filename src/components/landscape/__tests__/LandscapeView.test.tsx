@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The persisted workspace store hydrates through the Tauri store plugin at
@@ -356,5 +356,34 @@ describe("LandscapeView", () => {
     useSessionStore.setState({ sessions: [buildSession({ status: "Idle" })] });
     renderLandscape();
     expect(screen.queryByLabelText("Show live activity for backend")).not.toBeInTheDocument();
+  });
+
+  it("the popover stays closed after Working→NeedsInput→Working (no uninvited reopen)", () => {
+    seedActivity(1, [
+      {
+        event_type: "ToolUseStarted",
+        session_id: 1,
+        tool_name: "Bash",
+        tool_use_id: "t1",
+        input_summary: "npx vitest run",
+        timestamp: "2026-08-13T10:00:01Z",
+      },
+    ]);
+    renderLandscape();
+    fireEvent.click(screen.getByLabelText("Show live activity for backend"));
+    expect(screen.getByText("Live activity")).toBeInTheDocument();
+
+    act(() => {
+      useSessionStore.setState({ sessions: [buildSession({ status: "NeedsInput" })] });
+    });
+    expect(screen.queryByText("Live activity")).not.toBeInTheDocument();
+
+    act(() => {
+      useSessionStore.setState({ sessions: [buildSession()] });
+    });
+    // Back to Working: the eye is offered again, but the popover only
+    // reopens on an explicit click — leaving Working reset the open state.
+    expect(screen.queryByText("Live activity")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Show live activity for backend")).toBeInTheDocument();
   });
 });

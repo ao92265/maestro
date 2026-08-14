@@ -26,7 +26,7 @@ import {
   samuraiPreflight,
 } from "@/lib/samurai";
 import type { UsageData } from "@/lib/usageParser";
-import { useSamuraiWorkflowStore } from "@/stores/useSamuraiWorkflowStore";
+import { workflowGraphForLaunch } from "@/stores/useSamuraiWorkflowStore";
 import {
   SAMURAI_TILE_CLOSE_STATES,
   type SamuraiSessionInfo,
@@ -516,11 +516,6 @@ export function LaunchSection({
   const startPolling = useUsageStore((s) => s.startPolling);
   useEffect(() => startPolling(), [startPolling]);
 
-  // Issue #91: the edited workflow graph (null = never edited — the backend
-  // then compiles its default template). Whatever this holds at launch is
-  // snapshotted into the run config.
-  const workflow = useSamuraiWorkflowStore((s) => s.graph);
-
   // Issue #83: the run's work, split so the orchestrator prompt can name each
   // set for what it is — parent epics whose children it discovers, and issues
   // named directly. Either may be empty; both may not.
@@ -688,6 +683,11 @@ export function LaunchSection({
     // Phase 2 — the launch proper (worktree → test gate → gen-1 spawn).
     setPhase("spawning");
     try {
+      // Issue #91: the edited workflow graph (null = never edited — the
+      // backend then compiles its default template), read behind the store's
+      // hydration gate so a launch right after app start can't send null
+      // while an edit still sits on disk.
+      const workflow = await workflowGraphForLaunch();
       const result = await samuraiLaunchRun(
         target,
         epicRefs,

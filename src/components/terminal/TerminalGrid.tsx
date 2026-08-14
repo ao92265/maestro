@@ -663,6 +663,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   }, [refreshBranches, isActive]);
 
   // Fetch MCP servers and plugins when projectPath is available
+  // biome-ignore lint/correctness/useExhaustiveDependencies: isActive is a deliberate extra dep — flipping back to this tab re-runs the fetch so the MCP/plugin lists refresh on re-activation (#88: risky lint fixes get an ignore, never a behavior change)
   useEffect(() => {
     if (!projectPath) return;
 
@@ -671,7 +672,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
 
     // Fetch plugins/skills
     fetchPlugins(projectPath).catch(console.error);
-  }, [projectPath, fetchMcpServers, fetchPlugins]);
+  }, [projectPath, isActive, fetchMcpServers, fetchPlugins]);
 
   // Update slot enabled MCP servers when servers are fetched.
   // Refill only slots created before the first fetch landed (flag unset AND

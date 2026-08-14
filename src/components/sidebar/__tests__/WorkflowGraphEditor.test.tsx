@@ -186,7 +186,7 @@ describe("WorkflowGraphEditor (issue #91)", () => {
     expect(workflowWalkOrder(graph)).toEqual(["implement", "review", "qa-report", "push"]);
   });
 
-  it("reset-to-default refetches the backend template and replaces every edit", async () => {
+  it("reset returns the store to null-means-default instead of pinning a copy", async () => {
     render(<WorkflowGraphEditor />);
     const box = await screen.findByLabelText("Edit step implement");
     fireEvent.change(box, { target: { value: "Edited away." } });
@@ -195,13 +195,17 @@ describe("WorkflowGraphEditor (issue #91)", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Reset workflow to default" }));
 
-    await waitFor(() => expect(storedGraph()).toEqual(defaultGraph()));
-    expect(screen.getByDisplayValue("Do the implement work.")).toBeInTheDocument();
+    // The store returns to "never edited": the launch sends workflow: null
+    // and the backend default GOVERNS — including future changes to it. A
+    // materialized copy would silently pin today's default forever.
+    await waitFor(() => expect(useSamuraiWorkflowStore.getState().graph).toBeNull());
+    // The editor still renders the backend default for display.
+    expect(await screen.findByDisplayValue("Do the implement work.")).toBeInTheDocument();
     expect(screen.getByDisplayValue("Do the review work.")).toBeInTheDocument();
-    // Once on mount (display fallback) + once for the reset itself.
+    // The display default is always the backend's — never a TS copy.
     expect(
-      invokeMock.mock.calls.filter(([cmd]) => cmd === "samurai_default_workflow"),
-    ).toHaveLength(2);
+      invokeMock.mock.calls.filter(([cmd]) => cmd === "samurai_default_workflow").length,
+    ).toBeGreaterThanOrEqual(2);
   });
 
   it("adds an empty box wired from the end of the walk, skipped until it has text", async () => {

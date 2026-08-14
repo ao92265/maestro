@@ -1,6 +1,6 @@
 import { Handle, type NodeProps, Position } from "@xyflow/react";
 import { ArrowUpRight, Eye, Folder, TerminalSquare, X } from "lucide-react";
-import { createContext, useContext, useState } from "react";
+import { createContext, useContext, useEffect, useState } from "react";
 import {
   agentBadge,
   badgeBaseClass,
@@ -169,6 +169,13 @@ export function TerminalNode({ data, selected }: NodeProps) {
   const d = data as TerminalNodeData;
   const { openTerminal } = useContext(LandscapeActionsContext);
   const [liveOpen, setLiveOpen] = useState(false);
+  // Leaving Working closes the popover FOR REAL (the render guard below only
+  // hides it) — otherwise Working→NeedsInput→Working would reopen it
+  // uninvited with the stale `liveOpen` still true.
+  const working = d.status === "Working";
+  useEffect(() => {
+    if (!working) setLiveOpen(false);
+  }, [working]);
   const badge = SESSION_STATUS_BADGES[d.status] ?? SESSION_STATUS_BADGES.Idle;
   return (
     <div
