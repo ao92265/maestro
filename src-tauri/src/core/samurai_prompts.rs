@@ -236,6 +236,159 @@ fn pr_discipline_reminder(is_list: bool) -> String {
     )
 }
 
+/// The GitHub work ONE run is scoped to (issue #83), split into the two
+/// things that are NOT the same: parent EPICS — whose child issues the
+/// orchestrator discovers from the epic itself — and standalone ISSUES named
+/// directly. Both used to arrive through a single "epic" field, so a run over
+/// `77, 78` was briefed as an epic with child issues that do not exist.
+///
+/// Every ref is normalised to its bare form (`5`, `#5`, ` #5 ` → `5`) and
+/// whitespace-collapsed, so no ref can smuggle a newline into a paste-able
+/// instruction (module doc); empty refs are dropped.
+///
+/// [`RunRefs::label`] is the run's IDENTITY string (`epic #5 · issues #7, #9`)
+/// — [`epic_slug`] turns it into the combined run slug (`epic-5-issues-7-9`)
+/// that branch, worktree and handoff filenames are built from, so identity
+/// keeps flowing through the one function it always did.
+/// [`RunRefs::prose`] is the same set spelled for prompt text
+/// (`GitHub epic #5 and issues #7, #9`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunRefs {
+    epics: Vec<String>,
+    issues: Vec<String>,
+}
+
+impl RunRefs {
+    /// From the launcher's two fields (or a run config's two lists).
+    pub fn new(
+        epics: impl IntoIterator<Item = impl AsRef<str>>,
+        issues: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Self {
+        Self {
+            epics: normalize_refs(epics),
+            issues: normalize_refs(issues),
+        }
+    }
+
+    /// Every ref is an epic, from ONE comma-separated string — the pre-#83
+    /// launcher wire. The launch path now sends the two fields separately
+    /// (`commands::samurai::run_refs`), so this survives as the shorthand the
+    /// prompt suites build their epic-only fixtures with.
+    #[cfg(test)]
+    pub fn epics_only(epics: &str) -> Self {
+        Self::new(epics.split(','), std::iter::empty::<&str>())
+    }
+
+    /// The epic refs, bare (`5`), in the order they were given.
+    pub fn epics(&self) -> &[String] {
+        &self.epics
+    }
+
+    /// The standalone issue refs, bare (`7`), in the order they were given.
+    pub fn issues(&self) -> &[String] {
+        &self.issues
+    }
+
+    /// No usable ref on either side — the launch command refuses this before
+    /// any prompt is built.
+    pub fn is_empty(&self) -> bool {
+        self.epics.is_empty() && self.issues.is_empty()
+    }
+
+    /// The run's identity/display string: `epic #5 · issues #7, #9`,
+    /// `issues #7, #9`, `epic #5`, `epics #5, #12`. Empty when there is
+    /// nothing to name — [`epic_slug`] then falls back to `epic`, so the
+    /// slug is never empty. The launch path stores this as the run's `epic`
+    /// identity field ([`SamuraiRunConfig::epic`](super::samurai_run_config::SamuraiRunConfig::epic)).
+    pub fn label(&self) -> String {
+        let epics = self.epic_phrase();
+        let issues = self.issue_phrase();
+        match (epics.is_empty(), issues.is_empty()) {
+            (false, false) => format!("{epics} · {issues}"),
+            (false, true) => epics,
+            (true, false) => issues,
+            (true, true) => String::new(),
+        }
+    }
+
+    /// The same set spelled for prompt prose: `GitHub epic #5`,
+    /// `GitHub issues #7, #9`, `GitHub epic #5 and issues #7, #9`.
+    pub fn prose(&self) -> String {
+        match (self.epics.is_empty(), self.issues.is_empty()) {
+            (false, false) => format!("GitHub {} and {}", self.epic_phrase(), self.issue_phrase()),
+            (false, true) => format!("GitHub {}", self.epic_phrase()),
+            (true, false) => format!("GitHub {}", self.issue_phrase()),
+            // Unreachable by construction (the launch command refuses an
+            // empty ref); mirrors epic_slug's `epic` fallback rather than
+            // emitting a dangling "for .".
+            (true, true) => "GitHub epic".to_string(),
+        }
+    }
+
+    /// `epic #5` / `epics #5, #12` / empty.
+    fn epic_phrase(&self) -> String {
+        if self.epics.is_empty() {
+            return String::new();
+        }
+        let noun = if self.epics.len() == 1 {
+            "epic"
+        } else {
+            "epics"
+        };
+        format!("{noun} {}", join_refs(&self.epics))
+    }
+
+    /// `issue #7` / `issues #7, #9` / empty.
+    fn issue_phrase(&self) -> String {
+        if self.issues.is_empty() {
+            return String::new();
+        }
+        let noun = if self.issues.len() == 1 {
+            "issue"
+        } else {
+            "issues"
+        };
+        format!("{noun} {}", join_refs(&self.issues))
+    }
+}
+
+/// Normalises every ref and drops the ones that carry nothing.
+fn normalize_refs(refs: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
+    refs.into_iter()
+        .filter_map(|r| normalize_ref(r.as_ref()))
+        .collect()
+}
+
+/// One ref, whitespace-collapsed and stripped of its leading `#`: `#5`, `5`
+/// and ` #5 ` all become `5`. `None` when nothing usable is left.
+fn normalize_ref(raw: &str) -> Option<String> {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let bare = collapsed.trim_start_matches('#').trim();
+    if bare.is_empty() {
+        None
+    } else {
+        Some(bare.to_string())
+    }
+}
+
+/// Display spelling of one bare ref: a number gets its `#` back (`5` → `#5`);
+/// anything else is left exactly as typed.
+fn display_ref(r: &str) -> String {
+    if r.bytes().all(|b| b.is_ascii_digit()) {
+        format!("#{r}")
+    } else {
+        r.to_string()
+    }
+}
+
+/// `#7, #9` — the display spelling of a ref list.
+fn join_refs(refs: &[String]) -> String {
+    refs.iter()
+        .map(|r| display_ref(r))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Filesystem-safe slug of an epic ref for the handoff filename: `#37` →
 /// `37`, `https://github.com/o/r/issues/9` → `https-github-com-o-r-issues-9`.
 /// ASCII alphanumerics are kept (lowercased); every other run of characters
@@ -304,7 +457,7 @@ pub fn handoff_instruction(epic: &str, generation: u32) -> String {
          contains exactly <samurai-ack>{ack}</samurai-ack>. \
          (2) Let in-flight subagents finish their CURRENT step only — start no new work. \
          (3) Ensure `.maestro/` is listed in this repo's .gitignore; add it if missing. \
-         (4) Commit WIP to the epic branch: stage named paths only (never `git add .` or \
+         (4) Commit WIP to this run's branch: stage named paths only (never `git add .` or \
          `git add -A`), one Conventional Commit message (`type(scope): summary`). \
          (5) Write the handoff file to {relpath} following the PRD section 6 template EXACTLY, \
          with these headings in this order: Goal / Done / In progress / Decisions + why / \
@@ -342,7 +495,7 @@ pub fn handoff_corrective_instruction(epic: &str, generation: u32, failure: &str
          (1) Acknowledge IMMEDIATELY by replying with a message that contains exactly \
          <samurai-ack>{ack}</samurai-ack> — note the value differs from the first \
          instruction's; use exactly this one. \
-         (2) Fix the failure above: write the handoff file and/or commit WIP to the epic \
+         (2) Fix the failure above: write the handoff file and/or commit WIP to this run's \
          branch (stage named paths only, Conventional Commit message). \
          (3) Then reply with a message that contains exactly \
          <samurai-handoff-written>{written}</samurai-handoff-written>. \
@@ -394,7 +547,7 @@ pub fn park_instruction(epic: &str, generation: u32) -> String {
          (2) Finish the CURRENT atomic step ONLY — let in-flight subagents finish their \
          current step, start NOTHING new. \
          (3) Ensure `.maestro/` is listed in this repo's .gitignore; add it if missing. \
-         (4) Commit ALL WIP to the epic branch: stage named paths only (never `git add .` or \
+         (4) Commit ALL WIP to this run's branch: stage named paths only (never `git add .` or \
          `git add -A`), one Conventional Commit message (`type(scope): summary`). \
          (5) Write or update the handoff file at {relpath} following the PRD section 6 \
          template EXACTLY, with these headings in this order: Goal / Done / In progress / \
@@ -429,7 +582,7 @@ pub fn park_corrective_instruction(epic: &str, generation: u32, failure: &str) -
          <samurai-ack>{ack}</samurai-ack> — note the value differs from the first \
          instruction's; use exactly this one. \
          (2) Fix the failure above: write/update the handoff file and/or commit ALL WIP to \
-         the epic branch (stage named paths only, Conventional Commit message). \
+         this run's branch (stage named paths only, Conventional Commit message). \
          (3) Then reply with a message that contains exactly \
          <samurai-handoff-written>{written}</samurai-handoff-written>. \
          Never quote, restate, or echo these marker strings anywhere else in any reply — \
@@ -521,13 +674,17 @@ fn is_issue_list(epic_text: &str) -> bool {
 /// The successor's first instruction (PRD §5.6 — one recovery path): read
 /// the predecessor's handoff in full, then either skip or run its Verify
 /// commands depending on the HEAD gate MAESTRO computed. Single line by
-/// construction (see module doc); the epic ref is whitespace-normalized so
+/// construction (see module doc); the run ref is whitespace-normalized so
 /// a pathological ref can never smuggle a newline into the paste.
 ///
 /// `compiled_workflow` (issue #91) is the run's numbered workflow — the
 /// caller recompiles it from the graph the run config snapshotted at
 /// launch (`samurai_workflow::compiled_for_run`), so the workflow survives
 /// handoffs unchanged.
+///
+/// `epic` is the run's IDENTITY string — [`RunRefs::label`] from issue #83
+/// onward, so it already spells what the run is (`epic #5`, `issues #7, #9`)
+/// and is never prefixed with the word "epic" here.
 pub fn successor_ritual_instruction(
     epic: &str,
     predecessor_generation: u32,
@@ -537,15 +694,12 @@ pub fn successor_ritual_instruction(
     let epic_text = epic.split_whitespace().collect::<Vec<_>>().join(" ");
     let generation = predecessor_generation + 1;
     let relpath = handoff_file_relpath(epic, predecessor_generation);
-    // Issue #87: a comma-separated issue list is not an epic.
+    // Issue #87: a comma-separated issue list must not get epic framing in
+    // the reminders. The identity string itself is self-describing from
+    // issue #83 onward (`RunRefs::label`), so the opening uses it verbatim.
     let is_list = is_issue_list(&epic_text);
-    let subject = if is_list {
-        format!("the following GitHub issues: {epic_text}")
-    } else {
-        format!("epic {epic_text}")
-    };
     let opening = format!(
-        "[Maestro Samurai] You are generation {generation} for {subject}, successor to \
+        "[Maestro Samurai] You are generation {generation} for {epic_text}, successor to \
          generation {predecessor_generation}. Read the handoff file at {relpath} IN FULL before \
          doing anything else — it and GitHub are your only sources of truth."
     );
@@ -572,16 +726,24 @@ pub fn successor_ritual_instruction(
 }
 
 /// The gen-1 opening brief (issue #63, PRD §5.8 + §12): what the FIRST
-/// generation of a freshly launched epic run receives on its first
+/// generation of a freshly launched run receives on its first
 /// `SessionStarted` — there is no handoff and no predecessor, so neither
-/// ritual applies. The orchestrator reads the epic and its child issues from
-/// GitHub, plans, works the issues via small idempotent subagent tasks with
-/// per-step commits (PRD §10: tree-kill containment), comments progress on
-/// the epic, and opens PRs. Single line by construction (see module doc);
-/// the epic ref is whitespace-normalized so a pathological ref can never
+/// ritual applies. The orchestrator reads its work from GitHub, plans, works
+/// the issues via small idempotent subagent tasks with per-step commits
+/// (PRD §10: tree-kill containment), comments progress, and opens PRs.
+/// Single line by construction (see module doc); every ref is
+/// whitespace-normalized by [`RunRefs`] so a pathological ref can never
 /// smuggle a newline into the paste.
 ///
-/// `repo_pin` is the `owner/repo` derived from the epic worktree's `origin`
+/// Issue #83: a run is scoped to EPICS, to standalone ISSUES, or to both, and
+/// the brief says which — telling an orchestrator that `77, 78` is an epic
+/// sent it hunting for a parent issue that does not exist. Three shapes:
+/// epics only (today's wording, unchanged), issues only (each issue read and
+/// commented on directly, no epic and no child issues anywhere), and both
+/// (the epic with its children PLUS the named standalone issues, progress
+/// commented on the epic).
+///
+/// `repo_pin` is the `owner/repo` derived from the run worktree's `origin`
 /// remote — PRD §10: gen-1 runs with `--dangerously-skip-permissions`, so
 /// every `gh` command must carry `--repo` explicitly. `None` (remote missing
 /// or unparseable — never blocks the launch) keeps the unpinned wording plus
@@ -590,73 +752,110 @@ pub fn successor_ritual_instruction(
 /// `compiled_workflow` (issue #91) is the run's numbered workflow, compiled
 /// by the caller from the graph the launch is snapshotting into the run
 /// config (`samurai_workflow::compile`).
-pub fn launch_instruction(epic: &str, repo_pin: Option<&str>, compiled_workflow: &str) -> String {
-    let epic_text = epic.split_whitespace().collect::<Vec<_>>().join(" ");
-    // Issue #87: the Launch panel accepts an epic ref OR a comma-separated
-    // issue list — a list has no epic issue to read or child issues to hunt
-    // for, so every epic-flavored phrase below is branched on this.
-    let is_list = is_issue_list(&epic_text);
-    let subject = if is_list {
-        format!("the following GitHub issues: {epic_text}")
+pub fn launch_instruction(refs: &RunRefs, repo_pin: Option<&str>, compiled_workflow: &str) -> String {
+    let has_epics = !refs.epics().is_empty();
+    let has_issues = !refs.issues().is_empty();
+    let many_epics = refs.epics().len() > 1;
+    let many_issues = refs.issues().len() > 1;
+    // Issue #87: a run with no parent epic must never get epic framing —
+    // the ORDER clause and the PR-title rule below say "issue", not
+    // "issue/epic", when the run is a plain issue list.
+    let is_list = !has_epics;
+
+    // What to read, WITHOUT the trailing `gh` clause (which is the same
+    // sentence tail in every shape).
+    let epic_read = if many_epics {
+        "read the epics' GitHub issues, ALL of their comments, and EVERY child issue they \
+         reference"
     } else {
-        format!("GitHub epic {epic_text}")
+        "read the epic's GitHub issue, ALL of its comments, and EVERY child issue it references"
     };
-    let worktree_owner = if is_list { "this run's" } else { "the epic's" };
-    let gh_read_subject = if is_list {
-        "EACH listed issue and ALL of its comments".to_string()
+    let read_subject = match (has_epics, has_issues) {
+        (true, true) if many_issues => format!(
+            "{epic_read}, plus the standalone issues {} and ALL of their comments",
+            join_refs(refs.issues())
+        ),
+        (true, true) => format!(
+            "{epic_read}, plus the standalone issue {} and ALL of its comments",
+            join_refs(refs.issues())
+        ),
+        (false, true) if many_issues => {
+            "read EACH of this run's GitHub issues and ALL of their comments".to_string()
+        }
+        (false, true) => "read this run's GitHub issue and ALL of its comments".to_string(),
+        // Epics only — and the (refused-upstream) empty run.
+        _ => epic_read.to_string(),
+    };
+    // Progress comments land on the epic whenever there is one (issue #83:
+    // "comment progress on the epic"); an issues-only run has no epic to
+    // gather them on, so each issue carries its own.
+    let progress_subject = match (has_epics, has_issues) {
+        (false, true) if many_issues => {
+            "comment progress on EACH of those GitHub issues as they complete, and open pull \
+             requests for finished work"
+        }
+        (false, true) => {
+            "comment progress on that GitHub issue as work completes, and open pull requests \
+             for finished work"
+        }
+        _ if many_epics => {
+            "comment progress on the epics' GitHub issues as issues complete, and open pull \
+             requests for finished work"
+        }
+        _ => {
+            "comment progress on the epic's GitHub issue as issues complete, and open pull \
+             requests for finished work"
+        }
+    };
+    // Same reasoning for where a NOT-ready issue gets reported.
+    let unready_note = match (has_epics, has_issues) {
+        (false, true) => "say so in that issue's progress comment",
+        _ if many_epics => "say so in your progress comment on the epics",
+        _ => "say so in your progress comment on the epic",
+    };
+    // One epic and nothing else keeps the pre-#83 sentence verbatim; every
+    // other shape covers work the word "epic" does not describe.
+    let worktree_sentence = if has_epics && !has_issues && !many_epics {
+        "This directory is the epic's dedicated worktree on its own branch."
     } else {
-        "the epic's GitHub issue, ALL of its comments, and EVERY child issue it references"
-            .to_string()
+        "This directory is this run's dedicated worktree on its own branch."
     };
-    let progress_note = if is_list {
-        "your progress comments"
-    } else {
-        "your progress comment on the epic"
-    };
-    let progress_lead = if is_list {
-        "comment progress on each listed issue as it completes"
-    } else {
-        "comment progress on the epic's GitHub issue as issues complete"
-    };
-    // Issue #95: merging a Samurai PR closes nothing unless its body links
-    // the issues it resolves. Issue #92: the title must enumerate every ref
-    // number the run covers from the moment the PR is created. `refs`
-    // mirrors pr_discipline_reminder's #87 no-epic-framing contract: a list
-    // has no epic number to list.
-    let refs = if is_list { "issue" } else { "issue/epic" };
-    let pr_discipline = format!(
-        "every PR body must contain `Closes #N` (or `Fixes #N`) for each issue it resolves so \
-         GitHub auto-closes them on merge, and every PR title must list every {refs} number \
-         this run covers, from the moment it is created (e.g. `feat(samurai): #76 #77 #78 — \
-         summary`)"
-    );
-    let (gh_read, gh_progress, caution) = match repo_pin {
+
+    let (gh_clause, progress_pin, caution) = match repo_pin {
         Some(pin) => (
-            format!(
-                "read {gh_read_subject} with the `gh` CLI, passing `--repo {pin}` explicitly \
-                 on every `gh` command"
-            ),
-            format!(
-                "{progress_lead}, and open pull requests for finished work — {pr_discipline} \
-                 (again via `gh` with `--repo {pin}` on every command)"
-            ),
+            format!(" with the `gh` CLI, passing `--repo {pin}` explicitly on every `gh` command"),
+            format!(" (again via `gh` with `--repo {pin}` on every command)"),
             String::new(),
         ),
         None => (
-            format!("read {gh_read_subject} with the `gh` CLI, run from this directory"),
-            format!("{progress_lead}, and open pull requests for finished work — {pr_discipline}"),
+            " with the `gh` CLI, run from this directory".to_string(),
+            String::new(),
             " CAUTION: Maestro could not determine this repository's origin remote, so no \
              `--repo` pin is available — before running any `gh` command, double-check it \
              targets the correct repository."
                 .to_string(),
         ),
     };
+    // Issue #95: merging a Samurai PR closes nothing unless its body links
+    // the issues it resolves. Issue #92: the title must enumerate every ref
+    // number the run covers from the moment the PR is created. `refs_word`
+    // mirrors pr_discipline_reminder's #87 no-epic-framing contract: a list
+    // has no epic number to list.
+    let refs_word = if is_list { "issue" } else { "issue/epic" };
+    let pr_discipline = format!(
+        "every PR body must contain `Closes #N` (or `Fixes #N`) for each issue it resolves so \
+         GitHub auto-closes them on merge, and every PR title must list every {refs_word} number \
+         this run covers, from the moment it is created (e.g. `feat(samurai): #76 #77 #78 — \
+         summary`)"
+    );
+    let gh_read = format!("{read_subject}{gh_clause}");
+    let gh_progress = format!("{progress_subject} — {pr_discipline}{progress_pin}");
     let order = order_contract_clause(is_list);
     let workflow = workflow_section(compiled_workflow);
     let clause = completion_declaration_clause();
     format!(
-        "[Maestro Samurai] You are generation 1, the FIRST orchestrator, for {subject}. This \
-         directory is {worktree_owner} dedicated worktree on its own branch. \
+        "[Maestro Samurai] You are generation 1, the FIRST orchestrator, for {subject}. \
+         {worktree_sentence} \
          Do the following: \
          (1) {gh_read}. \
          (2) Assess whether each issue is AGENT-READY — scope clear enough to implement, \
@@ -669,15 +868,15 @@ pub fn launch_instruction(epic: &str, repo_pin: Option<&str>, compiled_workflow:
          agent-ready. \
          Work only the ready ones. For each issue that is NOT ready, comment on it saying \
          exactly what is missing (for a missing command, name exactly which command), \
-         exclude it from this run, and say so in {progress_note} instead of guessing at the \
-         intent. \
+         exclude it from this run, and {unready_note} instead of guessing at the intent. \
          (3) Plan the work across the agent-ready issues before touching code. \
          (4) Work them via SMALL idempotent subagent tasks, each committing its \
          completed step to THIS branch (stage named paths only, never `git add .` or \
          `git add -A`; Conventional Commit messages `type(scope): summary`). \
          (5) {gh_progress}. \
          (6) NEVER switch to, commit to, or push any other branch, and NEVER touch any \
-         repository other than this one.{caution}{order}{workflow}{clause}"
+         repository other than this one.{caution}{order}{workflow}{clause}",
+        subject = refs.prose(),
     )
 }
 
@@ -695,11 +894,14 @@ pub fn recovery_digest_relpath(epic: &str, successor_generation: u32) -> String 
 /// The successor's first instruction when there is NO handoff to read
 /// (issue #56, PRD §5.6 recovery mode): the predecessor died — or its
 /// validated handoff file vanished before successor prep. Reconstruction
-/// sources in priority order: git history, the epic's GitHub issue, and the
-/// pre-digested transcript summary (hints, not truth) — then the project's
-/// standard verification BEFORE trusting anything. Single line by
-/// construction (see module doc); the epic ref is whitespace-normalized so a
+/// sources in priority order: git history, this run's GitHub issue(s), and
+/// the pre-digested transcript summary (hints, not truth) — then the
+/// project's standard verification BEFORE trusting anything. Single line by
+/// construction (see module doc); the run ref is whitespace-normalized so a
 /// pathological ref can never smuggle a newline into the paste.
+///
+/// `epic` is the run's IDENTITY string ([`RunRefs::label`] from issue #83
+/// onward), so nothing here prefixes it with the word "epic".
 ///
 /// `repo_pin` is the `owner/repo` derived from the working dir's `origin`
 /// remote. PRD §10: successors run with `--dangerously-skip-permissions`, so
@@ -717,43 +919,26 @@ pub fn recovery_ritual_instruction(
     compiled_workflow: &str,
 ) -> String {
     let epic_text = epic.split_whitespace().collect::<Vec<_>>().join(" ");
-    // Issue #87: same phantom-epic-hunt bug as launch_instruction — a list
-    // has no epic issue to read or comment on.
+    // Issue #87: a comma-separated issue list must not get epic framing in
+    // the PR-discipline reminder (the run wording itself is neutral —
+    // "this run's GitHub issue(s)" — from issue #83 onward).
     let is_list = is_issue_list(&epic_text);
     let generation = predecessor_generation + 1;
     let digest_relpath = recovery_digest_relpath(epic, generation);
-    let subject = if is_list {
-        format!("the following GitHub issues: {epic_text}")
-    } else {
-        format!("epic {epic_text}")
-    };
-    let gh_read_subject = if is_list {
-        "EACH listed issue and ALL of its comments".to_string()
-    } else {
-        "the epic's GitHub issue and ALL of its comments".to_string()
-    };
-    let gh_comment_subject = if is_list {
-        "comment on each listed issue"
-    } else {
-        "comment on the epic's GitHub issue"
-    };
-    let remaining_work = if is_list {
-        "this run's remaining work"
-    } else {
-        "the epic's remaining work"
-    };
     let (gh_read, gh_comment, caution) = match repo_pin {
         Some(pin) => (
             format!(
-                "read {gh_read_subject} with the `gh` CLI, passing `--repo {pin}` explicitly \
-                 on every `gh` command"
+                "read this run's GitHub issue(s) and ALL of their comments with the `gh` CLI, \
+                 passing `--repo {pin}` explicitly on every `gh` command"
             ),
-            format!("{gh_comment_subject} (again via `gh` with `--repo {pin}`)"),
+            format!("comment on this run's GitHub issue(s) (again via `gh` with `--repo {pin}`)"),
             String::new(),
         ),
         None => (
-            format!("read {gh_read_subject} with the `gh` CLI, run from this directory"),
-            gh_comment_subject.to_string(),
+            "read this run's GitHub issue(s) and ALL of their comments with the `gh` CLI, run \
+             from this directory"
+                .to_string(),
+            "comment on this run's GitHub issue(s)".to_string(),
             " CAUTION: Maestro could not determine this repository's origin remote, so no \
              `--repo` pin is available — before running any `gh` command, double-check it \
              targets the correct repository."
@@ -765,7 +950,7 @@ pub fn recovery_ritual_instruction(
     let clause = completion_declaration_clause();
     let pr_reminder = pr_discipline_reminder(is_list);
     format!(
-        "[Maestro Samurai] RECOVERY MODE: you are generation {generation} for {subject}. \
+        "[Maestro Samurai] RECOVERY MODE: you are generation {generation} for {epic_text}. \
          Generation {predecessor_generation} died without a valid handoff file, so there is \
          nothing to hand off to you. Reconstruct the state of the work from three sources: \
          (1) run `git log --oneline -20` in this repository; \
@@ -775,7 +960,7 @@ pub fn recovery_ritual_instruction(
          Then run the project's standard verification (build + tests) BEFORE trusting or \
          continuing anything — investigate and fix any failure first. Once verification passes, \
          {gh_comment} that generation {generation} has taken over in \
-         recovery mode, then continue {remaining_work}.{caution}{order}{workflow}{clause} \
+         recovery mode, then continue this run's remaining work.{caution}{order}{workflow}{clause} \
          {pr_reminder}"
     )
 }
@@ -1143,9 +1328,11 @@ mod tests {
     #[test]
     fn test_ritual_instruction_head_match_branch_skips_verify() {
         let text = successor_ritual_instruction("#37", 2, true, &wf());
-        // Identity: generation, epic, predecessor.
+        // Identity: generation, the run's own ref, predecessor. Issue #83:
+        // the ref is NOT prefixed with "epic" here — the identity string
+        // (RunRefs::label) already says what the run is.
         assert!(text.contains("generation 3"));
-        assert!(text.contains("epic #37"));
+        assert!(text.contains("generation 3 for #37"));
         assert!(text.contains("successor to generation 2"));
         // The predecessor's handoff file, via the same path function the
         // validator used.
@@ -1207,19 +1394,19 @@ mod tests {
         // Identity: what happened and who the successor is.
         assert!(text.contains("RECOVERY MODE"));
         assert!(text.contains("generation 3"));
-        assert!(text.contains("epic #37"));
+        assert!(text.contains("generation 3 for #37"));
         assert!(text.contains("Generation 2 died without a valid handoff file"));
         // The three reconstruction sources.
         assert!(text.contains("`git log --oneline -20`"));
         assert!(text.contains("`gh` CLI"));
-        assert!(text.contains("ALL of its comments"));
+        assert!(text.contains("ALL of their comments"));
         assert!(text.contains(".maestro/handoffs/37-gen3-recovery.md"));
         // The digest is hints, not truth.
         assert!(text.contains("hints, NOT as truth"));
         // Verify before trusting anything, then announce and continue.
         assert!(text.contains("standard verification (build + tests) BEFORE trusting"));
-        assert!(text.contains("comment on the epic's GitHub issue"));
-        assert!(text.contains("continue the epic's remaining work"));
+        assert!(text.contains("comment on this run's GitHub issue(s)"));
+        assert!(text.contains("continue this run's remaining work"));
         // No normal-ritual language: there is no handoff to read.
         assert!(!text.contains("Read the handoff file"));
         assert!(!text.contains("SKIP"));
@@ -1256,22 +1443,35 @@ mod tests {
 
     // --- issue #63: gen-1 launch brief ---
 
+    /// An empty ref list, spelled so type inference has something to chew on.
+    const NO_REFS: [&str; 0] = [];
+
     #[test]
     fn test_launch_instruction_is_single_line() {
         for pin in [None, Some("owner/repo")] {
-            let text = launch_instruction("#38", pin, &wf());
-            assert!(!text.contains('\n'), "launch brief must not contain \\n");
-            assert!(!text.contains('\r'), "launch brief must not contain \\r");
+            for refs in [
+                RunRefs::epics_only("#38"),
+                RunRefs::new(NO_REFS, ["7", "9"]),
+                RunRefs::new(["5"], ["7"]),
+            ] {
+                let text = launch_instruction(&refs, pin, &wf());
+                assert!(!text.contains('\n'), "launch brief must not contain \\n");
+                assert!(!text.contains('\r'), "launch brief must not contain \\r");
+            }
         }
-        // A pathological epic ref cannot smuggle a newline into the paste.
-        let text = launch_instruction("epic\nwith newline", None, &wf());
+        // A pathological ref cannot smuggle a newline into the paste — on
+        // EITHER side of the split (issue #83).
+        let text = launch_instruction(&RunRefs::epics_only("epic\nwith newline"), None, &wf());
         assert!(!text.contains('\n'));
         assert!(text.contains("epic with newline"));
+        let text = launch_instruction(&RunRefs::new(NO_REFS, ["7\n9"]), None, &wf());
+        assert!(!text.contains('\n'));
+        assert!(text.contains("issue 7 9"));
     }
 
     #[test]
     fn test_launch_instruction_content() {
-        let text = launch_instruction("#38", None, &wf());
+        let text = launch_instruction(&RunRefs::epics_only("#38"), None, &wf());
         // Identity: gen-1, the epic, its dedicated worktree.
         assert!(text.contains("generation 1"));
         assert!(text.contains("epic #38"));
@@ -1305,7 +1505,7 @@ mod tests {
         // PRD §10: gen-1 runs with --dangerously-skip-permissions, so BOTH
         // the issue reads and the progress/PR clause carry --repo explicitly
         // (mirrors recovery_ritual_instruction's pinning language).
-        let text = launch_instruction("#38", Some("nachogl1/maestro"), &wf());
+        let text = launch_instruction(&RunRefs::epics_only("#38"), Some("nachogl1/maestro"), &wf());
         assert_eq!(
             text.matches("--repo nachogl1/maestro").count(),
             2,
@@ -1313,14 +1513,218 @@ mod tests {
         );
         assert!(text.contains("passing `--repo nachogl1/maestro` explicitly"));
         assert!(!text.contains("CAUTION"));
+        // The pin rides every shape, not just the epic one (issue #83).
+        for refs in [
+            RunRefs::new(NO_REFS, ["7", "9"]),
+            RunRefs::new(["5"], ["7"]),
+        ] {
+            let text = launch_instruction(&refs, Some("nachogl1/maestro"), &wf());
+            assert_eq!(
+                text.matches("--repo nachogl1/maestro").count(),
+                2,
+                "read AND progress clauses must be pinned: {text}"
+            );
+            assert!(!text.contains("CAUTION"));
+        }
     }
 
     #[test]
     fn test_launch_instruction_without_pin_carries_a_caution() {
-        let text = launch_instruction("#38", None, &wf());
-        assert!(!text.contains("passing `--repo"));
-        assert!(text.contains("CAUTION"));
-        assert!(text.contains("double-check it targets the correct repository"));
+        for refs in [
+            RunRefs::epics_only("#38"),
+            RunRefs::new(NO_REFS, ["7", "9"]),
+            RunRefs::new(["5"], ["7"]),
+        ] {
+            let text = launch_instruction(&refs, None, &wf());
+            assert!(!text.contains("passing `--repo"));
+            assert!(text.contains("CAUTION"));
+            assert!(text.contains("double-check it targets the correct repository"));
+        }
+    }
+
+    // --- issue #83: epics and issues named separately ---
+
+    #[test]
+    fn test_run_refs_normalises_every_ref() {
+        // `#5`, `5` and ` #5 ` are one ref; empties are dropped.
+        let refs = RunRefs::new(["#5", " 12 ", "", "  ", "#"], [" #7", "9"]);
+        assert_eq!(refs.epics().to_vec(), vec!["5", "12"]);
+        assert_eq!(refs.issues().to_vec(), vec!["7", "9"]);
+        assert!(!refs.is_empty());
+        assert!(RunRefs::new(NO_REFS, NO_REFS).is_empty());
+        // The pre-#83 wire: ONE comma-separated field, every ref an epic.
+        let refs = RunRefs::epics_only("#77, 78,");
+        assert_eq!(refs.epics().to_vec(), vec!["77", "78"]);
+        assert!(refs.issues().is_empty());
+        // No ref can smuggle a newline (the paste-ability invariant).
+        let refs = RunRefs::new(["5\n6"], NO_REFS);
+        assert_eq!(refs.epics().to_vec(), vec!["5 6"]);
+        assert!(!refs.label().contains('\n'));
+    }
+
+    #[test]
+    fn test_run_refs_label_slugs_to_the_combined_run_slug() {
+        // The identity property later steps store as the run's `epic` field:
+        // the label IS what epic_slug turns into the run's branch/worktree/
+        // handoff-filename slug, so the split never touches epic_slug.
+        let both = RunRefs::new(["5"], ["7", "9"]);
+        assert_eq!(both.label(), "epic #5 · issues #7, #9");
+        assert_eq!(epic_slug(&both.label()), "epic-5-issues-7-9");
+
+        let issues = RunRefs::new(NO_REFS, ["7", "9"]);
+        assert_eq!(issues.label(), "issues #7, #9");
+        assert_eq!(epic_slug(&issues.label()), "issues-7-9");
+
+        let epic = RunRefs::epics_only("5");
+        assert_eq!(epic.label(), "epic #5");
+        assert_eq!(epic_slug(&epic.label()), "epic-5");
+
+        // Plurals agree on both sides.
+        assert_eq!(RunRefs::epics_only("5, 12").label(), "epics #5, #12");
+        assert_eq!(RunRefs::new(NO_REFS, ["7"]).label(), "issue #7");
+        assert_eq!(
+            RunRefs::new(["5", "12"], ["7"]).label(),
+            "epics #5, #12 · issue #7"
+        );
+
+        // Pathological: nothing usable on either side still slugs to a
+        // legal, non-empty name — epic_slug's existing `epic` fallback.
+        let empty = RunRefs::new(NO_REFS, NO_REFS);
+        assert_eq!(empty.label(), "");
+        assert_eq!(epic_slug(&empty.label()), "epic");
+        assert_eq!(epic_slug(&RunRefs::epics_only(" , ").label()), "epic");
+    }
+
+    #[test]
+    fn test_run_refs_prose_names_each_set() {
+        assert_eq!(RunRefs::epics_only("#5").prose(), "GitHub epic #5");
+        assert_eq!(RunRefs::epics_only("5, 12").prose(), "GitHub epics #5, #12");
+        assert_eq!(
+            RunRefs::new(NO_REFS, ["7", "9"]).prose(),
+            "GitHub issues #7, #9"
+        );
+        assert_eq!(RunRefs::new(NO_REFS, ["7"]).prose(), "GitHub issue #7");
+        assert_eq!(
+            RunRefs::new(["5"], ["7", "9"]).prose(),
+            "GitHub epic #5 and issues #7, #9"
+        );
+        assert_eq!(
+            RunRefs::new(["5", "12"], ["7"]).prose(),
+            "GitHub epics #5, #12 and issue #7"
+        );
+    }
+
+    #[test]
+    fn test_launch_instruction_epics_only_wording_keeps_epic_framing() {
+        // Issue #83 acceptance criterion, adapted after the samurai-epic-106
+        // merge: byte-equality with the pre-split brief no longer holds
+        // (issues #91/#92/#93/#95/#96 appended the workflow/order/PR/
+        // completion riders and #106's runnability check extended step 2),
+        // but an epic-only run must keep the pre-split epic framing in every
+        // sentence the #83 split could have changed.
+        let text = launch_instruction(&RunRefs::epics_only("#38"), None, &wf());
+        assert!(text.starts_with(
+            "[Maestro Samurai] You are generation 1, the FIRST orchestrator, for GitHub epic \
+             #38. This directory is the epic's dedicated worktree on its own branch."
+        ));
+        assert!(text.contains(
+            "read the epic's GitHub issue, ALL of its comments, and EVERY child issue it \
+             references with the `gh` CLI, run from this directory"
+        ));
+        assert!(text.contains("say so in your progress comment on the epic"));
+        assert!(text.contains("comment progress on the epic's GitHub issue as issues complete"));
+        assert!(text.contains(
+            "CAUTION: Maestro could not determine this repository's origin remote"
+        ));
+    }
+
+    #[test]
+    fn test_launch_instruction_issues_only_never_mentions_an_epic() {
+        let text = launch_instruction(&RunRefs::new(NO_REFS, ["7", "9"]), None, &wf());
+        // Named for what it is, plural agreeing.
+        assert!(text.contains("for GitHub issues #7, #9."));
+        assert!(text.contains("This directory is this run's dedicated worktree"));
+        // Each issue is read, and progress is commented on each issue.
+        assert!(text.contains("read EACH of this run's GitHub issues and ALL of their comments"));
+        assert!(text.contains("comment progress on EACH of those GitHub issues as they complete"));
+        assert!(text.contains("say so in that issue's progress comment"));
+        // The whole point: no phantom parent, no phantom children.
+        assert!(
+            !text.to_lowercase().contains("epic"),
+            "still says epic: {text}"
+        );
+        assert!(
+            !text.contains("child issue"),
+            "still says child issue: {text}"
+        );
+        // Singular agrees too.
+        let one = launch_instruction(&RunRefs::new(NO_REFS, ["7"]), None, &wf());
+        assert!(one.contains("for GitHub issue #7."));
+        assert!(one.contains("read this run's GitHub issue and ALL of its comments"));
+        assert!(one.contains("comment progress on that GitHub issue as work completes"));
+        assert!(!one.to_lowercase().contains("epic"));
+    }
+
+    #[test]
+    fn test_launch_instruction_both_names_the_epic_and_the_issues_separately() {
+        let text = launch_instruction(&RunRefs::new(["5"], ["7", "9"]), None, &wf());
+        // The identity sentence names both sets, separately.
+        assert!(text.contains("for GitHub epic #5 and issues #7, #9."));
+        // Read the epic AND its children AND the named standalone issues.
+        assert!(text.contains(
+            "read the epic's GitHub issue, ALL of its comments, and EVERY child issue it \
+             references, plus the standalone issues #7, #9 and ALL of their comments"
+        ));
+        // Progress still gathers on the epic.
+        assert!(text.contains("comment progress on the epic's GitHub issue as issues complete"));
+        // Singular standalone issue agrees.
+        let one = launch_instruction(&RunRefs::new(["5"], ["7"]), None, &wf());
+        assert!(one.contains("for GitHub epic #5 and issue #7."));
+        assert!(one.contains("plus the standalone issue #7 and ALL of its comments"));
+    }
+
+    #[test]
+    fn test_launch_instruction_epic_plurals_agree() {
+        let text = launch_instruction(&RunRefs::epics_only("5, 12"), None, &wf());
+        assert!(text.contains("for GitHub epics #5, #12."));
+        assert!(text.contains(
+            "read the epics' GitHub issues, ALL of their comments, and EVERY child issue they \
+             reference"
+        ));
+        assert!(text.contains("comment progress on the epics' GitHub issues as issues complete"));
+        assert!(text.contains("say so in your progress comment on the epics"));
+    }
+
+    #[test]
+    fn test_sibling_prompts_never_call_a_set_of_issues_an_epic() {
+        // From step 1b onward these receive RunRefs::label() — an
+        // issues-only run must never be described as an epic anywhere.
+        let label = RunRefs::new(NO_REFS, ["7", "9"]).label();
+        let successor = successor_ritual_instruction(&label, 2, true, &wf());
+        assert!(successor.contains("generation 3 for issues #7, #9"));
+        let recovery = recovery_ritual_instruction(&label, 2, Some("nachogl1/maestro"), &wf());
+        assert!(recovery.contains("generation 3 for issues #7, #9"));
+        for text in [
+            successor,
+            recovery,
+            recovery_ritual_instruction(&label, 2, None, &wf()),
+            handoff_instruction(&label, 2),
+            handoff_corrective_instruction(&label, 2, "handoff file missing"),
+            park_instruction(&label, 2),
+            park_corrective_instruction(&label, 2, "WIP is not committed"),
+        ] {
+            assert!(
+                !text.to_lowercase().contains("epic"),
+                "still says epic: {text}"
+            );
+        }
+        // And an epic-only run still reads exactly as it did: the label
+        // itself supplies the word.
+        let label = RunRefs::epics_only("#5").label();
+        assert!(successor_ritual_instruction(&label, 2, true, &wf())
+            .contains("generation 3 for epic #5"));
+        assert!(recovery_ritual_instruction(&label, 2, None, &wf())
+            .contains("you are generation 3 for epic #5."));
     }
 
     // --- issue #87: comma-separated issue list is not an epic ---
@@ -1338,10 +1742,16 @@ mod tests {
     fn test_launch_instruction_list_shape_has_no_epic_framing() {
         // Given a plain issue list, the brief must not send gen-1 hunting
         // for a phantom epic issue that "references" the listed issues.
-        let text = launch_instruction("#76, #77, #78", Some("nachogl1/maestro"), &wf());
-        assert!(text.contains("the following GitHub issues: #76, #77, #78"));
-        assert!(text.contains("EACH listed issue and ALL of its comments"));
-        assert!(text.contains("comment progress on each listed issue as it completes"));
+        // (Post-#83 the list arrives as standalone issues in RunRefs and the
+        // wording is main's issues-only shape.)
+        let text = launch_instruction(
+            &RunRefs::new(NO_REFS, ["76", "77", "78"]),
+            Some("nachogl1/maestro"),
+            &wf(),
+        );
+        assert!(text.contains("for GitHub issues #76, #77, #78"));
+        assert!(text.contains("read EACH of this run's GitHub issues and ALL of their comments"));
+        assert!(text.contains("comment progress on EACH of those GitHub issues as they complete"));
         assert!(!text.to_lowercase().contains("epic"));
         assert!(!text.to_lowercase().contains("child issue"));
         // The rest of the brief is unaffected.
@@ -1353,7 +1763,7 @@ mod tests {
     #[test]
     fn test_launch_instruction_single_epic_ref_keeps_todays_wording() {
         // Acceptance: a single epic ref must be untouched by the #87 fix.
-        let text = launch_instruction("#38", None, &wf());
+        let text = launch_instruction(&RunRefs::epics_only("#38"), None, &wf());
         assert!(text.contains("for GitHub epic #38"));
         assert!(text.contains("the epic's dedicated worktree"));
         assert!(text.contains(
@@ -1365,8 +1775,10 @@ mod tests {
 
     #[test]
     fn test_successor_ritual_instruction_list_shape_has_no_epic_framing() {
+        // Pre-#83 configs store the raw comma list as the run's identity;
+        // the brief must carry it verbatim, with zero epic framing.
         let text = successor_ritual_instruction("77, 78", 2, true, &wf());
-        assert!(text.contains("the following GitHub issues: 77, 78"));
+        assert!(text.contains("generation 3 for 77, 78"));
         assert!(!text.to_lowercase().contains("epic"));
         assert!(text.contains("generation 3"));
         assert!(text.contains("successor to generation 2"));
@@ -1375,9 +1787,9 @@ mod tests {
     #[test]
     fn test_recovery_ritual_instruction_list_shape_has_no_epic_framing() {
         let text = recovery_ritual_instruction("77, 78", 2, Some("nachogl1/maestro"), &wf());
-        assert!(text.contains("the following GitHub issues: 77, 78"));
-        assert!(text.contains("EACH listed issue and ALL of its comments"));
-        assert!(text.contains("comment on each listed issue"));
+        assert!(text.contains("generation 3 for 77, 78"));
+        assert!(text.contains("read this run's GitHub issue(s) and ALL of their comments"));
+        assert!(text.contains("comment on this run's GitHub issue(s)"));
         assert!(text.contains("this run's remaining work"));
         assert!(!text.to_lowercase().contains("epic"));
         assert!(text.contains("RECOVERY MODE"));
@@ -1392,8 +1804,8 @@ mod tests {
         // must demand VERIFIED runnability, not assumption — for the epic
         // shape AND the list shape.
         for text in [
-            launch_instruction("#38", Some("nachogl1/maestro"), &wf()),
-            launch_instruction("#76, #77, #78", None, &wf()),
+            launch_instruction(&RunRefs::epics_only("#38"), Some("nachogl1/maestro"), &wf()),
+            launch_instruction(&RunRefs::new(NO_REFS, ["76", "77", "78"]), None, &wf()),
         ] {
             // Runnability is part of the agent-ready bar…
             assert!(
@@ -1433,7 +1845,7 @@ mod tests {
         // Merging a Samurai PR must close the issues it resolves — GitHub
         // only does that when the PR body says so.
         for pin in [None, Some("nachogl1/maestro")] {
-            let text = launch_instruction("#38", pin, &wf());
+            let text = launch_instruction(&RunRefs::epics_only("#38"), pin, &wf());
             assert!(text.contains("Closes #N"), "{text}");
             assert!(text.contains("Fixes #N"), "{text}");
             assert!(text.contains("GitHub auto-closes them on merge"), "{text}");
@@ -1463,7 +1875,7 @@ mod tests {
 
     #[test]
     fn test_launch_instruction_instructs_pr_title_enumerates_refs() {
-        let text = launch_instruction("#38", None, &wf());
+        let text = launch_instruction(&RunRefs::epics_only("#38"), None, &wf());
         assert!(
             text.contains(
                 "every PR title must list every issue/epic number this run covers, from the \
@@ -1501,8 +1913,8 @@ mod tests {
         // so EVERY orchestrator brief — gen-1 (epic ref or issue list) and
         // both successor rituals — must tell the model how to declare.
         let briefs = [
-            launch_instruction("#38", Some("nachogl1/maestro"), &wf()),
-            launch_instruction("77, 78", None, &wf()),
+            launch_instruction(&RunRefs::epics_only("#38"), Some("nachogl1/maestro"), &wf()),
+            launch_instruction(&RunRefs::new(NO_REFS, ["77", "78"]), None, &wf()),
             successor_ritual_instruction("#37", 2, true, &wf()),
             successor_ritual_instruction("#37", 2, false, &wf()),
             recovery_ritual_instruction("#37", 2, Some("nachogl1/maestro"), &wf()),
@@ -1538,14 +1950,14 @@ mod tests {
         // FIRST — before any code — and never silently reorders. A deviation
         // goes through the order-alert marker + the user's answer in the
         // terminal.
-        let epic = launch_instruction("#38", Some("nachogl1/maestro"), &wf());
+        let epic = launch_instruction(&RunRefs::epics_only("#38"), Some("nachogl1/maestro"), &wf());
         assert!(
             epic.contains("the order in which the epic lists its child issues"),
             "{epic}"
         );
         // List shape stays epic-free (enforced by
         // test_launch_instruction_list_shape_has_no_epic_framing).
-        let list = launch_instruction("#76, #77, #78", None, &wf());
+        let list = launch_instruction(&RunRefs::new(NO_REFS, ["76", "77", "78"]), None, &wf());
         assert!(
             list.contains("the order in which the issues are listed above"),
             "{list}"
@@ -1615,8 +2027,8 @@ mod tests {
         // branches) and recovery briefs all embed the compiled workflow,
         // clearly delimited, still one paste-able line.
         let briefs = [
-            launch_instruction("#38", Some("nachogl1/maestro"), &wf()),
-            launch_instruction("#76, #77, #78", None, &wf()),
+            launch_instruction(&RunRefs::epics_only("#38"), Some("nachogl1/maestro"), &wf()),
+            launch_instruction(&RunRefs::new(NO_REFS, ["76", "77", "78"]), None, &wf()),
             successor_ritual_instruction("#37", 2, true, &wf()),
             successor_ritual_instruction("#37", 2, false, &wf()),
             recovery_ritual_instruction("#37", 2, Some("nachogl1/maestro"), &wf()),
@@ -1675,7 +2087,7 @@ mod tests {
         // launch — whatever compiled text arrives is what must ride.
         let custom = "Step 1: custom implement Step 2: custom ship";
         for text in [
-            launch_instruction("#38", None, custom),
+            launch_instruction(&RunRefs::epics_only("#38"), None, custom),
             successor_ritual_instruction("#37", 2, true, custom),
             recovery_ritual_instruction("#37", 2, None, custom),
         ] {
@@ -1690,14 +2102,14 @@ mod tests {
         // A graph edited down to nothing yields no WORKFLOW shell — and a
         // pathological compiled string cannot smuggle a newline in.
         for text in [
-            launch_instruction("#38", None, ""),
+            launch_instruction(&RunRefs::epics_only("#38"), None, ""),
             successor_ritual_instruction("#37", 2, false, "  "),
             recovery_ritual_instruction("#37", 2, None, ""),
         ] {
             assert!(!text.contains("WORKFLOW"), "{text}");
             assert!(!text.contains("END OF"), "{text}");
         }
-        let text = launch_instruction("#38", None, "Step 1: a\nStep 2: b");
+        let text = launch_instruction(&RunRefs::epics_only("#38"), None, "Step 1: a\nStep 2: b");
         assert!(!text.contains('\n'), "workflow text must be normalized");
         assert!(text.contains("Step 1: a Step 2: b"));
     }
@@ -1706,7 +2118,7 @@ mod tests {
     fn test_workflow_section_keeps_the_list_shape_epic_free() {
         // The #87 contract survives the new section: a comma-separated list
         // brief must stay free of epic framing even WITH the workflow.
-        let text = launch_instruction("#76, #77, #78", None, &wf());
+        let text = launch_instruction(&RunRefs::new(NO_REFS, ["76", "77", "78"]), None, &wf());
         assert!(!text.to_lowercase().contains("epic"), "{text}");
         let text = successor_ritual_instruction("77, 78", 2, true, &wf());
         assert!(!text.to_lowercase().contains("epic"), "{text}");

@@ -25,6 +25,14 @@ use super::claude_event::ClaudeEvent;
 /// Maximum number of pending statuses to buffer (prevents memory leaks).
 const MAX_PENDING_STATUSES: usize = 100;
 
+/// Synthetic state used by the Stop hook to say "the agent ended its turn".
+///
+/// It is not an MCP state an agent can report — it exists so a turn end can
+/// travel through the same emit/buffer/flush plumbing as a real status report
+/// (see [`handle_hook_stop`]), and maps to the `AwaitingInput` status the
+/// frontend normalizes into `NeedsInput`.
+const AWAITING_INPUT_STATE: &str = "awaiting_input";
+
 /// Callback for emitting status events. In production this wraps `AppHandle::emit`;
 /// in tests it captures events into a `Vec`.
 type EmitFn = Arc<dyn Fn(SessionStatusPayload) + Send + Sync>;
@@ -263,6 +271,7 @@ fn emit_status(
         "needs_input" => "NeedsInput",
         "finished" => "Done",
         "error" => "Error",
+        AWAITING_INPUT_STATE => "AwaitingInput",
         other => {
             log::warn!("Unknown status state: {}", other);
             "Unknown"
@@ -785,14 +794,49 @@ async fn handle_hook_stop(
     // the terminal as waiting for a reply. The frontend normalizes it to
     // NeedsInput unless the agent already reported a terminal state
     // (Done/Error) via MCP, or it handed work off to running subagents.
-    emit_hook_status(
-        &state,
-        maestro_session_id,
-        "AwaitingInput",
-        "Waiting for your input",
-        None,
-    )
-    .await;
+    let project_path = {
+        let projects = state.session_projects.read().await;
+        projects.get(&maestro_session_id).cloned()
+    };
+    if let Some(project_path) = project_path {
+        (state.emit_fn)(SessionStatusPayload {
+            session_id: maestro_session_id,
+            project_path,
+            status: "AwaitingInput".to_string(),
+            message: "Waiting for your input".to_string(),
+            needs_input_prompt: None,
+        });
+    } else {
+        // Not registered (yet): the CLI can end a turn before session
+        // registration completes, and a Maestro restart re-registers sessions
+        // whose MCP process is already alive. Dropping the emit left the UI
+        // with no turn-end signal at all — the session simply looked idle — so
+        // buffer it exactly like an MCP status: `register_session` flushes it
+        // as soon as the session appears.
+        let mut pending = state.pending_statuses.write().await;
+        if pending.len() < MAX_PENDING_STATUSES {
+            info!(
+                "[HOOK] stop: session {} not registered, buffering turn end",
+                maestro_session_id
+            );
+            pending.insert(
+                maestro_session_id,
+                StatusRequest {
+                    session_id: maestro_session_id,
+                    instance_id: state.instance_id.clone(),
+                    state: AWAITING_INPUT_STATE.to_string(),
+                    message: "Waiting for your input".to_string(),
+                    needs_input_prompt: None,
+                    timestamp: Utc::now().to_rfc3339(),
+                },
+            );
+        } else {
+            info!(
+                "[HOOK] stop: pending buffer full, dropping turn end for session {}",
+                maestro_session_id
+            );
+        }
+    }
 
     StatusCode::OK
 }
@@ -1176,18 +1220,49 @@ mod tests {
         assert!(events.lock().unwrap().is_empty());
     }
 
+    /// Issue #77 cause 3: a turn end for a session the server does not know
+    /// about yet used to be logged and thrown away, so the UI never learned the
+    /// agent had stopped. It is buffered now, and registration flushes it.
     #[tokio::test]
-    async fn stop_hook_skips_status_emit_for_unregistered_session() {
+    async fn stop_hook_buffers_turn_end_for_unregistered_session() {
         let (emit_fn, events) = test_emit_fn();
-        let (addr, _p, _pend) = start_test_http_server("inst-secret", emit_fn).await;
+        let (addr, projects, pending) =
+            start_test_http_server("inst-secret", emit_fn.clone()).await;
 
         let body = serde_json::json!({
             "session_id": "claude-uuid",
             "hook_event_name": "Stop",
         });
-        assert_eq!(post_hook(addr, "/hook/stop", Some("inst-secret"), body).await, 200);
+        assert_eq!(
+            post_hook(addr, "/hook/stop", Some("inst-secret"), body).await,
+            200
+        );
 
+        // Nothing emitted yet — there is no project path to route it to…
         assert!(events.lock().unwrap().is_empty());
+        {
+            let buf = pending.read().await;
+            assert_eq!(buf[&1].state, AWAITING_INPUT_STATE);
+        }
+
+        // …but the moment the session registers, the turn end reaches the UI.
+        let server = StatusServer {
+            port: 0,
+            instance_id: "inst-secret".to_string(),
+            emit_fn,
+            session_projects: projects,
+            pending_statuses: pending.clone(),
+        };
+        server.register_session(1, "/path/project").await;
+
+        {
+            let emitted = events.lock().unwrap();
+            assert_eq!(emitted.len(), 1);
+            assert_eq!(emitted[0].session_id, 1);
+            assert_eq!(emitted[0].project_path, "/path/project");
+            assert_eq!(emitted[0].status, "AwaitingInput");
+        }
+        assert!(pending.read().await.is_empty());
     }
 
     // ── Hash tests ──────────────────────────────────────────────────
@@ -1438,6 +1513,8 @@ mod tests {
             ("needs_input", "NeedsInput"),
             ("finished", "Done"),
             ("error", "Error"),
+            // Synthetic Stop-hook state — buffered turn ends flush through here.
+            (AWAITING_INPUT_STATE, "AwaitingInput"),
         ] {
             post_status(addr, &make_status(1, "inst-1", mcp_state, "msg")).await;
             let emitted = events.lock().unwrap();
@@ -1445,7 +1522,7 @@ mod tests {
             assert_eq!(last.status, expected_status, "state '{}' should map to '{}'", mcp_state, expected_status);
         }
 
-        assert_eq!(events.lock().unwrap().len(), 5);
+        assert_eq!(events.lock().unwrap().len(), 6);
     }
 
     // ── Hook endpoint tests ──────────────────────────────────────────

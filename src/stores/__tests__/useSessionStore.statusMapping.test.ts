@@ -64,6 +64,8 @@ describe("resolveStatusEvent: signal → state table", () => {
     existing: BackendSessionStatus | undefined;
     incoming: string;
     subagents?: number;
+    /** The agent reported Done/Error during the turn this Stop closes. */
+    reportedThisTurn?: boolean;
     expected: BackendSessionStatus | null;
   };
 
@@ -93,7 +95,8 @@ describe("resolveStatusEvent: signal → state table", () => {
       incoming: "Working",
       expected: "Working",
     },
-    // Stop hook (AwaitingInput): NeedsInput unless terminal or handed off.
+    // Stop hook (AwaitingInput): NeedsInput unless the agent reported a
+    // terminal state during this very turn, or it handed off to subagents.
     {
       name: "Stop hook onto Working",
       existing: "Working",
@@ -107,22 +110,38 @@ describe("resolveStatusEvent: signal → state table", () => {
       expected: "NeedsInput",
     },
     {
-      name: "Stop hook dropped on Done",
+      name: "Stop hook dropped when Done was reported this turn",
       existing: "Done",
       incoming: "AwaitingInput",
+      reportedThisTurn: true,
       expected: null,
     },
     {
-      name: "Stop hook dropped on Error",
+      name: "Stop hook dropped when Error was reported this turn",
       existing: "Error",
       incoming: "AwaitingInput",
+      reportedThisTurn: true,
       expected: null,
     },
+    // Issue #77 cause 1: a STALE terminal state — no fresh report in the
+    // turn this stop closes — must not swallow the turn end.
     {
-      name: "Stop hook dropped on Timeout",
+      name: "Stop hook onto a stale Done",
+      existing: "Done",
+      incoming: "AwaitingInput",
+      expected: "NeedsInput",
+    },
+    {
+      name: "Stop hook onto a stale Error",
+      existing: "Error",
+      incoming: "AwaitingInput",
+      expected: "NeedsInput",
+    },
+    {
+      name: "Stop hook recovers a startup Timeout (the CLI is alive)",
       existing: "Timeout",
       incoming: "AwaitingInput",
-      expected: null,
+      expected: "NeedsInput",
     },
     {
       name: "Stop hook with running subagents",
@@ -175,11 +194,12 @@ describe("resolveStatusEvent: signal → state table", () => {
     },
   ];
 
-  it.each(rows)("$name", ({ existing, incoming, subagents, expected }) => {
+  it.each(rows)("$name", ({ existing, incoming, subagents, reportedThisTurn, expected }) => {
     const resolved = resolveStatusEvent(
       { status: incoming as BackendSessionStatus, message: "msg" },
       existing,
       subagents ?? 0,
+      reportedThisTurn ?? false,
     );
     if (expected === null) {
       expect(resolved).toBeNull();
@@ -239,9 +259,14 @@ describe("session status: signal sequences through the listener", () => {
   });
 
   it("class 2 regression: a Done session works again on the next turn", () => {
-    useSessionStore.setState({ sessions: [session(1, "Done")] });
+    useSessionStore.setState({ sessions: [session(1, "Working")] });
 
-    // Stop hook right after the MCP `finished` report — dropped, Done stays.
+    // The agent reports `finished` over MCP, closing the turn as Done.
+    emit(wire(1, "Done", { message: "all finished" }));
+    expect(useSessionStore.getState().sessions[0].status).toBe("Done");
+
+    // Stop hook right after the MCP `finished` report — same turn, so it is
+    // dropped and Done stays.
     emit(wire(1, "AwaitingInput"));
     expect(useSessionStore.getState().sessions[0].status).toBe("Done");
 

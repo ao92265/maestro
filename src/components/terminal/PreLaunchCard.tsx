@@ -237,8 +237,8 @@ export function PreLaunchCard({
     let ignore = false;
     const sessionPath = selectedRepoPath || projectPath;
     listClaudeSessions(sessionPath)
-      .then((sessions) => {
-        if (!ignore) setClaudeSessions(sessions);
+      .then((listing) => {
+        if (!ignore) setClaudeSessions(listing.sessions);
       })
       .catch(() => {
         if (!ignore) setClaudeSessions([]);

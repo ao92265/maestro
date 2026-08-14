@@ -345,9 +345,9 @@ pub fn run() {
                 }
                 // Samurai (issue #53): idle-gate signal (Stop hook →
                 // SessionEnded reason "stop"). Tapped here, pre-dedup: the
-                // EventBus dedup key for SessionEnded ignores the reason, so
-                // a Stop landing within the 5s window of another SessionEnded
-                // would never reach a bus-side tee.
+                // EventBus dedups SessionEnded per session and reason, so a
+                // Stop landing within the 5s window of another Stop would
+                // never reach a bus-side tee.
                 if let Some(injector) = samurai_injector_for_hooks.get() {
                     injector.observe_hook(&event);
                 }
@@ -1110,6 +1110,8 @@ pub fn run() {
             // Samurai Second Brain file inventory (issue #65)
             commands::samurai::samurai_files_list,
             commands::samurai::samurai_file_delete,
+            // Guarded read of any listed Samurai file (issue #82)
+            commands::samurai::samurai_file_read,
             commands::samurai::samurai_timer_cancel,
             // Samurai journal (Phase 5, issue #69)
             commands::samurai::samurai_journal_add,

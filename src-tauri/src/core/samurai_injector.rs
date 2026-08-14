@@ -10,10 +10,10 @@
 //!    reports the agent finished its turn (`SessionEnded { reason: "stop" }`),
 //!    never on trigger alone. The signal is tapped in `lib.rs`'s
 //!    `hook_emit_fn` chain via [`observe_hook`](SamuraiInjector::observe_hook),
-//!    NOT the EventBus tee: the bus dedup key for `SessionEnded` ignores
-//!    `reason` (5s window, see `claude_event.rs`), so a Stop landing shortly
-//!    after a SessionEnd — or after another Stop — could be swallowed before
-//!    it ever reached a bus-side tee. Issue #54 closes P2.2's known gap: the
+//!    NOT the EventBus tee: the bus dedups `SessionEnded` by session *and*
+//!    reason inside a 5s window (see `claude_event.rs`), so a Stop landing
+//!    shortly after another Stop could be swallowed before it ever reached
+//!    a bus-side tee. Issue #54 closes P2.2's known gap: the
 //!    controller also tracks whether each session's most recent signal *was*
 //!    a Stop ([`idle_effect`]), and a session that is idle right now is
 //!    injected at tick time instead of waiting for a future Stop that will
@@ -301,6 +301,23 @@ impl PendingInstruction {
             failure: None,
             stuck_alerted: false,
         }
+    }
+
+    /// How long since the latest injection; `None` before the first.
+    /// [`AgeableInstant`] carries the test-only backdate offset (issue #90),
+    /// so these reads never underflow on a freshly booted machine.
+    fn injected_elapsed(&self) -> Option<Duration> {
+        self.injected_at.map(|t| t.elapsed())
+    }
+
+    /// How long this entry has been WAITING for an idle signal.
+    fn waiting_elapsed(&self) -> Duration {
+        self.waiting_since.elapsed()
+    }
+
+    /// How long since the ACK arrived; `None` before it does.
+    fn acked_elapsed(&self) -> Option<Duration> {
+        self.acked_at.map(|t| t.elapsed())
     }
 }
 
@@ -1077,8 +1094,8 @@ impl SamuraiInjector {
                         p.acked,
                         p.attempts,
                         p.awaiting_retry,
-                        p.injected_at.map(|t| t.elapsed()),
-                        p.waiting_since.elapsed(),
+                        p.injected_elapsed(),
+                        p.waiting_elapsed(),
                         timeout,
                         max_turn_wait,
                     ) {
@@ -1159,7 +1176,7 @@ impl SamuraiInjector {
                 match written_verdict(
                     p.validating,
                     p.corrective,
-                    p.acked_at.map(|t| t.elapsed()),
+                    p.acked_elapsed(),
                     written_window,
                 ) {
                     WrittenVerdict::Keep => {}

@@ -40,7 +40,7 @@ use std::sync::{Mutex, PoisonError};
 use serde::{Deserialize, Serialize};
 
 use super::samurai_config::SamuraiConfig;
-use super::samurai_prompts::epic_slug;
+use super::samurai_prompts::{epic_slug, RunRefs};
 use super::samurai_workflow::WorkflowGraph;
 use super::status_server::StatusServer;
 
@@ -69,8 +69,25 @@ pub struct SamuraiRunConfig {
     /// re-normalizes on every save/lookup so a verbatim and a plain spelling
     /// can never map to two different files.
     pub project_path: String,
-    /// Epic reference (e.g. `#37` or a full issue URL).
+    /// The run's IDENTITY string and the key everything else is built from:
+    /// [`epic_slug`] turns it into this file's name, the branch, the worktree
+    /// folder and the handoff filenames. Since issue #83 a launch stores
+    /// [`RunRefs::label`] here (`epic #5 · issues #7, #9`); configs written
+    /// before that hold a single raw ref (`#37`) and keep working unchanged —
+    /// both are just strings this field never interprets.
     pub epic: String,
+    /// Parent epic refs, bare (`5`), in the order the launcher gave them
+    /// (issue #83). `#[serde(default)]` — a config written before the split
+    /// has no such key and loads with an empty list, which must never break
+    /// listing, archiving or cleanup: [`epic`](Self::epic) alone still keys
+    /// the run.
+    #[serde(default)]
+    pub epics: Vec<String>,
+    /// Standalone issue refs, bare (`7`) — the issues named directly rather
+    /// than discovered from an epic (issue #83). Same back-compat contract as
+    /// [`epics`](Self::epics).
+    #[serde(default)]
+    pub issues: Vec<String>,
     /// `--repo owner/repo` pin for orchestrator prompts (PRD §10). `None`
     /// when the remote did not parse — the prompt then carries an explicit
     /// caution instead (same policy as `samurai_replicator::derive_repo_pin`,
@@ -111,6 +128,8 @@ impl SamuraiRunConfig {
         Self {
             project_path: normalize_project(&project_path.into()),
             epic: epic.into(),
+            epics: Vec::new(),
+            issues: Vec::new(),
             repo_pin: None,
             worktree_path: worktree_path.into(),
             model: None,
@@ -119,6 +138,18 @@ impl SamuraiRunConfig {
             status: RunConfigStatus::Active,
             created_at: chrono::Utc::now().to_rfc3339(),
         }
+    }
+
+    /// Records the structured refs behind the run (issue #83). `refs` must be
+    /// the same value whose [`RunRefs::label`] was passed as `epic`, so the
+    /// two lists always describe the identity string rather than contradict
+    /// it. Chained onto [`new`](Self::new) at launch; a config that never
+    /// calls it keeps the pre-#83 shape (empty lists), which is exactly what
+    /// an old on-disk file deserialises to.
+    pub fn with_refs(mut self, refs: &RunRefs) -> Self {
+        self.epics = refs.epics().to_vec();
+        self.issues = refs.issues().to_vec();
+        self
     }
 }
 
@@ -387,6 +418,8 @@ mod tests {
         for key in [
             "project_path",
             "epic",
+            "epics",
+            "issues",
             "repo_pin",
             "worktree_path",
             "model",
@@ -413,6 +446,89 @@ mod tests {
         );
         assert_eq!(config.repo_pin, None);
         assert_eq!(config.thresholds, None);
+        // Issue #83: the structured refs start empty — the pre-split shape.
+        assert!(config.epics.is_empty());
+        assert!(config.issues.is_empty());
+    }
+
+    #[test]
+    fn test_with_refs_records_the_lists_behind_the_label() {
+        // Issue #83: `epic` stays the identity string ([`RunRefs::label`]) and
+        // the two lists say what it was built from, normalised to bare refs.
+        let refs = RunRefs::new(["#5"], ["7", "#9"]);
+        let config =
+            SamuraiRunConfig::new("C:/git/maestro", refs.label(), "C:/wt").with_refs(&refs);
+        assert_eq!(config.epic, "epic #5 · issues #7, #9");
+        assert_eq!(config.epics, vec!["5".to_string()]);
+        assert_eq!(config.issues, vec!["7".to_string(), "9".to_string()]);
+
+        // The label is what keys the file, so one launch of an epic plus two
+        // issues lands on the combined slug — the same slug the branch,
+        // worktree and handoff filenames use.
+        let dir = tempdir().unwrap();
+        let store = RunConfigStore::new(dir.path().to_path_buf());
+        store.save(&config).unwrap();
+        let path = store.config_path("C:/git/maestro", &config.epic);
+        assert!(
+            path.ends_with("epic-5-issues-7-9.json"),
+            "unexpected config path {path:?}"
+        );
+        assert_eq!(store.get("C:/git/maestro", &config.epic).unwrap(), config);
+    }
+
+    #[test]
+    fn test_pre_split_config_still_loads_lists_and_archives() {
+        // Issue #83 back-compat — the acceptance criterion that matters most:
+        // a config written BEFORE `epics`/`issues` existed has neither key. It
+        // must deserialise, list, and stay findable by its `epic` for the
+        // lookup/archive/cleanup path, because a broken deserialise silently
+        // orphans a LIVE run's worktree. The literal old JSON is written by
+        // hand on purpose: round-tripping today's struct would prove nothing.
+        let dir = tempdir().unwrap();
+        let store = RunConfigStore::new(dir.path().to_path_buf());
+        let project = "C:/git/maestro";
+        // `r##` on purpose — the JSON contains `"#37"`, which would close an
+        // `r#` raw string.
+        let old_json = r##"{
+  "project_path": "C:/git/maestro",
+  "epic": "#37",
+  "repo_pin": "nachogl1/maestro",
+  "worktree_path": "C:/worktrees/maestro-37",
+  "model": "opus",
+  "thresholds": null,
+  "status": "ACTIVE",
+  "created_at": "2026-08-01T09:00:00+00:00"
+}"##;
+        let path = dir.path().join(project_dir_name(project)).join("37.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, old_json).unwrap();
+
+        // Cold-start reconciliation still sees it…
+        let active = store.load_active();
+        assert_eq!(active.len(), 1, "pre-split config must still list");
+        assert_eq!(active[0].epic, "#37");
+        assert_eq!(active[0].worktree_path, "C:/worktrees/maestro-37");
+        // …with the new fields defaulted rather than fatal.
+        assert!(active[0].epics.is_empty());
+        assert!(active[0].issues.is_empty());
+        // …the file inventory too.
+        assert_eq!(store.list_with_paths().len(), 1);
+
+        // Lookup by the run's epic works, in either spelling (both slug to
+        // `37`), which is how cleanup and resume find it.
+        let loaded = store.get(project, "#37").expect("found by its own epic");
+        assert_eq!(loaded.repo_pin.as_deref(), Some("nachogl1/maestro"));
+        assert_eq!(loaded.model.as_deref(), Some("opus"));
+        assert!(store.get(project, "37").is_some());
+
+        // And cleanup can archive it in place, keeping the file.
+        store.archive(project, "#37").unwrap();
+        assert_eq!(
+            store.get(project, "#37").unwrap().status,
+            RunConfigStatus::Archived
+        );
+        assert!(path.exists());
+        assert!(store.load_active().is_empty());
     }
 
     #[test]

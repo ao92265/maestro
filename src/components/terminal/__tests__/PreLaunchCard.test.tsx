@@ -3,7 +3,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { PreLaunchCard, type SessionSlot } from "../PreLaunchCard";
 
 vi.mock("@/lib/terminal", () => ({
-  listClaudeSessions: vi.fn().mockResolvedValue([]),
+  listClaudeSessions: vi
+    .fn()
+    .mockResolvedValue({ sessions: [], total_found: 0, truncated: false, unreadable: 0 }),
   deleteClaudeSession: vi.fn().mockResolvedValue(undefined),
 }));
 

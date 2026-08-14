@@ -141,6 +141,11 @@ describe("TerminalGrid pending samurai launch", () => {
     invokeMock.mockReset();
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "generate_project_hash") return "hash";
+      // The session listing reports what it could not return, so it is an
+      // object, not a bare list (issue #78).
+      if (cmd === "list_claude_sessions") {
+        return { sessions: [], total_found: 0, truncated: false, unreadable: 0 };
+      }
       return [];
     });
     spawnShellMock.mockClear();

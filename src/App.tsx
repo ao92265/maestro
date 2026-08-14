@@ -947,6 +947,7 @@ function App() {
                 width={rightPanelWidth}
                 onResize={handleRightPanelResize}
                 onClose={() => setUtilityPanel(null)}
+                onNavigateToSession={handleAgentNavigate}
               />
             )}
 

@@ -43,9 +43,17 @@ come from here (and from the samurai watchdog).
 ## Merge rules (`resolveStatusEvent`, exact order)
 
 1. **`AwaitingInput`** (Stop hook — weak, fires on every turn end):
-   - dropped if the session is `Done`/`Error`/`Timeout` (a turn-end blip never
-     downgrades an explicit terminal state);
-   - `Working` ("N subagents running") while background subagents run;
+   - dropped ONLY if the agent reported `Done`/`Error` during the very turn
+     this stop closes (the store tracks that mark and the stop consumes it).
+     The session's *current* status is deliberately not consulted: one stale
+     `Done` would otherwise swallow every later turn end forever (issue #77
+     cause 1), and a live stop is better evidence than a startup `Timeout`
+     heuristic — a stop on a `Timeout` session recovers it to `NeedsInput`;
+   - `Working` ("N subagents running") while background subagents are
+     *plausibly* alive — a running subagent only counts for 30 minutes from
+     spawn, and a watchdog re-checks when the last one ages out so a
+     completion event that never arrives cannot pin the dots (issue #77
+     cause 4);
    - otherwise `NeedsInput`.
 2. **`SessionEnded`**: dropped if `Done`/`Error` (the outcome stays visible);
    otherwise `Idle`, clearing any needs-input prompt.

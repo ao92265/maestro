@@ -3645,7 +3645,7 @@ mod tests {
         let h = harness(dir.path());
         let project = "C:/git/proj-launch";
         let brief = samurai_prompts::launch_instruction(
-            "#38",
+            &samurai_prompts::RunRefs::epics_only("#38"),
             Some("nachogl1/maestro"),
             &samurai_workflow::compiled_for_run(None),
         );
@@ -3689,7 +3689,7 @@ mod tests {
         let h = harness(dir.path());
         let project = "C:/git/proj-launch-retry";
         let brief = samurai_prompts::launch_instruction(
-            "#38",
+            &samurai_prompts::RunRefs::epics_only("#38"),
             None,
             &samurai_workflow::compiled_for_run(None),
         );
@@ -3789,7 +3789,7 @@ mod tests {
     /// test starts from.
     fn deliver_launch_brief(h: &Harness, project: &str) {
         let brief = samurai_prompts::launch_instruction(
-            "#38",
+            &samurai_prompts::RunRefs::epics_only("#38"),
             Some("nachogl1/maestro"),
             &samurai_workflow::compiled_for_run(None),
         );
@@ -3923,7 +3923,7 @@ mod tests {
         let h = harness(dir.path());
         let project = "C:/git/proj-launch-dropped";
         let brief = samurai_prompts::launch_instruction(
-            "#38",
+            &samurai_prompts::RunRefs::epics_only("#38"),
             None,
             &samurai_workflow::compiled_for_run(None),
         );

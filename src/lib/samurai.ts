@@ -204,7 +204,17 @@ export interface SamuraiWorkflowGraph {
 export interface SamuraiRunConfig {
   /** Canonical project path (Windows `\\?\` prefix already stripped). */
   project_path: string;
+  /**
+   * The run's identity AND display string. Since issue #83 a launch stores
+   * the readable label here (`epic #5 · issues #7, #9`); configs written
+   * before that hold a single raw ref (`#38`). Render this rather than
+   * rebuilding it from the two lists below, which older configs leave empty.
+   */
   epic: string;
+  /** Parent epic refs, bare (`5`); empty for configs written before #83. */
+  epics: string[];
+  /** Standalone issue refs, bare (`7`); empty for pre-#83 configs. */
+  issues: string[];
   /** `--repo owner/repo` pin for orchestrator prompts; null when unknown. */
   repo_pin: string | null;
   /** The epic's stable worktree path (PRD §5.9). */
@@ -277,6 +287,7 @@ export interface SamuraiTestGateProgress {
 
 /** What a successful launch set up. */
 export interface SamuraiLaunchResult {
+  /** The run's readable label (`epic #5 · issues #7, #9`) — issue #83. */
   epic: string;
   branch: string;
   worktree_path: string;
@@ -304,16 +315,19 @@ export function samuraiPreflight(projectPath: string): Promise<SamuraiPreflight>
 }
 
 /**
- * Launches an epic run: server-side preflight re-check, epic worktree at the
- * stable path, test-suite gate inside that worktree (issue #90b — bootstrap
- * + `cargo test --workspace`, progress on `samurai-test-gate-event`; a red
+ * Launches a run: server-side preflight re-check, run worktree at the stable
+ * path, test-suite gate inside that worktree (issue #90b — bootstrap +
+ * `cargo test --workspace`, progress on `samurai-test-gate-event`; a red
  * suite blocks the launch unless `skipTestGate` overrides), ACTIVE run
  * config, gen-1 spawn with the opening brief. Refusals (gh auth, no
  * governing window, live session, red gate) arrive as rejected promises
  * with the reason.
  *
- * `epic` accepts an epic ref, one issue, or a comma-separated list — the
- * backend normalizes the spelling so `#77,78` and `#77 , 78` are one run.
+ * `epics` and `issues` are the launcher's two fields (issue #83) — parent
+ * epics whose child issues the run discovers, and issues named directly.
+ * Each element may itself be a comma-separated list, and a leading `#` is
+ * optional: the backend splits and normalizes the spelling, so `["#77,78"]`
+ * and `["#77", "78"]` are the same run. It refuses an empty combined set.
  *
  * `workflow` (issue #91) is the run's workflow graph — the editor's edited
  * graph, or omitted/null for the default template. Whatever the run
@@ -322,7 +336,8 @@ export function samuraiPreflight(projectPath: string): Promise<SamuraiPreflight>
  */
 export function samuraiLaunchRun(
   projectPath: string,
-  epic: string,
+  epics: string[],
+  issues: string[],
   model: string | null,
   handoffContextPct: number | null,
   skipTestGate: boolean,
@@ -330,7 +345,8 @@ export function samuraiLaunchRun(
 ): Promise<SamuraiLaunchResult> {
   return invoke("samurai_launch_run", {
     projectPath,
-    epic,
+    epics,
+    issues,
     model,
     handoffContextPct,
     skipTestGate,
@@ -592,4 +608,23 @@ export function samuraiHarvestArm(sessionId: number): Promise<void> {
  */
 export function samuraiHarvestRead(path: string): Promise<string> {
   return invoke("samurai_harvest_read", { path });
+}
+
+// ---------------------------------------------------------------------------
+// Issue #82: guarded read of ANY listed Samurai file — the Second Brain viewer
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads one Samurai-managed file by absolute path, read-only (Rust
+ * `samurai_file_read`) — the Second Brain's file viewer serves every row's
+ * content from here, not just harvest reports.
+ *
+ * Containment is the backend's: the path is accepted ONLY if the inventory it
+ * recomputes on every call — the same snapshot `samuraiFilesList` returns —
+ * currently holds it. Anything else, anything over the 2 MB cap, and any read
+ * failure rejects with a plain readable string; render it as-is rather than
+ * parsing it.
+ */
+export function samuraiFileRead(path: string): Promise<string> {
+  return invoke("samurai_file_read", { path });
 }
