@@ -93,6 +93,13 @@ const WRITTEN_WINDOW_MULTIPLIER: u32 = 3;
 /// long turn.
 const STUCK_WAIT_MULTIPLIER: u32 = 3;
 
+/// How many consecutive ticks a WORKING session may have no context reading
+/// at all before the `context_blind` ALERT fires (10 × 30s = 5 minutes). A
+/// freshly spawned orchestrator produces its first assistant message with
+/// usage within seconds, so a gap this long is a broken watch, not a slow
+/// start — and it means the handoff can never trigger for that session.
+const BLIND_TICKS_BEFORE_ALERT: u32 = 10;
+
 /// Resolves a Maestro session id to the directory its shell works in (the
 /// worktree/sub-repo-aware cwd the SessionManager recorded). Injected as a
 /// closure so the controller stays constructible in tests without tauri
@@ -895,6 +902,11 @@ pub struct SamuraiInjector {
     /// #54 bonus fix; see [`idle_effect`]). Holds bare u32s, so an
     /// unsupervised session costs one integer until its SessionEnd.
     idle_now: Arc<Mutex<HashSet<u32>>>,
+    /// Consecutive ticks a WORKING session has had NO context reading, per
+    /// session — the blindness detector behind the `context_blind` ALERT
+    /// ([`note_blind_tick`](SamuraiInjector::note_blind_tick)). Cleared the
+    /// moment a reading lands, and pruned to the supervised set each tick.
+    blind_ticks: Mutex<HashMap<u32, u32>>,
     /// Issue #55: the replication controller a validated handoff chains
     /// into. It also shares this controller's tick (its no-start timeout
     /// pass) and hook tap (SessionStarted ritual delivery). `None` only in
@@ -930,6 +942,7 @@ impl SamuraiInjector {
             session_dirs,
             pending: Arc::new(Mutex::new(HashMap::new())),
             idle_now: Arc::new(Mutex::new(HashSet::new())),
+            blind_ticks: Mutex::new(HashMap::new()),
             replicator,
             parker: std::sync::OnceLock::new(),
             run_configs: std::sync::OnceLock::new(),
@@ -1020,8 +1033,21 @@ impl SamuraiInjector {
         // handoff. The state machine enforces one-in-flight and handoff/park
         // exclusivity and writes the HANDOFF(phase=requested) audit row; a
         // rejected transition already produced its illegal_transition ALERT.
+        let mut supervised: Vec<u32> = Vec::new();
         for session in self.supervisor.list_sessions() {
+            supervised.push(session.session_id);
             let percent = self.context.percent(session.session_id);
+            // A WORKING session with no reading cannot ever trigger, and the
+            // predicate below says so silently — which is indistinguishable
+            // from "still below the threshold" in the audit trail. Blindness
+            // means the transcript never reached the context store (the
+            // session was never watched, or its watcher stopped), so the
+            // handoff can never fire for the rest of the run: say it once.
+            if session.state == SupervisorState::Working && percent.is_none() {
+                self.note_blind_tick(&session);
+            } else {
+                self.lock_blind().remove(&session.session_id);
+            }
             // Review F4: a per-run threshold override on the epic's run
             // config replaces the global handoff trigger for this session.
             let threshold = self
@@ -1055,6 +1081,8 @@ impl SamuraiInjector {
                 ),
             }
         }
+        // Teardown leaves no callback here, so unsupervised ids would linger.
+        self.lock_blind().retain(|id, _| supervised.contains(id));
 
         // Prune + timeout pass. Re-list: the trigger pass above may have just
         // moved sessions into HANDOFF_REQUESTED.
@@ -1725,6 +1753,48 @@ impl SamuraiInjector {
         self.pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Test-only view of a session's consecutive blind-tick count.
+    #[cfg(test)]
+    pub(crate) fn blind_ticks_view(&self, session_id: u32) -> Option<u32> {
+        self.lock_blind().get(&session_id).copied()
+    }
+
+    fn lock_blind(&self) -> std::sync::MutexGuard<'_, HashMap<u32, u32>> {
+        self.blind_ticks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Counts one tick of a WORKING session with no context reading, and
+    /// raises the `context_blind` ALERT on the tick the count reaches
+    /// [`BLIND_TICKS_BEFORE_ALERT`] — exactly once, since the count only
+    /// equals it once and a reading clears the entry.
+    fn note_blind_tick(&self, session: &SessionSnapshot) {
+        let ticks = {
+            let mut blind = self.lock_blind();
+            let entry = blind.entry(session.session_id).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        if ticks != BLIND_TICKS_BEFORE_ALERT {
+            return;
+        }
+        log::warn!(
+            "samurai injector: session {} has had no context reading for {ticks} ticks — the handoff trigger is blind",
+            session.session_id
+        );
+        self.audit.append(
+            &session.project,
+            AuditEvent::now(
+                session.epic.clone(),
+                AuditEventKind::Alert,
+                session.generation,
+                session.session_id,
+                json!({ "kind": "context_blind", "ticks": ticks }),
+            ),
+        );
     }
 
     /// Test-only view of one pending entry: (attempts, acked, awaiting_retry).
@@ -2446,6 +2516,60 @@ mod tests {
             Some(HandoffRequested),
             "44.1% is past the 40% default: the tick must request the handoff"
         );
+    }
+
+    /// A WORKING session that never gets a context reading can never hand
+    /// off. Before the blindness detector that failed in total silence — the
+    /// audit trail of a blind run and of a run merely sitting under the
+    /// threshold were identical, which is what made a real failure
+    /// undiagnosable after the fact.
+    #[tokio::test]
+    async fn test_a_session_with_no_context_reading_alerts_once() {
+        let dir = tempdir().unwrap();
+        let (injector, audit, supervisor, context, _dirs) = harness(dir.path());
+        let project = "C:/git/proj-blind";
+        supervisor
+            .register_session(1, project.into(), "epic-blind".into(), 1)
+            .unwrap();
+
+        let alerts = |rows: Vec<AuditEvent>| {
+            rows.into_iter()
+                .filter(|r| {
+                    r.event == AuditEventKind::Alert && r.details["kind"] == "context_blind"
+                })
+                .count()
+        };
+
+        // Nine blind ticks stay quiet: a slow first assistant message must
+        // never raise an alert.
+        for _ in 0..(BLIND_TICKS_BEFORE_ALERT - 1) {
+            injector.tick();
+        }
+        assert_eq!(
+            alerts(audit.read(project, None, None).await.unwrap().events),
+            0
+        );
+
+        // The tenth says it, once — further blind ticks stay silent.
+        injector.tick();
+        injector.tick();
+        injector.tick();
+        assert_eq!(
+            alerts(audit.read(project, None, None).await.unwrap().events),
+            1,
+            "the blindness alert fires exactly once per session"
+        );
+        assert_eq!(
+            injector.session_state(1),
+            Some(Working),
+            "alerting never moves the session"
+        );
+
+        // A reading arriving clears the count, so a later blind spell can
+        // alert again rather than being masked by the first one.
+        context.observe(&context_event(1, 10.0));
+        injector.tick();
+        assert!(injector.blind_ticks_view(1).is_none());
     }
 
     #[tokio::test]

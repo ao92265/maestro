@@ -2936,6 +2936,210 @@ mod tests {
         );
     }
 
+    /// The whole feature, from the context reading that arrives in a
+    /// transcript to the successor staged for spawn — the cycle a live run
+    /// performs, with only the PTY and the frontend's spawn call stubbed.
+    ///
+    /// Every step is the production one: a real file append parsed by the
+    /// real watcher, the real context store, the real trigger, the real
+    /// instruction text, the real git validation against a real repo whose
+    /// WIP is really committed. The agent is the only actor simulated — it
+    /// replies with the markers and does the work the instruction demands.
+    #[tokio::test]
+    async fn test_context_crossing_drives_the_whole_handoff_cycle() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-handoff-cycle";
+        let epic = "epic #113";
+        let session = 7u32;
+
+        // The session's working directory is a real repository.
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        h.dirs
+            .lock()
+            .unwrap()
+            .insert(session, repo.path().to_string_lossy().into_owned());
+
+        // The real watcher feeding the real context store, wired exactly as
+        // `lib.rs` wires its event tee.
+        let context = Arc::new(SamuraiContextStore::new());
+        let context_for_bus = context.clone();
+        let bus = Arc::new(crate::core::event_bus::EventBus::new(Arc::new(
+            move |event: ClaudeEvent| context_for_bus.observe(&event),
+        )));
+        let watcher = crate::core::transcript_watcher::TranscriptWatcher::new(bus);
+        let transcript = dir.path().join("cycle.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let transcript = transcript.canonicalize().unwrap();
+        watcher.start_watching(session, transcript.clone());
+
+        // The injector, chained into this replicator like production's.
+        let typed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let typed_rec = typed.clone();
+        let dirs_for_resolver = h.dirs.clone();
+        let session_dirs: SessionDirResolver =
+            Arc::new(move |id| dirs_for_resolver.lock().unwrap().get(&id).cloned());
+        let injector = SamuraiInjector::new(
+            h.supervisor.clone(),
+            context.clone(),
+            h.config.clone(),
+            Arc::new(
+                move |_, data: String, outcome: crate::core::samurai_pty::DeliveryOutcome| {
+                    typed_rec.lock().unwrap().push(data);
+                    outcome(Ok(()));
+                },
+            ),
+            h.audit.clone(),
+            session_dirs,
+            Some(h.replicator.clone()),
+        );
+
+        h.supervisor
+            .register_session(session, project.into(), epic.into(), 1)
+            .unwrap();
+        // The agent finished a turn, so an instruction can be typed at once.
+        injector.observe_hook(&ClaudeEvent::SessionEnded {
+            session_id: session,
+            reason: "stop".into(),
+            timestamp: "t".into(),
+        });
+
+        // Below the threshold: the tick must leave the session alone.
+        append_assistant_usage(&transcript, 300_000);
+        wait_until(|| context.percent(session) == Some(30.0)).await;
+        injector.tick();
+        assert_eq!(
+            state_of(&h.supervisor, session),
+            Some(SupervisorState::Working),
+            "30% is under the 40% default"
+        );
+        assert!(typed.lock().unwrap().is_empty(), "nothing typed under it");
+
+        // Crossing it: 441,033 tokens of a 1M window = 44.1%.
+        append_assistant_usage(&transcript, 441_033);
+        wait_until(|| context.percent(session) == Some(44.1)).await;
+        injector.tick();
+        assert_eq!(
+            state_of(&h.supervisor, session),
+            Some(SupervisorState::HandoffRequested)
+        );
+
+        // The instruction really was typed, and it is the handoff one.
+        use crate::core::samurai_injector::{ACK_TAG, WRITTEN_TAG};
+        let instruction = typed.lock().unwrap().join("");
+        assert!(
+            instruction.contains(ACK_TAG) && instruction.contains("Handoff requested"),
+            "the injected text must be the handoff instruction: {instruction}"
+        );
+        let relpath = samurai_prompts::handoff_file_relpath(epic, 1);
+        assert!(
+            instruction.contains(&relpath),
+            "it must name the gen-1 handoff file: {instruction}"
+        );
+
+        // The agent acknowledges, then does what it was told: commits WIP and
+        // writes the §6 file recording the post-commit HEAD.
+        injector.observe(&ClaudeEvent::AssistantMessage {
+            session_id: session,
+            uuid: "ack".into(),
+            text: format!(
+                "<{ACK_TAG}>{}</{ACK_TAG}>",
+                samurai_prompts::handoff_ack_value(1)
+            ),
+            model: "claude-opus-5".into(),
+            token_usage: None,
+            timestamp: "t".into(),
+        });
+        commit_wip(repo.path());
+        let head = read_repo_head(repo.path()).unwrap();
+        write_handoff(repo.path(), epic, 1, &head);
+        injector.observe(&ClaudeEvent::AssistantMessage {
+            session_id: session,
+            uuid: "written".into(),
+            text: format!(
+                "<{WRITTEN_TAG}>{}</{WRITTEN_TAG}>",
+                samurai_prompts::handoff_written_value(1)
+            ),
+            model: "claude-opus-5".into(),
+            token_usage: None,
+            timestamp: "t".into(),
+        });
+
+        // Validation → HANDOFF_WRITTEN → teardown → KILLED → successor staged.
+        wait_until(|| state_of(&h.supervisor, session) == Some(SupervisorState::Killed)).await;
+        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
+        assert_eq!(
+            *h.torn_down.lock().unwrap(),
+            vec![session],
+            "gen-1 is torn down"
+        );
+        let spawn = h.spawns.lock().unwrap()[0].clone();
+        assert_eq!(spawn.generation, 2, "the successor is generation 2");
+        let (_, ritual) = h.replicator.pending_view(2).unwrap();
+        assert!(
+            ritual.contains("SKIP"),
+            "HEAD matches the handoff, so the successor skips verify: {ritual}"
+        );
+
+        // The audit tells the whole story, in order.
+        let kinds: Vec<AuditEventKind> = h
+            .audit
+            .read(project, None, None)
+            .await
+            .unwrap()
+            .events
+            .into_iter()
+            .map(|r| r.event)
+            .filter(|k| *k != AuditEventKind::Inject)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                AuditEventKind::Spawn,
+                AuditEventKind::Handoff, // requested
+                AuditEventKind::Handoff, // written
+                AuditEventKind::Kill,    // gen-1 killed for the handoff
+            ],
+            "audit trail of a clean handoff"
+        );
+    }
+
+    /// Appends one assistant line whose usage sums to `context_tokens`, the
+    /// shape `claude-opus-5` writes: input + cache creation + cache read.
+    fn append_assistant_usage(transcript: &Path, context_tokens: u64) {
+        use std::io::Write;
+        let line = format!(
+            r#"{{"parentUuid":"u","isSidechain":false,"type":"assistant","message":{{"model":"claude-opus-5","id":"m","type":"message","role":"assistant","content":[{{"type":"text","text":"working"}}],"usage":{{"input_tokens":4,"output_tokens":120,"cache_creation_input_tokens":1029,"cache_read_input_tokens":{}}}}},"uuid":"a","timestamp":"2026-08-14T13:58:09.201Z"}}"#,
+            context_tokens - 1033
+        );
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(transcript)
+            .unwrap();
+        writeln!(f, "{line}").unwrap();
+    }
+
+    /// The WIP commit the handoff instruction demands, staging one named path.
+    fn commit_wip(dir: &Path) {
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .hide_console_window()
+                .output()
+                .expect("git must be runnable in tests");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        std::fs::write(dir.join("tracked.txt"), "v2\n").unwrap();
+        run(&["add", "tracked.txt"]);
+        run(&["commit", "-q", "-m", "feat(scratch): wip before handoff"]);
+    }
+
     // --- issue #56: recovery digest extraction ---
 
     /// A transcript user-message line with one text block.
