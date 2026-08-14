@@ -1,7 +1,8 @@
 /// <reference types="vitest/config" />
-import { defineConfig } from "vite";
+
 import react from "@vitejs/plugin-react";
 import path from "path";
+import { defineConfig } from "vite";
 
 const host = process.env.TAURI_DEV_HOST;
 
@@ -75,11 +76,6 @@ export default defineConfig(async () => ({
     // Without an explicit include, vitest also collects the full test suite
     // out of every stale agent worktree under .claude/worktrees.
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
-    exclude: [
-      "**/node_modules/**",
-      "**/dist/**",
-      "**/.claude/**",
-      "**/target/**",
-    ],
+    exclude: ["**/node_modules/**", "**/dist/**", "**/.claude/**", "**/target/**"],
   },
 }));

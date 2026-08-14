@@ -10,8 +10,8 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 import { listen } from "@tauri-apps/api/event";
 
-import { useAgentStore, type SubagentInfo } from "../useAgentStore";
-import { useSessionStore, type BackendSessionStatus, type SessionConfig } from "../useSessionStore";
+import { type SubagentInfo, useAgentStore } from "../useAgentStore";
+import { type BackendSessionStatus, type SessionConfig, useSessionStore } from "../useSessionStore";
 
 const listenMock = vi.mocked(listen);
 
@@ -37,7 +37,7 @@ function agent(
   sessionId: number,
   agentId: string,
   completedAt: number | null,
-  spawnedAt: string = new Date().toISOString()
+  spawnedAt: string = new Date().toISOString(),
 ): SubagentInfo {
   return {
     agentId,
@@ -98,7 +98,10 @@ function mcpStatus(sessionId: number, status: BackendSessionStatus, message: str
 
 describe("session status: the Stop hook vs. running subagents", () => {
   beforeAll(async () => {
-    listenMock.mockImplementation((async (_name: string, cb: (event: { payload: unknown }) => void) => {
+    listenMock.mockImplementation((async (
+      _name: string,
+      cb: (event: { payload: unknown }) => void,
+    ) => {
       handler = cb;
       return () => {};
     }) as unknown as typeof listen);

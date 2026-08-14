@@ -1,5 +1,5 @@
-import { create } from "zustand";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { create } from "zustand";
 import type { ClaudeEvent } from "@/types/claude-events";
 
 interface SessionActivity {
@@ -59,7 +59,7 @@ const EMPTY_SESSION: SessionActivity = Object.freeze(createEmptySession());
  */
 function foldEvents(
   sessions: Record<number, SessionActivity>,
-  batch: ClaudeEvent[]
+  batch: ClaudeEvent[],
 ): Record<number, SessionActivity> {
   // Mutable working copies, keyed by session. `events` is always a fresh array
   // so pushing into it never touches the previous state.

@@ -1,7 +1,11 @@
 import { useMemo } from "react";
-import { useSessionStore, type BackendSessionStatus, type SessionConfig } from "@/stores/useSessionStore";
-import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 import { samePath } from "@/lib/path";
+import {
+  type BackendSessionStatus,
+  type SessionConfig,
+  useSessionStore,
+} from "@/stores/useSessionStore";
+import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 
 /**
  * The sessions belonging to a project tab.
@@ -12,7 +16,7 @@ import { samePath } from "@/lib/path";
  */
 export function sessionsForTab(tab: WorkspaceTab, sessions: SessionConfig[]): SessionConfig[] {
   return sessions.filter(
-    (s) => tab.sessionIds.includes(s.id) && samePath(s.project_path, tab.projectPath)
+    (s) => tab.sessionIds.includes(s.id) && samePath(s.project_path, tab.projectPath),
   );
 }
 
@@ -24,13 +28,7 @@ export function sessionsForTab(tab: WorkspaceTab, sessions: SessionConfig[]): Se
  * need me?", and with several terminals per project something is almost always
  * working — ranking Working first hid every blocked terminal behind a busy one.
  */
-export type ProjectStatus =
-  | "idle"
-  | "starting"
-  | "working"
-  | "needs-input"
-  | "done"
-  | "error";
+export type ProjectStatus = "idle" | "starting" | "working" | "needs-input" | "done" | "error";
 
 /**
  * Maps backend session status to CSS color class names.
@@ -75,7 +73,7 @@ export function useProjectStatus(tabId: string): {
 
     // Count active sessions (not Done or Error)
     const activeSessionCount = projectSessions.filter(
-      (s) => s.status !== "Done" && s.status !== "Error"
+      (s) => s.status !== "Done" && s.status !== "Error",
     ).length;
 
     // Priority-based status aggregation

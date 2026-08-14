@@ -11,11 +11,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-import {
-  useSessionStore,
-  type BackendSessionStatus,
-  type SessionConfig,
-} from "../useSessionStore";
+import { type BackendSessionStatus, type SessionConfig, useSessionStore } from "../useSessionStore";
 
 const listenMock = vi.mocked(listen);
 const invokeMock = vi.mocked(invoke);
@@ -23,7 +19,7 @@ const invokeMock = vi.mocked(invoke);
 function session(
   id: number,
   status: BackendSessionStatus = "Idle",
-  projectPath = "C:/proj"
+  projectPath = "C:/proj",
 ): SessionConfig {
   return {
     id,
@@ -39,7 +35,7 @@ function session(
 let emitStatus: (
   sessionId: number,
   status: BackendSessionStatus | "AwaitingInput",
-  projectPath?: string
+  projectPath?: string,
 ) => void;
 
 beforeAll(async () => {

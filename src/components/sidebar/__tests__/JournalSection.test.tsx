@@ -1,6 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
+import { ask } from "@tauri-apps/plugin-dialog";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // The persisted zustand stores hydrate through the Tauri store plugin at
 // import time; happy-dom has no Tauri backend, so stub it out.
@@ -14,14 +15,17 @@ vi.mock("@tauri-apps/plugin-store", () => ({
   },
 }));
 
-import { JournalSection } from "../JournalSection";
-import type {
-  SamuraiJournalEntry,
-  SamuraiJournalEntryStatus,
-} from "@/lib/samurai";
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  ask: vi.fn(),
+}));
+
+import type { SamuraiJournalEntry, SamuraiJournalEntryStatus } from "@/lib/samurai";
+import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
+import { JournalSection } from "../JournalSection";
 
 const invokeMock = vi.mocked(invoke);
+const askMock = vi.mocked(ask);
 
 function buildTab(overrides: Partial<WorkspaceTab> = {}): WorkspaceTab {
   return {
@@ -39,49 +43,58 @@ function buildTab(overrides: Partial<WorkspaceTab> = {}): WorkspaceTab {
   };
 }
 
-type JournalRow = { entry: SamuraiJournalEntry; status: SamuraiJournalEntryStatus };
+type JournalRow = { entry: SamuraiJournalEntry; status: SamuraiJournalEntryStatus; raw: string };
 
 function journalRow(
   overrides: Partial<SamuraiJournalEntry> = {},
   status: SamuraiJournalEntryStatus = "UNCONSUMED",
 ): JournalRow {
-  return {
-    entry: {
-      ts: "2026-08-06T10:00:00Z",
-      category: "BOTTLENECK",
-      text: "CI queue blocked for an hour",
-      project: "C:\\git\\maestro",
-      ...overrides,
-    },
-    status,
+  const entry: SamuraiJournalEntry = {
+    ts: "2026-08-06T10:00:00Z",
+    category: "BOTTLENECK",
+    text: "CI queue blocked for an hour",
+    project: "C:\\git\\maestro",
+    ...overrides,
   };
+  // The identity `samurai_journal_delete` matches on — a real backend hands
+  // back the entry's exact on-disk JSONL text; any string unique per entry
+  // is enough to exercise the round trip here.
+  return { entry, status, raw: JSON.stringify(entry) };
 }
 
 /**
  * Routes the global invoke mock. `rows` is mutated by `samurai_journal_add`
- * (newest LAST, like the backend) so a post-add refresh shows the new entry;
- * `harvestError` makes `samurai_harvest_run` reject with that string.
+ * (newest LAST, like the backend) so a post-add refresh shows the new entry,
+ * and by `samurai_journal_delete` (removes the row whose `raw` matches,
+ * rejecting like the backend when nothing matches). There is no harvest
+ * command here on purpose (issue #98): the click only lists the journal and
+ * queues a pending launch.
  */
-function mockInvoke(rows: JournalRow[], opts: { fileSizeBytes?: number; harvestError?: string } = {}) {
+function mockInvoke(rows: JournalRow[], opts: { fileSizeBytes?: number } = {}) {
   invokeMock.mockImplementation(async (cmd: string, args?: unknown) => {
     switch (cmd) {
       case "samurai_journal_list":
         return { entries: rows, file_size_bytes: opts.fileSizeBytes ?? 2048 };
       case "samurai_journal_add": {
         const { category, text, project } = args as SamuraiJournalEntry & { project?: string };
-        rows.push({
-          entry: { ts: new Date().toISOString(), category, text, project },
-          status: "UNCONSUMED",
-        });
+        const entry: SamuraiJournalEntry = {
+          ts: new Date().toISOString(),
+          category,
+          text,
+          project,
+        };
+        rows.push({ entry, status: "UNCONSUMED", raw: JSON.stringify(entry) });
         return undefined;
       }
-      case "samurai_harvest_run":
-        if (opts.harvestError) throw opts.harvestError;
-        return {
-          date: "2026-08-06",
-          markdown: "# Harvest 2026-08-06",
-          generated_at: "2026-08-06T18:00:00Z",
-        };
+      case "samurai_journal_delete": {
+        const { raw } = args as { raw: string };
+        const remaining = rows.filter((r) => r.raw !== raw);
+        const removed = rows.length - remaining.length;
+        rows.length = 0;
+        rows.push(...remaining);
+        if (removed === 0) throw "journal entry not found";
+        return removed;
+      }
       default:
         return undefined;
     }
@@ -91,7 +104,9 @@ function mockInvoke(rows: JournalRow[], opts: { fileSizeBytes?: number; harvestE
 describe("JournalSection (issue #71)", () => {
   beforeEach(() => {
     invokeMock.mockReset();
+    askMock.mockReset();
     useWorkspaceStore.setState({ tabs: [buildTab()] });
+    usePendingLaunchStore.setState({ pending: [] });
   });
 
   it("renders entries newest-first with category badges and harvest statuses", async () => {
@@ -148,16 +163,34 @@ describe("JournalSection (issue #71)", () => {
     expect(input).toHaveValue("");
   });
 
-  it("runs the harvest, shows the success notice and tells the parent", async () => {
-    const onHarvested = vi.fn();
+  // Issue #98: "Harvest now" opens an interactive triage session instead of
+  // running a headless report — the click queues a pending launch for the
+  // active tab's grid (the History-tab mechanism) and mounts the grid.
+  it("opens a harvest triage session via the pending-launch store", async () => {
     mockInvoke([journalRow()]);
-    render(<JournalSection onHarvested={onHarvested} />);
+    render(<JournalSection />);
     expect(await screen.findByText("CI queue blocked for an hour")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Harvest now" }));
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("samurai_harvest_run"));
-    expect(await screen.findByText("Report 2026-08-06 written — see Files")).toBeInTheDocument();
-    await waitFor(() => expect(onHarvested).toHaveBeenCalledTimes(1));
+
+    await waitFor(() => expect(usePendingLaunchStore.getState().pending).toHaveLength(1));
+    expect(usePendingLaunchStore.getState().pending[0]).toMatchObject({
+      tabId: "tab-1",
+      mode: "Claude",
+      resumeSessionId: null,
+      // The active project's MAIN checkout — the journal is account-wide,
+      // no worktree is derived.
+      workingDirOverride: "C:\\git\\maestro",
+      customName: "harvest triage",
+      harvest: true,
+    });
+    // The grid must be (re)mounted to consume the request.
+    expect(useWorkspaceStore.getState().tabs[0].sessionsLaunched).toBe(true);
+    expect(
+      await screen.findByText("Triage session opened — 1 entry will be injected there"),
+    ).toBeInTheDocument();
+    // No headless run: the only backend calls are journal lists/adds.
+    expect(invokeMock).not.toHaveBeenCalledWith("samurai_harvest_run");
   });
 
   it("keeps the last good rows when a refresh fails", async () => {
@@ -183,9 +216,7 @@ describe("JournalSection (issue #71)", () => {
 
   it("badges the full journal entry count, not the rendered tail", async () => {
     // Fix m6c: 60 entries, only the newest 50 render — the badge says 60.
-    const rows = Array.from({ length: 60 }, (_, i) =>
-      journalRow({ text: `entry ${i}` }),
-    );
+    const rows = Array.from({ length: 60 }, (_, i) => journalRow({ text: `entry ${i}` }));
     mockInvoke(rows);
     render(<JournalSection />);
 
@@ -195,19 +226,78 @@ describe("JournalSection (issue #71)", () => {
     expect(screen.getByText("60")).toBeInTheDocument();
   });
 
-  it("surfaces the harvest error string inline, matter-of-fact", async () => {
-    const onHarvested = vi.fn();
-    mockInvoke([], {
-      harvestError: "Nothing to harvest — no unconsumed journal entries.",
-    });
-    render(<JournalSection onHarvested={onHarvested} />);
-    expect(await screen.findByText("No journal entries yet.")).toBeInTheDocument();
+  it("refuses to open a session when nothing is unconsumed", async () => {
+    // Issue #98: an empty (or fully consumed) journal shows the pinned
+    // refusal WITHOUT opening a terminal — no launch is queued.
+    mockInvoke([journalRow({}, "CONSUMED")]);
+    render(<JournalSection />);
+    expect(await screen.findByText("CI queue blocked for an hour")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Harvest now" }));
     expect(
       await screen.findByText("Nothing to harvest — no unconsumed journal entries."),
     ).toBeInTheDocument();
-    expect(screen.queryByText(/written — see Files/)).toBeNull();
-    expect(onHarvested).not.toHaveBeenCalled();
+    expect(usePendingLaunchStore.getState().pending).toHaveLength(0);
+    expect(screen.queryByText(/Triage session opened/)).toBeNull();
+  });
+
+  // Issue #100: per-entry delete with a guarded confirm.
+  it("deletes an entry only after confirming; cancel does nothing", async () => {
+    const rows = [journalRow({ text: "delete me" })];
+    const raw = rows[0].raw;
+    mockInvoke(rows);
+    render(<JournalSection />);
+    expect(await screen.findByText("delete me")).toBeInTheDocument();
+
+    const deleteBtn = screen.getByRole("button", { name: "Delete journal entry: delete me" });
+
+    // Cancel: the confirm is asked, but nothing is deleted.
+    askMock.mockResolvedValueOnce(false);
+    fireEvent.click(deleteBtn);
+    await waitFor(() => expect(askMock).toHaveBeenCalledTimes(1));
+    expect(invokeMock).not.toHaveBeenCalledWith("samurai_journal_delete", expect.anything());
+    expect(screen.getByText("delete me")).toBeInTheDocument();
+
+    // Confirm: deletes by the row's raw identity and refreshes.
+    askMock.mockResolvedValueOnce(true);
+    fireEvent.click(deleteBtn);
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("samurai_journal_delete", { raw }));
+    expect(await screen.findByText("Deleted journal entry.")).toBeInTheDocument();
+    expect(screen.queryByText("delete me")).toBeNull();
+  });
+
+  it("deletes a CONSUMED entry too — harvest status does not gate the delete control", async () => {
+    mockInvoke([journalRow({ text: "already harvested" }, "CONSUMED")]);
+    render(<JournalSection />);
+    expect(await screen.findByText("already harvested")).toBeInTheDocument();
+
+    askMock.mockResolvedValueOnce(true);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Delete journal entry: already harvested" }),
+    );
+    await waitFor(() => expect(screen.queryByText("already harvested")).toBeNull());
+  });
+
+  it("surfaces the backend error when a delete fails", async () => {
+    const rows = [journalRow({ text: "will fail" })];
+    mockInvoke(rows);
+    render(<JournalSection />);
+    expect(await screen.findByText("will fail")).toBeInTheDocument();
+
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "samurai_journal_list") return { entries: rows, file_size_bytes: 1024 };
+      if (cmd === "samurai_journal_delete") {
+        throw "journal entry not found — it may already be gone, or a harvest changed it";
+      }
+      return undefined;
+    });
+    askMock.mockResolvedValueOnce(true);
+    fireEvent.click(screen.getByRole("button", { name: "Delete journal entry: will fail" }));
+
+    expect(
+      await screen.findByText(/journal entry not found — it may already be gone/),
+    ).toBeInTheDocument();
+    // The failed delete did not remove the row.
+    expect(screen.getByText("will fail")).toBeInTheDocument();
   });
 });

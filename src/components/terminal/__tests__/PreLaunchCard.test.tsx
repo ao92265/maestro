@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { PreLaunchCard, type SessionSlot } from "../PreLaunchCard";
 
 vi.mock("@/lib/terminal", () => ({
@@ -8,7 +8,6 @@ vi.mock("@/lib/terminal", () => ({
     .mockResolvedValue({ sessions: [], total_found: 0, truncated: false, unreadable: 0 }),
   deleteClaudeSession: vi.fn().mockResolvedValue(undefined),
 }));
-
 
 describe("PreLaunchCard branch creation", () => {
   const makeSlot = (overrides?: Partial<SessionSlot>): SessionSlot => ({
@@ -141,7 +140,7 @@ describe("PreLaunchCard branch creation", () => {
 
     await waitFor(() => {
       expect(
-        screen.getByText("Invalid name. Use letters, numbers, dots, dashes, slashes.")
+        screen.getByText("Invalid name. Use letters, numbers, dots, dashes, slashes."),
       ).toBeInTheDocument();
     });
     expect(onCreateBranch).not.toHaveBeenCalled();

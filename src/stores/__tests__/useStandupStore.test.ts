@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The persisted store hydrates through the Tauri store plugin at import time;
 // happy-dom has no Tauri backend, so stub it out.
@@ -14,7 +14,7 @@ vi.mock("@tauri-apps/plugin-store", () => ({
   },
 }));
 
-import { localDateString, useStandupStore, type StandupReport } from "../useStandupStore";
+import { localDateString, type StandupReport, useStandupStore } from "../useStandupStore";
 
 const invokeMock = vi.mocked(invoke);
 
@@ -156,7 +156,7 @@ describe("useStandupStore", () => {
     });
     expect(invokeMock).not.toHaveBeenCalledWith(
       "generate_standup_report",
-      expect.objectContaining({ projectPath: "C:/git/bad" })
+      expect.objectContaining({ projectPath: "C:/git/bad" }),
     );
     expect(useStandupStore.getState().reports["C:/git/bad"].status).toBe("error");
     expect(useStandupStore.getState().reports["C:/git/good"].status).toBe("ready");
@@ -168,7 +168,10 @@ describe("useStandupStore", () => {
   it("loadLatest does not clobber a slot taken while it was reading", async () => {
     let resolveLoad!: (r: StandupReport | null) => void;
     invokeMock.mockImplementationOnce(
-      () => new Promise<StandupReport | null>((res) => (resolveLoad = res))
+      () =>
+        new Promise<StandupReport | null>((res) => {
+          resolveLoad = res;
+        }),
     );
     const pending = useStandupStore.getState().loadLatest("C:/git/proj");
     // A generation fails and takes the slot while the disk read is in flight.

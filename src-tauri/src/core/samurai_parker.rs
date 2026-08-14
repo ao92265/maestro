@@ -462,6 +462,14 @@ impl SamuraiParker {
 
     /// Sweep complete: arm one timer per parked/absorbed (project, epic),
     /// then — and only then — clear the engaged flag (issue #60 point 6).
+    ///
+    /// A timer CAN be armed here for a run whose config is already
+    /// COMPLETED (verification can flip it while the orchestrator's session
+    /// is still live and parkable). That is deliberate: every park timer
+    /// funnels through `SamuraiResumer::on_fire`, whose ACTIVE-run gate
+    /// (review F2) drops stale timers instead of spawning — duplicating
+    /// that gate here would only add a run-config dependency for noise
+    /// reduction.
     fn complete_sweep(&self, state: &mut SweepState) {
         let parked_epics = std::mem::take(&mut state.parked_epics);
         let resets_at = state.resets_at.take();

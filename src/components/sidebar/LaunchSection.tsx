@@ -1,3 +1,4 @@
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import {
   AlertTriangle,
@@ -14,23 +15,27 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { samePath } from "@/lib/path";
 import {
+  type SamuraiPreflight,
+  type SamuraiRunListEntry,
+  type SamuraiRunOrchestrator,
+  type SamuraiSupervisorState,
+  type SamuraiTestGateProgress,
   samuraiCleanupEpic,
   samuraiLaunchRun,
   samuraiListRuns,
   samuraiPreflight,
-  type SamuraiPreflight,
-  type SamuraiRunConfig,
-  type SamuraiSupervisorState,
 } from "@/lib/samurai";
 import type { UsageData } from "@/lib/usageParser";
+import { workflowGraphForLaunch } from "@/stores/useSamuraiWorkflowStore";
 import {
   SAMURAI_TILE_CLOSE_STATES,
-  useSessionStore,
   type SamuraiSessionInfo,
+  useSessionStore,
 } from "@/stores/useSessionStore";
 import { useUsageStore } from "@/stores/useUsageStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 import { cardClass, SectionHeader } from "./sectionChrome";
+import { WorkflowGraphEditor } from "./WorkflowGraphEditor";
 
 /** Last path segment, for compact project display. */
 function baseName(path: string): string {
@@ -99,6 +104,70 @@ function allowanceClass(left: number | null): string {
   if (left <= 10) return "text-maestro-red";
   if (left <= 25) return "text-maestro-orange";
   return "text-maestro-green";
+}
+
+/** Compact token-count display: `1_000_000` -> `1M`, `200_000` -> `200K`. */
+function formatContextWindow(tokens: number): string {
+  if (tokens >= 1_000_000) {
+    const millions = tokens / 1_000_000;
+    return `${Number.isInteger(millions) ? millions : millions.toFixed(1)}M`;
+  }
+  if (tokens >= 1_000) return `${Math.round(tokens / 1000)}K`;
+  return String(tokens);
+}
+
+/** Context-fill meter colouring: green plenty of room, amber filling up, red
+ *  near the handoff trigger — the inverse of `allowanceClass` (here HIGH is
+ *  the concerning direction). */
+function contextMeterClass(percent: number): string {
+  if (percent >= 80) return "bg-maestro-red";
+  if (percent >= 50) return "bg-maestro-orange";
+  return "bg-maestro-green";
+}
+
+/**
+ * One run row's orchestrator details (issue #102): model, generation,
+ * session id, and — while the run is still live — a small context-fill
+ * meter. A COMPLETED run's context reading is no longer live (its terminal
+ * has torn down), so the meter is omitted rather than showing a frozen or
+ * absent number under a "live" bar. Missing individual fields (no session
+ * registered yet) render as a dash, never a guess.
+ */
+function OrchestratorDetails({
+  orchestrator,
+  showLiveContext,
+}: {
+  orchestrator: SamuraiRunOrchestrator;
+  showLiveContext: boolean;
+}) {
+  const { generation, session_id, model, context_window, context_percent } = orchestrator;
+  return (
+    <div className="flex items-center gap-1.5 pl-1 text-[10px] text-maestro-muted">
+      <span className="min-w-0 flex-1 truncate" title={model ?? undefined}>
+        {model ?? "—"}
+      </span>
+      <span className="shrink-0">Gen {generation ?? "—"}</span>
+      <span className="shrink-0" title={session_id != null ? `Session ${session_id}` : undefined}>
+        Session {session_id ?? "—"}
+      </span>
+      {showLiveContext && (
+        <span className="flex shrink-0 items-center gap-1 tabular-nums">
+          <span className="h-1 w-8 overflow-hidden rounded-full bg-maestro-border/60">
+            {context_percent != null && (
+              <span
+                className={`block h-full ${contextMeterClass(context_percent)}`}
+                style={{ width: `${Math.min(100, Math.max(0, context_percent))}%` }}
+              />
+            )}
+          </span>
+          <span>
+            {context_percent != null ? `${context_percent}%` : "—"}
+            {context_window != null ? ` / ${formatContextWindow(context_window)}` : ""}
+          </span>
+        </span>
+      )}
+    </div>
+  );
 }
 
 /** One pass/fail preflight row. */
@@ -212,6 +281,12 @@ function ModelPicker({
   );
 }
 
+/** Stable per-row identity — project + epic, matching the list `key` (an
+ *  epic name alone is not unique across projects). */
+function runKey(run: SamuraiRunListEntry): string {
+  return `${run.project_path}-${run.epic}`;
+}
+
 /** Where a run's live agent sits, or why it cannot be opened (issue #84). */
 type OpenTarget =
   | { kind: "open"; tabId: string; sessionId: number }
@@ -244,7 +319,7 @@ const CLOSED_TILE_REASON: Partial<Record<SamuraiSupervisorState, string>> = {
  * running the same epic number.
  */
 function findOpenTarget(
-  run: SamuraiRunConfig,
+  run: SamuraiRunListEntry,
   samuraiBySessionId: Record<number, SamuraiSessionInfo>,
   tabs: WorkspaceTab[],
 ): OpenTarget {
@@ -278,62 +353,99 @@ function findOpenTarget(
   return { kind: "open", tabId: tab.id, sessionId: live.sessionId };
 }
 
-/** One active run with its open-the-agent and cleanup actions. */
+/** One listed run (live or finished-awaiting-cleanup) with its
+ *  open-the-agent and cleanup actions. */
 function RunRow({
   run,
   target,
   onOpen,
   onCleanup,
-  busy,
+  pending,
+  otherBusy,
+  error,
 }: {
-  run: SamuraiRunConfig;
+  run: SamuraiRunListEntry;
   target: OpenTarget;
   onOpen: (tabId: string, sessionId: number) => void;
-  onCleanup: (run: SamuraiRunConfig) => void;
-  busy: boolean;
+  onCleanup: (run: SamuraiRunListEntry) => void;
+  /** Issue #99: this exact row's cleanup is in flight — spinner + dimmed row
+   *  until the backend answers, so the click reads as "working" immediately
+   *  instead of doing nothing for several seconds. */
+  pending: boolean;
+  /** A different row's cleanup is in flight — this row waits too, so two
+   *  cleanups never race. */
+  otherBusy: boolean;
+  /** The last cleanup attempt for this row failed — shown in place rather
+   *  than silently reverting to the pre-click row (issue #99). */
+  error: string | null;
 }) {
+  const isCompleted = run.status === "COMPLETED";
   const open = target.kind === "open" ? target : null;
   const openHint = target.kind === "open" ? OPEN_HINT : target.reason;
   return (
     <div
-      className="flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] hover:bg-maestro-surface"
+      className={`rounded px-1 py-0.5 hover:bg-maestro-surface ${pending ? "opacity-60" : ""}`}
       title={`worktree: ${run.worktree_path}\nrepo pin: ${run.repo_pin ?? "none"}\ncreated: ${run.created_at}`}
     >
-      <span className="shrink-0 rounded bg-maestro-green/20 px-1 py-px text-[9px] font-bold tracking-wide text-maestro-green">
-        ACTIVE
-      </span>
-      <span className="min-w-0 flex-1 truncate text-maestro-text">
-        {/* Already the readable label since issue #83 (`epic #5 · issues #7,
-            #9`), and a single raw ref (`#38`) for configs written before it —
-            rendering the stored string is what keeps both shapes right. */}
-        {run.epic}
-        <span className="text-maestro-muted"> · {baseName(run.project_path)}</span>
-        {run.model ? <span className="text-maestro-muted"> · {run.model}</span> : null}
-      </span>
-      {/* The reason rides the wrapper, not the button: a disabled button takes
-          no pointer events, so its own `title` would never surface — and the
-          row's worktree tooltip would answer the hover instead. */}
-      <span className="flex shrink-0" title={openHint}>
+      <div className="flex items-center gap-1.5 text-[11px]">
+        {/* Issue #96: a COMPLETED run is verified finished (all issues closed,
+            PR open) and only awaits the manual cleanup — visually distinct
+            from a live ACTIVE run. */}
+        {isCompleted ? (
+          <span
+            className="shrink-0 rounded bg-maestro-accent/20 px-1 py-px text-[9px] font-bold tracking-wide text-maestro-accent"
+            title="Run verified complete — every issue closed, PR open. Awaiting cleanup."
+          >
+            FINISHED
+          </span>
+        ) : (
+          <span className="shrink-0 rounded bg-maestro-green/20 px-1 py-px text-[9px] font-bold tracking-wide text-maestro-green">
+            ACTIVE
+          </span>
+        )}
+        <span className="min-w-0 flex-1 truncate text-maestro-text">
+          {/* Already the readable label since issue #83 (`epic #5 · issues #7,
+              #9`), and a single raw ref (`#38`) for configs written before it —
+              rendering the stored string is what keeps both shapes right. */}
+          {run.epic}
+          <span className="text-maestro-muted"> · {baseName(run.project_path)}</span>
+        </span>
+        {/* The reason rides the wrapper, not the button: a disabled button takes
+            no pointer events, so its own `title` would never surface — and the
+            row's worktree tooltip would answer the hover instead. */}
+        <span className="flex shrink-0" title={openHint}>
+          <button
+            type="button"
+            onClick={() => open && onOpen(open.tabId, open.sessionId)}
+            disabled={open === null}
+            className="rounded p-1 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-accent disabled:opacity-40"
+            aria-label={`Open the agent for run ${run.epic}`}
+          >
+            <TerminalSquare size={12} />
+          </button>
+        </span>
         <button
           type="button"
-          onClick={() => open && onOpen(open.tabId, open.sessionId)}
-          disabled={open === null}
-          className="rounded p-1 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-accent disabled:opacity-40"
-          aria-label={`Open the agent for run ${run.epic}`}
+          onClick={() => onCleanup(run)}
+          disabled={pending || otherBusy}
+          className="rounded p-1 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-red disabled:opacity-40"
+          aria-label={`Clean up run ${run.epic}`}
+          title="Delete this run's worktree and branch, cancel its timer, archive its run config (asks first)"
         >
-          <TerminalSquare size={12} />
+          {pending ? <Loader2 size={12} className="animate-spin" /> : <Trash2 size={12} />}
         </button>
-      </span>
-      <button
-        type="button"
-        onClick={() => onCleanup(run)}
-        disabled={busy}
-        className="rounded p-1 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-red disabled:opacity-40"
-        aria-label={`Clean up run ${run.epic}`}
-        title="Delete this run's worktree and branch, cancel its timer, archive its run config (asks first)"
-      >
-        <Trash2 size={12} />
-      </button>
+      </div>
+      {/* Issue #102: the orchestrator's live details — a COMPLETED run's
+          context reading is no longer live, so the meter is omitted. */}
+      <OrchestratorDetails orchestrator={run.orchestrator} showLiveContext={!isCompleted} />
+      {error && (
+        <p className="mt-0.5 flex items-center gap-1 pl-1 text-[10px] text-maestro-red">
+          <XCircle size={10} className="shrink-0" />
+          <span className="min-w-0 flex-1 truncate" title={error}>
+            {error}
+          </span>
+        </p>
+      )}
     </div>
   );
 }
@@ -366,6 +478,14 @@ const PHASE_LABEL: Record<LaunchPhase, string> = {
   preflight: "Checking gh auth + allowance…",
   spawning: "Creating worktree, spawning gen-1…",
 };
+
+/** Gate steps that are still running (issue #90b) — the ones worth a live
+ *  progress row; `passed`/`failed` resolve through the launch promise. */
+const GATE_RUNNING_STEPS: SamuraiTestGateProgress["step"][] = [
+  "bootstrap_npm",
+  "bootstrap_mcp",
+  "cargo_test",
+];
 
 /**
  * Samurai run launcher (issue #63, PRD §5.8 + §9): the form that starts an
@@ -405,6 +525,14 @@ export function LaunchSection({
   // Review F4: optional per-run handoff trigger override. Empty = the
   // global config applies (backend stores thresholds: None).
   const [handoffPct, setHandoffPct] = useState("");
+  // Issue #90b: the explicit red-baseline override. Default OFF — the gate
+  // runs and a red `cargo test --workspace` blocks the launch.
+  const [skipGate, setSkipGate] = useState(false);
+  // The latest test-gate tick plus when it arrived, so the elapsed display
+  // keeps counting between backend ticks (cargo test is one long step).
+  const [gate, setGate] = useState<{ progress: SamuraiTestGateProgress; at: number } | null>(null);
+  // 1 Hz re-render while the gate line is showing (drives the elapsed time).
+  const [, setGateTick] = useState(0);
   const [preflight, setPreflight] = useState<SamuraiPreflight | null>(null);
   // The project a running launch belongs to — a result that outlives a tab
   // switch is dropped rather than applied to the newly active project.
@@ -413,8 +541,12 @@ export function LaunchSection({
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   // null = loading.
-  const [runs, setRuns] = useState<SamuraiRunConfig[] | null>(null);
-  const [cleaningEpic, setCleaningEpic] = useState<string | null>(null);
+  const [runs, setRuns] = useState<SamuraiRunListEntry[] | null>(null);
+  // Issue #99: which row's cleanup is in flight (keyed like the list — an
+  // epic name alone is not unique across projects), plus the last failed
+  // row's error so the row can render it in place.
+  const [deletingKey, setDeletingKey] = useState<string | null>(null);
+  const [rowError, setRowError] = useState<{ key: string; message: string } | null>(null);
 
   const refreshRuns = useCallback(async () => {
     try {
@@ -436,7 +568,43 @@ export function LaunchSection({
     setPreflight(null);
     setError(null);
     setNotice(null);
+    setGate(null);
   }, [projectPath]);
+
+  // Issue #90b: live test-gate progress. The backend streams one tick per
+  // gate step during the launch; other projects' ticks are skipped (the
+  // AuditSection subscription pattern).
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: UnlistenFn | null = null;
+    listen<SamuraiTestGateProgress>("samurai-test-gate-event", (e) => {
+      if (!samePath(e.payload.project, currentProjectRef.current)) return;
+      setGate({ progress: e.payload, at: Date.now() });
+    })
+      .then((fn) => {
+        if (disposed) {
+          fn();
+          return;
+        }
+        unlisten = fn;
+      })
+      .catch(() => {
+        // Event system unavailable (tests) — the launch still resolves.
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  // Tick the elapsed display once a second while a gate step is running.
+  const gateRunning =
+    phase === "spawning" && gate !== null && GATE_RUNNING_STEPS.includes(gate.progress.step);
+  useEffect(() => {
+    if (!gateRunning) return;
+    const id = setInterval(() => setGateTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, [gateRunning]);
 
   const epicRefs = useMemo(() => refParts(epics), [epics]);
   const issueRefs = useMemo(() => refParts(issues), [issues]);
@@ -484,6 +652,7 @@ export function LaunchSection({
     setError(null);
     setNotice(null);
     setPreflight(null);
+    setGate(null);
 
     // Phase 1 — preflight. The backend re-runs it inside the launch anyway;
     // running it here first is what lets a failure render as pass/fail rows
@@ -511,10 +680,23 @@ export function LaunchSection({
       return;
     }
 
-    // Phase 2 — the launch proper.
+    // Phase 2 — the launch proper (worktree → test gate → gen-1 spawn).
     setPhase("spawning");
     try {
-      const result = await samuraiLaunchRun(target, epicRefs, issueRefs, model.trim() || null, pct);
+      // Issue #91: the edited workflow graph (null = never edited — the
+      // backend then compiles its default template), read behind the store's
+      // hydration gate so a launch right after app start can't send null
+      // while an edit still sits on disk.
+      const workflow = await workflowGraphForLaunch();
+      const result = await samuraiLaunchRun(
+        target,
+        epicRefs,
+        issueRefs,
+        model.trim() || null,
+        pct,
+        skipGate,
+        workflow,
+      );
       if (currentProjectRef.current !== target) return;
       setNotice(
         `Run launched: ${result.epic} on ${result.branch} (worktree ${result.worktree_path})${result.stale_timer_cancelled ? " — stale resume timer cancelled" : ""}`,
@@ -528,10 +710,11 @@ export function LaunchSection({
       if (currentProjectRef.current === target) setError(String(err));
     } finally {
       setPhase(null);
+      setGate(null);
     }
   };
 
-  const handleCleanup = async (run: SamuraiRunConfig) => {
+  const handleCleanup = async (run: SamuraiRunListEntry) => {
     // Destructive, never silent (PRD §5.9) — same ask() confirm pattern as
     // the audit clear.
     const confirmed = await ask(
@@ -539,7 +722,12 @@ export function LaunchSection({
       { title: "Clean Up Run", kind: "warning" },
     ).catch(() => false);
     if (!confirmed) return;
-    setCleaningEpic(run.epic);
+    const key = runKey(run);
+    // Issue #99: pending lands in the same tick as the confirm, before the
+    // backend call even starts — the row shows a spinner immediately rather
+    // than sitting inert for the several seconds the delete actually takes.
+    setDeletingKey(key);
+    setRowError(null);
     setError(null);
     setNotice(null);
     try {
@@ -558,9 +746,12 @@ export function LaunchSection({
       );
       await refreshRuns();
     } catch (err) {
-      setError(String(err));
+      // Surfaced on the row itself rather than the form's error line —
+      // reverting to the pre-click row with no explanation would look like
+      // nothing happened (issue #99).
+      setRowError({ key, message: String(err) });
     } finally {
-      setCleaningEpic(null);
+      setDeletingKey(null);
     }
   };
 
@@ -665,6 +856,25 @@ export function LaunchSection({
             </p>
           </div>
 
+          <div>
+            <label
+              className="flex items-center gap-1.5 text-[11px] text-maestro-text"
+              title="The launch bootstraps the epic worktree (npm install, mcp-server build) and runs `cargo test --workspace` in it first; a red suite blocks the launch. Tick this to skip that gate and launch anyway."
+            >
+              <input
+                type="checkbox"
+                checked={skipGate}
+                onChange={(e) => setSkipGate(e.target.checked)}
+                disabled={phase !== null}
+                className="h-3 w-3 accent-maestro-accent"
+              />
+              Skip test-suite gate
+            </label>
+            <p className="mt-0.5 text-[10px] leading-snug text-maestro-muted">
+              Off (default): the launch runs the worktree's test suite first and blocks on red.
+            </p>
+          </div>
+
           <div className="flex items-start gap-1.5 rounded border border-maestro-orange/40 bg-maestro-orange/10 p-1.5 text-[10px] leading-snug text-maestro-text">
             <AlertTriangle size={12} className="mt-px shrink-0 text-maestro-orange" />
             <span>
@@ -683,7 +893,14 @@ export function LaunchSection({
             {phase ? (
               <span className="flex items-center justify-center gap-1.5">
                 <Loader2 size={11} className="animate-spin" />
-                {PHASE_LABEL[phase]}
+                {/* Issue #90b: while the test gate runs, its live step (with
+                    elapsed time, ticking between backend events) replaces
+                    the generic spawning label. */}
+                {gateRunning && gate
+                  ? `${gate.progress.detail} · ${
+                      gate.progress.elapsed_secs + Math.floor((Date.now() - gate.at) / 1000)
+                    }s`
+                  : PHASE_LABEL[phase]}
               </span>
             ) : (
               "Launch"
@@ -756,27 +973,36 @@ export function LaunchSection({
           </p>
         ) : (
           <div className="space-y-0.5">
-            {runs.map((run) => (
-              <RunRow
-                key={`${run.project_path}-${run.epic}`}
-                run={run}
-                // No route out of the sidebar means the button cannot do what
-                // it offers, so it must not offer it — "no silent no-op"
-                // applies to a missing `onNavigate` exactly as it does to a
-                // missing session.
-                target={
-                  onNavigate
-                    ? findOpenTarget(run, samuraiBySessionId, tabs)
-                    : { kind: "blocked", reason: NO_SESSION_REASON }
-                }
-                onOpen={(tabId, sessionId) => onNavigate?.(tabId, sessionId)}
-                onCleanup={handleCleanup}
-                busy={cleaningEpic !== null}
-              />
-            ))}
+            {runs.map((run) => {
+              const key = runKey(run);
+              return (
+                <RunRow
+                  key={key}
+                  run={run}
+                  // No route out of the sidebar means the button cannot do what
+                  // it offers, so it must not offer it — "no silent no-op"
+                  // applies to a missing `onNavigate` exactly as it does to a
+                  // missing session.
+                  target={
+                    onNavigate
+                      ? findOpenTarget(run, samuraiBySessionId, tabs)
+                      : { kind: "blocked", reason: NO_SESSION_REASON }
+                  }
+                  onOpen={(tabId, sessionId) => onNavigate?.(tabId, sessionId)}
+                  onCleanup={handleCleanup}
+                  pending={deletingKey === key}
+                  otherBusy={deletingKey !== null && deletingKey !== key}
+                  error={rowError?.key === key ? rowError.message : null}
+                />
+              );
+            })}
           </div>
         )}
       </div>
+
+      {/* Issue #91: the run workflow the briefs compile from — edited here,
+          persisted across restarts, sent with the launch above. */}
+      <WorkflowGraphEditor />
     </div>
   );
 }

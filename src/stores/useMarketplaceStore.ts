@@ -21,8 +21,8 @@ import {
   uninstallPlugin,
 } from "@/lib/marketplace";
 import type {
-  InstallScope,
   InstalledPlugin,
+  InstallScope,
   MarketplaceFilters,
   MarketplacePlugin,
   MarketplaceSource,
@@ -108,10 +108,7 @@ interface MarketplaceState {
   setSearchText: (text: string) => void;
 
   /** Sets a filter value. */
-  setFilter: <K extends keyof MarketplaceFilters>(
-    key: K,
-    value: MarketplaceFilters[K]
-  ) => void;
+  setFilter: <K extends keyof MarketplaceFilters>(key: K, value: MarketplaceFilters[K]) => void;
 
   /** Clears all filters. */
   clearFilters: () => void;
@@ -126,7 +123,7 @@ interface MarketplaceState {
   installPlugin: (
     pluginId: string,
     scope: InstallScope,
-    projectPath?: string
+    projectPath?: string,
   ) => Promise<InstalledPlugin | null>;
 
   /** Uninstalls a plugin. */
@@ -291,9 +288,7 @@ export const useMarketplaceStore = create<MarketplaceState>()((set, get) => ({
       set((state) => ({
         sources: state.sources.filter((s) => s.id !== sourceId),
         // Also remove plugins from this source
-        availablePlugins: state.availablePlugins.filter(
-          (p) => p.marketplace_id !== sourceId
-        ),
+        availablePlugins: state.availablePlugins.filter((p) => p.marketplace_id !== sourceId),
       }));
     } catch (err) {
       console.error("Failed to remove marketplace source:", err);
@@ -305,9 +300,7 @@ export const useMarketplaceStore = create<MarketplaceState>()((set, get) => ({
     try {
       const newState = await toggleMarketplaceSource(sourceId);
       set((state) => ({
-        sources: state.sources.map((s) =>
-          s.id === sourceId ? { ...s, is_enabled: newState } : s
-        ),
+        sources: state.sources.map((s) => (s.id === sourceId ? { ...s, is_enabled: newState } : s)),
       }));
 
       // Refresh available plugins
@@ -327,10 +320,7 @@ export const useMarketplaceStore = create<MarketplaceState>()((set, get) => ({
     set({ searchText: text });
   },
 
-  setFilter: <K extends keyof MarketplaceFilters>(
-    key: K,
-    value: MarketplaceFilters[K]
-  ) => {
+  setFilter: <K extends keyof MarketplaceFilters>(key: K, value: MarketplaceFilters[K]) => {
     set((state) => ({
       filters: { ...state.filters, [key]: value },
     }));
@@ -351,7 +341,7 @@ export const useMarketplaceStore = create<MarketplaceState>()((set, get) => ({
   installPlugin: async (
     pluginId: string,
     scope: InstallScope,
-    projectPath?: string
+    projectPath?: string,
   ): Promise<InstalledPlugin | null> => {
     set({ installingPluginId: pluginId, error: null });
 
@@ -378,9 +368,7 @@ export const useMarketplaceStore = create<MarketplaceState>()((set, get) => ({
     try {
       await uninstallPlugin(installedPluginId);
       set((state) => ({
-        installedPlugins: state.installedPlugins.filter(
-          (p) => p.id !== installedPluginId
-        ),
+        installedPlugins: state.installedPlugins.filter((p) => p.id !== installedPluginId),
         uninstallingPluginId: null,
       }));
     } catch (err) {
@@ -393,15 +381,11 @@ export const useMarketplaceStore = create<MarketplaceState>()((set, get) => ({
   },
 
   isInstalled: (marketplacePluginId: string): boolean => {
-    return get().installedPlugins.some(
-      (p) => p.plugin_id === marketplacePluginId
-    );
+    return get().installedPlugins.some((p) => p.plugin_id === marketplacePluginId);
   },
 
   getInstalledVersion: (marketplacePluginId: string): string | null => {
-    const installed = get().installedPlugins.find(
-      (p) => p.plugin_id === marketplacePluginId
-    );
+    const installed = get().installedPlugins.find((p) => p.plugin_id === marketplacePluginId);
     return installed?.version ?? null;
   },
 
@@ -433,16 +417,12 @@ export const useMarketplaceStore = create<MarketplaceState>()((set, get) => ({
 
       // Tags filter
       if (filters.tags.length > 0) {
-        const hasAllTags = filters.tags.every((tag) =>
-          plugin.tags.includes(tag)
-        );
+        const hasAllTags = filters.tags.every((tag) => plugin.tags.includes(tag));
         if (!hasAllTags) return false;
       }
 
       // Installed filter
-      const isInstalled = installedPlugins.some(
-        (p) => p.plugin_id === plugin.id
-      );
+      const isInstalled = installedPlugins.some((p) => p.plugin_id === plugin.id);
 
       if (filters.showInstalled && !isInstalled) {
         return false;

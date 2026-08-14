@@ -1,4 +1,4 @@
-import { ShieldAlert, ExternalLink, X, RefreshCw } from "lucide-react";
+import { ExternalLink, RefreshCw, ShieldAlert, X } from "lucide-react";
 import { useState } from "react";
 import { requestFullDiskAccess } from "@/lib/permissions";
 
@@ -13,12 +13,7 @@ interface FDADialogProps {
  * Dialog shown when the app needs Full Disk Access to open a project
  * in a TCC-protected location (Desktop, Documents, Downloads).
  */
-export function FDADialog({
-  path,
-  onDismiss,
-  onDismissPermanently,
-  onRetry,
-}: FDADialogProps) {
+export function FDADialog({ path, onDismiss, onDismissPermanently, onRetry }: FDADialogProps) {
   const [isRetrying, setIsRetrying] = useState(false);
 
   const handleOpenSettings = async () => {
@@ -55,27 +50,23 @@ export function FDADialog({
           <div className="flex h-10 w-10 items-center justify-center rounded-full bg-amber-500/15">
             <ShieldAlert size={20} className="text-amber-500" />
           </div>
-          <h2 className="text-lg font-semibold text-maestro-text">
-            Full Disk Access Required
-          </h2>
+          <h2 className="text-lg font-semibold text-maestro-text">Full Disk Access Required</h2>
         </div>
 
         {/* Description */}
         <div className="mb-6 space-y-3 text-sm text-maestro-muted">
           <p>
             Maestro needs Full Disk Access to open{" "}
-            <strong className="text-maestro-text">{folderName}</strong> because
-            it's in a protected location.
+            <strong className="text-maestro-text">{folderName}</strong> because it's in a protected
+            location.
           </p>
           {path && (
-            <p className="rounded bg-maestro-bg px-2 py-1.5 font-mono text-xs break-all">
-              {path}
-            </p>
+            <p className="rounded bg-maestro-bg px-2 py-1.5 font-mono text-xs break-all">{path}</p>
           )}
           <p>
             Projects on <strong className="text-maestro-text">external drives</strong> or{" "}
-            <strong className="text-maestro-text">network mounts</strong> work without
-            this permission.
+            <strong className="text-maestro-text">network mounts</strong> work without this
+            permission.
           </p>
         </div>
 
@@ -109,8 +100,8 @@ export function FDADialog({
 
         {/* Help text */}
         <p className="mt-4 text-xs text-maestro-muted/70">
-          In System Settings, go to Privacy &amp; Security &rarr; Full Disk Access,
-          then enable Maestro.
+          In System Settings, go to Privacy &amp; Security &rarr; Full Disk Access, then enable
+          Maestro.
         </p>
       </div>
     </div>

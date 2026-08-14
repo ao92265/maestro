@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock Tauri dependencies before importing the store
 vi.mock("@tauri-apps/plugin-store", () => ({
@@ -19,11 +19,7 @@ vi.mock("@/lib/terminal", () => ({
 }));
 
 import { invoke } from "@tauri-apps/api/core";
-import {
-  useWorkspaceStore,
-  withWorkspaceRoot,
-  type RepositoryInfo,
-} from "../useWorkspaceStore";
+import { type RepositoryInfo, useWorkspaceStore, withWorkspaceRoot } from "../useWorkspaceStore";
 
 const mockInvoke = vi.mocked(invoke);
 
@@ -62,9 +58,7 @@ describe("withWorkspaceRoot", () => {
   });
 
   it("treats trailing separators as the same path", () => {
-    const result = withWorkspaceRoot("C:\\git\\dreadnought\\", [
-      repo("C:\\git\\dreadnought"),
-    ]);
+    const result = withWorkspaceRoot("C:\\git\\dreadnought\\", [repo("C:\\git\\dreadnought")]);
 
     expect(result).toHaveLength(1);
   });
@@ -127,9 +121,7 @@ describe("updateRepositories keeps the workspace root", () => {
     });
 
     // Simulate a focus-refresh rescan, which returns only the nested repos
-    useWorkspaceStore
-      .getState()
-      .updateRepositories("t1", [repo("C:\\git\\dreadnought\\maestro")]);
+    useWorkspaceStore.getState().updateRepositories("t1", [repo("C:\\git\\dreadnought\\maestro")]);
 
     const tab = useWorkspaceStore.getState().tabs[0];
     expect(tab.repositories[0].path).toBe("C:\\git\\dreadnought");

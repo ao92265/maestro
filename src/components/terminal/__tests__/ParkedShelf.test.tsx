@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // The session store subscribes to Tauri events at listener-init time; the
 // global setup already mocks @tauri-apps/api/core, event needs its own stub.
@@ -7,18 +7,18 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
-import { ParkedShelf } from "../ParkedShelf";
 import {
-  useSessionStore,
   type BackendSessionStatus,
   type SessionConfig,
+  useSessionStore,
 } from "@/stores/useSessionStore";
+import { ParkedShelf } from "../ParkedShelf";
 
 function session(
   id: number,
   projectPath: string,
   name: string | null = null,
-  status: BackendSessionStatus = "Working"
+  status: BackendSessionStatus = "Working",
 ): SessionConfig {
   return {
     id,

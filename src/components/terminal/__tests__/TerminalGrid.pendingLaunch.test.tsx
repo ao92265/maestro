@@ -105,11 +105,12 @@ vi.mock("@/lib/samurai", async (importOriginal) => {
   return {
     ...actual,
     samuraiRegisterSession: vi.fn(async () => ({})),
+    samuraiHarvestArm: vi.fn(async () => {}),
   };
 });
 
 import { invoke } from "@tauri-apps/api/core";
-import { samuraiRegisterSession } from "@/lib/samurai";
+import { samuraiHarvestArm, samuraiRegisterSession } from "@/lib/samurai";
 import { spawnShell, writeStdin } from "@/lib/terminal";
 import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
 import { useSessionStore } from "@/stores/useSessionStore";
@@ -119,6 +120,7 @@ const invokeMock = vi.mocked(invoke);
 const spawnShellMock = vi.mocked(spawnShell);
 const writeStdinMock = vi.mocked(writeStdin);
 const registerMock = vi.mocked(samuraiRegisterSession);
+const harvestArmMock = vi.mocked(samuraiHarvestArm);
 
 const WORKTREE = "C:/wt/samurai-77-78";
 
@@ -139,11 +141,17 @@ describe("TerminalGrid pending samurai launch", () => {
     invokeMock.mockReset();
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "generate_project_hash") return "hash";
+      // The session listing reports what it could not return, so it is an
+      // object, not a bare list (issue #78).
+      if (cmd === "list_claude_sessions") {
+        return { sessions: [], total_found: 0, truncated: false, unreadable: 0 };
+      }
       return [];
     });
     spawnShellMock.mockClear();
     writeStdinMock.mockClear();
     registerMock.mockClear();
+    harvestArmMock.mockClear();
     useSessionStore.setState({ sessions: [], samuraiBySessionId: {}, parkedSessionIds: [] });
     usePendingLaunchStore.setState({ pending: [] });
   });
@@ -183,5 +191,44 @@ describe("TerminalGrid pending samurai launch", () => {
     // Exactly one terminal: the stray unsupervised one is the bug.
     expect(spawnShellMock).toHaveBeenCalledTimes(1);
     expect(useSessionStore.getState().sessions).toHaveLength(1);
+  });
+
+  // Issue #98: a "Harvest now" launch rides the same pending-launch flow —
+  // the grid must arm the backend's journal-prompt injection BEFORE the CLI
+  // command is typed, so the gate is set ahead of claude's SessionStart hook.
+  it("arms the harvest triage before launching the CLI for a harvest claim", async () => {
+    usePendingLaunchStore.getState().request({
+      tabId: "tab-1",
+      mode: "Claude",
+      resumeSessionId: null,
+      workingDirOverride: "C:/proj",
+      branch: null,
+      customName: "harvest triage",
+      harvest: true,
+    });
+
+    render(<TerminalGrid projectPath="C:/proj" tabId="tab-1" isActive />);
+
+    await waitFor(() => expect(spawnShellMock).toHaveBeenCalled());
+    // The shell opens in the project's MAIN checkout (the override), no
+    // worktree derivation.
+    const [workingDir] = spawnShellMock.mock.calls[0];
+    expect(workingDir).toBe("C:/proj");
+
+    // Armed exactly once, with the launched session's id…
+    await waitFor(() => expect(harvestArmMock).toHaveBeenCalledTimes(1));
+    expect(harvestArmMock).toHaveBeenCalledWith(1);
+    // …and strictly before the CLI command went to the PTY.
+    await waitFor(() => expect(writeStdinMock).toHaveBeenCalled());
+    expect(harvestArmMock.mock.invocationCallOrder[0]).toBeLessThan(
+      writeStdinMock.mock.invocationCallOrder[0],
+    );
+
+    // A plain interactive session: no samurai supervision registration, no
+    // forced skip-permissions.
+    expect(registerMock).not.toHaveBeenCalled();
+    const cli = writeStdinMock.mock.calls.map((c) => String(c[1])).join("\n");
+    expect(cli).not.toContain("--dangerously-skip-permissions");
+    expect(spawnShellMock).toHaveBeenCalledTimes(1);
   });
 });

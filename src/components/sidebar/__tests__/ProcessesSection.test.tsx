@@ -1,7 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // The persisted zustand stores hydrate through the Tauri store plugin at
 // import time; happy-dom has no Tauri backend, so stub it out.
@@ -19,8 +19,8 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   ask: vi.fn(),
 }));
 
-import { ProcessesSection } from "../ProcessesSection";
 import type { DevProcess } from "@/lib/processes";
+import { ProcessesSection } from "../ProcessesSection";
 
 const invokeMock = vi.mocked(invoke);
 const askMock = vi.mocked(ask);
@@ -75,7 +75,12 @@ describe("ProcessesSection", () => {
         buildProc({ pid: 100 }),
         buildProc({ pid: 101 }),
         buildProc({ pid: 102 }),
-        buildProc({ pid: 200, matched: "uvicorn", cmd: "python -m uvicorn app:app", cwd: "C:\\git\\api" }),
+        buildProc({
+          pid: 200,
+          matched: "uvicorn",
+          cmd: "python -m uvicorn app:app",
+          cwd: "C:\\git\\api",
+        }),
       ],
     });
     render(<ProcessesSection />);

@@ -37,8 +37,8 @@ describe("isWorktreeAtRisk", () => {
       isWorktreeAtRisk(
         cleanStatus({
           staged: [{ path: "a.ts", status: "modified", old_path: null }],
-        })
-      )
+        }),
+      ),
     ).toBe(true);
   });
 
@@ -47,8 +47,8 @@ describe("isWorktreeAtRisk", () => {
       isWorktreeAtRisk(
         cleanStatus({
           unstaged: [{ path: "a.ts", status: "modified", old_path: null }],
-        })
-      )
+        }),
+      ),
     ).toBe(true);
   });
 
@@ -69,8 +69,8 @@ describe("isWorktreeAtRisk", () => {
               summary: "wip",
             },
           ],
-        })
-      )
+        }),
+      ),
     ).toBe(true);
   });
 
@@ -79,8 +79,8 @@ describe("isWorktreeAtRisk", () => {
       isWorktreeAtRisk(
         cleanStatus({
           stashes: [{ ref_name: "stash@{0}", message: "wip", branch: "main" }],
-        })
-      )
+        }),
+      ),
     ).toBe(true);
   });
 });

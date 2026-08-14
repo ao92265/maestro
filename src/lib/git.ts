@@ -51,7 +51,7 @@ export async function getBranches(repoPath: string): Promise<BranchInfo[]> {
  * @returns List of branches with worktree status
  */
 export async function getBranchesWithWorktreeStatus(
-  repoPath: string
+  repoPath: string,
 ): Promise<BranchWithWorktreeStatus[]> {
   const [branches, worktrees] = await Promise.all([
     getBranches(repoPath),
@@ -59,7 +59,7 @@ export async function getBranchesWithWorktreeStatus(
   ]);
 
   const worktreeBranches = new Set(
-    worktrees.map((wt) => wt.branch).filter((b): b is string => b !== null)
+    worktrees.map((wt) => wt.branch).filter((b): b is string => b !== null),
   );
 
   return branches.map((branch) => ({
@@ -185,9 +185,7 @@ export interface WorktreeStatus {
  * staged/unstaged/untracked files, unpushed commits, and stashes — i.e.
  * everything that would be lost if the worktree or its branch were deleted.
  */
-export async function getWorktreesStatus(
-  repoPath: string
-): Promise<WorktreeStatus[]> {
+export async function getWorktreesStatus(repoPath: string): Promise<WorktreeStatus[]> {
   return invoke<WorktreeStatus[]>("git_worktrees_status", { repoPath });
 }
 
@@ -203,7 +201,7 @@ export async function getWorktreesStatus(
 export async function discardFile(
   worktreePath: string,
   path: string,
-  oldPath?: string | null
+  oldPath?: string | null,
 ): Promise<void> {
   return invoke<void>("git_discard_file", {
     worktreePath,
@@ -218,10 +216,7 @@ export async function discardFile(
  * @param worktreePath - Absolute path to the worktree the file lives in
  * @param path - Repo-relative path of the untracked file to delete
  */
-export async function removeFile(
-  worktreePath: string,
-  path: string
-): Promise<void> {
+export async function removeFile(worktreePath: string, path: string): Promise<void> {
   return invoke<void>("git_remove_file", { worktreePath, path });
 }
 
@@ -255,7 +250,7 @@ export async function getFileDiff(
   worktreePath: string,
   path: string,
   mode: FileDiffMode,
-  oldPath?: string | null
+  oldPath?: string | null,
 ): Promise<FileDiff> {
   return invoke<FileDiff>("git_file_diff", {
     worktreePath,

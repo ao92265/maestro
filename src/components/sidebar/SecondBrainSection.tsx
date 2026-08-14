@@ -1,20 +1,30 @@
 import { ask } from "@tauri-apps/plugin-dialog";
-import { Eraser, Eye, FileText, Files, Loader2, RefreshCw, TimerOff, Trash2, X } from "lucide-react";
+import {
+  Eraser,
+  Eye,
+  Files,
+  FileText,
+  Loader2,
+  RefreshCw,
+  TimerOff,
+  Trash2,
+  X,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { MarkdownBody } from "@/components/git/shared/MarkdownBody";
+import { HealthReasonLines } from "@/components/shared/HealthReasonLines";
 import type { HealthFlag } from "@/lib/healthRules";
 import {
   isSamuraiInUseError,
+  type SamuraiFileEntry,
+  type SamuraiFileKind,
   samuraiCleanupEpic,
   samuraiFileDelete,
   samuraiFileRead,
   samuraiFilesList,
   samuraiHarvestRead,
   samuraiTimerCancel,
-  type SamuraiFileEntry,
-  type SamuraiFileKind,
 } from "@/lib/samurai";
-import { MarkdownBody } from "@/components/git/shared/MarkdownBody";
-import { HealthReasonLines } from "@/components/shared/HealthReasonLines";
 import { flagsByRow, useHealthStore } from "@/stores/useHealthStore";
 import { AuditSection } from "./AuditSection";
 import { JournalSection } from "./JournalSection";
@@ -445,7 +455,9 @@ export function SecondBrainSection() {
     <div className="space-y-3">
       <AuditSection />
 
-      <JournalSection onHarvested={refresh} />
+      {/* Issue #98: harvest opens an interactive session — no report row
+          lands in this inventory anymore, so no refresh callback. */}
+      <JournalSection />
 
       <div className={cardClass}>
         <SectionHeader

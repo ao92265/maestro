@@ -193,6 +193,50 @@ fn corrective_instruction_for(
     }
 }
 
+/// A capture-time [`Instant`] that test code can artificially age without
+/// rewinding the underlying clock (issue #90). `Instant` is boot-relative on
+/// Windows, so `Instant::now().checked_sub(by)` underflows whenever the
+/// machine's uptime is shorter than `by` — flaky right after a reboot, green
+/// on a long-running box. Advancing the *reading* side instead (adding to
+/// elapsed time) can never underflow, so tests age these clocks that way.
+/// `pub(crate)`: shared with `samurai_replicator`, which has the same
+/// backdate-for-tests need on its own staged-ritual clocks.
+#[derive(Clone, Copy)]
+pub(crate) struct AgeableInstant {
+    at: Instant,
+    /// Test-only extra age layered on top of `at`'s real elapsed time.
+    /// Always zero outside tests; production reads are unaffected.
+    #[cfg(test)]
+    extra: Duration,
+}
+
+impl AgeableInstant {
+    pub(crate) fn now() -> Self {
+        Self {
+            at: Instant::now(),
+            #[cfg(test)]
+            extra: Duration::ZERO,
+        }
+    }
+
+    pub(crate) fn elapsed(&self) -> Duration {
+        #[cfg(test)]
+        {
+            self.at.elapsed() + self.extra
+        }
+        #[cfg(not(test))]
+        {
+            self.at.elapsed()
+        }
+    }
+
+    /// Test-only: simulate `by` additional elapsed time on this timestamp.
+    #[cfg(test)]
+    pub(crate) fn backdate(&mut self, by: Duration) {
+        self.extra += by;
+    }
+}
+
 /// One instruction the controller is shepherding from trigger to ACK to the
 /// validated handoff. Created when the trigger transitions a session into
 /// HANDOFF_REQUESTED; dropped when the session leaves that state, validation
@@ -210,18 +254,18 @@ struct PendingInstruction {
     /// Injection attempts so far: 0 (waiting for first idle), 1, or 2 (max).
     attempts: u8,
     /// When the latest injection was written; `None` before the first.
-    injected_at: Option<Instant>,
+    injected_at: Option<AgeableInstant>,
     /// When the entry started (or resumed) WAITING for an idle signal:
     /// stamped at creation, and re-stamped whenever a retry/corrective is
     /// armed. Caps the wait (finding E): no injection possible within
     /// `ack_timeout_secs * STUCK_WAIT_MULTIPLIER` of this → ALERT.
-    waiting_since: Instant,
+    waiting_since: AgeableInstant,
     /// The orchestrator replied with the expected ACK marker.
     acked: bool,
     /// Attempt 1 timed out; re-inject at the next idle signal.
     awaiting_retry: bool,
     /// When the ACK arrived — the written-marker window runs from here.
-    acked_at: Option<Instant>,
+    acked_at: Option<AgeableInstant>,
     /// The written marker arrived and the two-check validation is in flight.
     validating: bool,
     /// This entry carries the single corrective re-instruction; any further
@@ -235,25 +279,6 @@ struct PendingInstruction {
     /// the ALERT is one-shot and the parker must stop counting it as pending
     /// — see [`TimeoutVerdict::AlertStuck`] and `has_pending`.
     stuck_alerted: bool,
-    /// Extra age added to the three clocks above when they are read.
-    ///
-    /// Always [`Duration::ZERO`] in the running app; only the `backdate_*`
-    /// test helpers ever set it. `Instant` is anchored at boot on Windows
-    /// and Linux, so ageing a clock with `Instant::checked_sub` underflows
-    /// on a machine that has been up for less than the backdate — the
-    /// stuck-wait test ages the waiting clock by ~39 minutes and panicked
-    /// on any freshly booted machine, CI included. Ageing through an added
-    /// offset instead cannot underflow, and the reset sites zero the
-    /// matching offset exactly where they re-stamp the `Instant`.
-    skew: ClockSkew,
-}
-
-/// Per-clock test-only age offsets — see [`PendingInstruction::skew`].
-#[derive(Debug, Default, Clone, Copy)]
-struct ClockSkew {
-    injected: Duration,
-    waiting: Duration,
-    acked: Duration,
 }
 
 impl PendingInstruction {
@@ -267,7 +292,7 @@ impl PendingInstruction {
             instruction,
             attempts: 0,
             injected_at: None,
-            waiting_since: Instant::now(),
+            waiting_since: AgeableInstant::now(),
             acked: false,
             awaiting_retry: false,
             acked_at: None,
@@ -275,23 +300,24 @@ impl PendingInstruction {
             corrective: false,
             failure: None,
             stuck_alerted: false,
-            skew: ClockSkew::default(),
         }
     }
 
     /// How long since the latest injection; `None` before the first.
+    /// [`AgeableInstant`] carries the test-only backdate offset (issue #90),
+    /// so these reads never underflow on a freshly booted machine.
     fn injected_elapsed(&self) -> Option<Duration> {
-        self.injected_at.map(|t| t.elapsed() + self.skew.injected)
+        self.injected_at.map(|t| t.elapsed())
     }
 
     /// How long this entry has been WAITING for an idle signal.
     fn waiting_elapsed(&self) -> Duration {
-        self.waiting_since.elapsed() + self.skew.waiting
+        self.waiting_since.elapsed()
     }
 
     /// How long since the ACK arrived; `None` before it does.
     fn acked_elapsed(&self) -> Option<Duration> {
-        self.acked_at.map(|t| t.elapsed() + self.skew.acked)
+        self.acked_at.map(|t| t.elapsed())
     }
 }
 
@@ -539,7 +565,12 @@ fn porcelain_line_blocks(line: &str) -> bool {
 /// successor's verify ritual is the real check). Blocking: runs inside
 /// `spawn_blocking`. Git runs with a fixed argv and `current_dir` — no
 /// shell, so untrusted strings are never interpolated into one.
-fn validate_handoff(working_dir: &Path, relpath: &str) -> Result<(), String> {
+///
+/// `Ok(sha)` carries the repo HEAD after both checks passed — with WIP
+/// committed, HEAD *is* the WIP commit — for the audit trail (issue #101).
+/// `None` only when HEAD itself cannot be read (e.g. an unborn branch); a
+/// missing SHA never fails an otherwise valid handoff.
+fn validate_handoff(working_dir: &Path, relpath: &str) -> Result<Option<String>, String> {
     if !working_dir.join(relpath).is_file() {
         return Err(format!("the handoff file is missing at {relpath}"));
     }
@@ -561,7 +592,7 @@ fn validate_handoff(working_dir: &Path, relpath: &str) -> Result<(), String> {
         .filter(|l| porcelain_line_blocks(l))
         .collect();
     if blocking.is_empty() {
-        Ok(())
+        Ok(wip_head_sha(working_dir))
     } else {
         Err(format!(
             "WIP is not committed — modified/staged tracked files remain: {}",
@@ -573,6 +604,35 @@ fn validate_handoff(working_dir: &Path, relpath: &str) -> Result<(), String> {
                 .join(", ")
         ))
     }
+}
+
+/// What a successful validation proved, for the audit trail (issue #101):
+/// where the handoff file was left and the WIP commit HEAD pointed at.
+struct ValidatedHandoff {
+    relpath: String,
+    wip_commit: Option<String>,
+}
+
+/// HEAD of the session's repo, for the audit trail (issue #101). Best
+/// effort: any failure logs and yields `None` — the SHA is replay context,
+/// never a third validation check.
+fn wip_head_sha(working_dir: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(working_dir)
+        .hide_console_window()
+        .output()
+        .map_err(|e| log::warn!("samurai injector: could not read HEAD for the audit row: {e}"))
+        .ok()?;
+    if !output.status.success() {
+        log::warn!(
+            "samurai injector: git rev-parse HEAD failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
 }
 
 /// First-round failure (validation or written-marker timeout): turn the
@@ -591,11 +651,9 @@ fn arm_corrective(p: &mut PendingInstruction, failure: String) {
     p.attempts = 1;
     p.awaiting_retry = true;
     // The wait for the corrective's idle starts now (finding E age cap).
-    p.waiting_since = Instant::now();
-    p.skew.waiting = Duration::ZERO;
+    p.waiting_since = AgeableInstant::now();
     p.acked = false;
     p.acked_at = None;
-    p.skew.acked = Duration::ZERO;
     p.validating = false;
     p.corrective = true;
     p.failure = Some(failure);
@@ -658,10 +716,10 @@ fn finish_validation(
     replicator: Option<&Arc<SamuraiReplicator>>,
     parker: Option<&Arc<SamuraiParker>>,
     session_id: u32,
-    outcome: Result<(), String>,
+    outcome: Result<ValidatedHandoff, String>,
 ) {
     enum Next {
-        Transition(PendingKind),
+        Transition(PendingKind, serde_json::Value),
         Alert(PendingKind, String, AuditEvent),
         Nothing,
     }
@@ -682,7 +740,7 @@ fn finish_validation(
             return;
         }
         match outcome {
-            Ok(()) => {
+            Ok(proof) => {
                 // Review F3a: the entry is deliberately KEPT in the map until
                 // the transition + completion chain below has RETURNED, and
                 // only removed then. Removing it here opened a gap where a
@@ -694,7 +752,16 @@ fn finish_validation(
                 // sweep open through the handover; the entry stays claimed
                 // via `validating`, so a replayed marker cannot restart a
                 // second validation meanwhile.
-                Next::Transition(p.kind)
+                //
+                // Issue #101: the transition row records WHERE the handoff
+                // file was left and the WIP commit it validated against.
+                Next::Transition(
+                    p.kind,
+                    json!({
+                        "handoff_file": proof.relpath,
+                        "wip_commit": proof.wip_commit,
+                    }),
+                )
             }
             Err(failure) => {
                 if p.corrective {
@@ -718,13 +785,17 @@ fn finish_validation(
         hook(pending as *const _ as usize, session_id);
     }
     match next {
-        Next::Transition(kind) => {
+        Next::Transition(kind, details) => {
             match kind {
                 PendingKind::Handoff => {
                     log::info!(
                         "samurai injector: session {session_id} handoff validated (file present, WIP committed) — HANDOFF_WRITTEN"
                     );
-                    match supervisor.transition(session_id, SupervisorState::HandoffWritten) {
+                    match supervisor.transition_with_details(
+                        session_id,
+                        SupervisorState::HandoffWritten,
+                        details,
+                    ) {
                         // Issue #55: a validated handoff chains straight into the
                         // replicator (kill gen-N, stage gen-N+1) — no polling.
                         Ok(snapshot) => {
@@ -742,7 +813,11 @@ fn finish_validation(
                     log::info!(
                         "samurai injector: session {session_id} park validated (file present, WIP committed) — PARKED"
                     );
-                    match supervisor.transition(session_id, SupervisorState::Parked) {
+                    match supervisor.transition_with_details(
+                        session_id,
+                        SupervisorState::Parked,
+                        details,
+                    ) {
                         // Issue #60: a validated park chains straight into the
                         // parker (teardown + sweep advance) — no polling.
                         // `on_parked` records the epic for its resume timer
@@ -889,6 +964,12 @@ impl SamuraiInjector {
     /// transcript-side activity update the idle flag. Every other variant is
     /// ignored, so the tee can pass the whole stream without filtering.
     pub fn observe(&self, event: &ClaudeEvent) {
+        // Issue #103: the replicator's post-delivery watch reads
+        // transcript-side turn activity (UserMessage above all) from this
+        // same tee — the forwarding mirror of `observe_hook` below.
+        if let Some(replicator) = &self.replicator {
+            replicator.observe(event);
+        }
         self.note_idle(event);
         if let ClaudeEvent::AssistantMessage {
             session_id, text, ..
@@ -911,7 +992,7 @@ impl SamuraiInjector {
         }
         self.note_idle(event);
         if let Some(session_id) = idle_session_id(event) {
-            self.on_idle(session_id);
+            self.on_idle(session_id, "stop_hook");
         }
     }
 
@@ -1026,8 +1107,7 @@ impl SamuraiInjector {
                             p.awaiting_retry = true;
                             // The wait for the retry's idle starts now
                             // (finding E age cap).
-                            p.waiting_since = Instant::now();
-                            p.skew.waiting = Duration::ZERO;
+                            p.waiting_since = AgeableInstant::now();
                         }
                         TimeoutVerdict::AlertStuck => {
                             // Finding E: no injection was possible yet —
@@ -1162,7 +1242,7 @@ impl SamuraiInjector {
             .copied()
             .collect();
         for id in idle_pending {
-            self.on_idle(id);
+            self.on_idle(id, "idle_at_tick");
         }
 
         // Issue #55: the replicator's timeout pass (a staged successor that
@@ -1246,20 +1326,58 @@ impl SamuraiInjector {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&session_id);
         if idle {
-            self.on_idle(session_id);
+            self.on_idle(session_id, "already_idle");
         }
     }
 
     /// Idle signal for one session: decide-and-record synchronously, then
-    /// hand the actual PTY write to the blocking pool.
-    fn on_idle(&self, session_id: u32) {
+    /// hand the actual PTY write to the blocking pool. `gate` names the idle
+    /// signal that let the injection through (issue #101) — it rides the
+    /// INJECT audit row so the trail shows WHY Maestro typed at that moment.
+    fn on_idle(&self, session_id: u32, gate: &'static str) {
         if let Some(data) = self.arm_injection_on_idle(session_id) {
+            self.record_injection(session_id, gate, &data);
             // The injection submits a prompt — the session is working again.
             self.idle_now
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&session_id);
             self.spawn_write(session_id, data);
+        }
+    }
+
+    /// Issue #101: one `INJECT phase=delivered` audit row per injection —
+    /// the instruction kind, a bounded excerpt, the attempt number, the
+    /// corrective flag and the idle gate. Reads the entry back under its own
+    /// short lock (the row is written right after the arm decision, so the
+    /// entry is still present); a raced removal simply skips the row.
+    fn record_injection(&self, session_id: u32, gate: &'static str, instruction: &str) {
+        let row = {
+            let pending = self.lock_pending();
+            pending.get(&session_id).map(|p| {
+                let (excerpt, total_chars) = super::samurai_audit::instruction_excerpt(instruction);
+                (
+                    p.project.clone(),
+                    AuditEvent::now(
+                        p.epic.clone(),
+                        AuditEventKind::Inject,
+                        p.generation,
+                        session_id,
+                        json!({
+                            "phase": "delivered",
+                            "instruction": p.kind.as_str(),
+                            "attempt": p.attempts,
+                            "corrective": p.corrective,
+                            "gate": gate,
+                            "excerpt": excerpt,
+                            "total_chars": total_chars,
+                        }),
+                    ),
+                )
+            })
+        };
+        if let Some((project, event)) = row {
+            self.audit.append(&project, event);
         }
     }
 
@@ -1281,8 +1399,7 @@ impl SamuraiInjector {
             return None;
         }
         p.attempts += 1;
-        p.injected_at = Some(Instant::now());
-        p.skew.injected = Duration::ZERO;
+        p.injected_at = Some(AgeableInstant::now());
         p.awaiting_retry = false;
         // The long turn finally ended and the instruction went in: the entry
         // is live again, so it counts as pending once more and a later
@@ -1315,43 +1432,63 @@ impl SamuraiInjector {
         let Some(value) = ack_value(text) else {
             return;
         };
-        let mut pending = self.lock_pending();
-        let Some(p) = pending.get_mut(&session_id) else {
-            log::warn!(
-                "samurai injector: ACK marker from session {session_id} with no pending instruction — ignored"
-            );
-            return;
-        };
-        if p.acked {
-            return;
-        }
-        // Round-scoped (finding C) AND kind-scoped (issue #60): the
-        // corrective round expects a DISTINCT value, so a transcript replay
-        // of round 1's ACK (claude --resume rewrites history into a new
-        // transcript, read from byte 0) can never consume the corrective
-        // round — and a replayed handoff ACK can never consume a park.
-        let expected = expected_ack_value(p.kind, p.generation, p.corrective);
-        if value == expected {
+        let ack_row = {
+            let mut pending = self.lock_pending();
+            let Some(p) = pending.get_mut(&session_id) else {
+                log::warn!(
+                    "samurai injector: ACK marker from session {session_id} with no pending instruction — ignored"
+                );
+                return;
+            };
+            if p.acked {
+                return;
+            }
+            // Round-scoped (finding C) AND kind-scoped (issue #60): the
+            // corrective round expects a DISTINCT value, so a transcript replay
+            // of round 1's ACK (claude --resume rewrites history into a new
+            // transcript, read from byte 0) can never consume the corrective
+            // round — and a replayed handoff ACK can never consume a park.
+            let expected = expected_ack_value(p.kind, p.generation, p.corrective);
+            if value != expected {
+                log::warn!(
+                    "samurai injector: session {session_id} ACK value {value:?} does not match expected {expected:?} — ignored"
+                );
+                return;
+            }
             log::info!(
                 "samurai injector: session {session_id} ACKed {} (gen-{})",
                 p.kind.as_str(),
                 p.generation
             );
+            // Issue #101: the positive ACK result, next to the delivered row
+            // (the negative result stays the existing ack_timeout ALERT).
+            let row = (
+                p.project.clone(),
+                AuditEvent::now(
+                    p.epic.clone(),
+                    AuditEventKind::Inject,
+                    p.generation,
+                    session_id,
+                    json!({
+                        "phase": "acked",
+                        "instruction": p.kind.as_str(),
+                        "attempt": p.attempts,
+                        "corrective": p.corrective,
+                    }),
+                ),
+            );
             // The soft wind-down has no written stage: the ACK IS the
             // completion — stop tracking, the session keeps WORKING.
             if p.kind == PendingKind::SoftWinddown {
                 pending.remove(&session_id);
-                return;
+            } else {
+                p.acked = true;
+                p.acked_at = Some(AgeableInstant::now());
+                p.awaiting_retry = false;
             }
-            p.acked = true;
-            p.acked_at = Some(Instant::now());
-            p.skew.acked = Duration::ZERO;
-            p.awaiting_retry = false;
-        } else {
-            log::warn!(
-                "samurai injector: session {session_id} ACK value {value:?} does not match expected {expected:?} — ignored"
-            );
-        }
+            row
+        };
+        self.audit.append(&ack_row.0, ack_row.1);
     }
 
     /// Written-marker scan for one assistant reply (issue #54): after the
@@ -1447,7 +1584,10 @@ impl SamuraiInjector {
         tauri::async_runtime::spawn(async move {
             let outcome = tokio::task::spawn_blocking(move || {
                 let dir = PathBuf::from(strip_extended_prefix(&working_dir));
-                validate_handoff(&dir, &relpath)
+                validate_handoff(&dir, &relpath).map(|wip_commit| ValidatedHandoff {
+                    relpath,
+                    wip_commit,
+                })
             })
             .await
             .unwrap_or_else(|e| Err(format!("validation task failed: {e}")));
@@ -1540,33 +1680,39 @@ impl SamuraiInjector {
     /// Test-only: age the latest injection so timeout paths run without
     /// real waiting. `pub(crate)` for the parker's sweep tests (issue #60).
     ///
-    /// Ages through [`PendingInstruction::skew`] rather than
-    /// `Instant::checked_sub`, which underflows on a machine booted more
-    /// recently than the backdate.
+    /// Ages the clock by advancing its *reading* side (`AgeableInstant`'s
+    /// extra elapsed time) rather than rewinding the stored `Instant` —
+    /// `Instant::now().checked_sub(by)` underflows whenever machine uptime
+    /// is shorter than `by` (issue #90), which made this flaky right after
+    /// a reboot.
     #[cfg(test)]
     pub(crate) fn backdate_injection(&self, session_id: u32, by: Duration) {
         let mut pending = self.lock_pending();
         let p = pending.get_mut(&session_id).expect("no pending entry");
-        assert!(p.injected_at.is_some(), "nothing injected");
-        p.skew.injected += by;
+        p.injected_at
+            .as_mut()
+            .expect("nothing injected")
+            .backdate(by);
     }
 
     /// Test-only: age the ACK so written-window paths run without waiting.
+    /// See [`Self::backdate_injection`] for why this advances rather than
+    /// rewinds the clock.
     #[cfg(test)]
     fn backdate_ack(&self, session_id: u32, by: Duration) {
         let mut pending = self.lock_pending();
         let p = pending.get_mut(&session_id).expect("no pending entry");
-        assert!(p.acked_at.is_some(), "not acked");
-        p.skew.acked += by;
+        p.acked_at.as_mut().expect("not acked").backdate(by);
     }
 
     /// Test-only: age the waiting clock so the stuck-wait cap (finding E)
-    /// runs without real waiting.
+    /// runs without real waiting. See [`Self::backdate_injection`] for why
+    /// this advances rather than rewinds the clock.
     #[cfg(test)]
     fn backdate_waiting(&self, session_id: u32, by: Duration) {
         let mut pending = self.lock_pending();
         let p = pending.get_mut(&session_id).expect("no pending entry");
-        p.skew.waiting += by;
+        p.waiting_since.backdate(by);
     }
 }
 
@@ -2014,13 +2160,16 @@ mod tests {
         assert!(err.contains("missing"), "unexpected: {err}");
         assert!(err.contains(&rel), "failure must name the path: {err}");
 
-        // File present (untracked .maestro/), tree clean → valid.
+        // File present (untracked .maestro/), tree clean → valid, and the
+        // WIP commit SHA (HEAD) rides along for the audit row (issue #101).
         write_handoff_file(repo, "#9", 1);
-        assert_eq!(validate_handoff(repo, &rel), Ok(()));
+        let sha = validate_handoff(repo, &rel).unwrap().expect("HEAD sha");
+        assert_eq!(sha.len(), 40, "full git SHA expected: {sha}");
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
 
         // Extra untracked files stay acceptable.
         std::fs::write(repo.join("scratch.txt"), "tmp\n").unwrap();
-        assert_eq!(validate_handoff(repo, &rel), Ok(()));
+        assert_eq!(validate_handoff(repo, &rel), Ok(Some(sha)));
 
         // A modified tracked file → WIP not committed.
         std::fs::write(repo.join("tracked.txt"), "v2\n").unwrap();
@@ -2403,6 +2552,73 @@ mod tests {
         assert_eq!(injector.session_state(1), Some(Working));
     }
 
+    // --- issue #101: INJECT audit rows (delivery + ACK result) ---
+
+    #[tokio::test]
+    async fn test_injection_and_ack_land_inject_audit_rows() {
+        let dir = tempdir().unwrap();
+        let (injector, audit, supervisor, context, _dirs) = harness(dir.path());
+        let project = "C:/git/proj-inj-audit";
+        supervisor
+            .register_session(1, project.into(), "epic-7".into(), 3)
+            .unwrap();
+        context.observe(&context_event(1, 50.0));
+        injector.tick(); // WORKING → HANDOFF_REQUESTED, instruction pending
+
+        // The Stop hook gates the injection → one INJECT phase=delivered row
+        // with the kind, attempt, gate and a bounded excerpt.
+        injector.observe_hook(&stop_event(1));
+        let rows = audit.read(project, None, None).await.unwrap().events;
+        let delivered: Vec<_> = rows
+            .iter()
+            .filter(|r| r.event == AuditEventKind::Inject && r.details["phase"] == "delivered")
+            .collect();
+        assert_eq!(delivered.len(), 1);
+        let d = delivered[0];
+        assert_eq!(d.epic, "epic-7");
+        assert_eq!(d.generation, 3);
+        assert_eq!(d.session_id, 1);
+        assert_eq!(d.details["instruction"], "handoff");
+        assert_eq!(d.details["attempt"], 1);
+        assert_eq!(d.details["corrective"], false);
+        assert_eq!(d.details["gate"], "stop_hook");
+        let full = samurai_prompts::handoff_instruction("epic-7", 3);
+        let excerpt = d.details["excerpt"].as_str().unwrap();
+        assert!(full.starts_with(excerpt), "excerpt is a prefix of the text");
+        assert!(excerpt.chars().count() <= crate::core::samurai_audit::EXCERPT_MAX_CHARS);
+        assert_eq!(
+            d.details["total_chars"].as_u64().unwrap() as usize,
+            full.chars().count()
+        );
+
+        // The matching ACK → one INJECT phase=acked row (the positive
+        // result; the negative one stays the ack_timeout ALERT).
+        injector.observe(&assistant_message(
+            1,
+            "<samurai-ack>handoff gen-3</samurai-ack>",
+        ));
+        let rows = audit.read(project, None, None).await.unwrap().events;
+        let acked: Vec<_> = rows
+            .iter()
+            .filter(|r| r.event == AuditEventKind::Inject && r.details["phase"] == "acked")
+            .collect();
+        assert_eq!(acked.len(), 1);
+        assert_eq!(acked[0].session_id, 1);
+        assert_eq!(acked[0].generation, 3);
+        assert_eq!(acked[0].details["instruction"], "handoff");
+        assert_eq!(acked[0].details["attempt"], 1);
+        assert_eq!(acked[0].details["corrective"], false);
+
+        // A wrong-value ACK never lands a row (exact-value discipline).
+        let before = rows.len();
+        injector.observe(&assistant_message(
+            1,
+            "<samurai-ack>handoff gen-99</samurai-ack>",
+        ));
+        let rows = audit.read(project, None, None).await.unwrap().events;
+        assert_eq!(rows.len(), before);
+    }
+
     // --- issue #54: written marker → validation → HANDOFF_WRITTEN ---
 
     /// Drives session 1 (generation `generation`) through trigger, idle
@@ -2469,9 +2685,19 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(rows
+        let written = rows
             .iter()
-            .any(|r| r.event == AuditEventKind::Handoff && r.details["phase"] == "written"));
+            .find(|r| r.event == AuditEventKind::Handoff && r.details["phase"] == "written")
+            .expect("HANDOFF phase=written row");
+        // Issue #101: the row records WHERE the handoff file is and the WIP
+        // commit the validation saw, so the trail is replayable.
+        assert_eq!(
+            written.details["handoff_file"],
+            samurai_prompts::handoff_file_relpath("epic-9", 2)
+        );
+        let sha = written.details["wip_commit"].as_str().unwrap();
+        assert_eq!(sha.len(), 40, "full git SHA expected: {sha}");
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
         assert!(!rows.iter().any(|r| r.event == AuditEventKind::Alert));
     }
 
@@ -3242,8 +3468,10 @@ mod tests {
         assert!(!data.contains("<samurai-handoff-written>"));
         assert_eq!(injector.session_state(1), Some(Working));
 
-        // The ACK alone completes the entry — no state change, no audit row
-        // beyond the SPAWN, and a later idle injects nothing.
+        // The ACK alone completes the entry — no state change, and a later
+        // idle injects nothing. The only extra audit row is the INJECT
+        // phase=acked record (issue #101); the wind-down stays stateless
+        // supervisor-side (no HANDOFF/PARK/ALERT rows).
         injector.observe(&assistant_message(
             1,
             "Winding down. <samurai-ack>winddown gen-3</samurai-ack>",
@@ -3252,7 +3480,11 @@ mod tests {
         assert_eq!(injector.session_state(1), Some(Working));
         assert!(injector.arm_injection_on_idle(1).is_none());
         let rows = audit.read(project, None, None).await.unwrap().events;
-        assert_eq!(rows.len(), 1, "SPAWN only — the wind-down is stateless");
+        assert_eq!(rows.len(), 2, "SPAWN + the INJECT acked record only");
+        assert_eq!(rows[0].event, AuditEventKind::Spawn);
+        assert_eq!(rows[1].event, AuditEventKind::Inject);
+        assert_eq!(rows[1].details["phase"], "acked");
+        assert_eq!(rows[1].details["instruction"], "soft_winddown");
     }
 
     #[tokio::test]

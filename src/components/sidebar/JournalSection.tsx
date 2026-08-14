@@ -1,18 +1,28 @@
+import { ask } from "@tauri-apps/plugin-dialog";
 // The spec asks for NotebookPen, which lucide-react 0.300.0 does not ship —
 // PenLine is the closest journal-writing glyph available.
-import { Loader2, PenLine, Plus, RefreshCw, Sparkles } from "lucide-react";
+import { Loader2, PenLine, Plus, RefreshCw, Sparkles, Trash2 } from "lucide-react";
 import type { FormEvent } from "react";
 import { useCallback, useEffect, useState } from "react";
 import {
-  samuraiHarvestRun,
-  samuraiJournalAdd,
-  samuraiJournalList,
   type SamuraiJournalCategory,
   type SamuraiJournalEntry,
   type SamuraiJournalEntryStatus,
+  type SamuraiJournalListEntry,
+  samuraiJournalAdd,
+  samuraiJournalDelete,
+  samuraiJournalList,
 } from "@/lib/samurai";
+import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { cardClass, SectionHeader } from "./sectionChrome";
+
+/**
+ * The empty-journal refusal, byte-identical to the backend's pinned
+ * `NOTHING_TO_HARVEST` (`commands/harvest.rs`) — shown before any terminal
+ * opens, so an empty journal never wastes a session.
+ */
+const NOTHING_TO_HARVEST = "Nothing to harvest — no unconsumed journal entries.";
 
 /** How many rows to show — the newest slice, same no-virtualization bar as the audit list. */
 const JOURNAL_TAIL = 50;
@@ -47,9 +57,14 @@ function formatTs(ts: string): string {
 function JournalRow({
   entry,
   status,
+  busy,
+  onDelete,
 }: {
   entry: SamuraiJournalEntry;
   status: SamuraiJournalEntryStatus;
+  busy: boolean;
+  /** Deletable whether UNCONSUMED, CONSUMED or ARCHIVED (issue #100). */
+  onDelete: () => void;
 }) {
   const badgeCls = CATEGORY_BADGES[entry.category] ?? "bg-maestro-muted/15 text-maestro-muted";
   // CONSUMED/ARCHIVED entries went into a harvest already — muted, labeled.
@@ -83,6 +98,16 @@ function JournalRow({
         </span>
       )}
       <span className="shrink-0 text-[10px] text-maestro-muted/70">{formatTs(entry.ts)}</span>
+      <button
+        type="button"
+        onClick={onDelete}
+        disabled={busy}
+        className="shrink-0 rounded p-1 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-red disabled:opacity-40"
+        aria-label={`Delete journal entry: ${entry.text}`}
+        title="Delete this journal entry (asks first)"
+      >
+        <Trash2 size={12} />
+      </button>
     </div>
   );
 }
@@ -91,18 +116,22 @@ function JournalRow({
  * Ops journal card (issue #71, PRD §5.12): add-entry form, the newest journal
  * entries with their harvest status, and the "Harvest now" trigger. Sits in
  * the Second Brain panel between the audit stream and the Files section.
- * `onHarvested` lets the parent refresh its file inventory after a harvest so
- * the new HARVEST_REPORT row appears.
+ *
+ * "Harvest now" (issue #98) opens an INTERACTIVE terminal session instead of
+ * running a headless report: it queues a pending launch for the active
+ * project's grid (the History-tab mechanism), the grid arms the backend, and
+ * the backend injects the journal-triage prompt — /insights, Downloads
+ * report, keep/file/discard discussion — on the session's first
+ * SessionStarted. Entry statuses flip to CONSUMED at that injection, so this
+ * list updates on the next refresh, not on click.
  */
-export function JournalSection({ onHarvested }: { onHarvested?: () => void }) {
+export function JournalSection() {
   const tabs = useWorkspaceStore((s) => s.tabs);
   const activeTab = tabs.find((t) => t.active);
   const projectPath = activeTab?.projectPath ?? "";
 
   // null = loading; rows are kept newest-first (the backend lists newest LAST).
-  const [rows, setRows] = useState<
-    { entry: SamuraiJournalEntry; status: SamuraiJournalEntryStatus }[] | null
-  >(null);
+  const [rows, setRows] = useState<SamuraiJournalListEntry[] | null>(null);
   // Full entry count from the last good list — the rows above are capped at
   // JOURNAL_TAIL, and the header badge must not lie about the journal's size.
   const [totalEntries, setTotalEntries] = useState(0);
@@ -112,7 +141,6 @@ export function JournalSection({ onHarvested }: { onHarvested?: () => void }) {
   const [category, setCategory] = useState<SamuraiJournalCategory>("BOTTLENECK");
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
-  const [harvestBusy, setHarvestBusy] = useState(false);
 
   // `isCancelled` lets the mount effect drop a result that resolves after
   // unmount (the HarvestReportModal's cancelled-flag pattern); button
@@ -160,22 +188,73 @@ export function JournalSection({ onHarvested }: { onHarvested?: () => void }) {
     }
   };
 
-  const handleHarvest = async () => {
-    setHarvestBusy(true);
+  /**
+   * Deletes one journal entry (issue #100), guarded confirm first (PRD
+   * §5.11 precedent — destructive, never silent). Consumed/archived entries
+   * are deletable too: harvest status only reflects triage, not whether the
+   * observation is worth keeping.
+   */
+  const handleDelete = async (row: SamuraiJournalListEntry) => {
+    const confirmed = await ask(`Delete this journal entry? "${row.entry.text}"`, {
+      title: "Delete Journal Entry",
+      kind: "warning",
+    }).catch(() => false);
+    if (!confirmed) return;
+    setBusy(true);
     setError(null);
     setNotice(null);
     try {
-      const report = await samuraiHarvestRun();
-      setNotice(`Report ${report.date} written — see Files`);
-      // Statuses flip to CONSUMED here; the parent's file list gains the
-      // report row.
+      await samuraiJournalDelete(row.raw);
+      setNotice("Deleted journal entry.");
       await refresh();
-      onHarvested?.();
     } catch (err) {
-      // Matter-of-fact: the backend's message (e.g. nothing-to-harvest).
       setError(String(err));
     } finally {
-      setHarvestBusy(false);
+      setBusy(false);
+    }
+  };
+
+  /**
+   * Opens the interactive harvest triage session (issue #98). No spinner /
+   * waiting state: the click only checks the journal and queues a launch —
+   * the work happens in the terminal that opens. A double-click is deduped
+   * by the pending-launch store (two identical requests are one launch).
+   * The terminal opens in the active project's MAIN checkout
+   * (workingDirOverride) — the journal is account-wide, so no worktree is
+   * derived; the active tab is simply where the user is working.
+   */
+  const handleHarvest = async () => {
+    setError(null);
+    setNotice(null);
+    if (!activeTab) {
+      setError("Open a project tab to start a harvest session.");
+      return;
+    }
+    try {
+      const result = await samuraiJournalList();
+      const unconsumed = result.entries.filter((e) => e.status === "UNCONSUMED").length;
+      if (unconsumed === 0) {
+        setError(NOTHING_TO_HARVEST);
+        return;
+      }
+      usePendingLaunchStore.getState().request({
+        tabId: activeTab.id,
+        mode: "Claude",
+        resumeSessionId: null,
+        workingDirOverride: projectPath || null,
+        branch: null,
+        customName: "harvest triage",
+        harvest: true,
+      });
+      // Same as the History tab: make sure the grid is mounted to consume
+      // the request (the project may sit on the idle landing view).
+      useWorkspaceStore.getState().setSessionsLaunched(activeTab.id, true);
+      setNotice(
+        `Triage session opened — ${unconsumed} ${unconsumed === 1 ? "entry" : "entries"} will be injected there`,
+      );
+    } catch (err) {
+      // Matter-of-fact: the backend's message.
+      setError(String(err));
     }
   };
 
@@ -206,16 +285,11 @@ export function JournalSection({ onHarvested }: { onHarvested?: () => void }) {
             <button
               type="button"
               onClick={handleHarvest}
-              disabled={harvestBusy}
-              className="flex items-center gap-1 rounded border border-maestro-border/60 px-1.5 py-0.5 text-[10px] font-semibold normal-case tracking-normal text-maestro-text transition-colors hover:bg-maestro-surface disabled:opacity-40"
+              className="flex items-center gap-1 rounded border border-maestro-border/60 px-1.5 py-0.5 text-[10px] font-semibold normal-case tracking-normal text-maestro-text transition-colors hover:bg-maestro-surface"
               aria-label="Harvest now"
-              title="Digest the unconsumed entries into today's harvest report (runs headless Claude)"
+              title="Open an interactive terminal session that triages the unconsumed entries with /insights"
             >
-              {harvestBusy ? (
-                <Loader2 size={11} className="animate-spin" />
-              ) : (
-                <Sparkles size={11} />
-              )}
+              <Sparkles size={11} />
               Harvest now
             </button>
           </span>
@@ -266,8 +340,14 @@ export function JournalSection({ onHarvested }: { onHarvested?: () => void }) {
         <p className="px-1 py-2 text-[11px] italic text-maestro-muted">No journal entries yet.</p>
       ) : (
         <div className="space-y-0.5">
-          {rows.map(({ entry, status }, i) => (
-            <JournalRow key={`${entry.ts}-${i}`} entry={entry} status={status} />
+          {rows.map((row, i) => (
+            <JournalRow
+              key={`${row.entry.ts}-${i}`}
+              entry={row.entry}
+              status={row.status}
+              busy={busy}
+              onDelete={() => handleDelete(row)}
+            />
           ))}
         </div>
       )}

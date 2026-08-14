@@ -29,6 +29,9 @@ use super::status_server::StatusServer;
 
 /// The audit event kinds (PRD §5.10). Sub-kinds (ack-timeout, breaker-tripped,
 /// threshold-crossed, illegal_transition, …) live in the free-form `details`.
+/// `INJECT` (issue #101) records every instruction Maestro types into an
+/// orchestrator terminal — delivery and ACK — so an unattended run can be
+/// replayed from the Audit panel alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AuditEventKind {
@@ -38,6 +41,25 @@ pub enum AuditEventKind {
     Resume,
     Complete,
     Alert,
+    Inject,
+}
+
+/// Cap on instruction excerpts recorded in `details` (issue #101): long
+/// enough to recognize the instruction, bounded so the append-only log never
+/// swallows a full multi-KB brief per injection.
+pub const EXCERPT_MAX_CHARS: usize = 200;
+
+/// `(excerpt, total_chars)` of an injected instruction for audit `details`:
+/// the first [`EXCERPT_MAX_CHARS`] characters (char-boundary safe) plus the
+/// full length, so the row shows what was said AND how much was elided.
+pub fn instruction_excerpt(text: &str) -> (String, usize) {
+    let total = text.chars().count();
+    let excerpt = if total > EXCERPT_MAX_CHARS {
+        text.chars().take(EXCERPT_MAX_CHARS).collect()
+    } else {
+        text.to_string()
+    };
+    (excerpt, total)
 }
 
 /// One audit row. Serialized as a single JSONL line:
@@ -395,6 +417,32 @@ mod tests {
             assert!(raw.get(key).is_some(), "missing key {key} in {raw}");
         }
         assert_eq!(raw["event"], "SPAWN");
+    }
+
+    #[test]
+    fn test_inject_kind_wire_spelling_and_excerpt_bounds() {
+        // Issue #101: the INJECT kind serializes SCREAMING like the rest.
+        assert_eq!(
+            serde_json::to_string(&AuditEventKind::Inject).unwrap(),
+            "\"INJECT\""
+        );
+
+        // Short text: verbatim, exact length.
+        assert_eq!(
+            instruction_excerpt("do the thing"),
+            ("do the thing".to_string(), 12)
+        );
+        // Long text: capped at EXCERPT_MAX_CHARS, total length preserved.
+        let long = "x".repeat(EXCERPT_MAX_CHARS + 300);
+        let (excerpt, total) = instruction_excerpt(&long);
+        assert_eq!(excerpt.chars().count(), EXCERPT_MAX_CHARS);
+        assert_eq!(total, EXCERPT_MAX_CHARS + 300);
+        // Multibyte safety: chars, not bytes.
+        let accented = "é".repeat(EXCERPT_MAX_CHARS + 50);
+        let (excerpt, total) = instruction_excerpt(&accented);
+        assert_eq!(excerpt.chars().count(), EXCERPT_MAX_CHARS);
+        assert_eq!(total, EXCERPT_MAX_CHARS + 50);
+        assert!(accented.starts_with(&excerpt));
     }
 
     #[tokio::test]

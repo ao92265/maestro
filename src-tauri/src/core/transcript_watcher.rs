@@ -849,6 +849,89 @@ mod tests {
         );
     }
 
+    /// The live-activity popover (issue #94) is fed by the ToolUseStarted and
+    /// AssistantMessage events of a session's own transcript: the watcher must
+    /// put both on the bus for the top-level file — with the parser's bounded,
+    /// multibyte-safe input summary — and keep them off it when the same line
+    /// is read out of a subagent's transcript, whose internals stay private.
+    #[test]
+    fn test_live_activity_events_surface_for_top_level_only() {
+        // 150 two-byte chars: over the parser's 120-char Bash summary bound,
+        // where a byte-indexed truncation would split a character.
+        let long_cmd = "é".repeat(150);
+        let line = format!(
+            r#"{{"type":"assistant","message":{{"model":"claude-fable-5","content":[{{"type":"text","text":"Пишу тесты дальше"}},{{"type":"tool_use","id":"toolu_live","name":"Bash","input":{{"command":"{long_cmd}"}}}}]}},"uuid":"live1","timestamp":"2026-08-13T10:00:00Z"}}"#
+        );
+
+        // Top-level read: the latest tool call and assistant text reach the bus.
+        let mut file = NamedTempFile::new().expect("create temp file");
+        writeln!(file, "{line}").unwrap();
+        file.flush().unwrap();
+        let (bus, collected) = test_event_bus();
+        read_new_lines(
+            1,
+            &file.path().to_path_buf(),
+            0,
+            &bus,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            None,
+        );
+        {
+            let events = collected.lock().unwrap();
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    ClaudeEvent::AssistantMessage { text, .. } if text == "Пишу тесты дальше"
+                )),
+                "expected the assistant text on the bus, got {:?}",
+                *events
+            );
+            let summary = events
+                .iter()
+                .find_map(|e| match e {
+                    ClaudeEvent::ToolUseStarted {
+                        tool_name,
+                        input_summary,
+                        ..
+                    } if tool_name == "Bash" => Some(input_summary.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("expected ToolUseStarted for Bash, got {:?}", *events));
+            assert!(summary.ends_with("..."), "long input must be truncated: {summary}");
+            assert_eq!(summary.chars().count(), 123, "120 chars + '...'");
+            assert!(
+                summary.trim_end_matches("...").chars().all(|c| c == 'é'),
+                "no character may be split by the bound: {summary}"
+            );
+        }
+
+        // The same line read out of a subagent transcript: internals stay off
+        // the bus — the popover's live summary is top-level only.
+        let mut sub_file = NamedTempFile::new().expect("create temp file");
+        writeln!(sub_file, "{line}").unwrap();
+        sub_file.flush().unwrap();
+        let (sub_bus, sub_collected) = test_event_bus();
+        read_new_lines(
+            1,
+            &sub_file.path().to_path_buf(),
+            0,
+            &sub_bus,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            Some("toolu_parent"),
+        );
+        let events = sub_collected.lock().unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                ClaudeEvent::AssistantMessage { .. } | ClaudeEvent::ToolUseStarted { .. }
+            )),
+            "a subagent's internal activity must stay off the bus: {:?}",
+            *events
+        );
+    }
+
     /// A background agent must stay RUNNING between its launch acknowledgement
     /// and its task notification. Emitting a completion off the immediate
     /// `async_launched` result would mark it done the moment it started.

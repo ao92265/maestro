@@ -1,4 +1,4 @@
-import { GitPullRequest, GitMerge, XCircle, FileEdit } from "lucide-react";
+import { FileEdit, GitMerge, GitPullRequest, XCircle } from "lucide-react";
 import { useMemo } from "react";
 import type { PullRequestInfo } from "../../../stores/useGitHubStore";
 
@@ -64,9 +64,7 @@ export function PullRequestRow({ pr, isSelected, onClick }: PullRequestRowProps)
       type="button"
       onClick={onClick}
       className={`flex w-full items-center gap-2 border-b border-maestro-border/30 px-3 py-2 text-left transition-colors ${
-        isSelected
-          ? "bg-maestro-accent/20 hover:bg-maestro-accent/25"
-          : "hover:bg-maestro-card/50"
+        isSelected ? "bg-maestro-accent/20 hover:bg-maestro-accent/25" : "hover:bg-maestro-card/50"
       }`}
     >
       {/* State icon */}

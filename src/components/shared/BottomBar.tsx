@@ -1,9 +1,9 @@
-import { useEffect } from "react";
 import { Play, UserRound } from "lucide-react";
-import { UsageBar } from "./UsageBar";
+import { useEffect } from "react";
+import { useClaudeAccountStore } from "@/stores/useClaudeAccountStore";
 import { SystemMetrics } from "./SystemMetrics";
 import { TerminalNavigator } from "./TerminalNavigator";
-import { useClaudeAccountStore } from "@/stores/useClaudeAccountStore";
+import { UsageBar } from "./UsageBar";
 
 interface BottomBarProps {
   /** Whether in the grid view (project selected and launched) */

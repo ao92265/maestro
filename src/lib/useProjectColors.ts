@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { useShallow } from "zustand/react/shallow";
-import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { resolveProjectColors } from "@/lib/projectColor";
+import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 
 /**
  * Clash-resolved accent colors for all open projects.

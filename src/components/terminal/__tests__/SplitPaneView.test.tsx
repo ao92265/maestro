@@ -1,6 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
 import { render } from "@testing-library/react";
 import { useEffect } from "react";
+import { describe, expect, it, vi } from "vitest";
 
 import { SplitPaneView } from "../SplitPaneView";
 import type { TreeNode } from "../splitTree";
@@ -90,9 +90,7 @@ describe("SplitPaneView", () => {
     );
     expect(probeMounts).toBe(2);
 
-    rerender(
-      <SplitPaneView node={vsplit("A", "B")} {...common} hiddenSlotIds={new Set(["A"])} />,
-    );
+    rerender(<SplitPaneView node={vsplit("A", "B")} {...common} hiddenSlotIds={new Set(["A"])} />);
 
     const hostA = container.querySelector('[data-slot-id="A"]') as HTMLElement;
     const hostB = container.querySelector('[data-slot-id="B"]') as HTMLElement;

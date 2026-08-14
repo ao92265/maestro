@@ -238,7 +238,11 @@ pub async fn generate_standup_report(
         &ai_runner::truncate_chars(&overview, MAX_OVERVIEW_CHARS),
     );
 
-    let markdown = ai_runner::run_and_save(&canonical, prompt, &report_dir, &today, NOUN).await?;
+    // No fixed heading: the standup's own voice rules forbid one (see
+    // DEFAULT_PROMPT_TEMPLATE), so the shared runner's save-time validation
+    // falls back to its generic "not a one-line chat reply" check.
+    let markdown =
+        ai_runner::run_and_save(&canonical, prompt, &report_dir, &today, None, NOUN).await?;
 
     Ok(StandupReport {
         project_path,

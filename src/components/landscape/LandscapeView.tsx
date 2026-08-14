@@ -1,20 +1,20 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import {
   Background,
   BackgroundVariant,
+  type Edge,
   MiniMap,
+  type Node,
+  type NodeMouseHandler,
   ReactFlow,
   ReactFlowProvider,
   useEdgesState,
   useNodesInitialized,
   useNodesState,
   useReactFlow,
-  type Edge,
-  type Node,
-  type NodeMouseHandler,
 } from "@xyflow/react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "@xyflow/react/dist/style.css";
 import {
   Bell,
@@ -27,40 +27,40 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import { projectColorFor } from "@/lib/projectColor";
-import { useProjectColors } from "@/lib/useProjectColors";
-import { sessionsForTab } from "@/hooks/useProjectStatus";
 import {
   AgentExchangeDrawer,
   agentMarkdownLines,
   edgeStroke,
 } from "@/components/session/agentPresentation";
-import { buildAgentTree, type AgentTreeNode } from "@/lib/agentTree";
-import { useAgentStore, type SubagentInfo } from "@/stores/useAgentStore";
+import { sessionsForTab } from "@/hooks/useProjectStatus";
+import { type AgentTreeNode, buildAgentTree } from "@/lib/agentTree";
+import { projectColorFor } from "@/lib/projectColor";
+import { useProjectColors } from "@/lib/useProjectColors";
+import { type SubagentInfo, useAgentStore } from "@/stores/useAgentStore";
 import { useLandscapeLayoutStore } from "@/stores/useLandscapeLayoutStore";
 import {
-  useSessionStore,
   type BackendSessionStatus,
   type SessionConfig,
+  useSessionStore,
 } from "@/stores/useSessionStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 import {
-  agentNodeId,
-  layoutLandscape,
-  projectNodeId,
-  terminalNodeId,
-  type LayoutAgent,
-  type LayoutProject,
-  type XY,
-} from "./layout";
-import {
-  landscapeNodeTypes,
-  LandscapeActionsProvider,
   type AgentNodeData,
   type LandscapeActions,
+  LandscapeActionsProvider,
+  landscapeNodeTypes,
   type ProjectNodeData,
   type TerminalNodeData,
 } from "./LandscapeNodes";
+import {
+  agentNodeId,
+  type LayoutAgent,
+  type LayoutProject,
+  layoutLandscape,
+  projectNodeId,
+  terminalNodeId,
+  type XY,
+} from "./layout";
 
 interface LandscapeViewProps {
   /** Leave the landscape and focus a terminal (or just its project). */
@@ -118,9 +118,7 @@ function terminalDescription(session: SessionConfig): string {
 /** Whether a session is doing something (used by the "active only" filter). */
 function sessionActive(session: SessionConfig): boolean {
   return (
-    session.status === "Working" ||
-    session.status === "NeedsInput" ||
-    session.status === "Starting"
+    session.status === "Working" || session.status === "NeedsInput" || session.status === "Starting"
   );
 }
 
@@ -375,7 +373,11 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
           source: pId,
           target: tId,
           animated: terminal.session.status === "Working",
-          style: { stroke: cluster.color, strokeWidth: 1.5, opacity: dimmed.has(tId) ? 0.15 : 0.65 },
+          style: {
+            stroke: cluster.color,
+            strokeWidth: 1.5,
+            opacity: dimmed.has(tId) ? 0.15 : 0.65,
+          },
         });
 
         // A root agent's edge leaves the terminal; a nested agent's edge
@@ -594,8 +596,7 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
   const liveSessionIds = useMemo(() => new Set(sessions.map((s) => s.id)), [sessions]);
 
   const clearableCount = useMemo(
-    () =>
-      agents.filter((a) => a.completedAt !== null || !liveSessionIds.has(a.sessionId)).length,
+    () => agents.filter((a) => a.completedAt !== null || !liveSessionIds.has(a.sessionId)).length,
     [agents, liveSessionIds],
   );
 
@@ -668,7 +669,10 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
         <div className="min-w-[8px] flex-1" />
 
         {exportError && (
-          <span className="max-w-[220px] shrink-0 truncate text-[10px] text-red-400" title={exportError}>
+          <span
+            className="max-w-[220px] shrink-0 truncate text-[10px] text-red-400"
+            title={exportError}
+          >
             Export failed: {exportError}
           </span>
         )}
@@ -685,18 +689,40 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
           <Bell size={11} />
           Needs input{attentionIds.length > 0 ? ` (${attentionIds.length})` : ""}
         </button>
-        <button type="button" onClick={handleReorganize} title="Undo every drag — re-run the tidy layout" className={toolbarButton}>
+        <button
+          type="button"
+          onClick={handleReorganize}
+          title="Undo every drag — re-run the tidy layout"
+          className={toolbarButton}
+        >
           <LayoutGrid size={11} />
           Reorganize
         </button>
-        <button type="button" onClick={fitAll} title="Zoom out to the whole landscape" className={toolbarButton}>
+        <button
+          type="button"
+          onClick={fitAll}
+          title="Zoom out to the whole landscape"
+          className={toolbarButton}
+        >
           <Maximize2 size={11} />
           Overview
         </button>
-        <button type="button" onClick={() => zoomIn({ duration: 200 })} aria-label="Zoom in" title="Zoom in" className={toolbarButton}>
+        <button
+          type="button"
+          onClick={() => zoomIn({ duration: 200 })}
+          aria-label="Zoom in"
+          title="Zoom in"
+          className={toolbarButton}
+        >
           <ZoomIn size={11} />
         </button>
-        <button type="button" onClick={() => zoomOut({ duration: 200 })} aria-label="Zoom out" title="Zoom out" className={toolbarButton}>
+        <button
+          type="button"
+          onClick={() => zoomOut({ duration: 200 })}
+          aria-label="Zoom out"
+          title="Zoom out"
+          className={toolbarButton}
+        >
           <ZoomOut size={11} />
         </button>
         <button
@@ -709,7 +735,12 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
           <Trash2 size={11} />
           Clear done{clearableCount > 0 ? ` (${clearableCount})` : ""}
         </button>
-        <button type="button" onClick={handleExport} title="Export every brief, report and counter to markdown" className={toolbarButton}>
+        <button
+          type="button"
+          onClick={handleExport}
+          title="Export every brief, report and counter to markdown"
+          className={toolbarButton}
+        >
           <Download size={11} />
           Export
         </button>
@@ -749,7 +780,12 @@ function LandscapeCanvas({ onNavigate, onClose }: LandscapeViewProps) {
               maxZoom={2}
               proOptions={{ hideAttribution: true }}
             >
-              <Background variant={BackgroundVariant.Dots} gap={26} size={1} color="rgb(var(--maestro-border))" />
+              <Background
+                variant={BackgroundVariant.Dots}
+                gap={26}
+                size={1}
+                color="rgb(var(--maestro-border))"
+              />
               <MiniMap
                 pannable
                 zoomable

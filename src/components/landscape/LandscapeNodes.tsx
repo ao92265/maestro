@@ -1,8 +1,6 @@
-import { createContext, useContext } from "react";
-import { Handle, Position, type NodeProps } from "@xyflow/react";
-import { ArrowUpRight, Folder, TerminalSquare, X } from "lucide-react";
-import { SamuraiBadge } from "@/components/terminal/SamuraiBadge";
-import { ThinkingIndicator } from "@/components/terminal/ThinkingIndicator";
+import { Handle, type NodeProps, Position } from "@xyflow/react";
+import { ArrowUpRight, Eye, Folder, TerminalSquare, X } from "lucide-react";
+import { createContext, useContext, useEffect, useState } from "react";
 import {
   agentBadge,
   badgeBaseClass,
@@ -10,6 +8,9 @@ import {
   statsLine,
   ToolStatsRow,
 } from "@/components/session/agentPresentation";
+import { LiveActivityPopover } from "@/components/session/LiveActivityPopover";
+import { SamuraiBadge } from "@/components/terminal/SamuraiBadge";
+import { ThinkingIndicator } from "@/components/terminal/ThinkingIndicator";
 import type { SubagentInfo } from "@/stores/useAgentStore";
 import type { BackendSessionStatus } from "@/stores/useSessionStore";
 import { AGENT_H, AGENT_W, PROJECT_H, PROJECT_W, TERMINAL_H, TERMINAL_W } from "./layout";
@@ -167,12 +168,20 @@ export function ProjectNode({ data, selected }: NodeProps) {
 export function TerminalNode({ data, selected }: NodeProps) {
   const d = data as TerminalNodeData;
   const { openTerminal } = useContext(LandscapeActionsContext);
+  const [liveOpen, setLiveOpen] = useState(false);
+  // Leaving Working closes the popover FOR REAL (the render guard below only
+  // hides it) — otherwise Working→NeedsInput→Working would reopen it
+  // uninvited with the stale `liveOpen` still true.
+  const working = d.status === "Working";
+  useEffect(() => {
+    if (!working) setLiveOpen(false);
+  }, [working]);
   const badge = SESSION_STATUS_BADGES[d.status] ?? SESSION_STATUS_BADGES.Idle;
   return (
     <div
       style={{ width: TERMINAL_W, height: TERMINAL_H }}
       title={d.description}
-      className={`flex flex-col justify-center rounded-lg border bg-maestro-card px-3 py-2 transition-opacity ${statusBorderClass(
+      className={`relative flex flex-col justify-center rounded-lg border bg-maestro-card px-3 py-2 transition-opacity ${statusBorderClass(
         d.status,
       )} ${dimClass(d.dimmed)} ${selected ? "ring-1 ring-maestro-accent" : ""}`}
     >
@@ -185,6 +194,23 @@ export function TerminalNode({ data, selected }: NodeProps) {
         <span className={`${badgeBaseClass} ${badge.cls}`}>{badge.label}</span>
         {/* Samurai supervision (issue #46) — nothing for non-supervised sessions. */}
         <SamuraiBadge sessionId={d.sessionId} />
+        {/* Live activity (issue #94): top-level sessions only — a subagent's
+            internals never reach the bus, so its node keeps the brief/report
+            drawer instead. */}
+        {d.status === "Working" && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setLiveOpen((v) => !v);
+            }}
+            aria-label={`Show live activity for ${d.title}`}
+            title="What is this agent doing right now?"
+            className="nodrag shrink-0 rounded p-0.5 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-text"
+          >
+            <Eye size={12} />
+          </button>
+        )}
         <button
           type="button"
           onClick={(e) => {
@@ -206,6 +232,13 @@ export function TerminalNode({ data, selected }: NodeProps) {
               d.runningAgentCount
             } running`}
       </p>
+      {/* Hidden (not just closed) if the session stops working, so a stale
+          "live" summary never outlives the eye that opened it. */}
+      {liveOpen && d.status === "Working" && (
+        <div className="nodrag nopan absolute left-0 top-full z-10 mt-1.5 w-[260px]">
+          <LiveActivityPopover sessionId={d.sessionId} onClose={() => setLiveOpen(false)} />
+        </div>
+      )}
       <EdgeHandles target source />
     </div>
   );
@@ -220,6 +253,7 @@ export function AgentNode({ data, selected }: NodeProps) {
   const running = agent.completedAt === null;
   const stats = statsLine(agent);
   return (
+    // biome-ignore lint/a11y/useSemanticElements: can't be a real <button> — it wraps a nested "Dismiss" <button>, and nested buttons are invalid HTML that breaks click handling.
     <div
       style={{ width: AGENT_W, height: AGENT_H }}
       title="Click to read the brief sent and the report returned"

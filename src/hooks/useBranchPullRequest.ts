@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import { getBranchPullRequest, type BranchPullRequest } from "@/lib/github";
+import { type BranchPullRequest, getBranchPullRequest } from "@/lib/github";
 
 /**
  * How often a terminal re-checks whether its branch has a PR yet. The lib-level
@@ -24,7 +24,7 @@ const UNKNOWN_BRANCH = "...";
 export function useBranchPullRequest(
   repoPath: string,
   branch: string | null,
-  isActive: boolean = true
+  isActive: boolean = true,
 ): BranchPullRequest | null {
   const [pr, setPr] = useState<BranchPullRequest | null>(null);
   const mountedRef = useRef(true);

@@ -37,14 +37,19 @@ export interface SamuraiSessionSnapshot {
   ts: string;
 }
 
-/** Audit row kinds (PRD §5.10). Sub-kinds live in `details.kind`. */
+/**
+ * Audit row kinds (PRD §5.10). Sub-kinds live in `details.kind`.
+ * `INJECT` (issue #101) records every instruction Maestro typed into an
+ * orchestrator terminal — `details.phase` is `"delivered"` or `"acked"`.
+ */
 export type SamuraiAuditEventKind =
   | "SPAWN"
   | "HANDOFF"
   | "PARK"
   | "RESUME"
   | "COMPLETE"
-  | "ALERT";
+  | "ALERT"
+  | "INJECT";
 
 /** One audit JSONL row — mirrors the Rust `AuditEvent`. */
 export interface SamuraiAuditEvent {
@@ -162,6 +167,39 @@ export interface SamuraiPreflight {
   windows_reported: boolean;
 }
 
+/**
+ * One workflow step box — mirrors the Rust `WorkflowNode`
+ * (`core/samurai_workflow.rs`). `id` is the stable identity edits preserve;
+ * step numbers are assigned at compile time, never stored.
+ */
+export interface SamuraiWorkflowNode {
+  id: string;
+  /** The step's instruction text (editable in the workflow editor). */
+  text: string;
+}
+
+/** One directed edge between two node ids — mirrors the Rust `WorkflowEdge`. */
+export interface SamuraiWorkflowEdge {
+  from: string;
+  to: string;
+}
+
+/**
+ * The run workflow graph (issue #91) — mirrors the Rust `WorkflowGraph`.
+ * The backend compiles the path reachable from `start` (following the FIRST
+ * outgoing edge per node, in edge-list order; cycles stop before a repeat;
+ * unreachable nodes are excluded) into the numbered WORKFLOW section of
+ * every orchestrator brief. The graph is instruction, not machinery — v1
+ * has no step enforcement. Snapshotted into the run config at launch, so
+ * successor briefs recompile the same workflow after handoffs.
+ */
+export interface SamuraiWorkflowGraph {
+  nodes: SamuraiWorkflowNode[];
+  edges: SamuraiWorkflowEdge[];
+  /** Node id the compile walk starts from. */
+  start: string;
+}
+
 /** One epic's run config — mirrors the Rust `SamuraiRunConfig` (P3.1). */
 export interface SamuraiRunConfig {
   /** Canonical project path (Windows `\\?\` prefix already stripped). */
@@ -184,9 +222,67 @@ export interface SamuraiRunConfig {
   model: string | null;
   /** Per-run threshold overrides; null = the global config applies. */
   thresholds: unknown;
-  status: "ACTIVE" | "ARCHIVED";
+  /**
+   * The workflow graph snapshotted at launch (issue #91); null on configs
+   * written before workflows existed — the backend then compiles the
+   * default template.
+   */
+  workflow: SamuraiWorkflowGraph | null;
+  /**
+   * ACTIVE = live; COMPLETED = verified finished (issue #96 — the
+   * orchestrator declared completion and the backend confirmed via gh that
+   * every batch issue is closed and the batch PR is open), awaiting the
+   * manual cleanup; ARCHIVED = cleaned up.
+   */
+  status: "ACTIVE" | "COMPLETED" | "ARCHIVED";
   /** RFC 3339 UTC creation timestamp. */
   created_at: string;
+}
+
+/**
+ * A run's orchestrator's live details (issue #102) — mirrors the Rust
+ * `SamuraiRunOrchestrator`. `generation`/`session_id` come from the
+ * supervisor's session list; `model`/`context_window`/`context_percent`
+ * come from the same per-session reading the 45% handoff trigger reads.
+ * Every field is `null` when its source has nothing yet — no session
+ * registered, or (for the live reading) no assistant message seen since —
+ * render that as a dash, never a guess.
+ */
+export interface SamuraiRunOrchestrator {
+  generation: number | null;
+  session_id: number | null;
+  model: string | null;
+  /** The model's context window, in tokens. */
+  context_window: number | null;
+  /** `0`–`100`, one decimal. */
+  context_percent: number | null;
+}
+
+/**
+ * One Active Runs row — mirrors the Rust `SamuraiRunListEntry`: every
+ * `SamuraiRunConfig` field (flattened on the wire) plus the live
+ * `orchestrator` details.
+ */
+export interface SamuraiRunListEntry extends SamuraiRunConfig {
+  orchestrator: SamuraiRunOrchestrator;
+}
+
+/**
+ * One tick of the launch test-suite gate (issue #90b) — payload of the live
+ * `samurai-test-gate-event` channel, emitted while the launch bootstraps the
+ * epic worktree and runs `cargo test --workspace` in it. Mirrors the Rust
+ * `TestGateProgress` (`core/samurai_test_gate.rs`).
+ */
+export interface SamuraiTestGateProgress {
+  /** Canonical project path — filter on it, like every samurai channel. */
+  project: string;
+  epic: string;
+  /** Wire step name. */
+  step: "bootstrap_npm" | "bootstrap_mcp" | "cargo_test" | "passed" | "failed";
+  /** Human line for the progress row ("bootstrap: npm install…"). */
+  detail: string;
+  /** Seconds since the gate started, as of this tick. */
+  elapsed_secs: number;
 }
 
 /** What a successful launch set up. */
@@ -220,15 +316,23 @@ export function samuraiPreflight(projectPath: string): Promise<SamuraiPreflight>
 
 /**
  * Launches a run: server-side preflight re-check, run worktree at the stable
- * path, ACTIVE run config, gen-1 spawn with the opening brief. Refusals (gh
- * auth, no governing window, live session) arrive as rejected promises with
- * the reason.
+ * path, test-suite gate inside that worktree (issue #90b — bootstrap +
+ * `cargo test --workspace`, progress on `samurai-test-gate-event`; a red
+ * suite blocks the launch unless `skipTestGate` overrides), ACTIVE run
+ * config, gen-1 spawn with the opening brief. Refusals (gh auth, no
+ * governing window, live session, red gate) arrive as rejected promises
+ * with the reason.
  *
  * `epics` and `issues` are the launcher's two fields (issue #83) — parent
  * epics whose child issues the run discovers, and issues named directly.
  * Each element may itself be a comma-separated list, and a leading `#` is
  * optional: the backend splits and normalizes the spelling, so `["#77,78"]`
  * and `["#77", "78"]` are the same run. It refuses an empty combined set.
+ *
+ * `workflow` (issue #91) is the run's workflow graph — the editor's edited
+ * graph, or omitted/null for the default template. Whatever the run
+ * launches with is snapshotted into its run config, so successor briefs
+ * recompile the same workflow after handoffs.
  */
 export function samuraiLaunchRun(
   projectPath: string,
@@ -236,6 +340,8 @@ export function samuraiLaunchRun(
   issues: string[],
   model: string | null,
   handoffContextPct: number | null,
+  skipTestGate: boolean,
+  workflow?: SamuraiWorkflowGraph | null,
 ): Promise<SamuraiLaunchResult> {
   return invoke("samurai_launch_run", {
     projectPath,
@@ -243,11 +349,27 @@ export function samuraiLaunchRun(
     issues,
     model,
     handoffContextPct,
+    skipTestGate,
+    workflow: workflow ?? null,
   });
 }
 
-/** Every ACTIVE run config across all projects — the active-runs list. */
-export function samuraiListRuns(): Promise<SamuraiRunConfig[]> {
+/**
+ * The DEFAULT workflow graph (issue #91) — the single source of truth for
+ * the workflow editor's reset-to-default, identical to what a launch
+ * without an explicit graph runs with.
+ */
+export function samuraiDefaultWorkflow(): Promise<SamuraiWorkflowGraph> {
+  return invoke("samurai_default_workflow");
+}
+
+/**
+ * Every unarchived run config across all projects — ACTIVE (live) plus
+ * COMPLETED (finished-awaiting-cleanup, issue #96) — the runs list. Each row
+ * carries its orchestrator's live details (issue #102): model, max context
+ * window, live context %, generation, session id.
+ */
+export function samuraiListRuns(): Promise<SamuraiRunListEntry[]> {
   return invoke("samurai_list_runs");
 }
 
@@ -380,12 +502,7 @@ export function samuraiGetConfig(): Promise<SamuraiConfig> {
 // ---------------------------------------------------------------------------
 
 /** Journal entry categories (PRD §5.12) — mirrors the Rust `JournalCategory`. */
-export type SamuraiJournalCategory =
-  | "BOTTLENECK"
-  | "ERROR"
-  | "IMPROVEMENT"
-  | "SKILL"
-  | "CONCERN";
+export type SamuraiJournalCategory = "BOTTLENECK" | "ERROR" | "IMPROVEMENT" | "SKILL" | "CONCERN";
 
 /**
  * One ops-journal JSONL line — mirrors the Rust `JournalEntry`
@@ -414,11 +531,23 @@ export interface SamuraiJournalEntry {
 export type SamuraiJournalEntryStatus = "UNCONSUMED" | "CONSUMED" | "ARCHIVED";
 
 /**
+ * Mirrors the Rust `JournalEntryWithStatus`. `raw` is the entry's exact
+ * on-disk JSONL text (no trailing newline) — entries carry no id, so this
+ * is the identity `samuraiJournalDelete` matches on; round-trip it
+ * unmodified (issue #100).
+ */
+export interface SamuraiJournalListEntry {
+  entry: SamuraiJournalEntry;
+  status: SamuraiJournalEntryStatus;
+  raw: string;
+}
+
+/**
  * Mirrors the Rust `JournalListResult`: the active file's entries (newest
  * last) with derived status, plus the file size in bytes.
  */
 export interface SamuraiJournalListResult {
-  entries: { entry: SamuraiJournalEntry; status: SamuraiJournalEntryStatus }[];
+  entries: SamuraiJournalListEntry[];
   file_size_bytes: number;
 }
 
@@ -439,39 +568,43 @@ export function samuraiJournalList(): Promise<SamuraiJournalListResult> {
   return invoke("samurai_journal_list");
 }
 
-// ---------------------------------------------------------------------------
-// Issue #70: harvest — journal digest via headless claude -p
-// ---------------------------------------------------------------------------
-
 /**
- * A generated harvest report — mirrors the Rust `HarvestReport`
- * (`src-tauri/src/commands/harvest.rs`). One per date, account-wide, saved
- * as `<app data>/harvest/<date>.md` (the Second Brain's `HARVEST_REPORT`
- * rows).
+ * Deletes one journal entry (destructive — confirm before calling), passing
+ * back the exact `raw` text `samuraiJournalList` returned for that row (see
+ * `SamuraiJournalListEntry.raw`). Byte-identical duplicate lines are deleted
+ * together — entries carry no id to distinguish them (issue #100). Resolves
+ * the number of lines removed; rejects when the identity no longer matches
+ * anything (e.g. a stale list from before a harvest changed the file).
  */
-export interface SamuraiHarvestReport {
-  /** Local calendar date the report belongs to (YYYY-MM-DD). */
-  date: string;
-  markdown: string;
-  /** RFC 3339 timestamp of when the report was generated. */
-  generated_at: string;
+export function samuraiJournalDelete(raw: string): Promise<number> {
+  return invoke("samurai_journal_delete", { raw });
 }
 
+// ---------------------------------------------------------------------------
+// Issue #98: harvest — interactive triage session
+// ---------------------------------------------------------------------------
+
 /**
- * Digests the unconsumed journal entries into today's harvest report via a
- * headless `claude -p` run, then marks them consumed (Rust
- * `samurai_harvest_run`). Rejects with "Nothing to harvest…" when the
- * journal has no unconsumed entries; a failed run never consumes them.
+ * Arms the interactive harvest triage for a just-launched session (Rust
+ * `samurai_harvest_arm`, issue #98). TerminalGrid calls this right before it
+ * types the CLI command — like the samurai successor registration — so the
+ * backend can inject the journal-triage prompt on the session's first
+ * SessionStarted hook signal. Journal entries flip to consumed AT that
+ * injection, not here. Rejects with "Nothing to harvest…" when the journal
+ * has no unconsumed entries.
  */
-export function samuraiHarvestRun(): Promise<SamuraiHarvestReport> {
-  return invoke("samurai_harvest_run");
+export function samuraiHarvestArm(sessionId: number): Promise<void> {
+  return invoke("samurai_harvest_arm", { sessionId });
 }
 
 /**
  * Reads one saved harvest report by absolute path — the Second Brain lists
  * `HARVEST_REPORT` rows by path, this serves their content (Rust
- * `samurai_harvest_read`). The backend refuses anything that is not a
- * regular file directly under the harvest directory.
+ * `samurai_harvest_read`). New reports no longer land there (issue #98
+ * moved harvest into an interactive session, whose /insights report goes to
+ * Downloads), but previously generated ones stay readable. The backend
+ * refuses anything that is not a regular file directly under the harvest
+ * directory.
  */
 export function samuraiHarvestRead(path: string): Promise<string> {
   return invoke("samurai_harvest_read", { path });

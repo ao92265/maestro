@@ -36,7 +36,7 @@ Maestro becomes the **supervisor brain** of development work. You hand it a GitH
 - **Statusline / hooks / transcripts** — Claude Code mechanisms Maestro already integrates with (see §4).
 - **Worktree** — a separate git checkout of the same repo, so parallel work never collides on branches.
 - **Circuit breaker** — a hard rule that stops an agent that is burning tokens without producing progress.
-- **Harvest** — a periodic report generated from the ops journal to improve our processes, skills, and Maestro itself.
+- **Harvest** — the interactive triage of unconsumed ops-journal entries (issue #98): a terminal session Maestro opens with the entries injected, which runs `/insights`, saves the report to Downloads, and discusses keep/file/discard — to improve our processes, skills, and Maestro itself.
 
 ---
 
@@ -60,7 +60,7 @@ The design deliberately builds on sensors and mechanisms that already exist in t
 - **Transcript watcher** (`src-tauri/src/core/transcript_watcher.rs`, `transcript_parser.rs`): tails Claude Code session transcripts, emits per-session token usage (→ context % is derivable) and subagent spawn/complete events.
 - **Hooks → status server** (`core/hook_config_writer.rs`, `core/status_server.rs`): SessionStart/SessionEnd/Stop hooks POST to a local HTTP server — Maestro knows when an agent finishes a turn (idle signal).
 - **Terminal injection** (`write_stdin` in `core/process_manager.rs`): Maestro can type into a session's terminal. (Blind — hence the idle-gate + ACK protocol, §5.3.)
-- **Headless runner** (`commands/ai_runner.rs`): spawns `claude -p` — already used for standup reports; reused for harvest.
+- **Headless runner** (`commands/ai_runner.rs`): spawns `claude -p` — already used for standup reports and the daily plan. (Harvest no longer uses it: issue #98 moved harvest into an interactive terminal session, §5.12.)
 - **Worktree manager** (`core/worktree_manager.rs`), **process kill/scan** (`commands/processes.rs`), **UtilityPanel UI pattern**, **attention mechanism** (`src/lib/healthRules.ts`), **gh runner** (`src-tauri/src/github/runner.rs`).
 
 **Consequence:** the originally-proposed sensor layer (statusline script + telemetry JSONL file + Python pollers) is **deleted from the design** — fully redundant, and it added the worst file-race risks.
@@ -134,9 +134,15 @@ Every successor — after handoff, park, crash, machine reboot, or app auto-upda
 
 Each epic gets its own git worktree (existing `WorktreeManager`) with a **stable path across generations**. This kills the known shared-checkout hazard (agents switching branches under each other / staging foreign files into WIP commits). Epic completion offers one-click cleanup (worktree + branch) — surfaced in the UI, never silent, because deleting git state is destructive.
 
+**Within-epic issue work is sequential by design** (issue #91): the orchestrator works strictly one issue at a time through the run's workflow — implement via small subagent steps → fresh-eyes review of that issue's diff → QA report committed to the branch → push — before taking up the next issue, then a batch phase (whole-branch review for cross-issue defects → batch QA using the committed per-issue reports → the PR readied for the HUMAN merge decision). The workflow is compiled into every orchestrator brief from the graph the run config snapshots at launch (editable in the launcher; default = the canonical chain above). It is instruction, not machinery — Maestro enforces no steps in v1.
+
+**Completion is DECLARE + VERIFY** (issue #96): the orchestrator declares completion (`<samurai-run-complete>issues #a #b pr #n</samurai-run-complete>`, instructed in every brief), then Maestro verifies the claim via `gh` (every probe pinned with the run's `--repo` pin when one is stored) before flipping the run config ACTIVE → COMPLETED. The run's own process closes issues via `Closes #N` links fired by the HUMAN merge, so "everything closed while the PR is still open" is unreachable by design; the verified matrix is instead: the claimed PR is **OPEN** and every claimed issue is **CLOSED or linked for close by that PR** (`closingIssuesReferences`), OR the PR is already **MERGED** and every claimed issue is **CLOSED** (a merged PR has fired its links — anything still open was not closed by it). Neither an unverified declaration nor GitHub state alone ever flips it. A COMPLETED run shows as finished-awaiting-cleanup, cold-start reconciliation skips it, and the manual cleanup above stays the separate step that archives it.
+
 ### 5.10 Audit log
 
 Per-project JSONL in app-data. Events: `SPAWN / HANDOFF / PARK / RESUME / COMPLETE / ALERT` with timestamp, epic, generation, session id, details. **The user deletes audit records manually** (explicit requirement — it is the human oversight surface and the primary testing instrument); a size warning fires when it grows. Orchestrators also comment progress on GitHub issues — a second, human-readable, teammate-visible record.
+
+`COMPLETE` lands at exactly the moment §5.9's verified completion flips the run config ACTIVE → COMPLETED (issue #96). A declaration that fails verification lands an `ALERT` (`completion_verification_failed`) instead, the config stays ACTIVE, and the failed claim is released for retry — an identical re-declaration (e.g. after a transient `gh` failure) verifies again instead of being swallowed by the replay dedupe.
 
 ### 5.11 Second Brain panel (frontend)
 
@@ -150,9 +156,8 @@ v1 is deliberately minimal: list, delete, warn. No file-manager ambitions.
 ### 5.12 Journal & harvest (Phase 5 — in scope)
 
 - **Ops journal** (app-data JSONL): bottlenecks, errors, improvements, skills gaps, concerns — recorded by agents (instructed in orchestrator prompts) and by the user, tagged by category and project.
-- **Harvest:** periodically, a headless `claude -p` run (same pattern as existing standup reports) digests unharvested entries into a markdown report with concrete recommendations — improving Maestro, our skills, and our processes (e.g. "QA runs tests 3×; run once at the end"). Reports land in app-data and are readable from the Files section.
-- `/insights` (Claude Code's session-analysis command) is terminal-only per docs — it is a **manual** step you can run and paste in, not automated.
-- Journal entries are marked consumed by a harvest and auto-archived after the next one; reports are deliverables you delete when read.
+- **Harvest (interactive, issue #98):** "Harvest now" opens a real terminal session in the active project's main checkout and injects one prompt carrying the unconsumed journal entries, oldest first up to a prompt-size cap — entries beyond the cap stay unconsumed for the next harvest and the prompt states how many were withheld — framed as "investigate whether each is worth acting on and what it is about". The prompt instructs the session to run `/insights` (terminal-only — exactly why the interactive design works where headless could not), save the `/insights` report to the user's Downloads folder named with the run date (`maestro-harvest-insights-<YYYY-MM-DD>.md`), read it back in the same session, and then discuss journal entries and insights together so the user decides keep/file/discard in the terminal. The prior headless `claude -p` report path is retired; previously generated reports stay listed and readable in the Files section.
+- Journal entries flip to consumed **at injection** — the moment the prompt lands in the terminal session. A session abandoned mid-triage does NOT restore the undiscussed entries (accepted trade-off). Consumed entries auto-archive after the next harvest, as before.
 
 ---
 
@@ -268,7 +273,7 @@ On disk but not re-rendered in-app (existing tools own them): Claude Code transc
 
 Epic: 15 issues. You write the run config in the launcher, hit start, walk away.
 
-- **T+0** — Preflight passes (gh auth, windows reported). Maestro creates the epic worktree, spawns **gen-1**, audit: `SPAWN`. Gen-1 reads the GitHub epic, plans, spawns `dev-issue-101`, `dev-issue-102`.
+- **T+0** — Preflight passes (gh auth, windows reported). Maestro creates the epic worktree, spawns **gen-1**, audit: `SPAWN`. Gen-1 reads the GitHub epic, validates the issue order, plans — then works the issues strictly ONE at a time through the run's workflow: `dev-issue-101` is implemented (small subagent steps, per-step commits), fresh-eyes reviewed, QA-reported (report committed to the branch) and pushed before `dev-issue-102` begins (within-epic issue work is sequential by design, §5.9).
 - **T+3h** — context crosses 40%. Watchdog waits for idle, injects "prepare handoff", gets ACK. Gen-1 lets `dev-issue-103` finish its step, writes `epic12-gen1.md`, commits WIP. Audit: `HANDOFF`. Maestro tree-kills gen-1, spawns **gen-2** at 0% context; gen-2 runs verify (HEAD matches → skipped), continues.
 - **T+4.5h** — 5h window hits 78%: soft threshold — no new subagents. At 90%: park. Gen-2 finishes its atomic step, updates the handoff, commits. Audit: `PARK`. Timer armed for reset+5min (persisted to disk).
 - **T+5h** — Windows applies an update and reboots. On next Maestro launch, cold-start reconciliation finds the live epic and the pending timer.
@@ -287,7 +292,7 @@ Audit trail you slept through: `SPAWN → HANDOFF → PARK → RESUME → … �
 | **2 — Self-healing** | Injection+ACK, handoff protocol, kill + successor spawn, verify ritual, circuit breaker | With threshold at 5%, a full handoff completes hands-off; successor continues real work; churn alert fires when starved |
 | **3 — Park & resume** | Soft/hard thresholds, sequential parking, persisted timers, cold-start reconciliation, worktree-per-epic, run config + launcher + preflight | With park at 2%, park→timer→fresh-spawn cycle survives an app restart in between |
 | **4 — Second Brain panel** | Audit + Files sections, delete/confirm, size warnings, clean-this-epic | All §8 files manageable in-app; warnings fire at thresholds |
-| **5 — Journal & harvest** | Ops journal, harvest via headless `claude -p`, reports in panel | A harvest produces a report from real journal entries |
+| **5 — Journal & harvest** | Ops journal, interactive harvest triage session (issue #98; originally headless `claude -p`), prior reports in panel | A harvest injects real journal entries into a live triage session |
 
 Each phase ships and is testable alone. Verification per project rules: run in `npm run tauri dev`, small commits, conventional commits, CI green before merge consideration.
 

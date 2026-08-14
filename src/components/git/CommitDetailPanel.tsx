@@ -11,7 +11,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { GraphNode } from "../../lib/graphLayout";
-import { useGitStore, type FileChange, type FileChangeStatus } from "../../stores/useGitStore";
+import { type FileChange, type FileChangeStatus, useGitStore } from "../../stores/useGitStore";
 
 interface CommitDetailPanelProps {
   node: GraphNode;
@@ -108,9 +108,7 @@ export function CommitDetailPanel({
     }
 
     // Sort directories
-    const sorted = Array.from(groups.entries()).sort(([a], [b]) =>
-      a.localeCompare(b)
-    );
+    const sorted = Array.from(groups.entries()).sort(([a], [b]) => a.localeCompare(b));
 
     return sorted;
   }, [files]);
@@ -121,9 +119,7 @@ export function CommitDetailPanel({
     <div className="flex h-full flex-col border-l border-maestro-border bg-maestro-surface">
       {/* Header */}
       <div className="flex shrink-0 items-center justify-between border-b border-maestro-border px-3 py-2">
-        <span className="text-sm font-medium text-maestro-text">
-          Commit Details
-        </span>
+        <span className="text-sm font-medium text-maestro-text">Commit Details</span>
         <button
           type="button"
           onClick={onClose}
@@ -142,10 +138,7 @@ export function CommitDetailPanel({
             SHA
           </div>
           <div className="flex items-center gap-2">
-            <div
-              className="h-2 w-2 shrink-0 rounded-full"
-              style={{ backgroundColor: railColor }}
-            />
+            <div className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: railColor }} />
             <code className="flex-1 truncate font-mono text-xs text-maestro-text">
               {commit.hash}
             </code>
@@ -155,11 +148,7 @@ export function CommitDetailPanel({
               className="rounded p-1 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text"
               aria-label="Copy hash"
             >
-              {copiedHash ? (
-                <Check size={12} className="text-green-400" />
-              ) : (
-                <Copy size={12} />
-              )}
+              {copiedHash ? <Check size={12} className="text-green-400" /> : <Copy size={12} />}
             </button>
           </div>
         </div>
@@ -170,9 +159,7 @@ export function CommitDetailPanel({
             Author
           </div>
           <div className="text-xs text-maestro-text">{commit.author_name}</div>
-          <div className="text-[11px] text-maestro-muted">
-            {commit.author_email}
-          </div>
+          <div className="text-[11px] text-maestro-muted">{commit.author_email}</div>
         </div>
 
         {/* Date */}
@@ -180,9 +167,7 @@ export function CommitDetailPanel({
           <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-maestro-muted/60">
             Date
           </div>
-          <div className="text-xs text-maestro-text">
-            {formatDate(commit.timestamp)}
-          </div>
+          <div className="text-xs text-maestro-text">{formatDate(commit.timestamp)}</div>
         </div>
 
         {/* Message */}
@@ -190,9 +175,7 @@ export function CommitDetailPanel({
           <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-maestro-muted/60">
             Message
           </div>
-          <div className="whitespace-pre-wrap text-xs text-maestro-text">
-            {commit.summary}
-          </div>
+          <div className="whitespace-pre-wrap text-xs text-maestro-text">{commit.summary}</div>
         </div>
 
         {/* Parents */}
@@ -203,10 +186,7 @@ export function CommitDetailPanel({
             </div>
             <div className="flex flex-col gap-1">
               {commit.parent_hashes.map((hash, i) => (
-                <code
-                  key={hash}
-                  className="font-mono text-[11px] text-maestro-muted"
-                >
+                <code key={hash} className="font-mono text-[11px] text-maestro-muted">
                   {i + 1}. {hash.slice(0, 12)}
                 </code>
               ))}
@@ -250,25 +230,17 @@ export function CommitDetailPanel({
           </div>
 
           {isLoadingFiles ? (
-            <div className="py-4 text-center text-xs text-maestro-muted">
-              Loading files...
-            </div>
+            <div className="py-4 text-center text-xs text-maestro-muted">Loading files...</div>
           ) : files.length === 0 ? (
-            <div className="py-4 text-center text-xs text-maestro-muted">
-              No files changed
-            </div>
+            <div className="py-4 text-center text-xs text-maestro-muted">No files changed</div>
           ) : (
             <div className="space-y-2">
               {filesByDirectory.map(([dir, dirFiles]) => (
                 <div key={dir}>
-                  <div className="mb-1 text-[10px] font-medium text-maestro-muted">
-                    {dir}
-                  </div>
+                  <div className="mb-1 text-[10px] font-medium text-maestro-muted">{dir}</div>
                   <div className="space-y-0.5">
                     {dirFiles.map((file) => {
-                      const { icon: Icon, color, label } = getFileStatusDisplay(
-                        file.status
-                      );
+                      const { icon: Icon, color, label } = getFileStatusDisplay(file.status);
                       const fileName = file.path.split("/").pop();
 
                       return (
@@ -280,9 +252,7 @@ export function CommitDetailPanel({
                           <span className="flex-1 truncate text-[11px] text-maestro-text">
                             {fileName}
                           </span>
-                          <span
-                            className={`shrink-0 text-[9px] font-medium ${color}`}
-                          >
+                          <span className={`shrink-0 text-[9px] font-medium ${color}`}>
                             {label}
                           </span>
                         </div>

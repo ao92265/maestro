@@ -1,7 +1,7 @@
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The persisted zustand stores hydrate through the Tauri store plugin at
 // import time; happy-dom has no Tauri backend, so stub it out.
@@ -41,10 +41,10 @@ beforeAll(async () => {
   ]);
 });
 
-import { SecondBrainSection } from "../SecondBrainSection";
 import { SAMURAI_IN_USE_ERROR_PREFIX, type SamuraiFileEntry } from "@/lib/samurai";
 import { useHealthStore } from "@/stores/useHealthStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
+import { SecondBrainSection } from "../SecondBrainSection";
 
 const invokeMock = vi.mocked(invoke);
 const askMock = vi.mocked(ask);

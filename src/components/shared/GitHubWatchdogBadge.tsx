@@ -41,9 +41,7 @@ export function GitHubWatchdogBadge({ onNavigate }: GitHubWatchdogBadgeProps) {
           </span>
         </button>
       )}
-      {prCount > 0 && issueCount > 0 && (
-        <span className="text-[10px] text-maestro-muted">·</span>
-      )}
+      {prCount > 0 && issueCount > 0 && <span className="text-[10px] text-maestro-muted">·</span>}
       {issueCount > 0 && (
         <button
           type="button"

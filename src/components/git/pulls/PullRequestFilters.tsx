@@ -1,9 +1,6 @@
 import { Search, X } from "lucide-react";
 import { useEffect, useState } from "react";
-import {
-  useGitHubStore,
-  type PrFilterState,
-} from "../../../stores/useGitHubStore";
+import { type PrFilterState, useGitHubStore } from "../../../stores/useGitHubStore";
 
 const STATE_FILTERS: Array<{ value: PrFilterState; label: string }> = [
   { value: "open", label: "Open" },
@@ -40,8 +37,7 @@ export function PullRequestFilters({ repoPath }: PullRequestFiltersProps) {
     fetchPullRequests(repoPath, filter, searchInput);
   };
 
-  const isChipActive = (clause: string) =>
-    searchInput.toLowerCase().includes(clause.toLowerCase());
+  const isChipActive = (clause: string) => searchInput.toLowerCase().includes(clause.toLowerCase());
 
   const toggleChip = (clause: string) => {
     let next: string;
@@ -51,7 +47,7 @@ export function PullRequestFilters({ repoPath }: PullRequestFiltersProps) {
         .replace(/\s+/g, " ")
         .trim();
     } else {
-      next = (searchInput.trim() + " " + clause).trim();
+      next = `${searchInput.trim()} ${clause}`.trim();
     }
     setSearchInput(next);
     applySearch(next);

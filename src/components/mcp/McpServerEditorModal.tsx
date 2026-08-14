@@ -1,15 +1,8 @@
-import {
-  FolderOpen,
-  Loader2,
-  Plus,
-  Terminal,
-  Trash2,
-  X,
-} from "lucide-react";
-import { useEffect, useRef, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { useMcpStore } from "@/stores/useMcpStore";
+import { FolderOpen, Loader2, Plus, Terminal, Trash2, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import type { McpCustomServer, McpManagedScope, McpManagedServer } from "@/lib/mcp";
+import { useMcpStore } from "@/stores/useMcpStore";
 
 /** Where a new/edited server definition is written. */
 type EditorScope = Exclude<McpManagedScope, "connector"> | "custom";
@@ -80,30 +73,23 @@ export function McpServerEditorModal({
   // and keeps pasted credentials out of the repo-tracked .mcp.json unless the
   // user explicitly chooses to share them.
   const [scope, setScope] = useState<EditorScope>(
-    server ? "custom" : (managedServer?.scope as EditorScope) ?? "local"
+    server ? "custom" : ((managedServer?.scope as EditorScope) ?? "local"),
   );
-  const [transport, setTransport] = useState<"stdio" | "http">(
-    managedIsUrl ? "http" : "stdio"
-  );
+  const [transport, setTransport] = useState<"stdio" | "http">(managedIsUrl ? "http" : "stdio");
   const [name, setName] = useState(server?.name ?? managedServer?.name ?? "");
   const [command, setCommand] = useState(
-    server?.command ?? (typeof managedConfig.command === "string" ? managedConfig.command : "")
+    server?.command ?? (typeof managedConfig.command === "string" ? managedConfig.command : ""),
   );
   const [argsString, setArgsString] = useState(
     server?.args.join(" ") ??
-      (Array.isArray(managedConfig.args) ? (managedConfig.args as string[]).join(" ") : "")
+      (Array.isArray(managedConfig.args) ? (managedConfig.args as string[]).join(" ") : ""),
   );
-  const [url, setUrl] = useState(
-    typeof managedConfig.url === "string" ? managedConfig.url : ""
-  );
-  const [workingDirectory, setWorkingDirectory] = useState(
-    server?.workingDirectory ?? ""
-  );
-  const [envVars, setEnvVars] = useState<Array<{ key: string; value: string }>>(
-    Object.entries(
-      server?.env ??
-        ((managedConfig.env ?? {}) as Record<string, string>)
-    ).map(([key, value]) => ({ key, value: String(value) }))
+  const [url, setUrl] = useState(typeof managedConfig.url === "string" ? managedConfig.url : "");
+  const [workingDirectory, setWorkingDirectory] = useState(server?.workingDirectory ?? "");
+  const [envVars, setEnvVars] = useState<Array<{ id: string; key: string; value: string }>>(
+    Object.entries(server?.env ?? ((managedConfig.env ?? {}) as Record<string, string>)).map(
+      ([key, value]) => ({ id: crypto.randomUUID(), key, value: String(value) }),
+    ),
   );
   const [isEnabled, setIsEnabled] = useState(server?.isEnabled ?? true);
   const [saving, setSaving] = useState(false);
@@ -149,17 +135,11 @@ export function McpServerEditorModal({
   };
 
   const addEnvVar = () => {
-    setEnvVars([...envVars, { key: "", value: "" }]);
+    setEnvVars([...envVars, { id: crypto.randomUUID(), key: "", value: "" }]);
   };
 
-  const updateEnvVar = (
-    index: number,
-    field: "key" | "value",
-    value: string
-  ) => {
-    setEnvVars(
-      envVars.map((ev, i) => (i === index ? { ...ev, [field]: value } : ev))
-    );
+  const updateEnvVar = (index: number, field: "key" | "value", value: string) => {
+    setEnvVars(envVars.map((ev, i) => (i === index ? { ...ev, [field]: value } : ev)));
   };
 
   const removeEnvVar = (index: number) => {
@@ -213,9 +193,7 @@ export function McpServerEditorModal({
 
   const collectEnv = (): Record<string, string> =>
     Object.fromEntries(
-      envVars
-        .filter((ev) => ev.key.trim())
-        .map((ev) => [ev.key.trim(), ev.value])
+      envVars.filter((ev) => ev.key.trim()).map((ev) => [ev.key.trim(), ev.value]),
     );
 
   /** Builds the raw JSON entry written into the config file. */
@@ -294,7 +272,7 @@ export function McpServerEditorModal({
           buildManagedConfig(),
           // Only an explicit edit may replace an existing entry; the Add
           // flow errors on a name collision instead of clobbering it.
-          !!managedServer
+          !!managedServer,
         );
       }
 
@@ -333,9 +311,7 @@ export function McpServerEditorModal({
         <div className="max-h-[70vh] space-y-4 overflow-y-auto p-4">
           {/* Scope */}
           <section>
-            <span className="mb-1.5 block text-xs font-medium text-maestro-text">
-              Scope
-            </span>
+            <span className="mb-1.5 block text-xs font-medium text-maestro-text">Scope</span>
             <div className="flex gap-1">
               {SCOPE_OPTIONS.map((option) => (
                 <button
@@ -353,17 +329,13 @@ export function McpServerEditorModal({
                 </button>
               ))}
             </div>
-            {scopeHint && (
-              <p className="mt-1 text-[10px] text-maestro-muted">{scopeHint}</p>
-            )}
+            {scopeHint && <p className="mt-1 text-[10px] text-maestro-muted">{scopeHint}</p>}
           </section>
 
           {/* Transport (managed scopes only — custom servers are always stdio) */}
           {!isCustom && (
             <section>
-              <span className="mb-1.5 block text-xs font-medium text-maestro-text">
-                Transport
-              </span>
+              <span className="mb-1.5 block text-xs font-medium text-maestro-text">Transport</span>
               <div className="flex gap-1">
                 {(["stdio", "http"] as const).map((t) => (
                   <button
@@ -385,10 +357,14 @@ export function McpServerEditorModal({
 
           {/* Name */}
           <section>
-            <label className="mb-1.5 block text-xs font-medium text-maestro-text">
+            <label
+              htmlFor="mcp-server-name"
+              className="mb-1.5 block text-xs font-medium text-maestro-text"
+            >
               Name
             </label>
             <input
+              id="mcp-server-name"
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
@@ -400,6 +376,7 @@ export function McpServerEditorModal({
                   : undefined
               }
               className="w-full rounded border border-maestro-border bg-maestro-surface px-3 py-2 text-xs text-maestro-text placeholder:text-maestro-muted focus:border-maestro-accent focus:outline-none disabled:opacity-60"
+              // biome-ignore lint/a11y/noAutofocus: modal opened via an explicit "Add server" action — autofocusing the first field is the expected UX here.
               autoFocus={!managedServer}
             />
           </section>
@@ -428,10 +405,14 @@ export function McpServerEditorModal({
           {!showUrl && (
             <>
               <section>
-                <label className="mb-1.5 block text-xs font-medium text-maestro-text">
+                <label
+                  htmlFor="mcp-server-command"
+                  className="mb-1.5 block text-xs font-medium text-maestro-text"
+                >
                   Command
                 </label>
                 <input
+                  id="mcp-server-command"
                   type="text"
                   value={command}
                   onChange={(e) => setCommand(e.target.value)}
@@ -441,10 +422,14 @@ export function McpServerEditorModal({
               </section>
 
               <section>
-                <label className="mb-1.5 block text-xs font-medium text-maestro-text">
+                <label
+                  htmlFor="mcp-server-args"
+                  className="mb-1.5 block text-xs font-medium text-maestro-text"
+                >
                   Arguments
                 </label>
                 <input
+                  id="mcp-server-args"
                   type="text"
                   value={argsString}
                   onChange={(e) => setArgsString(e.target.value)}
@@ -459,11 +444,15 @@ export function McpServerEditorModal({
               {/* Working Directory (custom servers only — not a standard MCP field) */}
               {isCustom && (
                 <section>
-                  <label className="mb-1.5 block text-xs font-medium text-maestro-text">
+                  <label
+                    htmlFor="mcp-server-working-dir"
+                    className="mb-1.5 block text-xs font-medium text-maestro-text"
+                  >
                     Working Directory
                   </label>
                   <div className="flex gap-2">
                     <input
+                      id="mcp-server-working-dir"
                       type="text"
                       value={workingDirectory}
                       onChange={(e) => setWorkingDirectory(e.target.value)}
@@ -484,9 +473,10 @@ export function McpServerEditorModal({
               {/* Environment Variables */}
               <section>
                 <div className="mb-1.5 flex items-center justify-between">
-                  <label className="text-xs font-medium text-maestro-text">
+                  {/* Group heading for the env var rows below — not a control label. */}
+                  <span className="text-xs font-medium text-maestro-text">
                     Environment Variables
-                  </label>
+                  </span>
                   <button
                     type="button"
                     onClick={addEnvVar}
@@ -503,7 +493,7 @@ export function McpServerEditorModal({
                     </p>
                   ) : (
                     envVars.map((ev, index) => (
-                      <div key={index} className="flex items-center gap-2">
+                      <div key={ev.id} className="flex items-center gap-2">
                         <input
                           type="text"
                           value={ev.key}
@@ -554,10 +544,11 @@ export function McpServerEditorModal({
 
           {/* Command Preview */}
           <section>
-            <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-maestro-text">
+            {/* Caption for the readonly preview below — not a control label. */}
+            <span className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-maestro-text">
               <Terminal size={12} />
               {showUrl ? "Endpoint Preview" : "Command Preview"}
-            </label>
+            </span>
             <div className="rounded-lg border border-maestro-border bg-maestro-surface p-2">
               <code className="text-[11px] text-maestro-accent break-all">
                 {buildCommandPreview()}
@@ -566,9 +557,7 @@ export function McpServerEditorModal({
           </section>
 
           {/* Error */}
-          {error && (
-            <p className="text-xs text-maestro-red">{error}</p>
-          )}
+          {error && <p className="text-xs text-maestro-red">{error}</p>}
         </div>
 
         {/* Actions */}
@@ -591,8 +580,10 @@ export function McpServerEditorModal({
                 <Loader2 size={12} className="animate-spin" />
                 Saving...
               </>
+            ) : isEditing ? (
+              "Save Changes"
             ) : (
-              isEditing ? "Save Changes" : "Add Server"
+              "Add Server"
             )}
           </button>
         </div>

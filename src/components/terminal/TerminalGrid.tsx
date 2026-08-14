@@ -1,41 +1,66 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, type ReactNode } from "react";
-
 import {
-  DndContext,
   closestCenter,
+  DndContext,
+  type DragEndEvent,
   PointerSensor,
   useSensor,
   useSensors,
-  type DragEndEvent,
 } from "@dnd-kit/core";
+import { restrictToHorizontalAxis } from "@dnd-kit/modifiers";
 import {
-  SortableContext,
   arrayMove,
   horizontalListSortingStrategy,
+  SortableContext,
   useSortable,
 } from "@dnd-kit/sortable";
-import { restrictToHorizontalAxis } from "@dnd-kit/modifiers";
 import { CSS } from "@dnd-kit/utilities";
 import { invoke } from "@tauri-apps/api/core";
 import { ask, open } from "@tauri-apps/plugin-dialog";
 import { GripVertical } from "lucide-react";
-
 import {
+  forwardRef,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useTerminalDragDrop } from "@/hooks/useTerminalDragDrop";
+import { useTerminalKeyboard } from "@/hooks/useTerminalKeyboard";
+import {
+  type BranchWithWorktreeStatus,
   getBranchesWithWorktreeStatus,
   invalidateCurrentBranchCache,
-  type BranchWithWorktreeStatus,
 } from "@/lib/git";
-import { removeSessionMcpConfig, removeOpenCodeMcpConfig, setSessionMcpServers, writeSessionMcpConfig, writeOpenCodeMcpConfig, type McpServerConfig } from "@/lib/mcp";
+import {
+  type McpServerConfig,
+  removeOpenCodeMcpConfig,
+  removeSessionMcpConfig,
+  setSessionMcpServers,
+  writeOpenCodeMcpConfig,
+  writeSessionMcpConfig,
+} from "@/lib/mcp";
+import { checkFullDiskAccess, pathRequiresFDA } from "@/lib/permissions";
 import {
   loadBranchConfig,
+  type PluginConfig,
   removeSessionPluginConfig,
+  type SkillConfig,
   saveBranchConfig,
   setSessionPlugins,
   setSessionSkills,
   writeSessionPluginConfig,
-  type PluginConfig,
-  type SkillConfig,
 } from "@/lib/plugins";
+import { projectColorFor } from "@/lib/projectColor";
+import { samuraiHarvestArm } from "@/lib/samurai";
+import { shellEscapePaths } from "@/lib/shellEscape";
+import {
+  registerSamuraiSuccessor,
+  samuraiSuccessorCliFlags,
+  successorLaunchImminent,
+} from "@/lib/spawnSession";
 import {
   AI_CLI_CONFIG,
   assignSessionBranch,
@@ -49,28 +74,36 @@ import {
   writeSessionHooksConfig,
   writeStdin,
 } from "@/lib/terminal";
-import { checkFullDiskAccess, pathRequiresFDA } from "@/lib/permissions";
-import { registerSamuraiSuccessor, samuraiSuccessorCliFlags, successorLaunchImminent } from "@/lib/spawnSession";
-import { useFDAStore } from "@/stores/useFDAStore";
-import { useCliSettingsStore } from "@/stores/useCliSettingsStore";
-import { cleanupSessionWorktree, prepareSessionWorktree } from "@/lib/worktreeManager";
-import { useTerminalDragDrop } from "@/hooks/useTerminalDragDrop";
-import { useTerminalKeyboard } from "@/hooks/useTerminalKeyboard";
-import { useMcpStore } from "@/stores/useMcpStore";
-import { useWorktreeSettingsStore } from "@/stores/useWorktreeSettingsStore";
-import { usePluginStore } from "@/stores/usePluginStore";
-import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
-import { useActivityStore } from "@/stores/useActivityStore";
-import { SAMURAI_TILE_CLOSE_STATES, useSessionStore } from "@/stores/useSessionStore";
-import type { AiMode } from "@/stores/useSessionStore";
-import { useWorkspaceStore, type RepositoryInfo, type WorkspaceType } from "@/stores/useWorkspaceStore";
-import { shellEscapePaths } from "@/lib/shellEscape";
-import { projectColorFor } from "@/lib/projectColor";
 import { useProjectColors } from "@/lib/useProjectColors";
+import { cleanupSessionWorktree, prepareSessionWorktree } from "@/lib/worktreeManager";
+import { useActivityStore } from "@/stores/useActivityStore";
+import { useCliSettingsStore } from "@/stores/useCliSettingsStore";
+import { useFDAStore } from "@/stores/useFDAStore";
+import { useMcpStore } from "@/stores/useMcpStore";
+import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
+import { usePluginStore } from "@/stores/usePluginStore";
+import type { AiMode } from "@/stores/useSessionStore";
+import { SAMURAI_TILE_CLOSE_STATES, useSessionStore } from "@/stores/useSessionStore";
+import {
+  type RepositoryInfo,
+  useWorkspaceStore,
+  type WorkspaceType,
+} from "@/stores/useWorkspaceStore";
+import { useWorktreeSettingsStore } from "@/stores/useWorktreeSettingsStore";
 import { ParkedShelf } from "./ParkedShelf";
 import { PreLaunchCard, type SessionSlot } from "./PreLaunchCard";
 import { SplitPaneView } from "./SplitPaneView";
-import { MAX_SESSIONS, createLeaf, removeLeaf, updateRatio, collectSlotIds, findSiblingSlotId, buildGridTree, swapSlots, type TreeNode } from "./splitTree";
+import {
+  buildGridTree,
+  collectSlotIds,
+  createLeaf,
+  findSiblingSlotId,
+  MAX_SESSIONS,
+  removeLeaf,
+  swapSlots,
+  type TreeNode,
+  updateRatio,
+} from "./splitTree";
 import { TerminalView } from "./TerminalView";
 import { SessionStatusDot, ThinkingIndicator } from "./ThinkingIndicator";
 
@@ -136,7 +169,7 @@ function focusSlotTextarea(slotId: string): void {
 function createEmptySlot(
   mcpServers: McpServerConfig[] = [],
   skills: SkillConfig[] = [],
-  plugins: PluginConfig[] = []
+  plugins: PluginConfig[] = [],
 ): SessionSlot {
   return {
     id: generateSlotId(),
@@ -272,21 +305,21 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   // Array reference is stable per tab (only replaced by setZoomTabOrder), so no useShallow needed.
   const zoomTabOrder = useWorkspaceStore((s) => (tabId ? s.zoomTabOrders[tabId] : undefined));
   const worktreeBasePath = useWorkspaceStore((s) =>
-    tabId ? s.tabs.find((t) => t.id === tabId)?.worktreeBasePath ?? null : null
+    tabId ? (s.tabs.find((t) => t.id === tabId)?.worktreeBasePath ?? null) : null,
   );
 
   // MCP store - use stable empty array reference to avoid infinite re-render loops
   const mcpServers = useMcpStore((s) =>
-    projectPath ? (s.projectServers[projectPath] ?? EMPTY_MCP_SERVERS) : EMPTY_MCP_SERVERS
+    projectPath ? (s.projectServers[projectPath] ?? EMPTY_MCP_SERVERS) : EMPTY_MCP_SERVERS,
   );
   const fetchMcpServers = useMcpStore((s) => s.fetchProjectServers);
 
   // Plugin store - use stable empty array references
   const skills = usePluginStore((s) =>
-    projectPath ? (s.projectSkills[projectPath] ?? EMPTY_SKILLS) : EMPTY_SKILLS
+    projectPath ? (s.projectSkills[projectPath] ?? EMPTY_SKILLS) : EMPTY_SKILLS,
   );
   const plugins = usePluginStore((s) =>
-    projectPath ? (s.projectPlugins[projectPath] ?? EMPTY_PLUGINS) : EMPTY_PLUGINS
+    projectPath ? (s.projectPlugins[projectPath] ?? EMPTY_PLUGINS) : EMPTY_PLUGINS,
   );
   const fetchPlugins = usePluginStore((s) => s.fetchProjectPlugins);
 
@@ -317,9 +350,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   const parkedSlotIds = useMemo(
     () =>
       new Set(
-        slots
-          .filter((s) => s.sessionId !== null && parkedSet.has(s.sessionId))
-          .map((s) => s.id),
+        slots.filter((s) => s.sessionId !== null && parkedSet.has(s.sessionId)).map((s) => s.id),
       ),
     [slots, parkedSet],
   );
@@ -375,18 +406,21 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   // Stable per-slot focus callbacks — avoids creating new arrow functions on every render,
   // which would defeat React.memo on TerminalView.
   const focusCallbacksRef = useRef(new Map<string, () => void>());
-  const getFocusCallback = useCallback((slotId: string) => {
-    let cb = focusCallbacksRef.current.get(slotId);
-    if (!cb) {
-      cb = () => {
-        // Clicking the pane is the user selecting it — attention is served.
-        clearSlotAttention(slotId);
-        setFocusedSlotId(slotId);
-      };
-      focusCallbacksRef.current.set(slotId, cb);
-    }
-    return cb;
-  }, [clearSlotAttention]);
+  const getFocusCallback = useCallback(
+    (slotId: string) => {
+      let cb = focusCallbacksRef.current.get(slotId);
+      if (!cb) {
+        cb = () => {
+          // Clicking the pane is the user selecting it — attention is served.
+          clearSlotAttention(slotId);
+          setFocusedSlotId(slotId);
+        };
+        focusCallbacksRef.current.set(slotId, cb);
+      }
+      return cb;
+    },
+    [clearSlotAttention],
+  );
 
   // Ordered slot IDs from the split tree (defines Cmd+1-9 ordering)
   const orderedSlotIds = useMemo(() => collectSlotIds(layoutTree), [layoutTree]);
@@ -407,17 +441,20 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   const zoomTabSensors = useSensors(
     useSensor(PointerSensor, {
       activationConstraint: { distance: 5 },
-    })
+    }),
   );
 
-  const handleZoomTabDragEnd = useCallback((event: DragEndEvent) => {
-    const { active, over } = event;
-    if (!tabId || !over || active.id === over.id) return;
-    const from = displaySlotIds.indexOf(active.id as string);
-    const to = displaySlotIds.indexOf(over.id as string);
-    if (from === -1 || to === -1) return;
-    setZoomTabOrder(tabId, arrayMove(displaySlotIds, from, to));
-  }, [tabId, displaySlotIds, setZoomTabOrder]);
+  const handleZoomTabDragEnd = useCallback(
+    (event: DragEndEvent) => {
+      const { active, over } = event;
+      if (!tabId || !over || active.id === over.id) return;
+      const from = displaySlotIds.indexOf(active.id as string);
+      const to = displaySlotIds.indexOf(over.id as string);
+      if (from === -1 || to === -1) return;
+      setZoomTabOrder(tabId, arrayMove(displaySlotIds, from, to));
+    },
+    [tabId, displaySlotIds, setZoomTabOrder],
+  );
 
   // Compute launched slots in tree order for keyboard navigation.
   // Parked panes are hidden, so Cmd+1-9 and cycling skip them.
@@ -426,8 +463,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     return orderedSlotIds
       .map((id) => slotMap.get(id))
       .filter(
-        (s): s is SessionSlot =>
-          s != null && s.sessionId !== null && !parkedSet.has(s.sessionId),
+        (s): s is SessionSlot => s != null && s.sessionId !== null && !parkedSet.has(s.sessionId),
       );
   }, [slots, orderedSlotIds, parkedSet]);
 
@@ -479,7 +515,9 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     const idx = visibleDisplaySlotIds.indexOf(zoomedSlotId);
     if (idx < 0) return;
     const prev =
-      visibleDisplaySlotIds[(idx - 1 + visibleDisplaySlotIds.length) % visibleDisplaySlotIds.length];
+      visibleDisplaySlotIds[
+        (idx - 1 + visibleDisplaySlotIds.length) % visibleDisplaySlotIds.length
+      ];
     clearSlotAttention(prev);
     setZoomedSlotId(prev);
     setFocusedSlotId(prev);
@@ -541,31 +579,37 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
    * Shared by drag-and-drop and the attach-file button so both take the
    * exact same code path.
    */
-  const insertPathsIntoSession = useCallback((sessionId: number, paths: string[], slotId: string) => {
-    // Trailing space separates this insertion from whatever comes next —
-    // without it two consecutive drops produce adjacent quoted strings
-    // ('/a/one.png''/b/two.png') that shells join into one bogus path.
-    const escaped = `${shellEscapePaths(paths)} `;
-    writeStdin(sessionId, escaped).catch(console.error);
-    // Focus the pane that received the paths so the user can keep typing
-    // right after the path. setFocusedSlotId updates the grid's focus ring;
-    // the direct DOM focus covers the already-focused pane (no isFocused
-    // transition for TerminalView's focus effect to react to).
-    setFocusedSlotId(slotId);
-    focusSlotTextarea(slotId);
-  }, []);
+  const insertPathsIntoSession = useCallback(
+    (sessionId: number, paths: string[], slotId: string) => {
+      // Trailing space separates this insertion from whatever comes next —
+      // without it two consecutive drops produce adjacent quoted strings
+      // ('/a/one.png''/b/two.png') that shells join into one bogus path.
+      const escaped = `${shellEscapePaths(paths)} `;
+      writeStdin(sessionId, escaped).catch(console.error);
+      // Focus the pane that received the paths so the user can keep typing
+      // right after the path. setFocusedSlotId updates the grid's focus ring;
+      // the direct DOM focus covers the already-focused pane (no isFocused
+      // transition for TerminalView's focus effect to react to).
+      setFocusedSlotId(slotId);
+      focusSlotTextarea(slotId);
+    },
+    [],
+  );
 
   /**
    * Opens the native file picker and inserts the chosen paths into the
    * session, reusing the drag-drop insertion path above.
    */
-  const handleAttachFiles = useCallback(async (sessionId: number, slotId: string) => {
-    const selected = await open({ multiple: true, title: "Attach Files" });
-    if (!selected) return; // user cancelled
-    const paths = Array.isArray(selected) ? selected : [selected];
-    if (paths.length === 0) return;
-    insertPathsIntoSession(sessionId, paths, slotId);
-  }, [insertPathsIntoSession]);
+  const handleAttachFiles = useCallback(
+    async (sessionId: number, slotId: string) => {
+      const selected = await open({ multiple: true, title: "Attach Files" });
+      if (!selected) return; // user cancelled
+      const paths = Array.isArray(selected) ? selected : [selected];
+      if (paths.length === 0) return;
+      insertPathsIntoSession(sessionId, paths, slotId);
+    },
+    [insertPathsIntoSession],
+  );
 
   // Drag-and-drop files from Finder/Explorer onto terminal panes.
   // Only the active project's grid handles window drop events — inactive
@@ -619,6 +663,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   }, [refreshBranches, isActive]);
 
   // Fetch MCP servers and plugins when projectPath is available
+  // biome-ignore lint/correctness/useExhaustiveDependencies: isActive is a deliberate extra dep — flipping back to this tab re-runs the fetch so the MCP/plugin lists refresh on re-activation (#88: risky lint fixes get an ignore, never a behavior change)
   useEffect(() => {
     if (!projectPath) return;
 
@@ -645,7 +690,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
             };
           }
           return slot;
-        })
+        }),
       );
     }
   }, [mcpServers]);
@@ -658,9 +703,17 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
         prev.map((slot) => {
           let updated = slot;
           if (!slot.skillsDefaultsApplied && slot.enabledSkills.length === 0 && skills.length > 0) {
-            updated = { ...updated, enabledSkills: skills.map((s) => s.id), skillsDefaultsApplied: true };
+            updated = {
+              ...updated,
+              enabledSkills: skills.map((s) => s.id),
+              skillsDefaultsApplied: true,
+            };
           }
-          if (!slot.pluginsDefaultsApplied && slot.enabledPlugins.length === 0 && plugins.length > 0) {
+          if (
+            !slot.pluginsDefaultsApplied &&
+            slot.enabledPlugins.length === 0 &&
+            plugins.length > 0
+          ) {
             updated = {
               ...updated,
               enabledPlugins: plugins.filter((p) => p.enabled_by_default).map((p) => p.id),
@@ -668,7 +721,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
             };
           }
           return updated;
-        })
+        }),
       );
     }
   }, [skills, plugins]);
@@ -713,29 +766,32 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
    * Saves branch config with debouncing.
    * Called when slot config changes (plugins, skills, MCP servers).
    */
-  const debouncedSaveBranchConfig = useCallback((slot: SessionSlot) => {
-    if (!effectiveRepoPath || !slot.branch) return;
+  const debouncedSaveBranchConfig = useCallback(
+    (slot: SessionSlot) => {
+      if (!effectiveRepoPath || !slot.branch) return;
 
-    // Clear existing timer for this slot
-    const existingTimer = branchConfigSaveTimers.current.get(slot.id);
-    if (existingTimer) {
-      clearTimeout(existingTimer);
-    }
+      // Clear existing timer for this slot
+      const existingTimer = branchConfigSaveTimers.current.get(slot.id);
+      if (existingTimer) {
+        clearTimeout(existingTimer);
+      }
 
-    // Set new timer
-    const timer = setTimeout(() => {
-      saveBranchConfig(effectiveRepoPath, slot.branch!, {
-        enabled_plugins: slot.enabledPlugins,
-        enabled_skills: slot.enabledSkills,
-        enabled_mcp_servers: slot.enabledMcpServers,
-      }).catch((err) => {
-        console.error("Failed to save branch config:", err);
-      });
-      branchConfigSaveTimers.current.delete(slot.id);
-    }, 500);
+      // Set new timer
+      const timer = setTimeout(() => {
+        saveBranchConfig(effectiveRepoPath, slot.branch!, {
+          enabled_plugins: slot.enabledPlugins,
+          enabled_skills: slot.enabledSkills,
+          enabled_mcp_servers: slot.enabledMcpServers,
+        }).catch((err) => {
+          console.error("Failed to save branch config:", err);
+        });
+        branchConfigSaveTimers.current.delete(slot.id);
+      }, 500);
 
-    branchConfigSaveTimers.current.set(slot.id, timer);
-  }, [effectiveRepoPath]);
+      branchConfigSaveTimers.current.set(slot.id, timer);
+    },
+    [effectiveRepoPath],
+  );
 
   // Save branch config when slot config changes (debounced)
   // Track previous slots to detect config changes
@@ -754,11 +810,9 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       // Check if config changed (but not the branch itself - that's handled by updateSlotBranch)
       const configChanged =
         prevSlot.branch === slot.branch && // Same branch
-        (
-          JSON.stringify(prevSlot.enabledPlugins) !== JSON.stringify(slot.enabledPlugins) ||
+        (JSON.stringify(prevSlot.enabledPlugins) !== JSON.stringify(slot.enabledPlugins) ||
           JSON.stringify(prevSlot.enabledSkills) !== JSON.stringify(slot.enabledSkills) ||
-          JSON.stringify(prevSlot.enabledMcpServers) !== JSON.stringify(slot.enabledMcpServers)
-        );
+          JSON.stringify(prevSlot.enabledMcpServers) !== JSON.stringify(slot.enabledMcpServers));
 
       if (configChanged) {
         debouncedSaveBranchConfig(slot);
@@ -773,282 +827,310 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
    * Spawns a shell with the configured settings. If a branch is selected,
    * prepares a worktree for that branch first.
    */
-  const launchSlotInner = useCallback(async (slotId: string) => {
-    const slot = slotsRef.current.find((s) => s.id === slotId);
-    if (!slot || slot.sessionId !== null) return;
+  const launchSlotInner = useCallback(
+    async (slotId: string) => {
+      const slot = slotsRef.current.find((s) => s.id === slotId);
+      if (!slot || slot.sessionId !== null) return;
 
-    try {
-      // Save branch config before launching (ensures it's persisted)
-      if (effectiveRepoPath && slot.branch) {
-        await saveBranchConfig(effectiveRepoPath, slot.branch, {
-          enabled_plugins: slot.enabledPlugins,
-          enabled_skills: slot.enabledSkills,
-          enabled_mcp_servers: slot.enabledMcpServers,
-        }).catch((err) => {
-          console.error("Failed to save branch config on launch:", err);
-          // Non-fatal - continue with launch
-        });
-      }
-
-      // Determine the working directory
-      // If a branch is selected, prepare a worktree first
-      // For multi-repo workspaces, use effectiveRepoPath for git operations
-      let workingDirectory = slot.workingDirOverride ?? effectiveRepoPath ?? projectPath;
-      let worktreePath: string | null = null;
-      let worktreeWarning: string | null = null;
-      let detectedBranch: string | null = null;
-
-      if (slot.workingDirOverride && slot.workingDirOverride !== (effectiveRepoPath ?? projectPath)) {
-        // Recovered worktree from the History tab: run there as-is, no
-        // preparation. Close-time deletion of a hand-made worktree is
-        // prevented by the backend's managed-base guard.
-        worktreePath = slot.workingDirOverride;
-      } else if (effectiveRepoPath && slot.worktreeMode !== "project" && !slot.resumeSessionId) {
-        // resumeSessionId pins the project dir: `claude --resume` cannot
-        // find the conversation from a worktree (see updateSlotResumeSession).
-        try {
-          const result = await prepareSessionWorktree(
-            effectiveRepoPath,
-            slot.branch ?? null,
-            worktreeBasePath,
-            slot.worktreeMode === "new",
-          );
-          workingDirectory = result.working_directory;
-          worktreePath = result.worktree_path;
-          worktreeWarning = result.warning;
-          detectedBranch = result.branch;
-
-          if (worktreeWarning) {
-            console.error(`[Worktree] Warning for branch "${slot.branch ?? "auto"}": ${worktreeWarning}`);
-          }
-          if (worktreePath) {
-            refreshBranches();
-          }
-        } catch (err) {
-          console.warn(`[Worktree] Failed to prepare worktree, falling back to project path:`, err);
-          workingDirectory = effectiveRepoPath;
+      try {
+        // Save branch config before launching (ensures it's persisted)
+        if (effectiveRepoPath && slot.branch) {
+          await saveBranchConfig(effectiveRepoPath, slot.branch, {
+            enabled_plugins: slot.enabledPlugins,
+            enabled_skills: slot.enabledSkills,
+            enabled_mcp_servers: slot.enabledMcpServers,
+          }).catch((err) => {
+            console.error("Failed to save branch config on launch:", err);
+            // Non-fatal - continue with launch
+          });
         }
-      }
 
-      // Generate project hash for MCP status identification
-      // This is passed as MAESTRO_PROJECT_HASH env var to enable process-isolated
-      // session identification (avoiding .mcp.json race conditions)
-      let envVars: Record<string, string> | undefined;
-      if (projectPath) {
-        const projectHash = await invoke<string>("generate_project_hash", { projectPath });
-        envVars = { MAESTRO_PROJECT_HASH: projectHash };
-      }
+        // Determine the working directory
+        // If a branch is selected, prepare a worktree first
+        // For multi-repo workspaces, use effectiveRepoPath for git operations
+        let workingDirectory = slot.workingDirOverride ?? effectiveRepoPath ?? projectPath;
+        let worktreePath: string | null = null;
+        let worktreeWarning: string | null = null;
+        let detectedBranch: string | null = null;
 
-      // Spawn the shell in the correct directory (worktree or project path)
-      // MAESTRO_SESSION_ID is automatically injected by the backend
-      const sessionId = await spawnShell(workingDirectory, envVars);
+        if (
+          slot.workingDirOverride &&
+          slot.workingDirOverride !== (effectiveRepoPath ?? projectPath)
+        ) {
+          // Recovered worktree from the History tab: run there as-is, no
+          // preparation. Close-time deletion of a hand-made worktree is
+          // prevented by the backend's managed-base guard.
+          worktreePath = slot.workingDirOverride;
+        } else if (effectiveRepoPath && slot.worktreeMode !== "project" && !slot.resumeSessionId) {
+          // resumeSessionId pins the project dir: `claude --resume` cannot
+          // find the conversation from a worktree (see updateSlotResumeSession).
+          try {
+            const result = await prepareSessionWorktree(
+              effectiveRepoPath,
+              slot.branch ?? null,
+              worktreeBasePath,
+              slot.worktreeMode === "new",
+            );
+            workingDirectory = result.working_directory;
+            worktreePath = result.worktree_path;
+            worktreeWarning = result.warning;
+            detectedBranch = result.branch;
 
-      // Register the session in SessionManager (required before assigning branch)
-      if (projectPath) {
-        const sessionConfig = await createSession(
-          sessionId,
-          slot.mode,
-          projectPath,
-          workingDirectory,
+            if (worktreeWarning) {
+              console.error(
+                `[Worktree] Warning for branch "${slot.branch ?? "auto"}": ${worktreeWarning}`,
+              );
+            }
+            if (worktreePath) {
+              refreshBranches();
+            }
+          } catch (err) {
+            console.warn(
+              `[Worktree] Failed to prepare worktree, falling back to project path:`,
+              err,
+            );
+            workingDirectory = effectiveRepoPath;
+          }
+        }
+
+        // Generate project hash for MCP status identification
+        // This is passed as MAESTRO_PROJECT_HASH env var to enable process-isolated
+        // session identification (avoiding .mcp.json race conditions)
+        let envVars: Record<string, string> | undefined;
+        if (projectPath) {
+          const projectHash = await invoke<string>("generate_project_hash", { projectPath });
+          envVars = { MAESTRO_PROJECT_HASH: projectHash };
+        }
+
+        // Spawn the shell in the correct directory (worktree or project path)
+        // MAESTRO_SESSION_ID is automatically injected by the backend
+        const sessionId = await spawnShell(workingDirectory, envVars);
+
+        // Register the session in SessionManager (required before assigning branch)
+        if (projectPath) {
+          const sessionConfig = await createSession(
+            sessionId,
+            slot.mode,
+            projectPath,
+            workingDirectory,
+          );
+
+          // Apply optional custom window name. Empty/whitespace is treated as "no
+          // custom name" — the backend normalizes it back to None.
+          const trimmedName = slot.customName.trim();
+          let finalName: string | null | undefined = sessionConfig.name;
+          if (trimmedName) {
+            try {
+              const renamed = await invoke<{ name?: string | null }>("rename_session", {
+                sessionId,
+                name: trimmedName,
+              });
+              finalName = renamed.name;
+            } catch (err) {
+              console.warn(`[Session] Failed to set custom name for session ${sessionId}:`, err);
+            }
+          }
+
+          // Add project to MCP status monitor for polling status updates
+          await invoke("add_mcp_project", { projectPath });
+          // Add session to store directly (don't refetch all sessions to avoid status reset)
+          useSessionStore.getState().addSession({
+            ...sessionConfig,
+            name: finalName,
+            status: sessionConfig.status as import("@/stores/useSessionStore").BackendSessionStatus,
+          });
+        }
+
+        // Assign the branch to the session so the header displays it.
+        // Use the explicitly selected branch, or the one detected from the worktree.
+        const effectiveBranch = slot.branch ?? detectedBranch;
+        if (effectiveBranch && worktreePath) {
+          const updatedConfig = await assignSessionBranch(sessionId, effectiveBranch, worktreePath);
+          useSessionStore.getState().updateSession(sessionId, {
+            branch: updatedConfig.branch,
+            worktree_path: updatedConfig.worktree_path,
+          });
+        } else if (effectiveBranch) {
+          useSessionStore.getState().updateSession(sessionId, { branch: effectiveBranch });
+        }
+
+        // Save enabled MCP servers for this session
+        if (projectPath) {
+          await setSessionMcpServers(projectPath, sessionId, slot.enabledMcpServers);
+        }
+
+        // Save enabled skills and plugins for this session
+        if (projectPath) {
+          await setSessionSkills(projectPath, sessionId, slot.enabledSkills);
+          await setSessionPlugins(projectPath, sessionId, slot.enabledPlugins);
+        }
+
+        // Update slot state FIRST to mount TerminalView and initialize xterm.js.
+        // This MUST happen before sending any commands to the PTY, otherwise
+        // xterm.js won't be listening when output arrives and it will be lost.
+        // This is also critical because CLIs like Codex send DSR (cursor position)
+        // queries on startup, and xterm.js must be mounted to respond to them.
+        setSlots((prev) =>
+          prev.map((s) =>
+            s.id === slotId ? { ...s, sessionId, worktreePath, worktreeWarning } : s,
+          ),
         );
 
-        // Apply optional custom window name. Empty/whitespace is treated as "no
-        // custom name" — the backend normalizes it back to None.
-        const trimmedName = slot.customName.trim();
-        let finalName: string | null | undefined = sessionConfig.name;
-        if (trimmedName) {
-          try {
-            const renamed = await invoke<{ name?: string | null }>("rename_session", {
-              sessionId,
-              name: trimmedName,
-            });
-            finalName = renamed.name;
-          } catch (err) {
-            console.warn(`[Session] Failed to set custom name for session ${sessionId}:`, err);
-          }
+        // Register session with the project
+        if (tabId) {
+          addSessionToProject(tabId, sessionId);
         }
 
-        // Add project to MCP status monitor for polling status updates
-        await invoke("add_mcp_project", { projectPath });
-        // Add session to store directly (don't refetch all sessions to avoid status reset)
-        useSessionStore.getState().addSession({
-          ...sessionConfig,
-          name: finalName,
-          status: sessionConfig.status as import("@/stores/useSessionStore").BackendSessionStatus,
-        });
-      }
+        // Auto-launch AI CLI after shell initializes
+        // IMPORTANT: For Claude mode, we must write MCP config and launch CLI atomically
+        // to prevent race conditions when multiple sessions launch without worktrees.
+        // Without worktrees, all sessions share the same .mcp.json file, so we must:
+        // 1. Write .mcp.json for this session
+        // 2. Launch CLI immediately (before any other session can overwrite .mcp.json)
+        // 3. Wait for CLI to read the config
+        if (slot.mode !== "Plain") {
+          const cliConfig = AI_CLI_CONFIG[slot.mode];
+          if (cliConfig.command) {
+            const isAvailable = await checkCliAvailable(cliConfig.command);
 
-      // Assign the branch to the session so the header displays it.
-      // Use the explicitly selected branch, or the one detected from the worktree.
-      const effectiveBranch = slot.branch ?? detectedBranch;
-      if (effectiveBranch && worktreePath) {
-        const updatedConfig = await assignSessionBranch(sessionId, effectiveBranch, worktreePath);
-        useSessionStore.getState().updateSession(sessionId, {
-          branch: updatedConfig.branch,
-          worktree_path: updatedConfig.worktree_path,
-        });
-      } else if (effectiveBranch) {
-        useSessionStore.getState().updateSession(sessionId, { branch: effectiveBranch });
-      }
+            if (isAvailable) {
+              // Write MCP config IMMEDIATELY before launching CLI
+              // This allows the CLI to discover MCP servers including the Maestro status server
+              if (workingDirectory && slot.mode === "Claude") {
+                try {
+                  await writeSessionMcpConfig(
+                    workingDirectory,
+                    sessionId,
+                    projectPath ?? workingDirectory,
+                    slot.enabledMcpServers,
+                  );
+                } catch (err) {
+                  console.error("Failed to write MCP config:", err);
+                  // Non-fatal - continue with CLI launch, MCP servers just won't be available
+                }
 
-      // Save enabled MCP servers for this session
-      if (projectPath) {
-        await setSessionMcpServers(projectPath, sessionId, slot.enabledMcpServers);
-      }
+                // Write plugin enabled/disabled state to settings.local.json
+                // Uses enabledPlugins format (not the legacy plugins array)
+                try {
+                  await writeSessionPluginConfig(
+                    workingDirectory,
+                    projectPath ?? workingDirectory,
+                    slot.enabledPlugins,
+                  );
+                } catch (err) {
+                  console.error("Failed to write plugin config:", err);
+                  // Non-fatal - continue with CLI launch
+                }
 
-      // Save enabled skills and plugins for this session
-      if (projectPath) {
-        await setSessionSkills(projectPath, sessionId, slot.enabledSkills);
-        await setSessionPlugins(projectPath, sessionId, slot.enabledPlugins);
-      }
+                // Write hooks config for Claude sessions
+                // This configures Claude Code to POST hook events back to Maestro's status server
+                try {
+                  await writeSessionHooksConfig(workingDirectory, sessionId);
+                } catch (err) {
+                  console.warn("Failed to write hooks config:", err);
+                  // Non-fatal: hooks are enhancement, session can work without them
+                }
+              } else if (workingDirectory && slot.mode === "OpenCode") {
+                // Write OpenCode MCP config (opencode.json format)
+                try {
+                  await writeOpenCodeMcpConfig(
+                    workingDirectory,
+                    sessionId,
+                    projectPath ?? workingDirectory,
+                    slot.enabledMcpServers,
+                  );
+                } catch (err) {
+                  console.error("Failed to write OpenCode MCP config:", err);
+                  // Non-fatal - continue with CLI launch
+                }
 
-      // Update slot state FIRST to mount TerminalView and initialize xterm.js.
-      // This MUST happen before sending any commands to the PTY, otherwise
-      // xterm.js won't be listening when output arrives and it will be lost.
-      // This is also critical because CLIs like Codex send DSR (cursor position)
-      // queries on startup, and xterm.js must be mounted to respond to them.
-      setSlots((prev) =>
-        prev.map((s) =>
-          s.id === slotId ? { ...s, sessionId, worktreePath, worktreeWarning } : s
-        )
-      );
-
-      // Register session with the project
-      if (tabId) {
-        addSessionToProject(tabId, sessionId);
-      }
-
-      // Auto-launch AI CLI after shell initializes
-      // IMPORTANT: For Claude mode, we must write MCP config and launch CLI atomically
-      // to prevent race conditions when multiple sessions launch without worktrees.
-      // Without worktrees, all sessions share the same .mcp.json file, so we must:
-      // 1. Write .mcp.json for this session
-      // 2. Launch CLI immediately (before any other session can overwrite .mcp.json)
-      // 3. Wait for CLI to read the config
-      if (slot.mode !== "Plain") {
-        const cliConfig = AI_CLI_CONFIG[slot.mode];
-        if (cliConfig.command) {
-          const isAvailable = await checkCliAvailable(cliConfig.command);
-
-          if (isAvailable) {
-            // Write MCP config IMMEDIATELY before launching CLI
-            // This allows the CLI to discover MCP servers including the Maestro status server
-            if (workingDirectory && slot.mode === "Claude") {
-              try {
-                await writeSessionMcpConfig(
-                  workingDirectory,
-                  sessionId,
-                  projectPath ?? workingDirectory,
-                  slot.enabledMcpServers
-                );
-              } catch (err) {
-                console.error("Failed to write MCP config:", err);
-                // Non-fatal - continue with CLI launch, MCP servers just won't be available
+                // Write plugin enabled/disabled state to settings.local.json
+                try {
+                  await writeSessionPluginConfig(
+                    workingDirectory,
+                    projectPath ?? workingDirectory,
+                    slot.enabledPlugins,
+                  );
+                } catch (err) {
+                  console.error("Failed to write plugin config:", err);
+                  // Non-fatal - continue with CLI launch
+                }
               }
 
-              // Write plugin enabled/disabled state to settings.local.json
-              // Uses enabledPlugins format (not the legacy plugins array)
+              // Wait for xterm.js to mount and start listening for PTY output
+              // This ensures we don't send CLI commands before the terminal is ready
+              // (which would cause output to be lost since Tauri events aren't buffered)
               try {
-                await writeSessionPluginConfig(
-                  workingDirectory,
-                  projectPath ?? workingDirectory,
-                  slot.enabledPlugins
-                );
+                await waitForTerminalReady(sessionId);
               } catch (err) {
-                console.error("Failed to write plugin config:", err);
-                // Non-fatal - continue with CLI launch
+                console.warn("Terminal ready timeout, proceeding anyway:", err);
               }
 
-              // Write hooks config for Claude sessions
-              // This configures Claude Code to POST hook events back to Maestro's status server
-              try {
-                await writeSessionHooksConfig(workingDirectory, sessionId);
-              } catch (err) {
-                console.warn("Failed to write hooks config:", err);
-                // Non-fatal: hooks are enhancement, session can work without them
-              }
-            } else if (workingDirectory && slot.mode === "OpenCode") {
-              // Write OpenCode MCP config (opencode.json format)
-              try {
-                await writeOpenCodeMcpConfig(
-                  workingDirectory,
-                  sessionId,
-                  projectPath ?? workingDirectory,
-                  slot.enabledMcpServers
-                );
-              } catch (err) {
-                console.error("Failed to write OpenCode MCP config:", err);
-                // Non-fatal - continue with CLI launch
+              // Brief delay for shell to initialize
+              await new Promise((resolve) => setTimeout(resolve, 100));
+
+              // Build CLI command with user-configured flags. A samurai
+              // successor (issue #55) additionally forces skip-permissions —
+              // an autonomous generation cannot answer permission prompts —
+              // and carries the run config's model preference (review F4).
+              const cliFlags = useCliSettingsStore.getState().getFlags(slot.mode);
+              const effectiveFlags = slot.samurai
+                ? samuraiSuccessorCliFlags(cliFlags, slot.samurai.model)
+                : cliFlags;
+              const cliCommand = buildCliCommand(
+                slot.mode,
+                effectiveFlags,
+                slot.resumeSessionId ?? undefined,
+              );
+
+              // Samurai successor: register under supervision BEFORE the CLI
+              // launches, so the backend's verify-ritual delivery is armed
+              // strictly ahead of claude's SessionStart hook. Registration
+              // failure is logged, not fatal — the session still launches and
+              // the backend's successor_no_start ALERT surfaces the gap.
+              if (slot.samurai) {
+                try {
+                  await registerSamuraiSuccessor(sessionId, slot.samurai);
+                } catch (err) {
+                  console.error("[Samurai] Failed to register successor session:", err);
+                }
               }
 
-              // Write plugin enabled/disabled state to settings.local.json
-              try {
-                await writeSessionPluginConfig(
-                  workingDirectory,
-                  projectPath ?? workingDirectory,
-                  slot.enabledPlugins
-                );
-              } catch (err) {
-                console.error("Failed to write plugin config:", err);
-                // Non-fatal - continue with CLI launch
+              // Harvest triage launch (issue #98): arm the backend BEFORE
+              // the CLI launches, so the journal-prompt injection gate is
+              // set strictly ahead of claude's SessionStart hook. Failure is
+              // logged, not fatal — the terminal still opens, just without
+              // the injected prompt.
+              if (slot.harvest) {
+                try {
+                  await samuraiHarvestArm(sessionId);
+                } catch (err) {
+                  console.error("[Harvest] Failed to arm the triage prompt:", err);
+                }
               }
+
+              // Send CLI launch command
+              await writeStdin(sessionId, `${cliCommand}\r`);
+
+              // Brief delay for CLI initialization.
+              // With session-specific MCP server names (maestro-1, maestro-2, etc.),
+              // we no longer have race conditions on .mcp.json, so we only need
+              // a minimal delay for general CLI startup.
+              await new Promise((resolve) => setTimeout(resolve, 500));
+            } else {
+              console.warn(
+                `CLI '${cliConfig.command}' not found. Install with: ${cliConfig.installHint}`,
+              );
             }
-
-            // Wait for xterm.js to mount and start listening for PTY output
-            // This ensures we don't send CLI commands before the terminal is ready
-            // (which would cause output to be lost since Tauri events aren't buffered)
-            try {
-              await waitForTerminalReady(sessionId);
-            } catch (err) {
-              console.warn("Terminal ready timeout, proceeding anyway:", err);
-            }
-
-            // Brief delay for shell to initialize
-            await new Promise((resolve) => setTimeout(resolve, 100));
-
-            // Build CLI command with user-configured flags. A samurai
-            // successor (issue #55) additionally forces skip-permissions —
-            // an autonomous generation cannot answer permission prompts —
-            // and carries the run config's model preference (review F4).
-            const cliFlags = useCliSettingsStore.getState().getFlags(slot.mode);
-            const effectiveFlags = slot.samurai
-              ? samuraiSuccessorCliFlags(cliFlags, slot.samurai.model)
-              : cliFlags;
-            const cliCommand = buildCliCommand(slot.mode, effectiveFlags, slot.resumeSessionId ?? undefined);
-
-            // Samurai successor: register under supervision BEFORE the CLI
-            // launches, so the backend's verify-ritual delivery is armed
-            // strictly ahead of claude's SessionStart hook. Registration
-            // failure is logged, not fatal — the session still launches and
-            // the backend's successor_no_start ALERT surfaces the gap.
-            if (slot.samurai) {
-              try {
-                await registerSamuraiSuccessor(sessionId, slot.samurai);
-              } catch (err) {
-                console.error("[Samurai] Failed to register successor session:", err);
-              }
-            }
-
-            // Send CLI launch command
-            await writeStdin(sessionId, `${cliCommand}\r`);
-
-            // Brief delay for CLI initialization.
-            // With session-specific MCP server names (maestro-1, maestro-2, etc.),
-            // we no longer have race conditions on .mcp.json, so we only need
-            // a minimal delay for general CLI startup.
-            await new Promise((resolve) => setTimeout(resolve, 500));
-          } else {
-            console.warn(
-              `CLI '${cliConfig.command}' not found. Install with: ${cliConfig.installHint}`
-            );
           }
         }
+      } catch (err) {
+        console.error("Failed to spawn shell:", err);
+        setError("Failed to start terminal session");
       }
-    } catch (err) {
-      console.error("Failed to spawn shell:", err);
-      setError("Failed to start terminal session");
-    }
-  }, [projectPath, effectiveRepoPath, worktreeBasePath, tabId, addSessionToProject, refreshBranches]);
+    },
+    [projectPath, effectiveRepoPath, worktreeBasePath, tabId, addSessionToProject, refreshBranches],
+  );
 
   /**
    * Launches a single slot by spawning a shell with the configured settings.
@@ -1056,26 +1138,29 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
    * NOTE: Uses withProjectLock to serialize launches within the same project.
    * This prevents race conditions where multiple sessions share the same .mcp.json file.
    */
-  const launchSlot = useCallback(async (slotId: string) => {
-    const slot = slotsRef.current.find((s) => s.id === slotId);
-    if (!slot || slot.sessionId !== null) return;
+  const launchSlot = useCallback(
+    async (slotId: string) => {
+      const slot = slotsRef.current.find((s) => s.id === slotId);
+      if (!slot || slot.sessionId !== null) return;
 
-    // Gate on FDA: if the project is in a TCC-protected directory, check
-    // Full Disk Access before any Rust-side filesystem operations.
-    if (projectPath && pathRequiresFDA(projectPath)) {
-      const hasAccess = await checkFullDiskAccess();
-      if (!hasAccess) {
-        useFDAStore.getState().requireAccess(projectPath, () => launchSlot(slotId));
-        return;
+      // Gate on FDA: if the project is in a TCC-protected directory, check
+      // Full Disk Access before any Rust-side filesystem operations.
+      if (projectPath && pathRequiresFDA(projectPath)) {
+        const hasAccess = await checkFullDiskAccess();
+        if (!hasAccess) {
+          useFDAStore.getState().requireAccess(projectPath, () => launchSlot(slotId));
+          return;
+        }
       }
-    }
 
-    // Serialize launches within the same project to prevent .mcp.json race conditions
-    const lockPath = projectPath ?? "no-project";
-    await withProjectLock(lockPath, async () => {
-      await launchSlotInner(slotId);
-    });
-  }, [projectPath, launchSlotInner]);
+      // Serialize launches within the same project to prevent .mcp.json race conditions
+      const lockPath = projectPath ?? "no-project";
+      await withProjectLock(lockPath, async () => {
+        await launchSlotInner(slotId);
+      });
+    },
+    [projectPath, launchSlotInner],
+  );
 
   /**
    * Launches all unlaunched slots sequentially.
@@ -1095,25 +1180,28 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
    * render-phase stale-zoom guard drops the user back to the grid. Returns
    * true when a neighbor took over — zoom AND focus already moved.
    */
-  const passZoomToNeighbor = useCallback((slotId: string): boolean => {
-    // Read through refs, not the render closure: kill paths call this after
-    // an async gap (confirm dialog / kill IPC), and a zoom requested during
-    // that gap must not be stomped by click-time state.
-    if (zoomedSlotIdRef.current !== slotId) return false;
-    const visible = visibleDisplaySlotIdsRef.current;
-    const idx = visible.indexOf(slotId);
-    const next = visible[(idx + 1) % visible.length];
-    // Eagle mode suspends the per-project zoom — clear the stale zoom so
-    // leaving eagle view doesn't land on a pane the user never chose.
-    if (!eagleMode && next !== undefined && next !== slotId) {
-      setZoomedSlotId(next);
-      setFocusedSlotId(next);
-      focusSlotTextarea(next);
-      return true;
-    }
-    setZoomedSlotId(null);
-    return false;
-  }, [eagleMode]);
+  const passZoomToNeighbor = useCallback(
+    (slotId: string): boolean => {
+      // Read through refs, not the render closure: kill paths call this after
+      // an async gap (confirm dialog / kill IPC), and a zoom requested during
+      // that gap must not be stomped by click-time state.
+      if (zoomedSlotIdRef.current !== slotId) return false;
+      const visible = visibleDisplaySlotIdsRef.current;
+      const idx = visible.indexOf(slotId);
+      const next = visible[(idx + 1) % visible.length];
+      // Eagle mode suspends the per-project zoom — clear the stale zoom so
+      // leaving eagle view doesn't land on a pane the user never chose.
+      if (!eagleMode && next !== undefined && next !== slotId) {
+        setZoomedSlotId(next);
+        setFocusedSlotId(next);
+        focusSlotTextarea(next);
+        return true;
+      }
+      setZoomedSlotId(null);
+      return false;
+    },
+    [eagleMode],
+  );
 
   /**
    * Handles killing/closing a session, updating the slot state.
@@ -1126,197 +1214,225 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
    * fire-and-forget remove racing its config writes would strip the hooks
    * the successor depends on.
    */
-  const handleKill = useCallback((sessionId: number, opts?: { keepDirArtifacts?: boolean }) => {
-    const keepDirArtifacts = opts?.keepDirArtifacts ?? false;
-    // Find the slot to get worktree path before removing
-    const slot = slotsRef.current.find((s) => s.sessionId === sessionId);
-    const worktreePath = slot?.worktreePath;
-    const workingDir = worktreePath || projectPath;
+  const handleKill = useCallback(
+    (sessionId: number, opts?: { keepDirArtifacts?: boolean }) => {
+      const keepDirArtifacts = opts?.keepDirArtifacts ?? false;
+      // Find the slot to get worktree path before removing
+      const slot = slotsRef.current.find((s) => s.sessionId === sessionId);
+      const worktreePath = slot?.worktreePath;
+      const workingDir = worktreePath || projectPath;
 
-    // If this is the last slot, return to idle landing view immediately —
-    // UNLESS a queued/claimed launch is about to land in this grid (samurai
-    // successor spawn, issue #55 — fresh-eyes finding A; History-tab resume
-    // shares the mechanism). Dropping to the landing view unmounts the grid,
-    // which would destroy that launch: a successor whose predecessor was the
-    // project's only session would never spawn. In that case fall through to
-    // the normal in-place removal and let the pending-launch effects (below)
-    // spawn the successor into the surviving grid.
-    // Both markers count: a claim that has already STARTED launching left
-    // autoLaunchSlotIdsRef, and unmounting the grid under an in-flight launch
-    // destroys it just as thoroughly as unmounting under a queued one.
-    const launchImminent = successorLaunchImminent(
-      usePendingLaunchStore.getState().pending,
-      autoLaunchSlotIdsRef.current.length + launchingSlotIdsRef.current.size,
-      tabId,
-    );
-    if (slotsRef.current.length <= 1 && !launchImminent && onAllSessionsClosedRef.current) {
-      // Clean up focus callback
-      if (slot) {
-        focusCallbacksRef.current.delete(slot.id);
-      }
-      // This branch skips setSlots, so the count-reporting effect never fires
-      // with 0 — report it explicitly or the parent keeps stale counts
-      // (e.g. the sidebar's "Stop All (1)" with nothing running).
-      onSessionCountChange?.(0, 0);
-      onAllSessionsClosedRef.current();
-    } else {
-      // Clean up cached focus callback for this slot
-      if (slot) {
-        focusCallbacksRef.current.delete(slot.id);
+      // If this is the last slot, return to idle landing view immediately —
+      // UNLESS a queued/claimed launch is about to land in this grid (samurai
+      // successor spawn, issue #55 — fresh-eyes finding A; History-tab resume
+      // shares the mechanism). Dropping to the landing view unmounts the grid,
+      // which would destroy that launch: a successor whose predecessor was the
+      // project's only session would never spawn. In that case fall through to
+      // the normal in-place removal and let the pending-launch effects (below)
+      // spawn the successor into the surviving grid.
+      // Both markers count: a claim that has already STARTED launching left
+      // autoLaunchSlotIdsRef, and unmounting the grid under an in-flight launch
+      // destroys it just as thoroughly as unmounting under a queued one.
+      const launchImminent = successorLaunchImminent(
+        usePendingLaunchStore.getState().pending,
+        autoLaunchSlotIdsRef.current.length + launchingSlotIdsRef.current.size,
+        tabId,
+      );
+      if (slotsRef.current.length <= 1 && !launchImminent && onAllSessionsClosedRef.current) {
+        // Clean up focus callback
+        if (slot) {
+          focusCallbacksRef.current.delete(slot.id);
+        }
+        // This branch skips setSlots, so the count-reporting effect never fires
+        // with 0 — report it explicitly or the parent keeps stale counts
+        // (e.g. the sidebar's "Stop All (1)" with nothing running).
+        onSessionCountChange?.(0, 0);
+        onAllSessionsClosedRef.current();
+      } else {
+        // Clean up cached focus callback for this slot
+        if (slot) {
+          focusCallbacksRef.current.delete(slot.id);
 
-        // Closing the zoomed pane keeps the user in zoom view
-        const zoomMoved = passZoomToNeighbor(slot.id);
+          // Closing the zoomed pane keeps the user in zoom view
+          const zoomMoved = passZoomToNeighbor(slot.id);
 
-        // If the closed pane was focused, focus its sibling
-        if (!zoomMoved && focusedSlotId === slot.id) {
-          const sibling = findSiblingSlotId(layoutTree, slot.id);
-          setFocusedSlotId(sibling);
+          // If the closed pane was focused, focus its sibling
+          if (!zoomMoved && focusedSlotId === slot.id) {
+            const sibling = findSiblingSlotId(layoutTree, slot.id);
+            setFocusedSlotId(sibling);
+          }
+
+          // Remove leaf from split tree
+          setLayoutTree((prev) => {
+            const result = removeLeaf(prev, slot.id);
+            return result ?? prev;
+          });
         }
 
-        // Remove leaf from split tree
-        setLayoutTree((prev) => {
-          const result = removeLeaf(prev, slot.id);
-          return result ?? prev;
-        });
+        setSlots((prev) => prev.filter((s) => s.sessionId !== sessionId));
       }
 
-      setSlots((prev) => prev.filter((s) => s.sessionId !== sessionId));
-    }
+      // Remove session from the session store
+      useSessionStore.getState().removeSession(sessionId);
 
-    // Remove session from the session store
-    useSessionStore.getState().removeSession(sessionId);
+      // Drop the dead session's activity feed (session ids are never reused,
+      // so without this every killed terminal retains up to 500 events —
+      // including full subagent prompts — for the app's lifetime).
+      useActivityStore.getState().clearSession(sessionId);
 
-    // Drop the dead session's activity feed (session ids are never reused,
-    // so without this every killed terminal retains up to 500 events —
-    // including full subagent prompts — for the app's lifetime).
-    useActivityStore.getState().clearSession(sessionId);
-
-    // Unregister session from the project
-    if (tabId) {
-      removeSessionFromProject(tabId, sessionId);
-    }
-
-    // Clean up session-specific MCP config (fire-and-forget)
-    if (workingDir && !keepDirArtifacts) {
-      if (slot?.mode === "OpenCode") {
-        removeOpenCodeMcpConfig(workingDir, sessionId).catch(console.error);
-      } else {
-        removeSessionMcpConfig(workingDir, sessionId).catch(console.error);
+      // Unregister session from the project
+      if (tabId) {
+        removeSessionFromProject(tabId, sessionId);
       }
-    }
 
-    // Clean up session-specific plugin config (fire-and-forget)
-    if (workingDir && !keepDirArtifacts) {
-      removeSessionPluginConfig(workingDir).catch(console.error);
-    }
-
-    // Clean up session-specific hooks config (fire-and-forget)
-    if (workingDir && slot?.mode === "Claude" && !keepDirArtifacts) {
-      removeSessionHooksConfig(workingDir).catch(console.error);
-    }
-
-    // Clean up worktree based on session close action setting
-    if (effectiveRepoPath && worktreePath && !keepDirArtifacts) {
-      const closeAction = useWorktreeSettingsStore.getState().worktreeCloseAction;
-      if (closeAction === "delete") {
-        cleanupSessionWorktree(effectiveRepoPath, worktreePath, worktreeBasePath)
-          .then(() => refreshBranches())
-          .catch(console.error);
-      } else if (closeAction === "ask") {
-        ask("Delete the worktree for this session?", {
-          title: "Clean Up Worktree",
-          kind: "info",
-        }).then((confirmed) => {
-          if (confirmed) {
-            cleanupSessionWorktree(effectiveRepoPath, worktreePath!, worktreeBasePath)
-              .then(() => refreshBranches())
-              .catch(console.error);
-          }
-        }).catch(console.error);
+      // Clean up session-specific MCP config (fire-and-forget)
+      if (workingDir && !keepDirArtifacts) {
+        if (slot?.mode === "OpenCode") {
+          removeOpenCodeMcpConfig(workingDir, sessionId).catch(console.error);
+        } else {
+          removeSessionMcpConfig(workingDir, sessionId).catch(console.error);
+        }
       }
-      // "keep" (default): do nothing — worktree persists
-    }
-  }, [tabId, effectiveRepoPath, projectPath, removeSessionFromProject, refreshBranches, focusedSlotId, layoutTree, onSessionCountChange, worktreeBasePath, passZoomToNeighbor]);
+
+      // Clean up session-specific plugin config (fire-and-forget)
+      if (workingDir && !keepDirArtifacts) {
+        removeSessionPluginConfig(workingDir).catch(console.error);
+      }
+
+      // Clean up session-specific hooks config (fire-and-forget)
+      if (workingDir && slot?.mode === "Claude" && !keepDirArtifacts) {
+        removeSessionHooksConfig(workingDir).catch(console.error);
+      }
+
+      // Clean up worktree based on session close action setting
+      if (effectiveRepoPath && worktreePath && !keepDirArtifacts) {
+        const closeAction = useWorktreeSettingsStore.getState().worktreeCloseAction;
+        if (closeAction === "delete") {
+          cleanupSessionWorktree(effectiveRepoPath, worktreePath, worktreeBasePath)
+            .then(() => refreshBranches())
+            .catch(console.error);
+        } else if (closeAction === "ask") {
+          ask("Delete the worktree for this session?", {
+            title: "Clean Up Worktree",
+            kind: "info",
+          })
+            .then((confirmed) => {
+              if (confirmed) {
+                cleanupSessionWorktree(effectiveRepoPath, worktreePath!, worktreeBasePath)
+                  .then(() => refreshBranches())
+                  .catch(console.error);
+              }
+            })
+            .catch(console.error);
+        }
+        // "keep" (default): do nothing — worktree persists
+      }
+    },
+    [
+      tabId,
+      effectiveRepoPath,
+      projectPath,
+      removeSessionFromProject,
+      refreshBranches,
+      focusedSlotId,
+      layoutTree,
+      onSessionCountChange,
+      worktreeBasePath,
+      passZoomToNeighbor,
+    ],
+  );
 
   /**
    * Removes a pre-launch slot (before it's launched).
    */
-  const removeSlot = useCallback((slotId: string) => {
-    focusCallbacksRef.current.delete(slotId);
+  const removeSlot = useCallback(
+    (slotId: string) => {
+      focusCallbacksRef.current.delete(slotId);
 
-    // If removing the last slot, return to idle landing view immediately
-    // rather than going through an intermediate empty state
-    if (slotsRef.current.length <= 1 && onAllSessionsClosedRef.current) {
-      onSessionCountChange?.(0, 0);
-      onAllSessionsClosedRef.current();
-      return;
-    }
+      // If removing the last slot, return to idle landing view immediately
+      // rather than going through an intermediate empty state
+      if (slotsRef.current.length <= 1 && onAllSessionsClosedRef.current) {
+        onSessionCountChange?.(0, 0);
+        onAllSessionsClosedRef.current();
+        return;
+      }
 
-    // Removing the zoomed pre-launch card keeps the user in zoom view
-    const zoomMoved = passZoomToNeighbor(slotId);
+      // Removing the zoomed pre-launch card keeps the user in zoom view
+      const zoomMoved = passZoomToNeighbor(slotId);
 
-    // If the removed pane was focused, focus its sibling
-    if (!zoomMoved && focusedSlotId === slotId) {
-      const sibling = findSiblingSlotId(layoutTree, slotId);
-      setFocusedSlotId(sibling);
-    }
+      // If the removed pane was focused, focus its sibling
+      if (!zoomMoved && focusedSlotId === slotId) {
+        const sibling = findSiblingSlotId(layoutTree, slotId);
+        setFocusedSlotId(sibling);
+      }
 
-    // Remove leaf from split tree
-    setLayoutTree((prev) => {
-      const result = removeLeaf(prev, slotId);
-      return result ?? prev;
-    });
+      // Remove leaf from split tree
+      setLayoutTree((prev) => {
+        const result = removeLeaf(prev, slotId);
+        return result ?? prev;
+      });
 
-    setSlots((prev) => prev.filter((s) => s.id !== slotId));
-  }, [focusedSlotId, layoutTree, onSessionCountChange, passZoomToNeighbor]);
+      setSlots((prev) => prev.filter((s) => s.id !== slotId));
+    },
+    [focusedSlotId, layoutTree, onSessionCountChange, passZoomToNeighbor],
+  );
 
   /** Kill a session's PTY and clean up its pane. False if this grid doesn't own it. */
-  const killSessionById = useCallback((sessionId: number): boolean => {
-    const slot = slotsRef.current.find((s) => s.sessionId === sessionId);
-    if (!slot) return false;
-    // Kill the backend PTY process (fire-and-forget)
-    killSession(sessionId).catch(console.error);
-    handleKill(sessionId);
-    return true;
-  }, [handleKill]);
+  const killSessionById = useCallback(
+    (sessionId: number): boolean => {
+      const slot = slotsRef.current.find((s) => s.sessionId === sessionId);
+      if (!slot) return false;
+      // Kill the backend PTY process (fire-and-forget)
+      killSession(sessionId).catch(console.error);
+      handleKill(sessionId);
+      return true;
+    },
+    [handleKill],
+  );
 
   /** Unpark a session if it is parked — focus/zoom targets must be visible. */
-  const unparkIfParked = (sessionId: number) => {
+  const unparkIfParked = useCallback((sessionId: number) => {
     const store = useSessionStore.getState();
     if (store.parkedSessionIds.includes(sessionId)) {
       store.unparkSession(sessionId);
     }
-  };
+  }, []);
 
   /** Focus the pane running a session. False if this grid doesn't own it. */
-  const focusSession = useCallback((sessionId: number): boolean => {
-    const slot = slotsRef.current.find((s) => s.sessionId === sessionId);
-    if (!slot) return false;
-    unparkIfParked(sessionId);
-    // Callers are user navigation (terminal navigator, eagle zoom, sidebar) —
-    // selecting the session clears its attention highlight.
-    useSessionStore.getState().clearSessionAttention(sessionId);
-    // Leave zoom if a different pane is zoomed, so the target is visible.
-    setZoomedSlotId((prev) => (prev === slot.id ? prev : null));
-    setFocusedSlotId(slot.id);
-    focusSlotTextarea(slot.id);
-    return true;
-  }, []);
+  const focusSession = useCallback(
+    (sessionId: number): boolean => {
+      const slot = slotsRef.current.find((s) => s.sessionId === sessionId);
+      if (!slot) return false;
+      unparkIfParked(sessionId);
+      // Callers are user navigation (terminal navigator, eagle zoom, sidebar) —
+      // selecting the session clears its attention highlight.
+      useSessionStore.getState().clearSessionAttention(sessionId);
+      // Leave zoom if a different pane is zoomed, so the target is visible.
+      setZoomedSlotId((prev) => (prev === slot.id ? prev : null));
+      setFocusedSlotId(slot.id);
+      focusSlotTextarea(slot.id);
+      return true;
+    },
+    [unparkIfParked],
+  );
 
   /** Zoom into the pane running a session (and focus it). False if this grid doesn't own it. */
-  const zoomSession = useCallback((sessionId: number): boolean => {
-    const slot = slotsRef.current.find((s) => s.sessionId === sessionId);
-    if (!slot) return false;
-    unparkIfParked(sessionId);
-    // User navigation — selecting the session clears its attention highlight.
-    useSessionStore.getState().clearSessionAttention(sessionId);
-    // Set (not toggle): repeated calls stay zoomed on the same pane, and any
-    // other pane's zoom is replaced.
-    setZoomedSlotId(slot.id);
-    setFocusedSlotId(slot.id);
-    focusSlotTextarea(slot.id);
-    return true;
-  }, []);
+  const zoomSession = useCallback(
+    (sessionId: number): boolean => {
+      const slot = slotsRef.current.find((s) => s.sessionId === sessionId);
+      if (!slot) return false;
+      unparkIfParked(sessionId);
+      // User navigation — selecting the session clears its attention highlight.
+      useSessionStore.getState().clearSessionAttention(sessionId);
+      // Set (not toggle): repeated calls stay zoomed on the same pane, and any
+      // other pane's zoom is replaced.
+      setZoomedSlotId(slot.id);
+      setFocusedSlotId(slot.id);
+      focusSlotTextarea(slot.id);
+      return true;
+    },
+    [unparkIfParked],
+  );
 
   /**
    * Parks a launched pane: hides it from the grid (CSS-only — the PTY and
@@ -1325,22 +1441,25 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
    * takes over the zoom (grid view only when nothing is left to zoom). Never
    * calls killSession — restoring via the shelf brings the terminal back intact.
    */
-  const handlePark = useCallback((slotId: string) => {
-    const slot = slotsRef.current.find((s) => s.id === slotId);
-    if (!slot || slot.sessionId === null) return;
-    useSessionStore.getState().parkSession(slot.sessionId);
-    // Parking the zoomed pane: the next pane in zoom-strip order takes over
-    // the zoom (helper clears the zoom and falls through when nothing is
-    // left to zoom, so the focus fallback below still runs).
-    if (passZoomToNeighbor(slotId)) return;
-    if (focusedSlotId === slotId) {
-      const parked = useSessionStore.getState().parkedSessionIds;
-      const fallback = slotsRef.current.find(
-        (s) => s.id !== slotId && s.sessionId !== null && !parked.includes(s.sessionId),
-      );
-      setFocusedSlotId(fallback ? fallback.id : findSiblingSlotId(layoutTree, slotId));
-    }
-  }, [focusedSlotId, layoutTree, passZoomToNeighbor]);
+  const handlePark = useCallback(
+    (slotId: string) => {
+      const slot = slotsRef.current.find((s) => s.id === slotId);
+      if (!slot || slot.sessionId === null) return;
+      useSessionStore.getState().parkSession(slot.sessionId);
+      // Parking the zoomed pane: the next pane in zoom-strip order takes over
+      // the zoom (helper clears the zoom and falls through when nothing is
+      // left to zoom, so the focus fallback below still runs).
+      if (passZoomToNeighbor(slotId)) return;
+      if (focusedSlotId === slotId) {
+        const parked = useSessionStore.getState().parkedSessionIds;
+        const fallback = slotsRef.current.find(
+          (s) => s.id !== slotId && s.sessionId !== null && !parked.includes(s.sessionId),
+        );
+        setFocusedSlotId(fallback ? fallback.id : findSiblingSlotId(layoutTree, slotId));
+      }
+    },
+    [focusedSlotId, layoutTree, passZoomToNeighbor],
+  );
 
   /**
    * Restores a parked session's pane into the view the user is in: while a
@@ -1379,15 +1498,15 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   const updateSlotMode = useCallback((slotId: string, mode: AiMode) => {
     setSlots((prev) =>
       prev.map((s) =>
-        s.id === slotId ? { ...s, mode, resumeSessionId: mode !== "Claude" ? null : s.resumeSessionId } : s
-      )
+        s.id === slotId
+          ? { ...s, mode, resumeSessionId: mode !== "Claude" ? null : s.resumeSessionId }
+          : s,
+      ),
     );
   }, []);
 
   const updateSlotCustomName = useCallback((slotId: string, name: string) => {
-    setSlots((prev) =>
-      prev.map((s) => (s.id === slotId ? { ...s, customName: name } : s))
-    );
+    setSlots((prev) => prev.map((s) => (s.id === slotId ? { ...s, customName: name } : s)));
   }, []);
 
   const updateSlotResumeSession = useCallback((slotId: string, sessionId: string | null) => {
@@ -1403,8 +1522,8 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
               // rule the History-tab launch already applies.
               worktreeMode: sessionId ? "project" : s.worktreeMode,
             }
-          : s
-      )
+          : s,
+      ),
     );
   }, []);
 
@@ -1412,49 +1531,47 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
    * Updates the branch for a slot.
    * When a branch is selected, loads any saved config for that branch.
    */
-  const updateSlotBranch = useCallback(async (slotId: string, branch: string | null) => {
-    // First update the branch
-    setSlots((prev) =>
-      prev.map((s) =>
-        s.id === slotId ? { ...s, branch } : s
-      )
-    );
+  const updateSlotBranch = useCallback(
+    async (slotId: string, branch: string | null) => {
+      // First update the branch
+      setSlots((prev) => prev.map((s) => (s.id === slotId ? { ...s, branch } : s)));
 
-    // If a branch is selected and we have a repo path, try to load saved config
-    if (branch && effectiveRepoPath) {
-      try {
-        const savedConfig = await loadBranchConfig(effectiveRepoPath, branch);
-        if (savedConfig) {
-          // Apply saved config to the slot
-          setSlots((prev) =>
-            prev.map((s) => {
-              if (s.id !== slotId) return s;
-              return {
-                ...s,
-                enabledPlugins: savedConfig.enabled_plugins,
-                enabledSkills: savedConfig.enabled_skills,
-                enabledMcpServers: savedConfig.enabled_mcp_servers,
-              };
-            })
-          );
+      // If a branch is selected and we have a repo path, try to load saved config
+      if (branch && effectiveRepoPath) {
+        try {
+          const savedConfig = await loadBranchConfig(effectiveRepoPath, branch);
+          if (savedConfig) {
+            // Apply saved config to the slot
+            setSlots((prev) =>
+              prev.map((s) => {
+                if (s.id !== slotId) return s;
+                return {
+                  ...s,
+                  enabledPlugins: savedConfig.enabled_plugins,
+                  enabledSkills: savedConfig.enabled_skills,
+                  enabledMcpServers: savedConfig.enabled_mcp_servers,
+                };
+              }),
+            );
+          }
+        } catch (err) {
+          console.error("Failed to load branch config:", err);
+          // Non-fatal - continue with current slot config
         }
-      } catch (err) {
-        console.error("Failed to load branch config:", err);
-        // Non-fatal - continue with current slot config
       }
-    }
-  }, [effectiveRepoPath]);
+    },
+    [effectiveRepoPath],
+  );
 
   /**
    * Updates the worktree mode for a slot.
    */
-  const updateSlotWorktreeMode = useCallback((slotId: string, mode: import("./PreLaunchCard").WorktreeMode) => {
-    setSlots((prev) =>
-      prev.map((s) =>
-        s.id === slotId ? { ...s, worktreeMode: mode } : s
-      )
-    );
-  }, []);
+  const updateSlotWorktreeMode = useCallback(
+    (slotId: string, mode: import("./PreLaunchCard").WorktreeMode) => {
+      setSlots((prev) => prev.map((s) => (s.id === slotId ? { ...s, worktreeMode: mode } : s)));
+    },
+    [],
+  );
 
   /**
    * Toggles an MCP server for a slot.
@@ -1468,7 +1585,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
           ? s.enabledMcpServers.filter((n) => n !== serverName)
           : [...s.enabledMcpServers, serverName];
         return { ...s, enabledMcpServers: newEnabled };
-      })
+      }),
     );
   }, []);
 
@@ -1484,21 +1601,24 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
           ? s.enabledSkills.filter((id) => id !== skillId)
           : [...s.enabledSkills, skillId];
         return { ...s, enabledSkills: newEnabled };
-      })
+      }),
     );
   }, []);
 
   /**
    * Selects all MCP servers for a slot.
    */
-  const selectAllMcp = useCallback((slotId: string) => {
-    setSlots((prev) =>
-      prev.map((s) => {
-        if (s.id !== slotId) return s;
-        return { ...s, enabledMcpServers: mcpServers.map((server) => server.name) };
-      })
-    );
-  }, [mcpServers]);
+  const selectAllMcp = useCallback(
+    (slotId: string) => {
+      setSlots((prev) =>
+        prev.map((s) => {
+          if (s.id !== slotId) return s;
+          return { ...s, enabledMcpServers: mcpServers.map((server) => server.name) };
+        }),
+      );
+    },
+    [mcpServers],
+  );
 
   /**
    * Unselects all MCP servers for a slot.
@@ -1508,25 +1628,28 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       prev.map((s) => {
         if (s.id !== slotId) return s;
         return { ...s, enabledMcpServers: [] };
-      })
+      }),
     );
   }, []);
 
   /**
    * Selects all plugins and skills for a slot.
    */
-  const selectAllPlugins = useCallback((slotId: string) => {
-    setSlots((prev) =>
-      prev.map((s) => {
-        if (s.id !== slotId) return s;
-        return {
-          ...s,
-          enabledPlugins: plugins.map((p) => p.id),
-          enabledSkills: skills.map((sk) => sk.id),
-        };
-      })
-    );
-  }, [plugins, skills]);
+  const selectAllPlugins = useCallback(
+    (slotId: string) => {
+      setSlots((prev) =>
+        prev.map((s) => {
+          if (s.id !== slotId) return s;
+          return {
+            ...s,
+            enabledPlugins: plugins.map((p) => p.id),
+            enabledSkills: skills.map((sk) => sk.id),
+          };
+        }),
+      );
+    },
+    [plugins, skills],
+  );
 
   /**
    * Unselects all plugins and skills for a slot.
@@ -1536,7 +1659,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       prev.map((s) => {
         if (s.id !== slotId) return s;
         return { ...s, enabledPlugins: [], enabledSkills: [] };
-      })
+      }),
     );
   }, []);
 
@@ -1544,55 +1667,58 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
    * Toggles a plugin for a slot.
    * Also toggles all skills belonging to that plugin.
    */
-  const toggleSlotPlugin = useCallback((slotId: string, pluginId: string) => {
-    // Find the plugin and its associated skills
-    const plugin = plugins.find((p) => p.id === pluginId);
-    if (!plugin) return;
+  const toggleSlotPlugin = useCallback(
+    (slotId: string, pluginId: string) => {
+      // Find the plugin and its associated skills
+      const plugin = plugins.find((p) => p.id === pluginId);
+      if (!plugin) return;
 
-    // Helper to extract base name from skill ID
-    const getSkillBaseName = (skillId: string): string => {
-      const colonIndex = skillId.indexOf(":");
-      return colonIndex >= 0 ? skillId.slice(colonIndex + 1) : skillId;
-    };
+      // Helper to extract base name from skill ID
+      const getSkillBaseName = (skillId: string): string => {
+        const colonIndex = skillId.indexOf(":");
+        return colonIndex >= 0 ? skillId.slice(colonIndex + 1) : skillId;
+      };
 
-    // Build map of base name -> skill for lookup
-    const skillByBaseName = new Map(skills.map((s) => [getSkillBaseName(s.id), s]));
+      // Build map of base name -> skill for lookup
+      const skillByBaseName = new Map(skills.map((s) => [getSkillBaseName(s.id), s]));
 
-    // Find all skill IDs that belong to this plugin
-    const pluginSkillIds: string[] = [];
-    for (const skillId of plugin.skills) {
-      const baseName = getSkillBaseName(skillId);
-      const skill = skillByBaseName.get(baseName);
-      if (skill) {
-        pluginSkillIds.push(skill.id);
-      }
-    }
-
-    setSlots((prev) =>
-      prev.map((s) => {
-        if (s.id !== slotId) return s;
-        const isEnabled = s.enabledPlugins.includes(pluginId);
-
-        // Toggle plugin
-        const newEnabledPlugins = isEnabled
-          ? s.enabledPlugins.filter((id) => id !== pluginId)
-          : [...s.enabledPlugins, pluginId];
-
-        // Toggle all associated skills
-        let newEnabledSkills: string[];
-        if (isEnabled) {
-          // Disabling plugin - remove all its skills
-          newEnabledSkills = s.enabledSkills.filter((id) => !pluginSkillIds.includes(id));
-        } else {
-          // Enabling plugin - add all its skills (avoid duplicates)
-          const skillsToAdd = pluginSkillIds.filter((id) => !s.enabledSkills.includes(id));
-          newEnabledSkills = [...s.enabledSkills, ...skillsToAdd];
+      // Find all skill IDs that belong to this plugin
+      const pluginSkillIds: string[] = [];
+      for (const skillId of plugin.skills) {
+        const baseName = getSkillBaseName(skillId);
+        const skill = skillByBaseName.get(baseName);
+        if (skill) {
+          pluginSkillIds.push(skill.id);
         }
+      }
 
-        return { ...s, enabledPlugins: newEnabledPlugins, enabledSkills: newEnabledSkills };
-      })
-    );
-  }, [plugins, skills]);
+      setSlots((prev) =>
+        prev.map((s) => {
+          if (s.id !== slotId) return s;
+          const isEnabled = s.enabledPlugins.includes(pluginId);
+
+          // Toggle plugin
+          const newEnabledPlugins = isEnabled
+            ? s.enabledPlugins.filter((id) => id !== pluginId)
+            : [...s.enabledPlugins, pluginId];
+
+          // Toggle all associated skills
+          let newEnabledSkills: string[];
+          if (isEnabled) {
+            // Disabling plugin - remove all its skills
+            newEnabledSkills = s.enabledSkills.filter((id) => !pluginSkillIds.includes(id));
+          } else {
+            // Enabling plugin - add all its skills (avoid duplicates)
+            const skillsToAdd = pluginSkillIds.filter((id) => !s.enabledSkills.includes(id));
+            newEnabledSkills = [...s.enabledSkills, ...skillsToAdd];
+          }
+
+          return { ...s, enabledPlugins: newEnabledPlugins, enabledSkills: newEnabledSkills };
+        }),
+      );
+    },
+    [plugins, skills],
+  );
 
   /**
    * Creates a new branch and optionally checks it out.
@@ -1652,7 +1778,15 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       killSessionById,
       isZoomed: () => zoomedSlotId !== null,
     }),
-    [addSession, launchAll, refreshBranches, focusSession, zoomSession, killSessionById, zoomedSlotId],
+    [
+      addSession,
+      launchAll,
+      refreshBranches,
+      focusSession,
+      zoomSession,
+      killSessionById,
+      zoomedSlotId,
+    ],
   );
 
   // ── History-tab / samurai-successor launches ─────────────────────
@@ -1665,7 +1799,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   // re-triggers this effect (the selector returns the next head entry) and
   // each claim gets its own slot.
   const pendingLaunch = usePendingLaunchStore((s) =>
-    tabId ? s.pending.find((p) => p.tabId === tabId) ?? null : null
+    tabId ? (s.pending.find((p) => p.tabId === tabId) ?? null) : null,
   );
 
   useEffect(() => {
@@ -1700,6 +1834,9 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       // the registration metadata; History launches leave both unset.
       customName: launch.customName ?? base.customName,
       samurai: launch.samurai ?? null,
+      // Harvest triage launches (issue #98) arm the backend's journal
+      // prompt injection right before the CLI launches.
+      harvest: launch.harvest ?? false,
       // The History tab always names the exact directory to run in. Reusing the
       // pristine slot would otherwise inherit its worktreeMode, and any mode but
       // "project" sends launchSlotInner into prepareSessionWorktree — moving the
@@ -1797,30 +1934,36 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   }, [samuraiBySessionId, handleKill]);
 
   // Handle zoom toggle for a slot
-  const handleToggleZoom = useCallback((slotId: string) => {
-    const zoomingIn = zoomedSlotId !== slotId;
-    setZoomedSlotId(zoomingIn ? slotId : null);
-    if (zoomingIn) {
-      // Zooming in is the user selecting the pane — clear its attention
-      // highlight and focus it (parity with the old dedicated zoom render,
-      // which hardcoded isFocused).
-      clearSlotAttention(slotId);
-      setFocusedSlotId(slotId);
-      focusSlotTextarea(slotId);
-    }
-  }, [zoomedSlotId, clearSlotAttention]);
+  const handleToggleZoom = useCallback(
+    (slotId: string) => {
+      const zoomingIn = zoomedSlotId !== slotId;
+      setZoomedSlotId(zoomingIn ? slotId : null);
+      if (zoomingIn) {
+        // Zooming in is the user selecting the pane — clear its attention
+        // highlight and focus it (parity with the old dedicated zoom render,
+        // which hardcoded isFocused).
+        clearSlotAttention(slotId);
+        setFocusedSlotId(slotId);
+        focusSlotTextarea(slotId);
+      }
+    },
+    [zoomedSlotId, clearSlotAttention],
+  );
 
   // Esc deliberately does NOT exit zoom: the focused terminal needs it
   // (e.g. interrupting Claude). Exit via the header button or Cmd/Ctrl+1.
 
   /** Swap the contents of two leaves so the user can rearrange panes. */
-  const handleSwapSlots = useCallback((srcSlotId: string, destSlotId: string) => {
-    if (!srcSlotId || !destSlotId || srcSlotId === destSlotId) return;
-    setLayoutTree((prev) => swapSlots(prev, srcSlotId, destSlotId));
-    // SplitPaneView may reorder the keyed pane hosts in the DOM to match the
-    // new traversal order, which blurs a focused terminal — restore it.
-    if (focusedSlotId) focusSlotTextarea(focusedSlotId);
-  }, [focusedSlotId]);
+  const handleSwapSlots = useCallback(
+    (srcSlotId: string, destSlotId: string) => {
+      if (!srcSlotId || !destSlotId || srcSlotId === destSlotId) return;
+      setLayoutTree((prev) => swapSlots(prev, srcSlotId, destSlotId));
+      // SplitPaneView may reorder the keyed pane hosts in the DOM to match the
+      // new traversal order, which blurs a focused terminal — restore it.
+      if (focusedSlotId) focusSlotTextarea(focusedSlotId);
+    },
+    [focusedSlotId],
+  );
 
   /**
    * Eagle view: dropping a tile onto another project's tile reorders the
@@ -1836,37 +1979,81 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
   const projectColors = useProjectColors();
   const eagleColor = useMemo(
     () =>
-      projectName
-        ? projectColors.get(projectName) ?? projectColorFor(projectName)
-        : undefined,
-    [projectName, projectColors]
+      projectName ? (projectColors.get(projectName) ?? projectColorFor(projectName)) : undefined,
+    [projectName, projectColors],
   );
 
-  const renderLeaf = useCallback((slotId: string) => {
-    const slot = slots.find((s) => s.id === slotId);
-    if (!slot) return null;
+  const renderLeaf = useCallback(
+    (slotId: string) => {
+      const slot = slots.find((s) => s.id === slotId);
+      if (!slot) return null;
 
-    const dropOverlay = isDraggingFiles && dropTargetSlotId === slot.id && slot.sessionId !== null && (
-      <div className="drop-zone-overlay">
-        <span>Drop to paste path</span>
-      </div>
-    );
+      const dropOverlay = isDraggingFiles &&
+        dropTargetSlotId === slot.id &&
+        slot.sessionId !== null && (
+          <div className="drop-zone-overlay">
+            <span>Drop to paste path</span>
+          </div>
+        );
 
-    // Eagle counts tiles across ALL projects (eagleTileCount) — the common
-    // 1-terminal-per-project layout must still be reorderable; while
-    // eagle-zoomed all other tiles are visibility:hidden, so handles are moot.
-    // Same while per-project zoomed: only the zoomed pane is visible.
-    const showReorderHandle = eagleMode
-      ? eagleTileCount > 1 && !eagleAnyZoomed
-      : slots.length > 1 && zoomedSlotId === null;
-    const isEagleZoomed =
-      eagleMode && slot.sessionId !== null && eagleZoomedSessionId === slot.sessionId;
-    const isEagleObscured = eagleMode && eagleAnyZoomed && !isEagleZoomed;
-    const isSlotZoomed = eagleMode ? isEagleZoomed : zoomedSlotId === slot.id;
+      // Eagle counts tiles across ALL projects (eagleTileCount) — the common
+      // 1-terminal-per-project layout must still be reorderable; while
+      // eagle-zoomed all other tiles are visibility:hidden, so handles are moot.
+      // Same while per-project zoomed: only the zoomed pane is visible.
+      const showReorderHandle = eagleMode
+        ? eagleTileCount > 1 && !eagleAnyZoomed
+        : slots.length > 1 && zoomedSlotId === null;
+      const isEagleZoomed =
+        eagleMode && slot.sessionId !== null && eagleZoomedSessionId === slot.sessionId;
+      const isEagleObscured = eagleMode && eagleAnyZoomed && !isEagleZoomed;
+      const isSlotZoomed = eagleMode ? isEagleZoomed : zoomedSlotId === slot.id;
 
-    if (slot.sessionId !== null) {
-      // TS narrowing on slot.sessionId doesn't survive into the closure below.
-      const sessionId = slot.sessionId;
+      if (slot.sessionId !== null) {
+        // TS narrowing on slot.sessionId doesn't survive into the closure below.
+        const sessionId = slot.sessionId;
+        return (
+          <DraggablePane
+            slotId={slot.id}
+            gridId={tabId}
+            showHandle={showReorderHandle}
+            onSwap={handleSwapSlots}
+            onCrossGridReorder={handleEagleCrossReorder}
+            eagleMode={eagleMode}
+            eagleHidden={false}
+            eagleZoomed={isEagleZoomed}
+            eagleObscured={isEagleObscured}
+            eagleReserveShelf={parkedSessionIds.length > 0}
+          >
+            <TerminalView
+              key={slot.id}
+              sessionId={slot.sessionId}
+              isFocused={focusedSlotId === slot.id}
+              isActive={isActive}
+              onFocus={getFocusCallback(slot.id)}
+              onKill={handleKill}
+              terminalCount={slots.length}
+              isZoomed={isSlotZoomed}
+              onToggleZoom={() =>
+                eagleMode ? onEagleZoomToggle?.(sessionId) : handleToggleZoom(slot.id)
+              }
+              onPark={() => handlePark(slot.id)}
+              onAttachFiles={() => {
+                handleAttachFiles(sessionId, slot.id).catch(console.error);
+              }}
+              // The color is always on: a terminal's border tells you which
+              // project it belongs to in every view, not just eagle. The written
+              // label stays eagle-only — inside a single project's grid every
+              // tile would repeat the same name.
+              projectLabel={eagleMode ? projectName : undefined}
+              projectColor={eagleColor}
+              hasMoveHandle={showReorderHandle}
+              showShortcutHints={!eagleMode}
+            />
+            {dropOverlay}
+          </DraggablePane>
+        );
+      }
+
       return (
         <DraggablePane
           slotId={slot.id}
@@ -1875,92 +2062,102 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
           onSwap={handleSwapSlots}
           onCrossGridReorder={handleEagleCrossReorder}
           eagleMode={eagleMode}
-          eagleHidden={false}
-          eagleZoomed={isEagleZoomed}
-          eagleObscured={isEagleObscured}
-          eagleReserveShelf={parkedSessionIds.length > 0}
+          eagleHidden={eagleMode}
+          eagleZoomed={false}
+          eagleObscured={false}
         >
-          <TerminalView
+          <PreLaunchCard
             key={slot.id}
-            sessionId={slot.sessionId}
-            isFocused={focusedSlotId === slot.id}
-            isActive={isActive}
-            onFocus={getFocusCallback(slot.id)}
-            onKill={handleKill}
-            terminalCount={slots.length}
+            slot={slot}
+            projectPath={projectPath ?? ""}
+            branches={branches}
+            isLoadingBranches={isLoadingBranches}
+            isGitRepo={isGitRepo}
+            repositories={repositories}
+            workspaceType={workspaceType}
+            selectedRepoPath={effectiveRepoPath}
+            onRepoChange={onRepoChange}
+            fetchBranchesForRepo={getBranchesWithWorktreeStatus}
+            mcpServers={mcpServers}
+            skills={skills}
+            plugins={plugins}
+            hasManagedWorktree={hasManagedWorktree}
+            onCreateBranch={handleCreateBranch}
+            onCustomNameChange={(name) => updateSlotCustomName(slot.id, name)}
+            onModeChange={(mode) => updateSlotMode(slot.id, mode)}
+            onBranchChange={(branch) => updateSlotBranch(slot.id, branch)}
+            onWorktreeModeChange={(mode) => updateSlotWorktreeMode(slot.id, mode)}
+            onRefreshBranches={refreshBranches}
+            onMcpToggle={(serverName) => toggleSlotMcp(slot.id, serverName)}
+            onSkillToggle={(skillId) => toggleSlotSkill(slot.id, skillId)}
+            onPluginToggle={(pluginId) => toggleSlotPlugin(slot.id, pluginId)}
+            onMcpSelectAll={() => selectAllMcp(slot.id)}
+            onMcpUnselectAll={() => unselectAllMcp(slot.id)}
+            onPluginsSelectAll={() => selectAllPlugins(slot.id)}
+            onPluginsUnselectAll={() => unselectAllPlugins(slot.id)}
+            onLaunch={() => launchSlot(slot.id)}
+            onRemove={() => removeSlot(slot.id)}
+            onResumeSessionChange={(sessionId) => updateSlotResumeSession(slot.id, sessionId)}
             isZoomed={isSlotZoomed}
-            onToggleZoom={() =>
-              eagleMode ? onEagleZoomToggle?.(sessionId) : handleToggleZoom(slot.id)
-            }
-            onPark={() => handlePark(slot.id)}
-            onAttachFiles={() => {
-              handleAttachFiles(sessionId, slot.id).catch(console.error);
-            }}
-            // The color is always on: a terminal's border tells you which
-            // project it belongs to in every view, not just eagle. The written
-            // label stays eagle-only — inside a single project's grid every
-            // tile would repeat the same name.
-            projectLabel={eagleMode ? projectName : undefined}
-            projectColor={eagleColor}
-            hasMoveHandle={showReorderHandle}
-            showShortcutHints={!eagleMode}
+            onToggleZoom={() => handleToggleZoom(slot.id)}
           />
-          {dropOverlay}
         </DraggablePane>
       );
-    }
-
-    return (
-      <DraggablePane
-        slotId={slot.id}
-        gridId={tabId}
-        showHandle={showReorderHandle}
-        onSwap={handleSwapSlots}
-        onCrossGridReorder={handleEagleCrossReorder}
-        eagleMode={eagleMode}
-        eagleHidden={eagleMode}
-        eagleZoomed={false}
-        eagleObscured={false}
-      >
-      <PreLaunchCard
-        key={slot.id}
-        slot={slot}
-        projectPath={projectPath ?? ""}
-        branches={branches}
-        isLoadingBranches={isLoadingBranches}
-        isGitRepo={isGitRepo}
-        repositories={repositories}
-        workspaceType={workspaceType}
-        selectedRepoPath={effectiveRepoPath}
-        onRepoChange={onRepoChange}
-        fetchBranchesForRepo={getBranchesWithWorktreeStatus}
-        mcpServers={mcpServers}
-        skills={skills}
-        plugins={plugins}
-        hasManagedWorktree={hasManagedWorktree}
-        onCreateBranch={handleCreateBranch}
-        onCustomNameChange={(name) => updateSlotCustomName(slot.id, name)}
-        onModeChange={(mode) => updateSlotMode(slot.id, mode)}
-        onBranchChange={(branch) => updateSlotBranch(slot.id, branch)}
-        onWorktreeModeChange={(mode) => updateSlotWorktreeMode(slot.id, mode)}
-        onRefreshBranches={refreshBranches}
-        onMcpToggle={(serverName) => toggleSlotMcp(slot.id, serverName)}
-        onSkillToggle={(skillId) => toggleSlotSkill(slot.id, skillId)}
-        onPluginToggle={(pluginId) => toggleSlotPlugin(slot.id, pluginId)}
-        onMcpSelectAll={() => selectAllMcp(slot.id)}
-        onMcpUnselectAll={() => unselectAllMcp(slot.id)}
-        onPluginsSelectAll={() => selectAllPlugins(slot.id)}
-        onPluginsUnselectAll={() => unselectAllPlugins(slot.id)}
-        onLaunch={() => launchSlot(slot.id)}
-        onRemove={() => removeSlot(slot.id)}
-        onResumeSessionChange={(sessionId) => updateSlotResumeSession(slot.id, sessionId)}
-        isZoomed={isSlotZoomed}
-        onToggleZoom={() => handleToggleZoom(slot.id)}
-      />
-      </DraggablePane>
-    );
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- Deps cover all render-affecting state
-  }, [slots, focusedSlotId, isActive, isDraggingFiles, dropTargetSlotId, getFocusCallback, handleKill, handleToggleZoom, handlePark, handleAttachFiles, handleSwapSlots, handleEagleCrossReorder, projectPath, branches, isLoadingBranches, isGitRepo, hasManagedWorktree, repositories, workspaceType, effectiveRepoPath, onRepoChange, mcpServers, skills, plugins, handleCreateBranch, updateSlotCustomName, updateSlotMode, updateSlotBranch, updateSlotWorktreeMode, refreshBranches, toggleSlotMcp, toggleSlotSkill, toggleSlotPlugin, selectAllMcp, unselectAllMcp, selectAllPlugins, unselectAllPlugins, launchSlot, removeSlot, updateSlotResumeSession, eagleMode, eagleZoomedSessionId, eagleAnyZoomed, onEagleZoomToggle, projectName, eagleColor, tabId, eagleTileCount, parkedSessionIds, zoomedSlotId]);
+      // eslint-disable-next-line react-hooks/exhaustive-deps -- Deps cover all render-affecting state
+    },
+    [
+      slots,
+      focusedSlotId,
+      isActive,
+      isDraggingFiles,
+      dropTargetSlotId,
+      getFocusCallback,
+      handleKill,
+      handleToggleZoom,
+      handlePark,
+      handleAttachFiles,
+      handleSwapSlots,
+      handleEagleCrossReorder,
+      projectPath,
+      branches,
+      isLoadingBranches,
+      isGitRepo,
+      hasManagedWorktree,
+      repositories,
+      workspaceType,
+      effectiveRepoPath,
+      onRepoChange,
+      mcpServers,
+      skills,
+      plugins,
+      handleCreateBranch,
+      updateSlotCustomName,
+      updateSlotMode,
+      updateSlotBranch,
+      updateSlotWorktreeMode,
+      refreshBranches,
+      toggleSlotMcp,
+      toggleSlotSkill,
+      toggleSlotPlugin,
+      selectAllMcp,
+      unselectAllMcp,
+      selectAllPlugins,
+      unselectAllPlugins,
+      launchSlot,
+      removeSlot,
+      updateSlotResumeSession,
+      eagleMode,
+      eagleZoomedSessionId,
+      eagleAnyZoomed,
+      onEagleZoomToggle,
+      projectName,
+      eagleColor,
+      tabId,
+      eagleTileCount,
+      parkedSessionIds,
+      zoomedSlotId,
+    ],
+  );
 
   const handleRatioChange = useCallback((nodeId: string, ratio: number) => {
     setLayoutTree((prev) => updateRatio(prev, nodeId, ratio));
@@ -2070,8 +2267,10 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
                   >
                     {orderedSlots.map((slot, index) => {
                       const isTabActive = slot.id === zoomedSlotId;
-                      const liveName = slot.sessionId !== null ? sessionNameById.get(slot.sessionId) : undefined;
-                      const label = liveName?.trim() || slot.customName.trim() || `Terminal ${index + 1}`;
+                      const liveName =
+                        slot.sessionId !== null ? sessionNameById.get(slot.sessionId) : undefined;
+                      const label =
+                        liveName?.trim() || slot.customName.trim() || `Terminal ${index + 1}`;
 
                       return (
                         <ZoomTab
@@ -2095,12 +2294,24 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
                 </DndContext>
               </div>
               <button
+                type="button"
                 onClick={() => handleToggleZoom(zoomedSlotId!)}
                 className="rounded p-0.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text"
                 title="Exit zoom"
               >
-                <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                <svg
+                  className="h-3.5 w-3.5"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                  aria-hidden="true"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M6 18L18 6M6 6l12 12"
+                  />
                 </svg>
               </button>
             </div>
@@ -2298,11 +2509,7 @@ function DraggablePane({
       // file drag-and-drop hit-testing working on the visible tile box.
       data-slot-id={eagleMode && !eagleHidden ? slotId : undefined}
       data-grid-id={eagleMode && !eagleHidden ? gridId : undefined}
-      style={
-        eagleMode && !eagleHidden && eagleObscured
-          ? { visibility: "hidden" }
-          : undefined
-      }
+      style={eagleMode && !eagleHidden && eagleObscured ? { visibility: "hidden" } : undefined}
     >
       {children}
       {showHandle && (
@@ -2314,9 +2521,7 @@ function DraggablePane({
               : "Drag to swap with another pane"
           }
           className={`absolute left-1 top-1 z-20 flex h-5 w-4 items-center justify-center rounded transition-colors hover:bg-maestro-card/80 hover:text-maestro-text ${
-            isDragging
-              ? "cursor-grabbing text-maestro-blue"
-              : "cursor-grab text-maestro-muted/40"
+            isDragging ? "cursor-grabbing text-maestro-blue" : "cursor-grab text-maestro-muted/40"
           }`}
         >
           <GripVertical size={12} />
@@ -2351,14 +2556,9 @@ function ZoomTab({
   /** Clicking the already-active tab toggles the warning flag (header parity). */
   onToggleFlag?: () => void;
 }) {
-  const {
-    attributes,
-    listeners,
-    setNodeRef,
-    transform,
-    transition,
-    isDragging,
-  } = useSortable({ id: slotId });
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: slotId,
+  });
 
   // The strip scrolls horizontally with a hidden scrollbar, so a tab activated
   // by keyboard (Alt+Arrow / number keys) can sit outside the visible range.
@@ -2413,10 +2613,11 @@ function ZoomTab({
       onClick={isActive && onToggleFlag ? handleActiveClick : onSelect}
       className={`
         flex shrink-0 items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors
-        ${isFlagged || hasAttention ? 'warning-flag' : ''}
-        ${isActive
-          ? 'bg-maestro-blue/15 text-maestro-blue'
-          : 'text-maestro-muted hover:bg-maestro-card hover:text-maestro-text'
+        ${isFlagged || hasAttention ? "warning-flag" : ""}
+        ${
+          isActive
+            ? "bg-maestro-blue/15 text-maestro-blue"
+            : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
         }
       `}
       title={

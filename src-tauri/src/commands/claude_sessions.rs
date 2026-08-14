@@ -25,6 +25,12 @@ const HEAD_SCAN_BYTES: u64 = 1024 * 1024;
 /// Bytes read back from the end of a transcript to recover the last message
 /// timestamp and a summary of the last activity. Deliberately small: transcripts
 /// reach tens of megabytes and this runs for every file on sidebar render.
+///
+/// The same window also serves the newest `{"type":"last-prompt"}` (and any
+/// late `{"type":"summary"}`) lookup: Claude Code appends a `last-prompt`
+/// line as turns complete, so the newest one sits near EOF — across all 353
+/// transcripts carrying one on the machine this was written against, the
+/// farthest was ~34 KB from the end.
 const TAIL_SCAN_BYTES: u64 = 256 * 1024;
 
 /// Maximum sessions returned from [`list_claude_sessions`]. Anything cut by
@@ -39,7 +45,18 @@ const MAX_PROMPT_CHARS: usize = 200;
 #[derive(Debug, Clone, Serialize)]
 pub struct ClaudeSessionInfo {
     pub session_id: String,
+    /// Conversation title from a `{"type":"summary","summary":...}` entry.
+    ///
+    /// No transcript on the machine this was written against (Claude Code
+    /// 2.1.229) contains such an entry, so this is usually `None`; the shape is
+    /// still parsed because it costs nothing in the existing scan and older /
+    /// newer Claude Code versions are documented to write it.
+    pub summary: Option<String>,
     pub first_prompt: Option<String>,
+    /// Most recent user prompt, from the newest `{"type":"last-prompt"}` entry
+    /// near the end of the transcript — shows where a long conversation left
+    /// off, which the first prompt alone cannot.
+    pub last_prompt: Option<String>,
     /// Preview of the most recent user/assistant message in the transcript.
     ///
     /// The opening line alone does not identify a long conversation — two runs
@@ -66,11 +83,16 @@ pub struct ClaudeSessionInfo {
     ///
     /// Reported even when the directory is gone — see [`Self::cwd_exists`].
     /// Blanking it here made the resume target ambiguous: the caller silently
-    /// retargeted to the project path with no way to say so.
+    /// retargeted to the project path with no way to say so. Check
+    /// [`Self::resumable`] before spawning here.
     pub cwd: Option<String>,
     /// Whether [`Self::cwd`] still exists on disk. `false` means a resume
     /// launched there would fail, so the caller must warn (and fall back).
     pub cwd_exists: bool,
+    /// Whether `claude --resume` can work: the recorded cwd still exists.
+    pub resumable: bool,
+    /// Human-readable reason when `resumable` is `false`.
+    pub resume_blocked_reason: Option<String>,
 }
 
 /// Result of a session listing: the rows plus everything that was *not*
@@ -180,18 +202,22 @@ fn message_text(val: &serde_json::Value) -> Option<String> {
 
 /// Encodes a filesystem path into Claude Code's projects-directory naming scheme.
 ///
-/// Empirically, Claude Code replaces every character that isn't ASCII alphanumeric,
-/// `_`, or `-` with a `-`. That means `/`, `.`, and space all map to `-`, and a
+/// Empirically, Claude Code replaces every character that isn't ASCII alphanumeric
+/// or `-` with a `-`. That means `/`, `.`, space, and `_` all map to `-`, and a
 /// dotfile like `/Users/alice/.config` becomes `-Users-alice--config` (the slash
 /// *and* the dot each become a dash, producing `--`).
 ///
 /// An earlier version only replaced `/`, which silently returned an empty list
 /// for any path containing a dot — e.g. hidden directories or extensions.
+///
+/// A later version kept `_` as-is, which silently returned an empty list for
+/// any path containing an underscore — e.g. `C:\git\Dreadnought_Father_Folder`,
+/// whose real transcript directory is `C--git-Dreadnought-Father-Folder` (issue #86).
 pub(crate) fn encode_project_path(project_path: &str) -> String {
     project_path
         .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            if c.is_ascii_alphanumeric() || c == '-' {
                 c
             } else {
                 '-'
@@ -369,6 +395,89 @@ fn is_safe_session_id(session_id: &str) -> bool {
         .all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
+/// Scans the tail of a transcript for the newest `{"type":"last-prompt"}` and
+/// `{"type":"summary"}` entries, returning `(summary, last_prompt)`.
+///
+/// Reads at most [`TAIL_SCAN_BYTES`] from the end (never the whole file) and
+/// walks the lines in reverse so the newest entry of each kind wins. When
+/// `expected_session_id` is known, `last-prompt` entries stamped with a
+/// *different* sessionId are ignored — resumed conversations copy entries
+/// across files, and a foreign session's prompt must not label this one.
+fn scan_tail_for_recent_entries(
+    path: &Path,
+    expected_session_id: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let Ok(mut file) = fs::File::open(path) else {
+        return (None, None);
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(TAIL_SCAN_BYTES);
+    // Over-read by one byte: if the window happens to start exactly at a line
+    // start, the extra byte is the previous line's '\n' and the buffer's first
+    // "line" is an empty artifact — so dropping the first line is correct in
+    // every case. (Seeking to `start` itself dropped a COMPLETE first line
+    // whenever the seek landed right after a newline.)
+    let read_from = start.saturating_sub(1);
+    if file.seek(SeekFrom::Start(read_from)).is_err() {
+        return (None, None);
+    }
+    let mut buf = Vec::with_capacity((len - read_from) as usize);
+    if file.read_to_end(&mut buf).is_err() {
+        return (None, None);
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = text.lines().collect();
+    // When the read started mid-file the first line is the empty artifact of
+    // the over-read '\n', or a genuine fragment of a line that began before
+    // the window; either way it carries nothing parseable, drop it.
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+
+    let mut summary: Option<String> = None;
+    let mut last_prompt: Option<String> = None;
+    for line in lines.iter().rev() {
+        // Cheap substring pre-filter so huge tool-result lines are not JSON-parsed.
+        let looks_last = last_prompt.is_none() && line.contains(r#""type":"last-prompt""#);
+        let looks_summary = summary.is_none() && line.contains(r#""type":"summary""#);
+        if !looks_last && !looks_summary {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match val.get("type").and_then(|v| v.as_str()) {
+            Some("last-prompt") if last_prompt.is_none() => {
+                let foreign = matches!(
+                    (expected_session_id, val.get("sessionId").and_then(|v| v.as_str())),
+                    (Some(expected), Some(stamped)) if expected != stamped
+                );
+                if !foreign {
+                    if let Some(p) = val.get("lastPrompt").and_then(|v| v.as_str()) {
+                        let p = p.trim();
+                        if !p.is_empty() {
+                            last_prompt = Some(truncate_chars(p, MAX_PROMPT_CHARS));
+                        }
+                    }
+                }
+            }
+            Some("summary") if summary.is_none() => {
+                if let Some(s) = val.get("summary").and_then(|v| v.as_str()) {
+                    let s = s.trim();
+                    if !s.is_empty() {
+                        summary = Some(truncate_chars(s, MAX_PROMPT_CHARS));
+                    }
+                }
+            }
+            _ => {}
+        }
+        if summary.is_some() && last_prompt.is_some() {
+            break;
+        }
+    }
+    (summary, last_prompt)
+}
+
 /// Metadata recovered from the beginning of a transcript.
 #[derive(Debug, Default)]
 struct HeadInfo {
@@ -377,6 +486,8 @@ struct HeadInfo {
     started_at: Option<String>,
     first_prompt: Option<String>,
     cwd: Option<String>,
+    /// Conversation title from a head-of-file `{"type":"summary"}` entry.
+    summary: Option<String>,
 }
 
 /// Metadata recovered from the end of a transcript.
@@ -434,6 +545,17 @@ fn scan_head(file: &mut fs::File) -> HeadInfo {
                 info.cwd = Some(dir.to_string());
             }
         }
+        // A `{"type":"summary","summary":...}` title line, when Claude wrote
+        // one, sits at the top of the file — before any user message, so this
+        // runs before the early break below can fire.
+        if info.summary.is_none() && val.get("type").and_then(|v| v.as_str()) == Some("summary") {
+            if let Some(s) = val.get("summary").and_then(|v| v.as_str()) {
+                let s = s.trim();
+                if !s.is_empty() {
+                    info.summary = Some(truncate_chars(s, MAX_PROMPT_CHARS));
+                }
+            }
+        }
 
         // Look for the first real user message (skip system-generated messages)
         if info.first_prompt.is_none() && val.get("type").and_then(|v| v.as_str()) == Some("user") {
@@ -471,13 +593,18 @@ fn scan_tail(file: &mut fs::File, len: u64) -> TailInfo {
     }
 
     let start = len.saturating_sub(TAIL_SCAN_BYTES);
-    if file.seek(SeekFrom::Start(start)).is_err() {
+    // Over-read by one byte (same boundary rule as
+    // `scan_tail_for_recent_entries`): a window that starts exactly at a line
+    // start then yields a leading empty artifact instead of losing the
+    // complete first line.
+    let read_from = start.saturating_sub(1);
+    if file.seek(SeekFrom::Start(read_from)).is_err() {
         return info;
     }
     let mut buf = Vec::new();
     if file
         .by_ref()
-        .take(TAIL_SCAN_BYTES)
+        .take(len - read_from)
         .read_to_end(&mut buf)
         .is_err()
     {
@@ -486,7 +613,7 @@ fn scan_tail(file: &mut fs::File, len: u64) -> TailInfo {
 
     let text = String::from_utf8_lossy(&buf);
     let mut lines: Vec<&str> = text.split('\n').collect();
-    // The window almost certainly starts mid-line; that fragment is not JSON.
+    // The first line is the over-read '\n' artifact or a mid-line fragment.
     if start > 0 && !lines.is_empty() {
         lines.remove(0);
     }
@@ -623,12 +750,44 @@ fn parse_session_file(path: &Path) -> Option<ClaudeSessionInfo> {
         .map(|ts| ts.with_timezone(&Utc))
         .unwrap_or_else(|| metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH).into());
 
+    // The newest last-prompt (and any late summary) lives near EOF — a bounded
+    // tail read, not a second pass over the whole file. The foreign-entry
+    // filter keys on the FILENAME stem, not the head sessionId: a resumed
+    // transcript opens with history copied from the ORIGINAL session (head
+    // entries stamped with the old id) while its own entries carry the id
+    // Claude named the file after — keying on the head id rejected the file's
+    // own newest last-prompt as foreign. Non-id-shaped stems (rare, hand-made
+    // files) fall back to the parsed session id.
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned());
+    let expected = stem
+        .as_deref()
+        .filter(|s| is_safe_session_id(s))
+        .unwrap_or(session_id.as_str());
+    let (tail_summary, last_prompt) = scan_tail_for_recent_entries(path, Some(expected));
+    let summary = head.summary.or(tail_summary);
+
     let cwd = head.cwd.or(tail.cwd);
     let cwd_exists = cwd.as_deref().is_some_and(|dir| Path::new(dir).is_dir());
 
+    // `claude --resume` only works from the transcript's own cwd. A recorded
+    // cwd that no longer exists (deleted worktree) cannot host a resume — keep
+    // it for display, but mark the session not resumable with the reason.
+    let (resumable, resume_blocked_reason) = if cwd.is_none() {
+        (
+            false,
+            Some("no working directory was recorded".to_string()),
+        )
+    } else if !cwd_exists {
+        (false, Some("its directory no longer exists".to_string()))
+    } else {
+        (true, None)
+    };
+
     Some(ClaudeSessionInfo {
         session_id,
+        summary,
         first_prompt: head.first_prompt,
+        last_prompt,
         last_activity: tail.last_activity,
         started_at: head.started_at.unwrap_or_default(),
         last_active: last_active.to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -636,6 +795,8 @@ fn parse_session_file(path: &Path) -> Option<ClaudeSessionInfo> {
         git_branch: head.git_branch.or(tail.git_branch),
         cwd,
         cwd_exists,
+        resumable,
+        resume_blocked_reason,
     })
 }
 
@@ -865,10 +1026,22 @@ mod tests {
     }
 
     #[test]
-    fn encode_preserves_existing_dashes_and_underscores() {
+    fn encode_preserves_dashes_but_maps_underscores_to_dashes() {
         assert_eq!(
             encode_project_path("/a-b_c/d_e-f"),
-            "-a-b_c-d_e-f"
+            "-a-b-c-d-e-f"
+        );
+    }
+
+    #[test]
+    fn encode_maps_underscore_in_real_world_path() {
+        // Regression (issue #86): Claude Code's own encoder maps `_` to `-`
+        // just like every other special char. Keeping `_` produced a directory
+        // name (`C--git-Dreadnought_Father_Folder`) that never exists on disk,
+        // so sessions/memories for any underscore path were invisible.
+        assert_eq!(
+            encode_project_path(r"C:\git\Dreadnought_Father_Folder"),
+            "C--git-Dreadnought-Father-Folder"
         );
     }
 
@@ -1116,7 +1289,8 @@ mod tests {
 
     #[test]
     fn parse_keeps_cwd_when_the_directory_still_exists() {
-        // The resume launch runs in this directory, so it must survive parsing.
+        // The resume launch runs in this directory, so it must survive parsing
+        // and the session must be marked resumable.
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_string_lossy().replace('\\', "\\\\");
         let path = tmp.path().join("abc.jsonl");
@@ -1128,13 +1302,16 @@ mod tests {
         let expected = tmp.path().to_string_lossy().into_owned();
         assert_eq!(info.cwd, Some(expected));
         assert!(info.cwd_exists);
+        assert!(info.resumable);
+        assert_eq!(info.resume_blocked_reason, None);
     }
 
     #[test]
-    fn parse_reports_a_missing_cwd_instead_of_blanking_it() {
-        // Deleted worktree: the directory is still the resume target the
-        // transcript recorded, so the UI must be able to name it and warn.
-        // Blanking it silently retargeted the launch to the project path.
+    fn parse_marks_gone_directory_not_resumable_but_keeps_cwd() {
+        // Deleted worktree: spawning a shell there would fail, so the session
+        // must be visibly non-resumable — but the recorded cwd survives so the
+        // UI can still say where the conversation ran and warn. Blanking it
+        // silently retargeted the launch to the project path.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("abc.jsonl");
         let jsonl = r#"{"sessionId":"abc","cwd":"/gone/worktree-xyz","type":"user","message":{"content":"hi"}}"#;
@@ -1142,6 +1319,173 @@ mod tests {
         let info = parse_session_file(&path).expect("parsed");
         assert_eq!(info.cwd.as_deref(), Some("/gone/worktree-xyz"));
         assert!(!info.cwd_exists);
+        assert!(!info.resumable);
+        assert!(
+            info.resume_blocked_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("directory")),
+            "reason must explain the missing directory: {:?}",
+            info.resume_blocked_reason
+        );
+    }
+
+    #[test]
+    fn parse_without_recorded_cwd_is_not_resumable_with_reason() {
+        // No cwd in the transcript means we cannot know where `claude --resume`
+        // would find the session, so it must not be offered as resumable.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("abc.jsonl");
+        fs::write(
+            &path,
+            r#"{"sessionId":"abc","type":"user","message":{"content":"hi"}}"#,
+        )
+        .unwrap();
+        let info = parse_session_file(&path).expect("parsed");
+        assert_eq!(info.cwd, None);
+        assert!(!info.resumable);
+        assert!(
+            info.resume_blocked_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("recorded")),
+            "reason must explain the missing record: {:?}",
+            info.resume_blocked_reason
+        );
+    }
+
+    // ---- summary / last-prompt (issue #104: legible history entries) ------
+
+    #[test]
+    fn parse_picks_up_summary_entry_as_title() {
+        // `{"type":"summary"}` lines sit at the top of a transcript when Claude
+        // generated a title. (None exist on this machine's real transcripts —
+        // shape taken from Claude Code documentation of the entry.)
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("abc.jsonl");
+        let jsonl = "\
+{\"type\":\"summary\",\"summary\":\"Fixing the login flow\",\"leafUuid\":\"00000000-0000-0000-0000-000000000000\"}\n\
+{\"sessionId\":\"abc\",\"type\":\"user\",\"message\":{\"content\":\"hello\"}}\n";
+        fs::write(&path, jsonl).unwrap();
+        let info = parse_session_file(&path).expect("parsed");
+        assert_eq!(info.summary.as_deref(), Some("Fixing the login flow"));
+        assert_eq!(info.first_prompt.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn parse_without_summary_entry_leaves_only_first_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("abc.jsonl");
+        let jsonl = r#"{"sessionId":"abc","type":"user","message":{"content":"hello"}}"#;
+        fs::write(&path, jsonl).unwrap();
+        let info = parse_session_file(&path).expect("parsed");
+        assert_eq!(info.summary, None);
+        assert_eq!(info.first_prompt.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn parse_takes_newest_last_prompt_entry() {
+        // Claude Code appends a `last-prompt` line as turns complete; the
+        // newest one (nearest EOF) is where the conversation left off.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("abc.jsonl");
+        let jsonl = "\
+{\"sessionId\":\"abc\",\"type\":\"user\",\"message\":{\"content\":\"first ask\"}}\n\
+{\"type\":\"last-prompt\",\"lastPrompt\":\"first ask\",\"leafUuid\":\"a\",\"sessionId\":\"abc\"}\n\
+{\"type\":\"last-prompt\",\"lastPrompt\":\"latest ask\",\"leafUuid\":\"b\",\"sessionId\":\"abc\"}\n";
+        fs::write(&path, jsonl).unwrap();
+        let info = parse_session_file(&path).expect("parsed");
+        assert_eq!(info.last_prompt.as_deref(), Some("latest ask"));
+        assert_eq!(info.first_prompt.as_deref(), Some("first ask"));
+    }
+
+    #[test]
+    fn parse_ignores_last_prompt_stamped_with_another_session_id() {
+        // Resumed conversations copy entries across files; a foreign session's
+        // prompt must not label this one.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("abc.jsonl");
+        let jsonl = "\
+{\"sessionId\":\"abc\",\"type\":\"user\",\"message\":{\"content\":\"mine\"}}\n\
+{\"type\":\"last-prompt\",\"lastPrompt\":\"foreign\",\"leafUuid\":\"a\",\"sessionId\":\"def\"}\n";
+        fs::write(&path, jsonl).unwrap();
+        let info = parse_session_file(&path).expect("parsed");
+        assert_eq!(info.last_prompt, None);
+    }
+
+    #[test]
+    fn tail_scan_finds_last_prompt_past_the_head_scan_window() {
+        // A transcript larger than the tail budget, with the last-prompt line
+        // far beyond MAX_LINES_SCANNED and huge filler lines in between: the
+        // bounded tail read must still find it (and drop the partial first
+        // line of the tail window without choking).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("abc.jsonl");
+        // Enough filler to exceed the (256 KB) tail budget.
+        let filler_payload = "x".repeat(500);
+        let mut jsonl =
+            String::from("{\"sessionId\":\"abc\",\"type\":\"user\",\"message\":{\"content\":\"start\"}}\n");
+        for _ in 0..600 {
+            jsonl.push_str(&format!(
+                "{{\"type\":\"assistant\",\"sessionId\":\"abc\",\"payload\":\"{filler_payload}\"}}\n"
+            ));
+        }
+        jsonl.push_str(
+            "{\"type\":\"last-prompt\",\"lastPrompt\":\"the closing ask\",\"leafUuid\":\"z\",\"sessionId\":\"abc\"}\n",
+        );
+        assert!(jsonl.len() as u64 > TAIL_SCAN_BYTES, "fixture must exceed the tail budget");
+        fs::write(&path, &jsonl).unwrap();
+        let info = parse_session_file(&path).expect("parsed");
+        assert_eq!(info.last_prompt.as_deref(), Some("the closing ask"));
+    }
+
+    #[test]
+    fn tail_scan_takes_the_own_last_prompt_of_a_resumed_transcript() {
+        // Resumed conversations START with history copied from the ORIGINAL
+        // session — head entries (copied last-prompts included) are stamped
+        // with the old id, while the file's own entries carry the id the file
+        // is named after. Keying the foreign filter on the head sessionId
+        // rejected the file's own newest last-prompt; the filename stem is
+        // the transcript's authoritative identity.
+        let tmp = tempfile::tempdir().unwrap();
+        let old_id = "aaaaaaaa-0000-0000-0000-000000000001";
+        let new_id = "bbbbbbbb-0000-0000-0000-000000000002";
+        let path = tmp.path().join(format!("{new_id}.jsonl"));
+        let jsonl = format!(
+            "{{\"sessionId\":\"{old_id}\",\"type\":\"user\",\"message\":{{\"content\":\"copied history\"}}}}\n\
+             {{\"type\":\"last-prompt\",\"lastPrompt\":\"copied ask\",\"leafUuid\":\"a\",\"sessionId\":\"{old_id}\"}}\n\
+             {{\"type\":\"last-prompt\",\"lastPrompt\":\"the resumed ask\",\"leafUuid\":\"b\",\"sessionId\":\"{new_id}\"}}\n"
+        );
+        fs::write(&path, &jsonl).unwrap();
+        let info = parse_session_file(&path).expect("parsed");
+        assert_eq!(info.last_prompt.as_deref(), Some("the resumed ask"));
+    }
+
+    #[test]
+    fn tail_scan_keeps_a_complete_first_window_line_on_the_newline_boundary() {
+        // When `len - TAIL_SCAN_BYTES` lands exactly on a line START (the
+        // byte before it is '\n'), the window's first line is COMPLETE and
+        // must be scanned — it used to be dropped unconditionally. The only
+        // last-prompt (and the only timestamp) sit exactly on that boundary.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("abc.jsonl");
+        let head = "{\"sessionId\":\"abc\",\"type\":\"user\",\"message\":{\"content\":\"start\"}}\n";
+        let boundary = "{\"type\":\"last-prompt\",\"lastPrompt\":\"the boundary ask\",\"leafUuid\":\"z\",\"sessionId\":\"abc\",\"timestamp\":\"2021-05-05T05:05:05.000Z\"}\n";
+        // One filler line padded so the boundary line's first byte lands
+        // exactly at `len - TAIL_SCAN_BYTES`.
+        let skeleton = "{\"type\":\"progress\",\"sessionId\":\"abc\",\"payload\":\"\"}\n";
+        let padding = TAIL_SCAN_BYTES as usize - boundary.len() - skeleton.len();
+        let filler = format!(
+            "{{\"type\":\"progress\",\"sessionId\":\"abc\",\"payload\":\"{}\"}}\n",
+            "x".repeat(padding)
+        );
+        let jsonl = format!("{head}{boundary}{filler}");
+        assert_eq!(jsonl.len() - head.len(), TAIL_SCAN_BYTES as usize);
+        fs::write(&path, &jsonl).unwrap();
+        let info = parse_session_file(&path).expect("parsed");
+        // scan_tail_for_recent_entries kept the boundary line…
+        assert_eq!(info.last_prompt.as_deref(), Some("the boundary ask"));
+        // …and so did scan_tail (this timestamp exists nowhere else — the
+        // old code fell back to the file's mtime).
+        assert_eq!(info.last_active, "2021-05-05T05:05:05.000Z");
     }
 
     #[test]

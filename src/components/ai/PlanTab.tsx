@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Loader2, RefreshCw } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 
 import { MarkdownBody } from "@/components/git/shared/MarkdownBody";
@@ -24,7 +24,7 @@ export function PlanTab() {
   // getSnapshot, and zustand v5 dropped the memoized selector path — without
   // it React re-renders forever ("The result of getSnapshot should be cached").
   const repoPaths = useWorkspaceStore(
-    useShallow((s) => s.tabs.map((t) => t.selectedRepoPath ?? t.projectPath))
+    useShallow((s) => s.tabs.map((t) => t.selectedRepoPath ?? t.projectPath)),
   );
   const status = usePlanStore((s) => s.status);
   const plan = usePlanStore((s) => s.plan);
@@ -52,7 +52,7 @@ export function PlanTab() {
       lastCommitted.current = value;
       setConcerns(value);
     },
-    [setConcerns]
+    [setConcerns],
   );
   // Adopt changes that came from elsewhere — notably the async hydration of
   // the persisted settings, which lands after mount — without clobbering
@@ -92,22 +92,21 @@ export function PlanTab() {
           className="min-h-[70px] resize-y rounded border border-maestro-border bg-maestro-surface p-2 text-[11px] leading-snug text-maestro-text outline-none focus:border-maestro-blue"
         />
         <p className="text-[10px] leading-snug text-maestro-muted">
-          Kept between runs and weighed above everything else when the plan is
-          written. One plan covers all open projects at once.
+          Kept between runs and weighed above everything else when the plan is written. One plan
+          covers all open projects at once.
         </p>
         {scheduleEnabled ? (
           <p className="text-[10px] leading-snug text-maestro-muted">
-            Generated automatically at {scheduleTime} — the daily time set on
-            the Report tab, which drives both. If the app was closed then, it
-            catches up on the next launch.
+            Generated automatically at {scheduleTime} — the daily time set on the Report tab, which
+            drives both. If the app was closed then, it catches up on the next launch.
           </p>
         ) : (
           <p className="flex items-start gap-1.5 text-[10px] leading-snug text-maestro-orange">
             <AlertTriangle size={11} className="mt-px shrink-0" />
             <span>
-              The daily schedule is off, so no plan is generated automatically.
-              Turn on "Daily report at" on the Report tab — it drives both — or
-              use the button below whenever you want one.
+              The daily schedule is off, so no plan is generated automatically. Turn on "Daily
+              report at" on the Report tab — it drives both — or use the button below whenever you
+              want one.
             </span>
           </p>
         )}
@@ -153,9 +152,7 @@ export function PlanTab() {
         )}
         {plan && !generating && <MarkdownBody content={plan.markdown} className="text-xs" />}
         {!plan && status !== "generating" && status !== "error" && (
-          <p className="text-[11px] text-maestro-muted">
-            No plan yet — hit "Generate plan" above.
-          </p>
+          <p className="text-[11px] text-maestro-muted">No plan yet — hit "Generate plan" above.</p>
         )}
       </div>
     </div>

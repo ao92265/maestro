@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import { parseUnifiedDiff, rowsForUntracked } from "../diffParser";
 
 /** A realistic single-file diff: one line changed, one added. */

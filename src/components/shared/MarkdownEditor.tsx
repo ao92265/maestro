@@ -6,6 +6,8 @@ interface MarkdownEditorProps {
   value: string;
   onChange: (value: string) => void;
   placeholder?: string;
+  /** Forwarded to the underlying textarea — pair with a <label htmlFor>. */
+  id?: string;
   /** Extra classes for the flex-column wrapper (e.g. "min-h-0 flex-1"). */
   className?: string;
   /**
@@ -47,6 +49,7 @@ export const MarkdownEditor = forwardRef<HTMLTextAreaElement, MarkdownEditorProp
       value,
       onChange,
       placeholder,
+      id,
       className = "",
       heightClassName = "h-80",
       textareaClassName = "",
@@ -64,6 +67,7 @@ export const MarkdownEditor = forwardRef<HTMLTextAreaElement, MarkdownEditorProp
     const textareaEl = (
       <textarea
         ref={ref}
+        id={id}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}

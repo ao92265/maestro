@@ -1,8 +1,8 @@
-import { useMarketplaceStore } from "@/stores/useMarketplaceStore";
-import type { InstallScope, MarketplacePlugin } from "@/types/marketplace";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Check, Folder, Package, User, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { useMarketplaceStore } from "@/stores/useMarketplaceStore";
+import type { InstallScope, MarketplacePlugin } from "@/types/marketplace";
 
 interface PluginInstallModalProps {
   plugin: MarketplacePlugin;
@@ -74,7 +74,7 @@ export function PluginInstallModal({
     const result = await installPlugin(
       plugin.id,
       scope,
-      scope === "user" ? undefined : projectPath
+      scope === "user" ? undefined : projectPath,
     );
 
     if (result) {
@@ -82,7 +82,12 @@ export function PluginInstallModal({
     }
   };
 
-  const scopeOptions: { value: InstallScope; label: string; description: string; icon: React.ReactNode }[] = [
+  const scopeOptions: {
+    value: InstallScope;
+    label: string;
+    description: string;
+    icon: React.ReactNode;
+  }[] = [
     {
       value: "user",
       label: "User",
@@ -126,19 +131,13 @@ export function PluginInstallModal({
           <div className="flex items-start gap-3">
             <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-maestro-accent/10">
               {plugin.icon_url ? (
-                <img
-                  src={plugin.icon_url}
-                  alt={plugin.name}
-                  className="h-6 w-6 rounded"
-                />
+                <img src={plugin.icon_url} alt={plugin.name} className="h-6 w-6 rounded" />
               ) : (
                 <Package size={20} className="text-maestro-accent" />
               )}
             </div>
             <div className="min-w-0 flex-1">
-              <h3 className="text-sm font-medium text-maestro-text">
-                {plugin.name}
-              </h3>
+              <h3 className="text-sm font-medium text-maestro-text">{plugin.name}</h3>
               <p className="text-xs text-maestro-muted">
                 {plugin.author} · v{plugin.version}
               </p>
@@ -148,9 +147,10 @@ export function PluginInstallModal({
 
         {/* Scope selection */}
         <div className="p-4">
-          <label className="mb-2 block text-xs font-medium text-maestro-text">
+          {/* Group heading for the scope buttons below — not a control label. */}
+          <span className="mb-2 block text-xs font-medium text-maestro-text">
             Installation Scope
-          </label>
+          </span>
           <div className="space-y-2">
             {scopeOptions.map((option) => (
               <button
@@ -174,12 +174,8 @@ export function PluginInstallModal({
                 </div>
                 <div className="flex-1">
                   <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium text-maestro-text">
-                      {option.label}
-                    </span>
-                    {scope === option.value && (
-                      <Check size={14} className="text-maestro-accent" />
-                    )}
+                    <span className="text-sm font-medium text-maestro-text">{option.label}</span>
+                    {scope === option.value && <Check size={14} className="text-maestro-accent" />}
                   </div>
                   <p className="text-xs text-maestro-muted">{option.description}</p>
                 </div>
@@ -190,11 +186,15 @@ export function PluginInstallModal({
           {/* Project path picker (for project/local scopes) */}
           {(scope === "project" || scope === "local") && (
             <div className="mt-4">
-              <label className="mb-2 block text-xs font-medium text-maestro-text">
+              <label
+                htmlFor="plugin-install-project-path"
+                className="mb-2 block text-xs font-medium text-maestro-text"
+              >
                 Project Directory
               </label>
               <div className="flex gap-2">
                 <input
+                  id="plugin-install-project-path"
                   type="text"
                   value={projectPath}
                   onChange={(e) => setProjectPath(e.target.value)}
@@ -213,9 +213,7 @@ export function PluginInstallModal({
           )}
 
           {/* Error message */}
-          {error && (
-            <p className="mt-2 text-xs text-red-400">{error}</p>
-          )}
+          {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
         </div>
 
         {/* Actions */}

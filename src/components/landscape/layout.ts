@@ -59,8 +59,7 @@ const CLUSTER_GAP_Y = 80;
 /** Node id helpers — also the identity used to persist manual positions. */
 export const projectNodeId = (tabId: string) => `project:${tabId}`;
 export const terminalNodeId = (sessionId: number) => `terminal:${sessionId}`;
-export const agentNodeId = (sessionId: number, agentId: string) =>
-  `agent:${sessionId}:${agentId}`;
+export const agentNodeId = (sessionId: number, agentId: string) => `agent:${sessionId}:${agentId}`;
 
 /** Height of one agent's whole subtree: itself or its stacked children. */
 function agentSubtreeHeight(agent: LayoutAgent): number {

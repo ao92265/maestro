@@ -1,6 +1,6 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // The persisted zustand stores hydrate through the Tauri store plugin at
 // import time; happy-dom has no Tauri backend, so stub it out.
@@ -20,13 +20,13 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
-import { HistorySection } from "../HistorySection";
 import type { ClaudeSessionInfo, ClaudeSessionListing } from "@/lib/terminal";
 import type { WorktreeInfo } from "@/lib/worktreeManager";
 import { useActivityStore } from "@/stores/useActivityStore";
 import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
 import { useSessionStore } from "@/stores/useSessionStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
+import { HistorySection } from "../HistorySection";
 
 const invokeMock = vi.mocked(invoke);
 
@@ -52,7 +52,9 @@ function buildTab(overrides: Partial<WorkspaceTab> = {}): WorkspaceTab {
 function conversation(overrides: Partial<ClaudeSessionInfo> = {}): ClaudeSessionInfo {
   return {
     session_id: "conv-repo",
+    summary: null,
     first_prompt: "Fix the login bug",
+    last_prompt: null,
     last_activity: "Updated auth.ts and ran the suite",
     started_at: "2026-08-10T09:00:00Z",
     last_active: "2026-08-10T10:00:00Z",
@@ -60,6 +62,8 @@ function conversation(overrides: Partial<ClaudeSessionInfo> = {}): ClaudeSession
     git_branch: "main",
     cwd: REPO,
     cwd_exists: true,
+    resumable: true,
+    resume_blocked_reason: null,
     ...overrides,
   };
 }
@@ -204,13 +208,19 @@ describe("HistorySection (issue #78)", () => {
     });
   });
 
-  it("warns in the row when the conversation's directory is gone", async () => {
+  it("disables the row when the conversation's directory is gone, with the reason", async () => {
+    // Adapted after the samurai-epic-106 merge: issue #104 replaced the
+    // resume-in-project-path fallback with a DISABLED row — `claude --resume`
+    // only finds a session from its own directory, so retargeting the shell
+    // could never actually resume the conversation.
     mockInvoke({
       listing: buildListing([
         conversation({
           session_id: "conv-gone",
           cwd: "C:\\git\\maestro\\gone-worktree",
           cwd_exists: false,
+          resumable: false,
+          resume_blocked_reason: "its directory no longer exists",
         }),
       ]),
     });
@@ -219,17 +229,14 @@ describe("HistorySection (issue #78)", () => {
 
     // Visible on the row itself — a tooltip is not enough.
     expect(screen.getByText("GONE")).toBeInTheDocument();
-    expect(
-      screen.getByText(/C:\\git\\maestro\\gone-worktree no longer exists/),
-    ).toBeInTheDocument();
-    expect(screen.getByText(/resuming starts the agent in maestro/)).toBeInTheDocument();
+    expect(screen.getByText(/Not resumable — its directory no longer exists/)).toBeInTheDocument();
 
-    // And the launch never points a shell at the missing directory.
-    fireEvent.click(screen.getByTitle(/Original directory is gone/));
-    expect(usePendingLaunchStore.getState().pending[0]).toMatchObject({
-      resumeSessionId: "conv-gone",
-      workingDirOverride: null,
-    });
+    // And the launch never points a shell at the missing directory: the row
+    // is disabled outright, so nothing is queued.
+    const row = screen.getByTitle(/Not resumable — its directory no longer exists/);
+    expect(row).toBeDisabled();
+    fireEvent.click(row);
+    expect(usePendingLaunchStore.getState().pending).toHaveLength(0);
   });
 
   it("says how many rows the display cap cut, and reveals them", async () => {

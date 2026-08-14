@@ -239,6 +239,21 @@ impl Supervisor {
         session_id: u32,
         to: SupervisorState,
     ) -> Result<SessionSnapshot, String> {
+        self.transition_with_details(session_id, to, serde_json::Value::Null)
+    }
+
+    /// [`transition`](Self::transition) with extra key/values merged into the
+    /// applied transition's audit row `details` (issue #101: the validated
+    /// handoff/park rows carry the handoff file path and WIP commit SHA).
+    /// Non-object `extra` values are ignored, so the plain path passes
+    /// `Null`. Rejection ALERT rows never carry the extras — they describe
+    /// the rejection, not the transition that failed to happen.
+    pub fn transition_with_details(
+        &self,
+        session_id: u32,
+        to: SupervisorState,
+        extra: serde_json::Value,
+    ) -> Result<SessionSnapshot, String> {
         let outcome = {
             let mut sessions = self
                 .sessions
@@ -287,7 +302,12 @@ impl Supervisor {
                         _ => None,
                     };
                     let snapshot = entry.snapshot(session_id);
-                    let audit_event = audit_for_transition(&snapshot, from);
+                    let mut audit_event = audit_for_transition(&snapshot, from);
+                    if let (Some(map), serde_json::Value::Object(extra_map)) =
+                        (audit_event.details.as_object_mut(), extra)
+                    {
+                        map.extend(extra_map);
+                    }
                     Ok((snapshot, audit_event))
                 }
             }
@@ -833,6 +853,52 @@ mod tests {
         assert_eq!(spawn.details["predecessor_generation"], 2);
         assert_eq!(spawn.generation, 3);
         assert_eq!(spawn.session_id, 9);
+    }
+
+    #[tokio::test]
+    async fn test_transition_with_details_merges_extra_into_transition_row() {
+        // Issue #101: the injector's validated handoff/park rides its file
+        // path + WIP SHA into the transition's audit row.
+        let dir = tempdir().unwrap();
+        let (supervisor, audit, _seen) = harness(dir.path());
+        let project = "C:/git/proj-tdetails";
+        supervisor
+            .register_session(4, project.into(), "epic-t".into(), 2)
+            .unwrap();
+        supervisor
+            .transition(4, SupervisorState::HandoffRequested)
+            .unwrap();
+        supervisor
+            .transition_with_details(
+                4,
+                SupervisorState::HandoffWritten,
+                json!({ "handoff_file": ".maestro/handoffs/epic-t-gen2.md", "wip_commit": "abc123" }),
+            )
+            .unwrap();
+
+        let rows = audit.read(project, None, None).await.unwrap().events;
+        let written = rows
+            .iter()
+            .find(|r| r.event == AuditEventKind::Handoff && r.details["phase"] == "written")
+            .unwrap();
+        // Base details survive and the extras ride along.
+        assert_eq!(written.details["from"], "HANDOFF_REQUESTED");
+        assert_eq!(
+            written.details["handoff_file"],
+            ".maestro/handoffs/epic-t-gen2.md"
+        );
+        assert_eq!(written.details["wip_commit"], "abc123");
+
+        // A rejected transition never carries the extras — its ALERT
+        // describes the rejection only.
+        let err = supervisor
+            .transition_with_details(4, SupervisorState::Parked, json!({ "wip_commit": "zzz" }))
+            .unwrap_err();
+        assert!(err.contains("illegal"), "unexpected reason: {err}");
+        let rows = audit.read(project, None, None).await.unwrap().events;
+        let alert = rows.last().unwrap();
+        assert_eq!(alert.event, AuditEventKind::Alert);
+        assert!(alert.details.get("wip_commit").is_none());
     }
 
     #[tokio::test]

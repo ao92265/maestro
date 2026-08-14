@@ -1,11 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { buildAgentTree, flattenAgentTree } from "../agentTree";
 import type { SubagentInfo } from "@/stores/useAgentStore";
+import { buildAgentTree, flattenAgentTree } from "../agentTree";
 
-function agent(
-  agentId: string,
-  overrides?: Partial<SubagentInfo>
-): SubagentInfo {
+function agent(agentId: string, overrides?: Partial<SubagentInfo>): SubagentInfo {
   return {
     agentId,
     sessionId: 1,
@@ -78,7 +75,7 @@ describe("buildAgentTree", () => {
         agent("a"),
         agent("a1", { parentAgentId: "a", spawnedAt: "2026-08-07T10:01:00.000Z" }),
         agent("b", { spawnedAt: "2026-08-07T10:02:00.000Z" }),
-      ])
+      ]),
     );
     expect(flat.map((n) => n.agent.agentId)).toEqual(["a", "a1", "b"]);
   });

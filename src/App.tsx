@@ -13,6 +13,7 @@ import { killSession } from "@/lib/terminal";
 import { useOpenProject } from "@/lib/useOpenProject";
 import { useProjectColors } from "@/lib/useProjectColors";
 import { useFDAStore } from "@/stores/useFDAStore";
+import { usePlanStore } from "@/stores/usePlanStore";
 import {
   initContextUsageListener,
   initSamuraiSupervisorListener,
@@ -20,35 +21,37 @@ import {
   stopSamuraiSupervisorListener,
   useSessionStore,
 } from "@/stores/useSessionStore";
+import { useStandupStore } from "@/stores/useStandupStore";
 import { type RepositoryInfo, useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { GitGraphPanel } from "./components/git/GitGraphPanel";
 import type { GitPanelTab } from "./components/git/GitPanelTabs";
 import { BottomBar } from "./components/shared/BottomBar";
+import { EagleProjectPickerModal } from "./components/shared/EagleProjectPickerModal";
 import { FDADialog } from "./components/shared/FDADialog";
 import {
   MultiProjectView,
   type MultiProjectViewHandle,
 } from "./components/shared/MultiProjectView";
+import { NotificationToasts } from "./components/shared/NotificationToasts";
 import {
   loadRightPanelWidth,
   RIGHT_PANEL_WIDTH_STORAGE_KEY,
 } from "./components/shared/PanelResizeHandle";
-import { EagleProjectPickerModal } from "./components/shared/EagleProjectPickerModal";
 import { ProjectTabs } from "./components/shared/ProjectTabs";
 import { type EagleProjectOption, TopBar } from "./components/shared/TopBar";
 import { UtilityPanel, type UtilityPanelKind } from "./components/shared/UtilityPanel";
 import {
   loadSavedSidebarTab,
-  saveSidebarTab,
   Sidebar,
-  sidebarTabShortcutTransition,
   type SidebarTabId,
+  saveSidebarTab,
+  sidebarTabShortcutTransition,
 } from "./components/sidebar/Sidebar";
+import { MAX_SESSIONS } from "./components/terminal/splitTree";
 import { UpdateNotification } from "./components/update/UpdateNotification";
-import { HEALTH_CHECK_INTERVAL_MS } from "./lib/healthRules";
 import { useAppKeyboard } from "./hooks/useAppKeyboard";
 import { useSwipeNavigation } from "./hooks/useSwipeNavigation";
-import { NotificationToasts } from "./components/shared/NotificationToasts";
+import { HEALTH_CHECK_INTERVAL_MS } from "./lib/healthRules";
 import { initActivityListener, stopActivityListener } from "./stores/useActivityStore";
 import { initAgentListener, stopAgentListener } from "./stores/useAgentStore";
 import { useGitHubStore } from "./stores/useGitHubStore";
@@ -61,10 +64,7 @@ import {
 import { useGitStore } from "./stores/useGitStore";
 import { useHealthStore } from "./stores/useHealthStore";
 import { useTerminalSettingsStore } from "./stores/useTerminalSettingsStore";
-import { usePlanStore } from "@/stores/usePlanStore";
-import { useStandupStore } from "@/stores/useStandupStore";
 import { useUpdateStore } from "./stores/useUpdateStore";
-import { MAX_SESSIONS } from "./components/terminal/splitTree";
 
 /**
  * Landscape graph, loaded on demand: it pulls in React Flow, which would
@@ -73,7 +73,7 @@ import { MAX_SESSIONS } from "./components/terminal/splitTree";
  * just the import.
  */
 const LandscapeView = lazy(() =>
-  import("./components/landscape/LandscapeView").then((m) => ({ default: m.LandscapeView }))
+  import("./components/landscape/LandscapeView").then((m) => ({ default: m.LandscapeView })),
 );
 
 /** Header title for each git-panel tab. */
@@ -340,14 +340,9 @@ function App() {
   // open workspace tabs (deduplicated by repo path — see helper docs).
   // Serialized so active-tab flips (which also mutate `tabs`) don't
   // re-invoke the command; the backend additionally ignores identical sets.
-  const watchedProjectsJson = useMemo(
-    () => JSON.stringify(watchedProjectsFromTabs(tabs)),
-    [tabs]
-  );
+  const watchedProjectsJson = useMemo(() => JSON.stringify(watchedProjectsFromTabs(tabs)), [tabs]);
   useEffect(() => {
-    void useGitHubWatchdogStore
-      .getState()
-      .syncProjects(JSON.parse(watchedProjectsJson));
+    void useGitHubWatchdogStore.getState().syncProjects(JSON.parse(watchedProjectsJson));
   }, [watchedProjectsJson]);
 
   // Health checker: rule-based memory/process checks on a quiet interval.
@@ -386,7 +381,7 @@ function App() {
   // recreate the interval on each switch. This only changes when a path is
   // actually added/removed — which is exactly when a fresh tick is wanted.
   const standupRepoPathsKey = useWorkspaceStore((s) =>
-    s.tabs.map((t) => t.selectedRepoPath ?? t.projectPath).join("\n")
+    s.tabs.map((t) => t.selectedRepoPath ?? t.projectPath).join("\n"),
   );
   useEffect(() => {
     const repoPaths = standupRepoPathsKey === "" ? [] : standupRepoPathsKey.split("\n");
@@ -416,7 +411,9 @@ function App() {
   // the active tab, so non-eagle behavior is unchanged.
   const clampedEagleGitIndex = tabs.length === 0 ? 0 : Math.min(eagleGitIndex, tabs.length - 1);
   const gitTargetTab = eagleView ? (tabs[clampedEagleGitIndex] ?? null) : activeTab;
-  const gitRepoPath = gitTargetTab ? (gitTargetTab.selectedRepoPath ?? gitTargetTab.projectPath) : undefined;
+  const gitRepoPath = gitTargetTab
+    ? (gitTargetTab.selectedRepoPath ?? gitTargetTab.projectPath)
+    : undefined;
 
   // Entering eagle view starts the carousel on the currently active project.
   useEffect(() => {
@@ -596,13 +593,12 @@ function App() {
   // Picking one leaves eagle view and opens a normal pre-launch card in that
   // project, so the terminal is configured (name/branch/worktree/…) before
   // launching — the same flow as adding a session outside eagle view.
-  const eagleProjects: EagleProjectOption[] = tabs
-    .map((t) => ({
-      tabId: t.id,
-      name: t.name,
-      color: projectColors.get(t.name) ?? projectColorFor(t.name),
-      atMax: (sessionCounts.get(t.id)?.slotCount ?? 0) >= MAX_SESSIONS,
-    }));
+  const eagleProjects: EagleProjectOption[] = tabs.map((t) => ({
+    tabId: t.id,
+    name: t.name,
+    color: projectColors.get(t.name) ?? projectColorFor(t.name),
+    atMax: (sessionCounts.get(t.id)?.slotCount ?? 0) >= MAX_SESSIONS,
+  }));
 
   const handleAddSessionToProject = useCallback(
     (tabId: string) => {
@@ -732,7 +728,7 @@ function App() {
 
       if (target) {
         const targetTab = wsTabs.find(
-          (t) => (t.selectedRepoPath ?? t.projectPath) === target.repoPath
+          (t) => (t.selectedRepoPath ?? t.projectPath) === target.repoPath,
         );
         if (targetTab && !targetTab.active) selectTab(targetTab.id);
       }
@@ -751,7 +747,7 @@ function App() {
       setGitPanelTab(kind);
       setGitPanelOpen(true);
     },
-    [selectTab]
+    [selectTab],
   );
 
   useAppKeyboard({

@@ -1,7 +1,7 @@
 import { memo } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { samePath } from "@/lib/path";
-import { useSessionStore, type SamuraiSupervisorState } from "@/stores/useSessionStore";
+import { type SamuraiSupervisorState, useSessionStore } from "@/stores/useSessionStore";
 
 /**
  * Human badge text + tint per supervisor state (issue #46 / PRD §9: the user
@@ -55,7 +55,7 @@ export const SamuraiBadge = memo(function SamuraiBadge({
         state: entry.state,
         contextPercent: session.contextPercent,
       };
-    })
+    }),
   );
   if (!info) return null;
 

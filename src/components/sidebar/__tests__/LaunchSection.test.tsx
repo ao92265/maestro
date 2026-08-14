@@ -1,7 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The persisted zustand stores hydrate through the Tauri store plugin at
 // import time; happy-dom has no Tauri backend, so stub it out.
@@ -19,20 +20,72 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   ask: vi.fn(),
 }));
 
-// useSessionStore binds Tauri event listeners at call time; nothing in these
-// tests listens, but the import must not reach a real event bridge.
+// The section subscribes to the live test-gate channel on mount (issue
+// #90b) — the AuditSection test's listen-capture pattern. useSessionStore
+// also binds Tauri event listeners at call time; the mock keeps the import
+// off the real event bridge either way.
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
-import { LaunchSection } from "../LaunchSection";
-import type { SamuraiPreflight, SamuraiRunConfig } from "@/lib/samurai";
+import type {
+  SamuraiPreflight,
+  SamuraiRunListEntry,
+  SamuraiRunOrchestrator,
+  SamuraiTestGateProgress,
+  SamuraiWorkflowGraph,
+} from "@/lib/samurai";
 import type { UsageData } from "@/lib/usageParser";
-import { useSessionStore, type SamuraiSessionInfo } from "@/stores/useSessionStore";
+import { useSamuraiWorkflowStore } from "@/stores/useSamuraiWorkflowStore";
+import { type SamuraiSessionInfo, useSessionStore } from "@/stores/useSessionStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
+import { LaunchSection } from "../LaunchSection";
+
+/**
+ * The section now embeds the React Flow workflow editor (issue #91), which
+ * measures through browser APIs happy-dom lacks — the LandscapeView test's
+ * stub block.
+ */
+beforeAll(() => {
+  class ResizeObserverStub {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  vi.stubGlobal("ResizeObserver", ResizeObserverStub);
+  vi.stubGlobal(
+    "DOMMatrixReadOnly",
+    class {
+      m22 = 1;
+      constructor(_transform?: string) {}
+    },
+  );
+  Object.defineProperty(HTMLElement.prototype, "getBoundingClientRect", {
+    configurable: true,
+    value: () => ({
+      x: 0,
+      y: 0,
+      width: 1200,
+      height: 800,
+      top: 0,
+      left: 0,
+      right: 1200,
+      bottom: 800,
+      toJSON: () => {},
+    }),
+  });
+  Object.defineProperty(SVGElement.prototype, "getBBox", {
+    configurable: true,
+    value: () => ({ x: 0, y: 0, width: 0, height: 0 }),
+  });
+});
 
 const invokeMock = vi.mocked(invoke);
 const askMock = vi.mocked(ask);
+const listenMock = vi.mocked(listen);
+
+/** Captured `samurai-test-gate-event` handler, so tests can stream ticks. */
+let emitGateEvent: (payload: SamuraiTestGateProgress) => void;
 
 function buildTab(overrides: Partial<WorkspaceTab> = {}): WorkspaceTab {
   return {
@@ -82,8 +135,20 @@ function buildUsage(overrides: Partial<UsageData> = {}): UsageData {
   };
 }
 
+/** Default orchestrator: nothing known yet — every field absent. */
+function orchestrator(overrides: Partial<SamuraiRunOrchestrator> = {}): SamuraiRunOrchestrator {
+  return {
+    generation: null,
+    session_id: null,
+    model: null,
+    context_window: null,
+    context_percent: null,
+    ...overrides,
+  };
+}
+
 /** A pre-#83 config by default: raw ref in `epic`, both lists empty. */
-function run(overrides: Partial<SamuraiRunConfig> = {}): SamuraiRunConfig {
+function run(overrides: Partial<SamuraiRunListEntry> = {}): SamuraiRunListEntry {
   return {
     project_path: "C:\\git\\maestro",
     epic: "#38",
@@ -93,16 +158,30 @@ function run(overrides: Partial<SamuraiRunConfig> = {}): SamuraiRunConfig {
     worktree_path: "C:\\data\\worktrees\\maestro-abc\\samurai-38",
     model: null,
     thresholds: null,
+    workflow: null,
     status: "ACTIVE",
     created_at: "2026-08-06T10:00:00Z",
+    orchestrator: orchestrator(),
     ...overrides,
+  };
+}
+
+/** A minimal workflow graph, for the editor fallback and edited-graph cases. */
+function workflowGraph(): SamuraiWorkflowGraph {
+  return {
+    nodes: [
+      { id: "implement", text: "Implement the issue." },
+      { id: "verify", text: "Verify and push." },
+    ],
+    edges: [{ from: "implement", to: "verify" }],
+    start: "implement",
   };
 }
 
 /** Routes the invoke mock by command; unknown commands resolve empty. */
 function mockInvoke({
   preflight = passPreflight(),
-  runs = [] as SamuraiRunConfig[],
+  runs = [] as SamuraiRunListEntry[],
   usage = buildUsage(),
 } = {}) {
   invokeMock.mockImplementation(async (cmd: string) => {
@@ -133,6 +212,9 @@ function mockInvoke({
           worktree_path: "C:\\data\\worktrees\\maestro-abc\\samurai-38",
           branch_deleted: true,
         };
+      // The embedded workflow editor's display fallback (issue #91).
+      case "samurai_default_workflow":
+        return workflowGraph();
       default:
         return undefined;
     }
@@ -164,8 +246,18 @@ describe("LaunchSection (issue #63)", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     askMock.mockReset();
+    listenMock.mockReset();
+    emitGateEvent = () => {};
+    listenMock.mockImplementation(((event: string, handler: (e: unknown) => void) => {
+      if (event === "samurai-test-gate-event") {
+        emitGateEvent = (payload) => handler({ payload });
+      }
+      return Promise.resolve(() => {});
+    }) as typeof listen);
     mockInvoke();
     useWorkspaceStore.setState({ tabs: [buildTab()] });
+    // Untouched workflow editor by default — launches send workflow: null.
+    useSamuraiWorkflowStore.setState({ graph: null });
     useSessionStore.setState({ samuraiBySessionId: {} });
   });
 
@@ -179,9 +271,11 @@ describe("LaunchSection (issue #63)", () => {
     expect(screen.getByLabelText("Issues")).toBeInTheDocument();
     expect(screen.getByLabelText("Model")).toBeInTheDocument();
     expect(screen.getByLabelText("Handoff at context %")).toBeInTheDocument();
-    // The agent-readiness declaration is gone — it is the model's call now,
-    // and all that is left is the warning.
-    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    // The agent-readiness declaration is gone — it is the model's call now.
+    // The only checkbox is the test-gate skip toggle (issue #90b), OFF by
+    // default: the gate runs unless the user explicitly opts out.
+    expect(screen.getAllByRole("checkbox")).toHaveLength(1);
+    expect(screen.getByRole("checkbox", { name: "Skip test-suite gate" })).not.toBeChecked();
     expect(screen.getByText(/Make sure the issues are agent-ready/)).toBeInTheDocument();
     // Nothing to work yet → Launch stays disabled.
     expect(screen.getByRole("button", { name: "Launch" })).toBeDisabled();
@@ -231,10 +325,27 @@ describe("LaunchSection (issue #63)", () => {
       issues: [],
       model: null,
       handoffContextPct: null,
+      skipTestGate: false,
+      // Issue #91: the workflow editor is untouched — null lets the backend
+      // fall back to (and snapshot) the default template.
+      workflow: null,
     });
     expect(
       await screen.findByText(/Run launched: epic #38 on samurai-epic-38/),
     ).toBeInTheDocument();
+  });
+
+  it("sends the edited workflow graph with the launch (issue #91)", async () => {
+    // A persisted edit (here: the chain cut after "implement") rides the
+    // launch verbatim — the backend snapshots exactly what the editor holds.
+    const edited: SamuraiWorkflowGraph = { ...workflowGraph(), edges: [] };
+    useSamuraiWorkflowStore.setState({ graph: edited });
+    render(<LaunchSection />);
+    fireEvent.change(screen.getByLabelText("Issues"), { target: { value: "#38" } });
+    fireEvent.click(screen.getByRole("button", { name: "Launch" }));
+
+    await waitFor(() => expect(callsOf("samurai_launch_run")).toHaveLength(1));
+    expect(callsOf("samurai_launch_run")[0][1]).toMatchObject({ workflow: edited });
   });
 
   it("launches from the Issues field alone, with no epic (issue #83)", async () => {
@@ -348,12 +459,86 @@ describe("LaunchSection (issue #63)", () => {
       issues: ["41"],
       model: null,
       handoffContextPct: 30,
+      skipTestGate: false,
+      workflow: null,
     });
     // Every field clears together after a launch.
     await screen.findByText(/Run launched: epic #38/);
     expect(screen.getByLabelText("Epics")).toHaveValue("");
     expect(screen.getByLabelText("Issues")).toHaveValue("");
     expect(screen.getByLabelText("Handoff at context %")).toHaveValue(null);
+  });
+
+  it("sends the skip test-gate toggle with the launch args (issue #90b)", async () => {
+    render(<LaunchSection />);
+    fireEvent.change(screen.getByLabelText("Issues"), { target: { value: "#38" } });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Skip test-suite gate" }));
+    fireEvent.click(screen.getByRole("button", { name: "Launch" }));
+
+    await waitFor(() => expect(callsOf("samurai_launch_run")).toHaveLength(1));
+    expect(callsOf("samurai_launch_run")[0][1]).toMatchObject({ skipTestGate: true });
+  });
+
+  it("renders live test-gate progress with elapsed time during a launch (issue #90b)", async () => {
+    let resolveLaunch: (result: unknown) => void = () => {};
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "samurai_preflight":
+          return passPreflight();
+        case "samurai_list_runs":
+          return [];
+        case "get_claude_usage":
+          return buildUsage();
+        case "samurai_launch_run":
+          return new Promise((resolve) => {
+            resolveLaunch = resolve;
+          });
+        default:
+          return undefined;
+      }
+    });
+    render(<LaunchSection />);
+    fireEvent.change(screen.getByLabelText("Issues"), { target: { value: "#38" } });
+    fireEvent.click(screen.getByRole("button", { name: "Launch" }));
+    await waitFor(() => expect(callsOf("samurai_launch_run")).toHaveLength(1));
+
+    // A backend tick lands: the button shows the step with elapsed time.
+    act(() => {
+      emitGateEvent({
+        project: "C:\\git\\maestro",
+        epic: "#38",
+        step: "cargo_test",
+        detail: "cargo test: running the workspace suite…",
+        elapsed_secs: 12,
+      });
+    });
+    expect(screen.getByText(/cargo test: running the workspace suite… · \d+s/)).toBeInTheDocument();
+
+    // Another project's tick must not repaint this launcher.
+    act(() => {
+      emitGateEvent({
+        project: "C:\\git\\other",
+        epic: "#9",
+        step: "bootstrap_npm",
+        detail: "bootstrap: npm install…",
+        elapsed_secs: 3,
+      });
+    });
+    expect(screen.queryByText(/npm install… ·/)).not.toBeInTheDocument();
+    expect(screen.getByText(/cargo test: running the workspace suite…/)).toBeInTheDocument();
+
+    // The launch resolves: the progress line clears with the phase.
+    await act(async () => {
+      resolveLaunch({
+        epic: "#38",
+        branch: "samurai-38",
+        worktree_path: "C:\\data\\worktrees\\maestro-abc\\samurai-38",
+        repo_pin: null,
+        stale_timer_cancelled: false,
+      });
+    });
+    expect(await screen.findByText(/Run launched: #38/)).toBeInTheDocument();
+    expect(screen.queryByText(/cargo test: running/)).not.toBeInTheDocument();
   });
 
   it("stops at failing preflight rows and never reaches the launch", async () => {
@@ -394,6 +579,176 @@ describe("LaunchSection (issue #63)", () => {
     expect(
       await screen.findByText(/Cleaned up run #38: removed worktree, branch samurai-38/),
     ).toBeInTheDocument();
+  });
+
+  it("shows an immediate spinner and dims the row while the delete is in flight, then removes it on success (issue #99)", async () => {
+    let resolveCleanup: (report: unknown) => void = () => {};
+    // The list still reports the run until the cleanup actually lands — the
+    // mock flips to empty only once the cleanup promise resolves, so a
+    // premature refresh (were the component to race one) would not
+    // accidentally make this assertion pass.
+    let listedRuns: SamuraiRunListEntry[] = [run()];
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "samurai_preflight":
+          return passPreflight();
+        case "samurai_list_runs":
+          return listedRuns;
+        case "get_claude_usage":
+          return buildUsage();
+        case "samurai_cleanup_epic":
+          return new Promise((resolve) => {
+            resolveCleanup = resolve;
+          });
+        case "samurai_default_workflow":
+          return workflowGraph();
+        default:
+          return undefined;
+      }
+    });
+    askMock.mockResolvedValue(true);
+    render(<LaunchSection />);
+
+    const trashButton = await screen.findByRole("button", { name: "Clean up run #38" });
+    fireEvent.click(trashButton);
+    await waitFor(() => expect(askMock).toHaveBeenCalledTimes(1));
+
+    // The cleanup call is still pending (resolveCleanup not called yet), but
+    // the button is already disabled and shows the spinner, and the row
+    // reads as pending — all before the backend answers.
+    await waitFor(() => expect(trashButton).toBeDisabled());
+    expect(trashButton.querySelector("svg.animate-spin")).toBeTruthy();
+    const rowEl = trashButton.parentElement?.parentElement;
+    expect(rowEl).toHaveClass("opacity-60");
+    expect(callsOf("samurai_cleanup_epic")).toHaveLength(1);
+
+    await act(async () => {
+      listedRuns = [];
+      resolveCleanup({
+        epic: "#38",
+        branch: "samurai-38",
+        timer_cancelled: true,
+        config_archived: true,
+        worktree_removed: true,
+        worktree_path: "C:\\data\\worktrees\\maestro-abc\\samurai-38",
+        branch_deleted: true,
+        spawn_cancelled: false,
+      });
+    });
+
+    await waitFor(() => expect(screen.queryByText("#38")).not.toBeInTheDocument());
+  });
+
+  it("surfaces a rejected delete as an inline row error instead of silently reverting (issue #99)", async () => {
+    mockInvoke({ runs: [run()] });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "samurai_preflight":
+          return passPreflight();
+        case "samurai_list_runs":
+          return [run()];
+        case "get_claude_usage":
+          return buildUsage();
+        case "samurai_cleanup_epic":
+          throw "cleanup refused: worktree has uncommitted changes";
+        case "samurai_default_workflow":
+          return workflowGraph();
+        default:
+          return undefined;
+      }
+    });
+    askMock.mockResolvedValue(true);
+    render(<LaunchSection />);
+
+    const trashButton = await screen.findByRole("button", { name: "Clean up run #38" });
+    fireEvent.click(trashButton);
+
+    // The row survives (the delete failed) and shows the failure in place —
+    // not a bare revert to the pre-click row, and not just the form's
+    // top-level error line.
+    expect(
+      await screen.findByText(/cleanup refused: worktree has uncommitted changes/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("#38")).toBeInTheDocument();
+    expect(trashButton).toBeEnabled();
+    expect(trashButton.querySelector("svg.animate-spin")).toBeFalsy();
+    const rowEl = trashButton.parentElement?.parentElement;
+    expect(rowEl).not.toHaveClass("opacity-60");
+  });
+
+  it("shows a COMPLETED run as finished-awaiting-cleanup, distinct from live (issue #96)", async () => {
+    mockInvoke({ runs: [run(), run({ epic: "#39", status: "COMPLETED" })] });
+    render(<LaunchSection />);
+
+    // The live run keeps its ACTIVE badge; the verified-complete one gets
+    // the distinct FINISHED badge naming the awaiting-cleanup state.
+    expect(await screen.findByText("FINISHED")).toBeInTheDocument();
+    expect(screen.getByText("ACTIVE")).toBeInTheDocument();
+    expect(screen.getByText("FINISHED").getAttribute("title")).toContain("Awaiting cleanup");
+    // Cleanup stays the separate manual step (PRD §5.9) — still offered.
+    expect(screen.getByRole("button", { name: "Clean up run #39" })).toBeInTheDocument();
+  });
+
+  it("shows the orchestrator's live details on a run row (issue #102)", async () => {
+    mockInvoke({
+      runs: [
+        run({
+          orchestrator: orchestrator({
+            generation: 3,
+            session_id: 42,
+            model: "claude-opus-4-6[1m]",
+            context_window: 1_000_000,
+            context_percent: 38.5,
+          }),
+        }),
+      ],
+    });
+    render(<LaunchSection />);
+
+    expect(await screen.findByText("claude-opus-4-6[1m]")).toBeInTheDocument();
+    expect(screen.getByText("Gen 3")).toBeInTheDocument();
+    expect(screen.getByText("Session 42")).toBeInTheDocument();
+    expect(screen.getByText("38.5% / 1M")).toBeInTheDocument();
+  });
+
+  it("renders absent orchestrator fields as dashes, never a guess (issue #102)", async () => {
+    // The default run() has no session registered yet: every orchestrator
+    // field is null.
+    mockInvoke({ runs: [run()] });
+    render(<LaunchSection />);
+
+    expect(await screen.findByText("Gen —")).toBeInTheDocument();
+    expect(screen.getByText("Session —")).toBeInTheDocument();
+    // The model slot and the context slot both render a bare dash.
+    expect(screen.getAllByText("—")).toHaveLength(2);
+  });
+
+  it("hides the live context % on a COMPLETED run (issue #102)", async () => {
+    // Even if the backend still reports a frozen reading for a run whose
+    // terminal already tore down, the panel must not present it as live.
+    mockInvoke({
+      runs: [
+        run({
+          epic: "#39",
+          status: "COMPLETED",
+          orchestrator: orchestrator({
+            generation: 2,
+            session_id: 7,
+            model: "claude-opus-4-6",
+            context_window: 200_000,
+            context_percent: 90,
+          }),
+        }),
+      ],
+    });
+    render(<LaunchSection />);
+
+    // The identity facts still show for a finished run…
+    expect(await screen.findByText("claude-opus-4-6")).toBeInTheDocument();
+    expect(screen.getByText("Gen 2")).toBeInTheDocument();
+    expect(screen.getByText("Session 7")).toBeInTheDocument();
+    // …but the live context reading does not.
+    expect(screen.queryByText(/90%/)).not.toBeInTheDocument();
   });
 
   it("reads an active run as `epic #5 · issues #7, #9`, legacy configs included", async () => {

@@ -1,5 +1,5 @@
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
 
 // The persisted workspace store hydrates through the Tauri store plugin at
 // import time; happy-dom has no Tauri backend, so stub it out.
@@ -17,11 +17,13 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
-import { LandscapeView } from "../LandscapeView";
-import { useAgentStore, type SubagentInfo } from "@/stores/useAgentStore";
+import { useActivityStore } from "@/stores/useActivityStore";
+import { type SubagentInfo, useAgentStore } from "@/stores/useAgentStore";
 import { useLandscapeLayoutStore } from "@/stores/useLandscapeLayoutStore";
-import { useSessionStore, type SessionConfig } from "@/stores/useSessionStore";
+import { type SessionConfig, useSessionStore } from "@/stores/useSessionStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
+import type { ClaudeEvent } from "@/types/claude-events";
+import { LandscapeView } from "../LandscapeView";
 
 /**
  * React Flow measures its container and nodes through browser APIs happy-dom
@@ -120,12 +122,29 @@ function renderLandscape(onNavigate = vi.fn(), onClose = vi.fn()) {
   return { ...result, onNavigate, onClose };
 }
 
+/** Seed the activity store the way a claude-events batch would. */
+function seedActivity(sessionId: number, events: ClaudeEvent[]) {
+  useActivityStore.setState((state) => ({
+    sessions: {
+      ...state.sessions,
+      [sessionId]: {
+        events,
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+        filesModified: [],
+        conversationUuids: [],
+      },
+    },
+  }));
+}
+
 describe("LandscapeView", () => {
   beforeEach(() => {
     useWorkspaceStore.setState({ tabs: [buildTab()] });
     useSessionStore.setState({ sessions: [buildSession()] });
     useAgentStore.setState({ agents: [buildAgent("a1")] });
     useLandscapeLayoutStore.setState({ positions: {} });
+    useActivityStore.setState({ sessions: {} });
     localStorage.clear();
   });
 
@@ -298,5 +317,73 @@ describe("LandscapeView", () => {
     useWorkspaceStore.setState({ tabs: [] });
     renderLandscape();
     expect(screen.getByText(/No projects open/)).toBeInTheDocument();
+  });
+
+  it("a working terminal node gets an eye that opens the live-activity popover", () => {
+    seedActivity(1, [
+      {
+        event_type: "AssistantMessage",
+        session_id: 1,
+        uuid: "a1",
+        text: "Fixing the failing test now.",
+        model: "claude-fable-5",
+        token_usage: null,
+        timestamp: "2026-08-13T10:00:00Z",
+      },
+      {
+        event_type: "ToolUseStarted",
+        session_id: 1,
+        tool_name: "Bash",
+        tool_use_id: "t1",
+        input_summary: "npx vitest run",
+        timestamp: "2026-08-13T10:00:01Z",
+      },
+    ]);
+    renderLandscape();
+
+    fireEvent.click(screen.getByLabelText("Show live activity for backend"));
+
+    expect(screen.getByText("Live activity")).toBeInTheDocument();
+    expect(screen.getByText("Bash")).toBeInTheDocument();
+    expect(screen.getByText("— npx vitest run")).toBeInTheDocument();
+    expect(screen.getByText("Fixing the failing test now.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("Close live activity"));
+    expect(screen.queryByText("Live activity")).not.toBeInTheDocument();
+  });
+
+  it("an idle terminal gets no eye — the live summary is for running sessions", () => {
+    useSessionStore.setState({ sessions: [buildSession({ status: "Idle" })] });
+    renderLandscape();
+    expect(screen.queryByLabelText("Show live activity for backend")).not.toBeInTheDocument();
+  });
+
+  it("the popover stays closed after Working→NeedsInput→Working (no uninvited reopen)", () => {
+    seedActivity(1, [
+      {
+        event_type: "ToolUseStarted",
+        session_id: 1,
+        tool_name: "Bash",
+        tool_use_id: "t1",
+        input_summary: "npx vitest run",
+        timestamp: "2026-08-13T10:00:01Z",
+      },
+    ]);
+    renderLandscape();
+    fireEvent.click(screen.getByLabelText("Show live activity for backend"));
+    expect(screen.getByText("Live activity")).toBeInTheDocument();
+
+    act(() => {
+      useSessionStore.setState({ sessions: [buildSession({ status: "NeedsInput" })] });
+    });
+    expect(screen.queryByText("Live activity")).not.toBeInTheDocument();
+
+    act(() => {
+      useSessionStore.setState({ sessions: [buildSession()] });
+    });
+    // Back to Working: the eye is offered again, but the popover only
+    // reopens on an explicit click — leaving Working reset the open state.
+    expect(screen.queryByText("Live activity")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Show live activity for backend")).toBeInTheDocument();
   });
 });

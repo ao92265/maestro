@@ -72,13 +72,9 @@ export function UpdateNotification() {
           <>
             <div className="flex items-center gap-2 text-xs">
               <span className="text-maestro-muted">Current:</span>
-              <span className="font-medium text-maestro-text">
-                v{updateInfo.current_version}
-              </span>
+              <span className="font-medium text-maestro-text">v{updateInfo.current_version}</span>
               <span className="text-maestro-muted mx-0.5">&rarr;</span>
-              <span className="font-medium text-maestro-green">
-                v{updateInfo.latest_version}
-              </span>
+              <span className="font-medium text-maestro-green">v{updateInfo.latest_version}</span>
             </div>
             {updateInfo.release_notes && (
               <p className="text-[11px] text-maestro-muted leading-relaxed line-clamp-3">

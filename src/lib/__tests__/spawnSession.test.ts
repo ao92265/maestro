@@ -19,16 +19,15 @@ vi.mock("@tauri-apps/plugin-store", () => ({
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-
+import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
+import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 import {
   initSamuraiSpawnListener,
   registerSamuraiSuccessor,
+  type SamuraiSpawnSuccessorEvent,
   samuraiSuccessorCliFlags,
   successorLaunchImminent,
-  type SamuraiSpawnSuccessorEvent,
 } from "../spawnSession";
-import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
-import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 
 const listenMock = vi.mocked(listen);
 const invokeMock = vi.mocked(invoke);
@@ -48,7 +47,9 @@ function tab(id: string, projectPath: string): WorkspaceTab {
   };
 }
 
-function spawnEvent(overrides: Partial<SamuraiSpawnSuccessorEvent> = {}): SamuraiSpawnSuccessorEvent {
+function spawnEvent(
+  overrides: Partial<SamuraiSpawnSuccessorEvent> = {},
+): SamuraiSpawnSuccessorEvent {
   return {
     project: "C:\\git\\proj",
     epic: "#37",

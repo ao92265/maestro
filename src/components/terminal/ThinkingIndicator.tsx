@@ -16,7 +16,9 @@ import { type BackendSessionStatus, useSessionStore } from "@/stores/useSessionS
  * Note: we treat "Starting" as idle (not thinking) — the dots would be
  * misleading before the CLI is even ready.
  */
-function deriveActivity(status: BackendSessionStatus | undefined): "thinking" | "needs-input" | "idle" {
+function deriveActivity(
+  status: BackendSessionStatus | undefined,
+): "thinking" | "needs-input" | "idle" {
   if (status === "Working") return "thinking";
   if (status === "NeedsInput") return "needs-input";
   return "idle";
@@ -142,8 +144,7 @@ export const ThinkingIndicator = memo(function ThinkingIndicator({
   }`;
 
   return (
-    <span
-      role="status"
+    <output
       aria-label={label}
       title={label}
       className={`inline-flex shrink-0 items-center gap-0.5 ${className}`}
@@ -151,6 +152,6 @@ export const ThinkingIndicator = memo(function ThinkingIndicator({
       <span style={{ ...dotStyle, animationDelay: "0ms" }} className={dotClass} />
       <span style={{ ...dotStyle, animationDelay: "180ms" }} className={dotClass} />
       <span style={{ ...dotStyle, animationDelay: "360ms" }} className={dotClass} />
-    </span>
+    </output>
   );
 });

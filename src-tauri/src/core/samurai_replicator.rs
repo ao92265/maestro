@@ -73,7 +73,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::json;
@@ -83,9 +83,10 @@ use crate::commands::ai_runner::{strip_ansi, truncate_chars};
 use super::claude_event::ClaudeEvent;
 use super::samurai_audit::{AuditEvent, AuditEventKind, AuditLog};
 use super::samurai_config::SharedSamuraiConfig;
-use super::samurai_injector::{strip_extended_prefix, SessionDirResolver};
+use super::samurai_injector::{strip_extended_prefix, AgeableInstant, SessionDirResolver};
 use super::samurai_journal::default_journal_file;
 use super::samurai_prompts;
+use super::samurai_workflow;
 use super::supervisor::{SessionSnapshot, Supervisor, SupervisorState};
 use super::transcript_parser;
 use super::windows_process::StdCommandExt;
@@ -110,6 +111,15 @@ pub type SuccessorEmitter = Arc<dyn Fn(&SuccessorSpawn) + Send + Sync>;
 /// CLI as a paste and leaves the instruction sitting in the input box,
 /// unsubmitted.
 pub type StdinWriter = Arc<dyn Fn(u32, String) + Send + Sync>;
+
+/// Issue #103: re-sends ONLY the lone Enter into a session's PTY. Used by
+/// the post-delivery watch when a typed-in instruction shows no evidence of
+/// a started turn — the Enter of a very long paste (the gen-1 launch brief
+/// above all) can be consumed as part of the paste burst, leaving the brief
+/// fully typed but never submitted. The body is NEVER re-sent: it already
+/// sits in the input box, and a re-paste would duplicate the prompt. The
+/// production closure wraps `samurai_pty::resend_submit`.
+pub type EnterResender = Arc<dyn Fn(u32) + Send + Sync>;
 
 /// Resolves a session's transcript file for the recovery digest (issue #56).
 /// The production closure (lib.rs) asks the transcript watcher first — it is
@@ -187,11 +197,16 @@ struct PendingRitual {
     /// predecessor at all, so the SPAWN audit details carry
     /// `trigger: "launch"` instead of predecessor linkage.
     launch: bool,
-    queued_at: Instant,
+    /// What started this generation (issue #101): `"handoff"` (validated
+    /// handoff chain), `"watchdog"` (DEAD recovery), `"resume_timer"` /
+    /// `"cold_start"` (fresh spawns) or `"launch"`. Rides into the SPAWN
+    /// audit row's details so the trail explains why gen-N+1 exists.
+    trigger: &'static str,
+    queued_at: AgeableInstant,
     /// Set when the frontend registered the successor: (session id, when).
     /// The no-start clock runs from here; before registration it runs from
     /// `queued_at` so a spawn flow that never happens still ALERTs.
-    registered: Option<(u32, Instant)>,
+    registered: Option<(u32, AgeableInstant)>,
     /// The no-start timeout fired for this entry (fresh-eyes finding G).
     /// Latched instead of deleted: a successor registered LATE (frontend
     /// stall past the timeout) must still get its ritual armed and
@@ -224,8 +239,100 @@ fn head_matches(handoff_sha: Option<&str>, current_head: Option<&str>) -> bool {
 
 /// Whether one pending ritual has waited too long for its successor to
 /// start. Strict boundary, same discipline as the injector's timeouts.
-fn no_start_expired(queued_at: Instant, registered_at: Option<Instant>, timeout: Duration) -> bool {
+fn no_start_expired(
+    queued_at: AgeableInstant,
+    registered_at: Option<AgeableInstant>,
+    timeout: Duration,
+) -> bool {
     registered_at.unwrap_or(queued_at).elapsed() > timeout
+}
+
+// ---------------------------------------------------------------------------
+// Issue #103: post-delivery watch — did the typed-in instruction ever submit?
+// ---------------------------------------------------------------------------
+
+/// How long a delivered instruction may sit with NO turn-start evidence
+/// before the lone Enter is re-sent. Evidence for a landed submit arrives
+/// within seconds (the CLI appends the `UserMessage` transcript entry at
+/// submission; the PreToolUse hook pushes on the first tool call), so 45s is
+/// an order-of-magnitude margin against false resends — and with the 30s
+/// tick driving this check, a swallowed Enter is recovered 45–75s after
+/// delivery instead of stranding the run until a human presses Enter
+/// (observed live 2026-08-12). Constant, not config: like `SUBMIT_DELAY`
+/// it is a property of the delivery mechanics, not a user preference.
+const ENTER_RESEND_WINDOW: Duration = Duration::from_secs(45);
+
+/// Bounded resends: one covers the observed failure (a single swallowed
+/// Enter), the second covers the resend itself being swallowed. Beyond that
+/// more Enters cannot be the fix, so the watch gives up with an ALERT.
+const MAX_ENTER_RESENDS: u32 = 2;
+
+/// One instruction typed into a successor's PTY, watched until something
+/// proves the submit landed (or the watch gives up). Armed at delivery
+/// time in [`SamuraiReplicator::observe_hook`]; released by
+/// [`turn_activity_session`] evidence; driven by the tick.
+struct DeliveredWatch {
+    project: String,
+    epic: String,
+    generation: u32,
+    session_id: u32,
+    /// Gen-1 LAUNCH flag, carried into the audit rows: the launch brief is
+    /// the longest paste and the reason this watch exists (issue #103).
+    launch: bool,
+    /// Delivery time, re-stamped on each resend so every attempt gets a
+    /// full window.
+    delivered_at: AgeableInstant,
+    resends: u32,
+}
+
+/// What the tick concluded about one delivered-but-unconfirmed instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnterResendVerdict {
+    /// Still inside the window — keep waiting.
+    Keep,
+    /// The window expired with resends left: re-send the lone Enter.
+    Resend,
+    /// The window expired and the resend budget is spent: ALERT and stop.
+    GiveUp,
+}
+
+/// Pure resend decision. Strict boundary (`>`), same discipline as every
+/// other timeout in the supervision chain.
+fn enter_resend_verdict(elapsed: Duration, resends: u32) -> EnterResendVerdict {
+    if elapsed <= ENTER_RESEND_WINDOW {
+        EnterResendVerdict::Keep
+    } else if resends < MAX_ENTER_RESENDS {
+        EnterResendVerdict::Resend
+    } else {
+        EnterResendVerdict::GiveUp
+    }
+}
+
+/// The events that release a delivery watch, keyed by session:
+///
+/// - `UserMessage` — the CLI writes the user entry to the transcript at
+///   prompt submission: the DIRECT proof the Enter landed. This is the same
+///   signal the injector's `idle_effect` already treats as "a genuine turn
+///   restart".
+/// - `ToolUseStarted` — the PreToolUse hook, an independent (non-transcript)
+///   channel: even if the transcript watcher never attached, the first tool
+///   call proves a turn is running.
+/// - `AssistantMessage` — covers a watcher that attached mid-turn and missed
+///   the user entry.
+/// - `SessionEnded` — any reason: `"stop"` is a turn boundary (a turn that
+///   ended must have started), anything else means the session is gone and
+///   there is nothing left to resend into.
+///
+/// `SessionStarted` is deliberately NOT evidence: it is the very signal the
+/// delivery rides on.
+fn turn_activity_session(event: &ClaudeEvent) -> Option<u32> {
+    match event {
+        ClaudeEvent::UserMessage { session_id, .. }
+        | ClaudeEvent::ToolUseStarted { session_id, .. }
+        | ClaudeEvent::AssistantMessage { session_id, .. }
+        | ClaudeEvent::SessionEnded { session_id, .. } => Some(*session_id),
+        _ => None,
+    }
 }
 
 /// `git rev-parse HEAD` in `dir` — fixed argv, no shell, hidden console.
@@ -520,7 +627,11 @@ pub struct SamuraiReplicator {
     teardown: SessionTeardown,
     emit_spawn: SuccessorEmitter,
     write_stdin: StdinWriter,
+    /// Issue #103: the Enter-only resend for the post-delivery watch.
+    resend_enter: EnterResender,
     pending: Mutex<Vec<PendingRitual>>,
+    /// Issue #103: instructions typed in but not yet proven submitted.
+    delivered: Mutex<Vec<DeliveredWatch>>,
     /// Issue #60: the parking-engaged check (see [`HandoffAbsorber`]).
     /// Unset (tests without a parker, or before setup finishes) = never
     /// absorb — successors spawn as in Phase 2.
@@ -533,7 +644,7 @@ pub struct SamuraiReplicator {
 }
 
 impl SamuraiReplicator {
-    // Eight distinct collaborators, each injected once at startup. A params
+    // Nine distinct collaborators, each injected once at startup. A params
     // struct would only move the same list one level out.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -545,6 +656,7 @@ impl SamuraiReplicator {
         teardown: SessionTeardown,
         emit_spawn: SuccessorEmitter,
         write_stdin: StdinWriter,
+        resend_enter: EnterResender,
     ) -> Self {
         Self {
             supervisor,
@@ -555,7 +667,9 @@ impl SamuraiReplicator {
             teardown,
             emit_spawn,
             write_stdin,
+            resend_enter,
             pending: Mutex::new(Vec::new()),
+            delivered: Mutex::new(Vec::new()),
             absorber: std::sync::OnceLock::new(),
             run_configs: std::sync::OnceLock::new(),
         }
@@ -581,6 +695,21 @@ impl SamuraiReplicator {
     /// read; `None` on every miss (no store bound, no config, no model).
     fn model_for(&self, project: &str, epic: &str) -> Option<String> {
         self.run_configs.get()?.get(project, epic)?.model
+    }
+
+    /// The epic's compiled workflow section (issue #91): the graph its run
+    /// config snapshotted at launch, or the default template when the
+    /// config predates workflows — or no store/config exists at all.
+    /// Resolved at brief-build time like [`Self::model_for`], so successor
+    /// and recovery briefs always recompile the SAME workflow the run
+    /// launched with.
+    fn workflow_for(&self, project: &str, epic: &str) -> String {
+        let stored = self
+            .run_configs
+            .get()
+            .and_then(|s| s.get(project, epic))
+            .and_then(|c| c.workflow);
+        samurai_workflow::compiled_for_run(stored.as_ref())
     }
 
     /// One `successor_spawn_failed` ALERT (P2.4 pattern): the successor for
@@ -736,6 +865,9 @@ impl SamuraiReplicator {
         }
 
         let generation = snapshot.generation + 1;
+        // Issue #91: the run's workflow, recompiled from the graph its
+        // config snapshotted at launch — rides both ritual variants.
+        let workflow = self.workflow_for(&snapshot.project, &snapshot.epic);
         let (instruction, recovery) = match head_gate {
             Some(head_matched) => {
                 log::info!(
@@ -754,6 +886,7 @@ impl SamuraiReplicator {
                             &snapshot.epic,
                             snapshot.generation,
                             head_matched,
+                            &workflow,
                         ),
                         samurai_prompts::journal_instruction(&default_journal_file()),
                     ),
@@ -791,6 +924,7 @@ impl SamuraiReplicator {
                             &snapshot.epic,
                             snapshot.generation,
                             repo_pin.as_deref(),
+                            &workflow,
                         ),
                         samurai_prompts::journal_instruction(&default_journal_file()),
                     ),
@@ -815,7 +949,8 @@ impl SamuraiReplicator {
             predecessor_generation: snapshot.generation,
             recovery,
             launch: false,
-            queued_at: Instant::now(),
+            trigger: "handoff",
+            queued_at: AgeableInstant::now(),
             registered: None,
             alerted: false,
             respawn: None,
@@ -871,6 +1006,9 @@ impl SamuraiReplicator {
         };
         let working_dir = strip_extended_prefix(&dir).to_string();
         let generation = snapshot.generation + 1;
+        // Issue #91: resolved before the lock (one small JSON read, same
+        // budget as model_for below) — never file I/O under the mutex.
+        let workflow = self.workflow_for(&snapshot.project, &snapshot.epic);
         // Stage synchronously, under the one lock, so a second DEAD
         // notification for the same generation can never double-stage.
         {
@@ -908,6 +1046,7 @@ impl SamuraiReplicator {
                         &snapshot.epic,
                         snapshot.generation,
                         None,
+                        &workflow,
                     ),
                     samurai_prompts::journal_instruction(&default_journal_file()),
                 ),
@@ -915,7 +1054,8 @@ impl SamuraiReplicator {
                 predecessor_generation: snapshot.generation,
                 recovery: true,
                 launch: false,
-                queued_at: Instant::now(),
+                trigger: "watchdog",
+                queued_at: AgeableInstant::now(),
                 registered: None,
                 alerted: false,
                 respawn: None,
@@ -942,6 +1082,8 @@ impl SamuraiReplicator {
                 .await
                 .unwrap_or(None);
             if let Some(pin) = repo_pin {
+                // Issue #91: resolved before the lock, like the staging path.
+                let workflow = this.workflow_for(&snapshot.project, &snapshot.epic);
                 let mut pending = this.lock_pending();
                 if let Some(p) = pending.iter_mut().find(|p| {
                     p.generation == generation
@@ -956,6 +1098,7 @@ impl SamuraiReplicator {
                             &snapshot.epic,
                             snapshot.generation,
                             Some(&pin),
+                            &workflow,
                         ),
                         samurai_prompts::journal_instruction(&default_journal_file()),
                     );
@@ -1022,6 +1165,7 @@ impl SamuraiReplicator {
         working_dir: &str,
         generation: u32,
         prior_generation: Option<u32>,
+        trigger: &'static str,
     ) {
         let Some(prior) = prior_generation else {
             log::error!(
@@ -1036,6 +1180,10 @@ impl SamuraiReplicator {
             );
         }
         let working_dir = strip_extended_prefix(working_dir).to_string();
+        // Issue #91: the run's workflow, recompiled from the launch
+        // snapshot — resolved once here (same JSON read budget as
+        // model_for), used by the placeholder and the real ritual alike.
+        let workflow = self.workflow_for(project, epic);
         let spawn = SuccessorSpawn {
             project: project.to_string(),
             epic: epic.to_string(),
@@ -1102,14 +1250,15 @@ impl SamuraiReplicator {
                 // / fix M4: the journaling rider rides every version.
                 instruction: format!(
                     "{} {}",
-                    samurai_prompts::recovery_ritual_instruction(epic, prior, None),
+                    samurai_prompts::recovery_ritual_instruction(epic, prior, None, &workflow),
                     samurai_prompts::journal_instruction(&default_journal_file()),
                 ),
                 predecessor_session_id: 0,
                 predecessor_generation: prior,
                 recovery: true,
                 launch: false,
-                queued_at: Instant::now(),
+                trigger,
+                queued_at: AgeableInstant::now(),
                 registered: None,
                 alerted: false,
                 respawn: Some(RespawnState {
@@ -1161,6 +1310,7 @@ impl SamuraiReplicator {
                                 &epic,
                                 prior,
                                 head_matched,
+                                &workflow,
                             ),
                             samurai_prompts::journal_instruction(&default_journal_file()),
                         ),
@@ -1194,6 +1344,7 @@ impl SamuraiReplicator {
                                 &epic,
                                 prior,
                                 repo_pin.as_deref(),
+                                &workflow,
                             ),
                             samurai_prompts::journal_instruction(&default_journal_file()),
                         ),
@@ -1282,7 +1433,8 @@ impl SamuraiReplicator {
                 predecessor_generation: 0,
                 recovery: false,
                 launch: true,
-                queued_at: Instant::now(),
+                trigger: "launch",
+                queued_at: AgeableInstant::now(),
                 registered: None,
                 alerted: false,
                 respawn: Some(RespawnState {
@@ -1377,6 +1529,9 @@ impl SamuraiReplicator {
                 let mut details = json!({
                     "predecessor_session_id": p.predecessor_session_id,
                     "predecessor_generation": p.predecessor_generation,
+                    // Issue #101: WHY this generation exists — handoff,
+                    // watchdog recovery, resume timer or cold start.
+                    "trigger": p.trigger,
                 });
                 // Issue #56: mark RECOVERY successors on their SPAWN row;
                 // normal successors keep the exact P2.4 shape.
@@ -1433,7 +1588,7 @@ impl SamuraiReplicator {
                 && p.epic == snapshot.epic
                 && p.project == snapshot.project
         }) {
-            p.registered = Some((snapshot.session_id, Instant::now()));
+            p.registered = Some((snapshot.session_id, AgeableInstant::now()));
             if p.alerted {
                 // Finding G: the successor_no_start ALERT already fired, but
                 // the entry was latched — a late registration still gets the
@@ -1459,7 +1614,13 @@ impl SamuraiReplicator {
     /// `SessionStarted` means claude is up and sitting at its prompt, so the
     /// ritual is typed in and the entry completes. Later SessionStarted
     /// events for the same id find no entry and do nothing.
+    ///
+    /// Issue #103: delivery also arms a [`DeliveredWatch`] — the writer's
+    /// Enter can be swallowed when the CLI is still consuming the paste
+    /// burst, and no ACK ladder covers these instructions. Hook-side
+    /// activity (PreToolUse above all) releases the watch here too.
     pub fn observe_hook(&self, event: &ClaudeEvent) {
+        self.note_turn_activity(event);
         let ClaudeEvent::SessionStarted { session_id, .. } = event else {
             return;
         };
@@ -1477,6 +1638,69 @@ impl SamuraiReplicator {
             );
             // Text only — the writer submits it (see [`StdinWriter`]).
             (self.write_stdin)(*session_id, p.instruction.clone());
+            // Issue #101: the brief Maestro typed into the fresh terminal is
+            // an injection like any other — record what was said (bounded
+            // excerpt) and what let it through (the first SessionStarted).
+            // No ACK ladder exists here; submission is watched below and
+            // failures land as submit_retry / submit_unconfirmed ALERTs.
+            let (excerpt, total_chars) =
+                super::samurai_audit::instruction_excerpt(&p.instruction);
+            self.audit.append(
+                &p.project,
+                AuditEvent::now(
+                    p.epic.clone(),
+                    AuditEventKind::Inject,
+                    p.generation,
+                    *session_id,
+                    json!({
+                        "phase": "delivered",
+                        "instruction": if p.launch {
+                            "launch_brief"
+                        } else if p.recovery {
+                            "recovery_ritual"
+                        } else {
+                            "successor_ritual"
+                        },
+                        "gate": "session_started",
+                        "excerpt": excerpt,
+                        "total_chars": total_chars,
+                    }),
+                ),
+            );
+            self.lock_delivered().push(DeliveredWatch {
+                project: p.project.clone(),
+                epic: p.epic.clone(),
+                generation: p.generation,
+                session_id: *session_id,
+                launch: p.launch,
+                delivered_at: AgeableInstant::now(),
+                resends: 0,
+            });
+        }
+    }
+
+    /// EventBus tap (forwarded by the injector's `observe`, the same tee the
+    /// ACK scanner reads): transcript-side activity — the `UserMessage` the
+    /// CLI writes at prompt submission above all — releases the delivery
+    /// watch (issue #103). Every other variant is ignored, so the tee can
+    /// pass the whole stream without filtering.
+    pub fn observe(&self, event: &ClaudeEvent) {
+        self.note_turn_activity(event);
+    }
+
+    /// Releases the delivery watch for a session that shows turn activity
+    /// (or is gone) — see [`turn_activity_session`] for the evidence table.
+    fn note_turn_activity(&self, event: &ClaudeEvent) {
+        let Some(session_id) = turn_activity_session(event) else {
+            return;
+        };
+        let mut delivered = self.lock_delivered();
+        let before = delivered.len();
+        delivered.retain(|d| d.session_id != session_id);
+        if delivered.len() != before {
+            log::info!(
+                "samurai replicator: session {session_id} shows turn activity — delivered instruction confirmed submitted"
+            );
         }
     }
 
@@ -1547,7 +1771,7 @@ impl SamuraiReplicator {
                                 respawn.attempts += 1;
                                 // Restart the window so each emit gets a
                                 // full ack_timeout to land.
-                                p.queued_at = Instant::now();
+                                p.queued_at = AgeableInstant::now();
                                 re_emits.push(respawn.spawn.clone());
                             }
                         }
@@ -1647,6 +1871,81 @@ impl SamuraiReplicator {
                 ),
             );
         }
+
+        // Issue #103: the post-delivery watch. A delivered instruction whose
+        // session shows no turn activity within the window gets the lone
+        // Enter re-sent (NEVER the body — it already sits in the input box),
+        // bounded by MAX_ENTER_RESENDS, then a final ALERT.
+        let mut rows: Vec<(String, AuditEvent)> = Vec::new();
+        {
+            let mut delivered = self.lock_delivered();
+            delivered.retain_mut(|d| {
+                if !sessions.iter().any(|s| s.session_id == d.session_id) {
+                    // Torn down / unregistered outside the samurai pipeline:
+                    // never write into a session that is no longer ours.
+                    return false;
+                }
+                match enter_resend_verdict(d.delivered_at.elapsed(), d.resends) {
+                    EnterResendVerdict::Keep => true,
+                    EnterResendVerdict::Resend => {
+                        d.resends += 1;
+                        // Re-stamp so each resend gets a full window.
+                        d.delivered_at = AgeableInstant::now();
+                        log::warn!(
+                            "samurai replicator: no turn activity from session {} since its instruction was typed in — re-sending the lone Enter (swallowed-submit recovery, issue #103)",
+                            d.session_id
+                        );
+                        // Issue #106 review F4: fire WHILE HOLDING the
+                        // delivered lock. Deciding under the lock but firing
+                        // after release left a gap where turn evidence could
+                        // release the watch (`note_turn_activity` takes this
+                        // same lock) and the queued `\r` still fired into the
+                        // already-started turn. Verdict and fire are atomic
+                        // now: a released watch can never resend. Safe to
+                        // hold: the resender is fire-and-forget (production
+                        // spawns an async task; tests push to a Vec) and
+                        // never re-enters the replicator.
+                        (self.resend_enter)(d.session_id);
+                        rows.push((
+                            d.project.clone(),
+                            AuditEvent::now(
+                                d.epic.clone(),
+                                AuditEventKind::Alert,
+                                d.generation,
+                                d.session_id,
+                                json!({
+                                    "kind": "submit_retry",
+                                    "attempt": d.resends,
+                                    "launch": d.launch,
+                                }),
+                            ),
+                        ));
+                        true
+                    }
+                    EnterResendVerdict::GiveUp => {
+                        rows.push((
+                            d.project.clone(),
+                            AuditEvent::now(
+                                d.epic.clone(),
+                                AuditEventKind::Alert,
+                                d.generation,
+                                d.session_id,
+                                json!({
+                                    "kind": "submit_unconfirmed",
+                                    "resends": d.resends,
+                                    "launch": d.launch,
+                                }),
+                            ),
+                        ));
+                        false
+                    }
+                }
+            });
+        }
+        // Audit I/O outside the lock, like every other tick pass.
+        for (project, row) in rows {
+            self.audit.append(&project, row);
+        }
     }
 
     /// Recover from a poisoned lock rather than panicking — event-path
@@ -1655,6 +1954,32 @@ impl SamuraiReplicator {
         self.pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Same poisoned-lock policy for the delivery watches (issue #103).
+    fn lock_delivered(&self) -> std::sync::MutexGuard<'_, Vec<DeliveredWatch>> {
+        self.delivered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Test-only: how many delivery watches are armed (issue #103).
+    #[cfg(test)]
+    fn delivered_count(&self) -> usize {
+        self.lock_delivered().len()
+    }
+
+    /// Test-only: age one session's delivery watch so the resend path runs
+    /// without real waiting (same `AgeableInstant` discipline as
+    /// [`Self::backdate`]).
+    #[cfg(test)]
+    fn backdate_delivered(&self, session_id: u32, by: Duration) {
+        let mut delivered = self.lock_delivered();
+        let d = delivered
+            .iter_mut()
+            .find(|d| d.session_id == session_id)
+            .expect("no delivery watch for the session");
+        d.delivered_at.backdate(by);
     }
 
     /// Test-only view of one staged ritual by successor generation:
@@ -1679,6 +2004,12 @@ impl SamuraiReplicator {
 
     /// Test-only: age a staged ritual's clocks so timeout paths run without
     /// real waiting.
+    ///
+    /// Ages by advancing the clocks' *reading* side (`AgeableInstant`'s
+    /// extra elapsed time) rather than rewinding the stored `Instant` —
+    /// `Instant::now().checked_sub(by)` underflows whenever machine uptime
+    /// is shorter than `by` (issue #90), which made this flaky right after
+    /// a reboot.
     #[cfg(test)]
     fn backdate(&self, generation: u32, by: Duration) {
         let mut pending = self.lock_pending();
@@ -1686,9 +2017,9 @@ impl SamuraiReplicator {
             .iter_mut()
             .find(|p| p.generation == generation)
             .expect("no staged ritual");
-        p.queued_at = p.queued_at.checked_sub(by).expect("backdate underflow");
-        if let Some((id, at)) = p.registered {
-            p.registered = Some((id, at.checked_sub(by).expect("backdate underflow")));
+        p.queued_at.backdate(by);
+        if let Some((_, at)) = &mut p.registered {
+            at.backdate(by);
         }
     }
 }
@@ -1717,6 +2048,8 @@ mod tests {
         torn_down: Arc<Mutex<Vec<u32>>>,
         spawns: Arc<Mutex<Vec<SuccessorSpawn>>>,
         writes: Arc<Mutex<Vec<(u32, String)>>>,
+        /// Issue #103: session ids the Enter-only resend fired for.
+        resends: Arc<Mutex<Vec<u32>>>,
         config: SharedSamuraiConfig,
     }
 
@@ -1755,6 +2088,12 @@ mod tests {
             writes_rec.lock().unwrap().push((id, data));
         });
 
+        let resends: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let resends_rec = resends.clone();
+        let resend_enter: EnterResender = Arc::new(move |id| {
+            resends_rec.lock().unwrap().push(id);
+        });
+
         let replicator = Arc::new(SamuraiReplicator::new(
             supervisor.clone(),
             audit.clone(),
@@ -1764,6 +2103,7 @@ mod tests {
             teardown,
             emit_spawn,
             write_stdin,
+            resend_enter,
         ));
         Harness {
             replicator,
@@ -1774,6 +2114,7 @@ mod tests {
             torn_down,
             spawns,
             writes,
+            resends,
             config,
         }
     }
@@ -1894,8 +2235,11 @@ mod tests {
     #[test]
     fn test_no_start_expiry_is_strict_and_prefers_registration_clock() {
         let timeout = Duration::from_secs(180);
-        let now = Instant::now();
-        let old = now.checked_sub(Duration::from_secs(181)).unwrap();
+        let now = AgeableInstant::now();
+        // Backdating (not `Instant::checked_sub`) so this can't underflow on
+        // a freshly booted machine — see issue #90.
+        let mut old = AgeableInstant::now();
+        old.backdate(Duration::from_secs(181));
         // Unregistered: the queue clock decides.
         assert!(no_start_expired(old, None, timeout));
         assert!(!no_start_expired(now, None, timeout));
@@ -2135,6 +2479,8 @@ mod tests {
         let details = h.replicator.spawn_details(project, "epic-9", 3).unwrap();
         assert_eq!(details["predecessor_session_id"], 1);
         assert_eq!(details["predecessor_generation"], 2);
+        // Issue #101: the SPAWN details name why gen-3 exists.
+        assert_eq!(details["trigger"], "handoff");
         let snapshot = h
             .supervisor
             .register_session_with_details(2, project.into(), "epic-9".into(), 3, details)
@@ -2158,6 +2504,7 @@ mod tests {
         assert_eq!(spawn_rows.len(), 1);
         assert_eq!(spawn_rows[0].details["predecessor_session_id"], 1);
         assert_eq!(spawn_rows[0].details["predecessor_generation"], 2);
+        assert_eq!(spawn_rows[0].details["trigger"], "handoff");
         assert_eq!(spawn_rows[0].details["state"], "WORKING");
         assert_eq!(spawn_rows[0].generation, 3);
 
@@ -2176,6 +2523,36 @@ mod tests {
         assert!(!writes[0].1.contains('\n'));
         assert!(writes[0].1.contains("generation 3"));
         assert!(writes[0].1.contains(".maestro/handoffs/epic-9-gen2.md"));
+
+        // Issue #101: the delivered ritual lands an INJECT audit row with a
+        // bounded excerpt of the exact text typed in.
+        let mut inject_rows = Vec::new();
+        for _ in 0..200 {
+            let rows = h.audit.read(project, None, None).await.unwrap().events;
+            inject_rows = rows
+                .into_iter()
+                .filter(|r| r.event == AuditEventKind::Inject)
+                .collect();
+            if !inject_rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(inject_rows.len(), 1);
+        let inject = &inject_rows[0];
+        assert_eq!(inject.session_id, 2);
+        assert_eq!(inject.generation, 3);
+        assert_eq!(inject.epic, "epic-9");
+        assert_eq!(inject.details["phase"], "delivered");
+        assert_eq!(inject.details["instruction"], "successor_ritual");
+        assert_eq!(inject.details["gate"], "session_started");
+        let excerpt = inject.details["excerpt"].as_str().unwrap();
+        assert!(writes[0].1.starts_with(excerpt), "excerpt is a prefix");
+        assert!(excerpt.chars().count() <= crate::core::samurai_audit::EXCERPT_MAX_CHARS);
+        assert_eq!(
+            inject.details["total_chars"].as_u64().unwrap() as usize,
+            writes[0].1.chars().count()
+        );
 
         // Delivery completes the entry: a restart never re-injects.
         assert!(h.replicator.pending_view(3).is_none());
@@ -2710,6 +3087,8 @@ mod tests {
         assert_eq!(details["recovery"], true);
         assert_eq!(details["predecessor_session_id"], 1);
         assert_eq!(details["predecessor_generation"], 2);
+        // Issue #101: the watchdog's DEAD verdict is what spawned gen-3.
+        assert_eq!(details["trigger"], "watchdog");
         let registered = h
             .supervisor
             .register_session_with_details(2, project.into(), "epic-9".into(), 3, details)
@@ -3054,7 +3433,7 @@ mod tests {
 
         // A fresh spawn (resume/reconcile path) carries the config's model …
         h.replicator
-            .spawn_generation(project, "epic-9", &working_dir, 4, Some(3));
+            .spawn_generation(project, "epic-9", &working_dir, 4, Some(3), "resume_timer");
         wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
         assert_eq!(
             h.spawns.lock().unwrap()[0].model.as_deref(),
@@ -3073,6 +3452,87 @@ mod tests {
         assert_eq!(h.spawns.lock().unwrap()[1].model, None);
     }
 
+    #[tokio::test]
+    async fn test_staged_briefs_recompile_the_stored_workflow_graph() {
+        // Issue #91: the run config snapshots the workflow graph at launch;
+        // every successor brief must recompile THAT graph — never the
+        // default — and a config without a graph falls back to the default
+        // template (backward compat).
+        use crate::core::samurai_run_config::{RunConfigStore, SamuraiRunConfig};
+        use crate::core::samurai_workflow::{WorkflowEdge, WorkflowGraph, WorkflowNode};
+
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-rep-workflow";
+        let store = Arc::new(RunConfigStore::new(dir.path().join("runs")));
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        let head = read_repo_head(repo.path()).unwrap();
+        write_handoff(repo.path(), "epic-9", 3, &head);
+        let working_dir = repo.path().to_string_lossy().into_owned();
+
+        let mut config = SamuraiRunConfig::new(project, "epic-9", working_dir.clone());
+        config.workflow = Some(WorkflowGraph {
+            nodes: vec![
+                WorkflowNode {
+                    id: "a".to_string(),
+                    text: "custom implement ritual".to_string(),
+                },
+                WorkflowNode {
+                    id: "b".to_string(),
+                    text: "custom ship ritual".to_string(),
+                },
+            ],
+            edges: vec![WorkflowEdge {
+                from: "a".to_string(),
+                to: "b".to_string(),
+            }],
+            start: "a".to_string(),
+        });
+        store.save(&config).unwrap();
+        // A second run whose config predates workflows (no graph stored).
+        store
+            .save(&SamuraiRunConfig::new(
+                project,
+                "epic-88",
+                working_dir.clone(),
+            ))
+            .unwrap();
+        h.replicator.set_run_configs(store);
+
+        // The successor ritual (handoff present) carries the STORED graph.
+        h.replicator
+            .spawn_generation(project, "epic-9", &working_dir, 4, Some(3), "resume_timer");
+        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
+        let (_, instruction) = h.replicator.pending_view(4).unwrap();
+        assert!(
+            instruction.contains("Step 1: custom implement ritual"),
+            "{instruction}"
+        );
+        assert!(
+            instruction.contains("Step 2: custom ship ritual"),
+            "{instruction}"
+        );
+        assert!(
+            !instruction.contains("fresh-eyes review"),
+            "the stored graph replaces the default: {instruction}"
+        );
+
+        // The graph-less config compiles the DEFAULT template (its spawn
+        // takes the recovery ritual — no epic-88 handoff exists — which
+        // must carry the workflow too).
+        h.replicator
+            .spawn_generation(project, "epic-88", &working_dir, 6, Some(5), "resume_timer");
+        wait_until(|| h.spawns.lock().unwrap().len() >= 2).await;
+        let (_, instruction) = h.replicator.pending_view(6).unwrap();
+        assert!(instruction.contains("RECOVERY MODE"), "{instruction}");
+        assert!(
+            instruction.contains("Step 2: Run a fresh-eyes review"),
+            "no stored graph → the default workflow: {instruction}"
+        );
+        assert!(instruction.contains("END OF WORKFLOW"), "{instruction}");
+    }
+
     // --- issue #61: spawn_generation (fresh spawns) + spawn retry ---
 
     #[tokio::test]
@@ -3086,7 +3546,7 @@ mod tests {
         let working_dir = repo.path().to_string_lossy().into_owned();
 
         h.replicator
-            .spawn_generation("C:/git/proj-sg-match", "epic-9", &working_dir, 4, Some(3));
+            .spawn_generation("C:/git/proj-sg-match", "epic-9", &working_dir, 4, Some(3), "resume_timer");
         wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
 
         // The spawn event names the fresh generation and its working dir.
@@ -3108,6 +3568,15 @@ mod tests {
         assert!(instruction.contains("journal.jsonl"));
         assert!(instruction.contains("\"BOTTLENECK\""));
         assert!(!instruction.contains('\n'));
+
+        // Issue #101: a fresh spawn's SPAWN linkage names its trigger (the
+        // resumer passes "resume_timer", the reconciler "cold_start").
+        let details = h
+            .replicator
+            .spawn_details("C:/git/proj-sg-match", "epic-9", 4)
+            .unwrap();
+        assert_eq!(details["trigger"], "resume_timer");
+        assert_eq!(details["predecessor_generation"], 3);
     }
 
     #[tokio::test]
@@ -3119,7 +3588,7 @@ mod tests {
         let working_dir = repo.path().to_string_lossy().into_owned();
 
         h.replicator
-            .spawn_generation("C:/git/proj-sg-rec", "epic-9", &working_dir, 4, Some(3));
+            .spawn_generation("C:/git/proj-sg-rec", "epic-9", &working_dir, 4, Some(3), "resume_timer");
         wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
 
         let (_, instruction) = h.replicator.pending_view(4).unwrap();
@@ -3151,9 +3620,9 @@ mod tests {
         let working_dir = repo.path().to_string_lossy().into_owned();
 
         h.replicator
-            .spawn_generation("C:/git/proj-sg-idem", "epic-9", &working_dir, 4, Some(3));
+            .spawn_generation("C:/git/proj-sg-idem", "epic-9", &working_dir, 4, Some(3), "resume_timer");
         h.replicator
-            .spawn_generation("C:/git/proj-sg-idem", "epic-9", &working_dir, 4, Some(3));
+            .spawn_generation("C:/git/proj-sg-idem", "epic-9", &working_dir, 4, Some(3), "resume_timer");
         wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
         // Give the (single) async prep task time to finish emitting.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3169,7 +3638,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         h.replicator
-            .spawn_generation("C:/git/proj-sg-gen1", "epic-9", "C:/tmp/wt", 1, None);
+            .spawn_generation("C:/git/proj-sg-gen1", "epic-9", "C:/tmp/wt", 1, None, "resume_timer");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(h.replicator.pending_count(1), 0);
         assert!(h.spawns.lock().unwrap().is_empty());
@@ -3185,6 +3654,7 @@ mod tests {
         let brief = samurai_prompts::launch_instruction(
             &samurai_prompts::RunRefs::epics_only("#38"),
             Some("nachogl1/maestro"),
+            &samurai_workflow::compiled_for_run(None),
         );
 
         h.replicator
@@ -3225,8 +3695,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         let project = "C:/git/proj-launch-retry";
-        let brief =
-            samurai_prompts::launch_instruction(&samurai_prompts::RunRefs::epics_only("#38"), None);
+        let brief = samurai_prompts::launch_instruction(
+            &samurai_prompts::RunRefs::epics_only("#38"),
+            None,
+            &samurai_workflow::compiled_for_run(None),
+        );
 
         h.replicator
             .spawn_first_generation(project, "#38", "C:/tmp/wt", brief.clone());
@@ -3243,13 +3716,258 @@ mod tests {
         assert_eq!(h.spawns.lock().unwrap().len(), 2, "dropped launch re-emits");
     }
 
+    // --- issue #103: post-delivery watch (swallowed-Enter recovery) ---
+
+    #[test]
+    fn test_enter_resend_verdict_table() {
+        let inside = ENTER_RESEND_WINDOW - Duration::from_secs(1);
+        let expired = ENTER_RESEND_WINDOW + Duration::from_secs(1);
+        // (elapsed, resends so far, expected)
+        let table = [
+            (inside, 0, EnterResendVerdict::Keep),
+            // Strict boundary, like every other timeout in the chain.
+            (ENTER_RESEND_WINDOW, 0, EnterResendVerdict::Keep),
+            (expired, 0, EnterResendVerdict::Resend),
+            (expired, MAX_ENTER_RESENDS - 1, EnterResendVerdict::Resend),
+            (expired, MAX_ENTER_RESENDS, EnterResendVerdict::GiveUp),
+            // A fresh window keeps waiting even with the budget spent —
+            // GiveUp only ever fires on an EXPIRED window.
+            (inside, MAX_ENTER_RESENDS, EnterResendVerdict::Keep),
+        ];
+        for (elapsed, resends, expected) in table {
+            assert_eq!(
+                enter_resend_verdict(elapsed, resends),
+                expected,
+                "elapsed {elapsed:?}, resends {resends}"
+            );
+        }
+    }
+
+    fn user_message(session_id: u32) -> ClaudeEvent {
+        ClaudeEvent::UserMessage {
+            session_id,
+            uuid: "u".into(),
+            text: "[Maestro Samurai] …".into(),
+            timestamp: "t".into(),
+        }
+    }
+
+    fn tool_use_started(session_id: u32) -> ClaudeEvent {
+        ClaudeEvent::ToolUseStarted {
+            session_id,
+            tool_name: "Bash".into(),
+            tool_use_id: "tu".into(),
+            input_summary: String::new(),
+            timestamp: "t".into(),
+        }
+    }
+
+    #[test]
+    fn test_turn_activity_classification() {
+        // Releases: the prompt-submission transcript entry, the first tool
+        // call (PreToolUse hook), an assistant reply, the session going away.
+        assert_eq!(turn_activity_session(&user_message(5)), Some(5));
+        assert_eq!(turn_activity_session(&tool_use_started(5)), Some(5));
+        assert_eq!(
+            turn_activity_session(&ClaudeEvent::AssistantMessage {
+                session_id: 5,
+                uuid: "a".into(),
+                text: "hi".into(),
+                model: "m".into(),
+                token_usage: None,
+                timestamp: "t".into(),
+            }),
+            Some(5)
+        );
+        assert_eq!(
+            turn_activity_session(&ClaudeEvent::SessionEnded {
+                session_id: 5,
+                reason: "stop".into(),
+                timestamp: "t".into(),
+            }),
+            Some(5)
+        );
+        // NOT evidence: SessionStarted is the very signal delivery rides on.
+        assert_eq!(turn_activity_session(&session_started(5)), None);
+    }
+
+    /// Stages a gen-1 launch, registers session 5 and delivers the brief on
+    /// its first SessionStarted — the armed-watch state every delivery-watch
+    /// test starts from.
+    fn deliver_launch_brief(h: &Harness, project: &str) {
+        let brief = samurai_prompts::launch_instruction(
+            &samurai_prompts::RunRefs::epics_only("#38"),
+            Some("nachogl1/maestro"),
+            &samurai_workflow::compiled_for_run(None),
+        );
+        h.replicator
+            .spawn_first_generation(project, "#38", "C:/tmp/wt-103", brief);
+        let details = h.replicator.spawn_details(project, "#38", 1).unwrap();
+        let snapshot = h
+            .supervisor
+            .register_session_with_details(5, project.into(), "#38".into(), 1, details)
+            .unwrap();
+        h.replicator.on_registered(&snapshot);
+        h.replicator.observe_hook(&session_started(5));
+        assert_eq!(h.writes.lock().unwrap().len(), 1, "brief delivered once");
+        assert_eq!(h.replicator.delivered_count(), 1, "delivery arms the watch");
+    }
+
+    #[tokio::test]
+    async fn test_swallowed_enter_resends_only_the_submit_key_and_is_bounded() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-103-resend";
+        deliver_launch_brief(&h, project);
+
+        // Inside the window: quiet.
+        h.replicator.tick();
+        assert!(h.resends.lock().unwrap().is_empty());
+
+        // First expiry: the lone Enter is re-sent — and ONLY the Enter, the
+        // brief body is never re-pasted (it already sits in the input box).
+        h.replicator
+            .backdate_delivered(5, ENTER_RESEND_WINDOW + Duration::from_secs(1));
+        h.replicator.tick();
+        assert_eq!(h.resends.lock().unwrap().clone(), vec![5]);
+        assert_eq!(h.writes.lock().unwrap().len(), 1, "body never re-sent");
+
+        // Second expiry: the bounded second resend.
+        h.replicator
+            .backdate_delivered(5, ENTER_RESEND_WINDOW + Duration::from_secs(1));
+        h.replicator.tick();
+        assert_eq!(h.resends.lock().unwrap().clone(), vec![5, 5]);
+
+        // Third expiry: budget spent — final ALERT and the watch is gone;
+        // further ticks stay quiet.
+        h.replicator
+            .backdate_delivered(5, ENTER_RESEND_WINDOW + Duration::from_secs(1));
+        h.replicator.tick();
+        assert_eq!(h.replicator.delivered_count(), 0);
+        h.replicator.tick();
+        assert_eq!(
+            h.resends.lock().unwrap().len(),
+            2,
+            "no resend after give-up"
+        );
+
+        // Audit trail: one submit_retry per resend, one final
+        // submit_unconfirmed, all naming the launch.
+        let mut retries = Vec::new();
+        let mut unconfirmed = Vec::new();
+        for _ in 0..200 {
+            let rows = h.audit.read(project, None, None).await.unwrap().events;
+            retries = rows
+                .iter()
+                .filter(|r| r.details["kind"] == "submit_retry")
+                .cloned()
+                .collect();
+            unconfirmed = rows
+                .into_iter()
+                .filter(|r| r.details["kind"] == "submit_unconfirmed")
+                .collect();
+            if retries.len() == 2 && unconfirmed.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(retries.len(), 2);
+        assert_eq!(retries[0].session_id, 5);
+        assert_eq!(retries[0].generation, 1);
+        assert_eq!(retries[0].details["attempt"], 1);
+        assert_eq!(retries[0].details["launch"], true);
+        assert_eq!(retries[1].details["attempt"], 2);
+        assert_eq!(unconfirmed.len(), 1);
+        assert_eq!(unconfirmed[0].session_id, 5);
+        assert_eq!(unconfirmed[0].details["resends"], 2);
+        assert_eq!(unconfirmed[0].details["launch"], true);
+    }
+
+    #[tokio::test]
+    async fn test_evidence_on_an_expired_watch_wins_over_the_due_resend() {
+        // Issue #106 review F4: the watch has already EXPIRED — the resend
+        // is due on the very next tick — when turn evidence arrives. The
+        // release must win: the Enter never fires (it would land in an
+        // already-started turn), no retry bookkeeping is written, and the
+        // body is (as always) never re-sent. With the resend now fired
+        // under the delivered lock, the release and the verdict+fire are
+        // atomic — this pins the observable contract.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-106-f4-gap";
+        deliver_launch_brief(&h, project);
+
+        h.replicator
+            .backdate_delivered(5, ENTER_RESEND_WINDOW + Duration::from_secs(1));
+        // Evidence lands between the expiry and the tick.
+        h.replicator.observe(&user_message(5));
+        assert_eq!(h.replicator.delivered_count(), 0, "watch released");
+
+        h.replicator.tick();
+        assert!(
+            h.resends.lock().unwrap().is_empty(),
+            "a released watch never resends"
+        );
+        assert_eq!(h.writes.lock().unwrap().len(), 1, "body never re-sent");
+        let rows = h.audit.read(project, None, None).await.unwrap().events;
+        assert!(
+            !rows.iter().any(|r| r.details["kind"] == "submit_retry"
+                || r.details["kind"] == "submit_unconfirmed"),
+            "no retry bookkeeping for a confirmed submit"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_turn_activity_releases_the_watch_and_stops_all_retries() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-103-release";
+        deliver_launch_brief(&h, project);
+
+        // Activity from an UNRELATED session must not release the watch.
+        h.replicator.observe(&user_message(99));
+        assert_eq!(h.replicator.delivered_count(), 1);
+
+        // The transcript-side UserMessage — the CLI writes the prompt entry
+        // at submission — proves the Enter landed (EventBus tee → observe).
+        h.replicator.observe(&user_message(5));
+        assert_eq!(h.replicator.delivered_count(), 0);
+
+        // Released: ticks never resend and never write audit rows.
+        h.replicator.tick();
+        assert!(h.resends.lock().unwrap().is_empty());
+        let rows = h.audit.read(project, None, None).await.unwrap().events;
+        assert!(
+            !rows.iter().any(|r| r.details["kind"] == "submit_retry"
+                || r.details["kind"] == "submit_unconfirmed"),
+            "no retry bookkeeping once the submit is confirmed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hook_side_tool_use_releases_the_watch_too() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        deliver_launch_brief(&h, "C:/git/proj-103-hook");
+
+        // PreToolUse arrives on the hook chain (observe_hook), an
+        // independent channel from the transcript watcher.
+        h.replicator.observe_hook(&tool_use_started(5));
+        assert_eq!(h.replicator.delivered_count(), 0);
+        h.replicator.tick();
+        assert!(h.resends.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn test_dropped_spawn_entry_does_not_block_a_later_relaunch() {
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         let project = "C:/git/proj-launch-dropped";
-        let brief =
-            samurai_prompts::launch_instruction(&samurai_prompts::RunRefs::epics_only("#38"), None);
+        let brief = samurai_prompts::launch_instruction(
+            &samurai_prompts::RunRefs::epics_only("#38"),
+            None,
+            &samurai_workflow::compiled_for_run(None),
+        );
 
         h.replicator
             .spawn_first_generation(project, "#38", "C:/tmp/wt", brief.clone());
@@ -3295,7 +4013,7 @@ mod tests {
         let working_dir = repo.path().to_string_lossy().into_owned();
 
         h.replicator
-            .spawn_generation(project, "epic-9", &working_dir, 4, Some(3));
+            .spawn_generation(project, "epic-9", &working_dir, 4, Some(3), "resume_timer");
         wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
         assert_eq!(h.spawns.lock().unwrap().len(), 1);
 
@@ -3384,7 +4102,7 @@ mod tests {
         let working_dir = repo.path().to_string_lossy().into_owned();
 
         h.replicator
-            .spawn_generation(project, "epic-9", &working_dir, 4, Some(3));
+            .spawn_generation(project, "epic-9", &working_dir, 4, Some(3), "resume_timer");
         wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
 
         let details = h.replicator.spawn_details(project, "epic-9", 4).unwrap();

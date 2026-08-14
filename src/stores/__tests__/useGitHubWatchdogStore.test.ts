@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // The persisted store hydrates through the Tauri store plugin at import time;
 // happy-dom has no Tauri backend, so stub it out.
@@ -19,9 +19,9 @@ import {
   carryForwardErroredLists,
   diffNewItems,
   useGitHubWatchdogStore,
-  watchedProjectsFromTabs,
   type WatchdogProjectResult,
   type WatchdogSnapshot,
+  watchedProjectsFromTabs,
 } from "../useGitHubWatchdogStore";
 
 const invokeMock = vi.mocked(invoke);
@@ -64,7 +64,7 @@ function project(
   repoPath: string,
   reviewRequests: PullRequestInfo[] = [],
   assignedIssues: IssueInfo[] = [],
-  errored: { prs?: boolean; issues?: boolean } = {}
+  errored: { prs?: boolean; issues?: boolean } = {},
 ): WatchdogProjectResult {
   return {
     name: repoPath.split("/").pop() ?? repoPath,
@@ -76,10 +76,7 @@ function project(
   };
 }
 
-function snapshot(
-  projects: WatchdogProjectResult[],
-  polledAt = 1000
-): WatchdogSnapshot {
+function snapshot(projects: WatchdogProjectResult[], polledAt = 1000): WatchdogSnapshot {
   return { status: "ok", projects, polledAt };
 }
 
@@ -147,7 +144,11 @@ describe("watchedProjectsFromTabs", () => {
   it("dedupes tabs that resolve to the same repo path (first wins)", () => {
     const projects = watchedProjectsFromTabs([
       { name: "maestro", projectPath: "C:/git/maestro", selectedRepoPath: null },
-      { name: "maestro-again", projectPath: "C:/git/elsewhere", selectedRepoPath: "C:/git/maestro" },
+      {
+        name: "maestro-again",
+        projectPath: "C:/git/elsewhere",
+        selectedRepoPath: "C:/git/maestro",
+      },
       { name: "other", projectPath: "C:/git/other", selectedRepoPath: null },
     ]);
     expect(projects).toEqual([
@@ -194,7 +195,7 @@ describe("useGitHubWatchdogStore", () => {
     useGitHubWatchdogStore
       .getState()
       .applySnapshot(
-        snapshot([project("C:/git/maestro", [pr(1), pr(2, "New PR")], [issue(10)])], 2000)
+        snapshot([project("C:/git/maestro", [pr(1), pr(2, "New PR")], [issue(10)])], 2000),
       );
 
     const { toasts } = useGitHubWatchdogStore.getState();
@@ -217,8 +218,8 @@ describe("useGitHubWatchdogStore", () => {
       .applySnapshot(
         snapshot(
           [project("C:/git/maestro", [pr(1)]), project("C:/git/other", [pr(7)], [issue(8)])],
-          2000
-        )
+          2000,
+        ),
       );
     expect(useGitHubWatchdogStore.getState().toasts).toEqual([]);
   });
@@ -278,7 +279,7 @@ describe("useGitHubWatchdogStore", () => {
     useGitHubWatchdogStore
       .getState()
       .applySnapshot(
-        snapshot([project("C:/git/maestro", [], [], { prs: true, issues: true })], 2000)
+        snapshot([project("C:/git/maestro", [], [], { prs: true, issues: true })], 2000),
       );
 
     const state = useGitHubWatchdogStore.getState();
@@ -307,9 +308,7 @@ describe("useGitHubWatchdogStore", () => {
   it("does not toast the first successful data after an errored first poll", () => {
     const store = useGitHubWatchdogStore.getState();
     // First-ever poll for the project fails (e.g. gh unauthenticated).
-    store.applySnapshot(
-      snapshot([project("C:/git/maestro", [], [], { prs: true, issues: true })])
-    );
+    store.applySnapshot(snapshot([project("C:/git/maestro", [], [], { prs: true, issues: true })]));
     // Auth fixed: everything the fetch returns is pre-existing, not "new".
     useGitHubWatchdogStore
       .getState()

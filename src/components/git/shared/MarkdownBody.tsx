@@ -1,4 +1,4 @@
-import { Suspense, lazy } from "react";
+import { lazy, Suspense } from "react";
 import type { Components } from "react-markdown";
 
 interface MarkdownBodyProps {
@@ -38,9 +38,7 @@ const COMPONENTS: Components = {
   ),
   // Style code blocks
   pre: ({ children }) => (
-    <pre className="my-2 overflow-x-auto rounded bg-maestro-bg p-2 text-[10px]">
-      {children}
-    </pre>
+    <pre className="my-2 overflow-x-auto rounded bg-maestro-bg p-2 text-[10px]">{children}</pre>
   ),
   // Style inline code
   code: ({ children, className }) => {
@@ -57,37 +55,25 @@ const COMPONENTS: Components = {
   },
   // Style paragraphs
   p: ({ children }) => (
-    <p className="mb-2 text-xs leading-relaxed text-maestro-muted last:mb-0">
-      {children}
-    </p>
+    <p className="mb-2 text-xs leading-relaxed text-maestro-muted last:mb-0">{children}</p>
   ),
   // Style lists
   ul: ({ children }) => (
-    <ul className="mb-2 ml-4 list-disc text-xs text-maestro-muted">
-      {children}
-    </ul>
+    <ul className="mb-2 ml-4 list-disc text-xs text-maestro-muted">{children}</ul>
   ),
   ol: ({ children }) => (
-    <ol className="mb-2 ml-4 list-decimal text-xs text-maestro-muted">
-      {children}
-    </ol>
+    <ol className="mb-2 ml-4 list-decimal text-xs text-maestro-muted">{children}</ol>
   ),
   li: ({ children }) => <li className="mb-0.5">{children}</li>,
   // Style headers
   h1: ({ children }) => (
-    <h1 className="mb-2 mt-3 text-sm font-semibold text-maestro-text first:mt-0">
-      {children}
-    </h1>
+    <h1 className="mb-2 mt-3 text-sm font-semibold text-maestro-text first:mt-0">{children}</h1>
   ),
   h2: ({ children }) => (
-    <h2 className="mb-2 mt-3 text-sm font-medium text-maestro-text first:mt-0">
-      {children}
-    </h2>
+    <h2 className="mb-2 mt-3 text-sm font-medium text-maestro-text first:mt-0">{children}</h2>
   ),
   h3: ({ children }) => (
-    <h3 className="mb-1 mt-2 text-xs font-medium text-maestro-text first:mt-0">
-      {children}
-    </h3>
+    <h3 className="mb-1 mt-2 text-xs font-medium text-maestro-text first:mt-0">{children}</h3>
   ),
   // Style blockquotes
   blockquote: ({ children }) => (
@@ -109,9 +95,7 @@ const COMPONENTS: Components = {
     </th>
   ),
   td: ({ children }) => (
-    <td className="border border-maestro-border px-2 py-1 text-maestro-muted">
-      {children}
-    </td>
+    <td className="border border-maestro-border px-2 py-1 text-maestro-muted">{children}</td>
   ),
   // Style task list items (GFM)
   input: ({ checked }) => (
@@ -162,13 +146,11 @@ const MarkdownRenderer = lazy(async () => {
  */
 export function MarkdownBody({ content, className = "", allowRawHtml = true }: MarkdownBodyProps) {
   if (!content) {
-    return (
-      <p className="text-xs italic text-maestro-muted">No description provided.</p>
-    );
+    return <p className="text-xs italic text-maestro-muted">No description provided.</p>;
   }
 
   // Convert <image src="..."> tags to standard markdown images
-  const processedContent = content.replace(/<image\s+src="([^"]+)"[^>]*>/gi, '![]($1)');
+  const processedContent = content.replace(/<image\s+src="([^"]+)"[^>]*>/gi, "![]($1)");
 
   return (
     <div className={`markdown-body ${className}`}>

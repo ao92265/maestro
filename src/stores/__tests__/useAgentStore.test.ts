@@ -8,13 +8,13 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { useAgentStore } from "../useAgentStore";
 import type { ClaudeEvent } from "@/types/claude-events";
+import { useAgentStore } from "../useAgentStore";
 
 function spawned(
   sessionId: number,
   agentId: string,
-  overrides?: Partial<Extract<ClaudeEvent, { event_type: "SubagentSpawned" }>>
+  overrides?: Partial<Extract<ClaudeEvent, { event_type: "SubagentSpawned" }>>,
 ): ClaudeEvent {
   return {
     event_type: "SubagentSpawned",
@@ -34,7 +34,7 @@ function completed(
   sessionId: number,
   agentId: string,
   success = true,
-  overrides?: Partial<Extract<ClaudeEvent, { event_type: "SubagentCompleted" }>>
+  overrides?: Partial<Extract<ClaudeEvent, { event_type: "SubagentCompleted" }>>,
 ): ClaudeEvent {
   return {
     event_type: "SubagentCompleted",
@@ -123,7 +123,7 @@ describe("useAgentStore", () => {
           other_tool_count: 4,
         },
         agent_run_id: "a4967701",
-      })
+      }),
     );
     expect(useAgentStore.getState().agents[0]).toMatchObject({
       report: "agent-status: done",
@@ -176,7 +176,7 @@ describe("useAgentStore", () => {
         agent_type: "general-purpose",
         model: "claude-fable-5",
         timestamp: "2026-08-07T10:00:00.000Z",
-      })
+      }),
     );
     const agents = useAgentStore.getState().agents;
     expect(agents).toHaveLength(1);
@@ -226,7 +226,7 @@ describe("useAgentStore", () => {
     useAgentStore.getState().handleEvent(spawned(1, "toolu_a"));
     useAgentStore.getState().handleEvent(
       // A completion from months ago, as a resumed session replays.
-      completed(1, "toolu_a", true, { timestamp: "2026-01-01T00:00:00.000Z" })
+      completed(1, "toolu_a", true, { timestamp: "2026-01-01T00:00:00.000Z" }),
     );
     expect(useAgentStore.getState().agents).toHaveLength(1);
     expect(useAgentStore.getState().agents[0].completedAt).not.toBeNull();

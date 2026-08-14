@@ -1,10 +1,10 @@
 import {
+  CircleDot,
+  FileWarning,
   GitBranch,
   GitFork,
   GitPullRequest,
-  CircleDot,
   MessageCircle,
-  FileWarning,
 } from "lucide-react";
 
 export type GitPanelTab = "commits" | "branches" | "status" | "prs" | "issues" | "discussions";

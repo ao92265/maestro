@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { usePendingLaunchStore, type PendingLaunch } from "../usePendingLaunchStore";
+import { type PendingLaunch, usePendingLaunchStore } from "../usePendingLaunchStore";
 
 function launchFor(tabId: string, resumeSessionId?: string): PendingLaunch {
   return {
@@ -74,9 +74,26 @@ describe("usePendingLaunchStore", () => {
     expect(usePendingLaunchStore.getState().consume("tab-1")).toBeNull();
   });
 
+  // Issue #98: two identical "Harvest now" clicks are ONE launch (the store
+  // is the double-click guard), but a harvest launch never dedupes against a
+  // plain launch that happens to match on every other field.
+  it("dedupes identical harvest requests but not harvest-vs-plain", () => {
+    const plain: PendingLaunch = { ...launchFor("tab-1"), resumeSessionId: null };
+    const harvest: PendingLaunch = { ...plain, harvest: true };
+    usePendingLaunchStore.getState().request(harvest);
+    usePendingLaunchStore.getState().request({ ...harvest });
+    expect(usePendingLaunchStore.getState().pending).toHaveLength(1);
+
+    usePendingLaunchStore.getState().request(plain);
+    expect(usePendingLaunchStore.getState().pending).toHaveLength(2);
+  });
+
   it("still queues near-duplicates that differ in samurai generation", () => {
-    const gen2: PendingLaunch = { ...launchFor("tab-1"), resumeSessionId: null,
-      samurai: { project: "C:/p", epic: "#37", generation: 2 } };
+    const gen2: PendingLaunch = {
+      ...launchFor("tab-1"),
+      resumeSessionId: null,
+      samurai: { project: "C:/p", epic: "#37", generation: 2 },
+    };
     const gen3 = { ...gen2, samurai: { ...gen2.samurai!, generation: 3 } };
     usePendingLaunchStore.getState().request(gen2);
     usePendingLaunchStore.getState().request(gen3);

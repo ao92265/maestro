@@ -1,7 +1,7 @@
-import { useEffect } from "react";
 import { RefreshCw } from "lucide-react";
-import { useUsageStore } from "@/stores/useUsageStore";
+import { useEffect } from "react";
 import { formatResetTime, getUsageBars, type UsageWindowBar } from "@/lib/usageParser";
+import { useUsageStore } from "@/stores/useUsageStore";
 
 function barColor(percent: number): string {
   if (percent < 50) return "bg-maestro-green";

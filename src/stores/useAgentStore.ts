@@ -1,5 +1,5 @@
-import { create } from "zustand";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { create } from "zustand";
 import type { ClaudeEvent, SubagentToolStats } from "@/types/claude-events";
 
 /**
@@ -139,7 +139,7 @@ function applyEvent(agents: SubagentInfo[], event: ClaudeEvent): SubagentInfo[] 
               agentRunId: event.agent_run_id || a.agentRunId,
               model: event.model || a.model,
             }
-          : a
+          : a,
       );
     }
     case "SubagentCompleted": {
@@ -149,7 +149,7 @@ function applyEvent(agents: SubagentInfo[], event: ClaudeEvent): SubagentInfo[] 
       const parsed = Date.parse(event.timestamp);
       const completedAt = Number.isNaN(parsed) ? Date.now() : parsed;
       const target = agents.find(
-        (a) => a.agentId === event.agent_id && a.sessionId === event.session_id
+        (a) => a.agentId === event.agent_id && a.sessionId === event.session_id,
       );
       if (!target) {
         // An orphan completion: the watcher never saw this agent's spawn
@@ -203,7 +203,7 @@ function applyEvent(agents: SubagentInfo[], event: ClaudeEvent): SubagentInfo[] 
               toolStats: event.tool_stats ?? a.toolStats,
               agentRunId: event.agent_run_id ?? a.agentRunId,
             }
-          : a
+          : a,
       );
     }
     default:
@@ -234,24 +234,20 @@ export const useAgentStore = create<AgentState>((set) => ({
 
   dismiss: (sessionId: number, agentId: string) =>
     set((state) => {
-      const kept = state.agents.filter(
-        (a) => a.agentId !== agentId || a.sessionId !== sessionId
-      );
+      const kept = state.agents.filter((a) => a.agentId !== agentId || a.sessionId !== sessionId);
       return kept.length === state.agents.length ? state : { agents: kept };
     }),
 
   clearFinished: (sessionId: number) =>
     set((state) => {
-      const kept = state.agents.filter(
-        (a) => a.sessionId !== sessionId || a.completedAt === null
-      );
+      const kept = state.agents.filter((a) => a.sessionId !== sessionId || a.completedAt === null);
       return kept.length === state.agents.length ? state : { agents: kept };
     }),
 
   clearFinishedAndDead: (liveSessionIds: ReadonlySet<number>) =>
     set((state) => {
       const kept = state.agents.filter(
-        (a) => a.completedAt === null && liveSessionIds.has(a.sessionId)
+        (a) => a.completedAt === null && liveSessionIds.has(a.sessionId),
       );
       return kept.length === state.agents.length ? state : { agents: kept };
     }),

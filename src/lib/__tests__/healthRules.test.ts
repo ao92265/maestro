@@ -5,8 +5,8 @@ import {
   evaluateProcesses,
   evaluateSamuraiFiles,
   HEALTH_THRESHOLDS,
-  processKey,
   type ProcessStreaks,
+  processKey,
 } from "../healthRules";
 import type { MemoryFile } from "../memory";
 import type { DevProcess } from "../processes";
@@ -63,7 +63,9 @@ describe("evaluateMemory", () => {
   });
 
   it("does not flag a project sitting exactly on the fact-count threshold", () => {
-    const files = Array.from({ length: HEALTH_THRESHOLDS.maxFactFiles }, (_, i) => file(`f${i}.md`));
+    const files = Array.from({ length: HEALTH_THRESHOLDS.maxFactFiles }, (_, i) =>
+      file(`f${i}.md`),
+    );
     expect(evaluateMemory({ dirName: "P", files, now: NOW })).toEqual([]);
   });
 
@@ -92,7 +94,6 @@ describe("evaluateMemory", () => {
     const files = [file("a.md", { modified: null }), file("b.md", { modified: "not-a-date" })];
     expect(evaluateMemory({ dirName: "P", files, now: NOW })).toEqual([]);
   });
-
 });
 
 describe("evaluateProcesses", () => {

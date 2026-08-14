@@ -1,8 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // The persisted zustand stores hydrate through the Tauri store plugin at
 // import time; happy-dom has no Tauri backend, so stub it out.
@@ -24,9 +24,9 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   ask: vi.fn(),
 }));
 
-import { AuditSection } from "../AuditSection";
 import type { SamuraiAuditEvent, SamuraiAuditEventPayload } from "@/lib/samurai";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
+import { AuditSection } from "../AuditSection";
 
 const invokeMock = vi.mocked(invoke);
 const listenMock = vi.mocked(listen);
@@ -99,9 +99,7 @@ describe("AuditSection (issue #46)", () => {
     render(<AuditSection />);
 
     expect(await screen.findByText("HANDOFF")).toBeInTheDocument();
-    const badges = screen
-      .getAllByText(/^(SPAWN|HANDOFF)$/)
-      .map((el) => el.textContent);
+    const badges = screen.getAllByText(/^(SPAWN|HANDOFF)$/).map((el) => el.textContent);
     expect(badges).toEqual(["HANDOFF", "SPAWN"]);
     expect(screen.getByText("gen-2")).toBeInTheDocument();
     expect(screen.getByText("kind=context_threshold")).toBeInTheDocument();
@@ -139,6 +137,69 @@ describe("AuditSection (issue #46)", () => {
     // Newest first: the streamed ALERT lands above the read SPAWN.
     const badges = screen.getAllByText(/^(SPAWN|ALERT)$/).map((el) => el.textContent);
     expect(badges).toEqual(["ALERT", "SPAWN"]);
+  });
+
+  it("expands a row into replay details and collapses it again (issue #101)", async () => {
+    const excerpt = "Your context window is nearly full. Write the handoff file for epic #36 …";
+    mockInvoke([
+      auditEvent({
+        event: "INJECT",
+        generation: 3,
+        session_id: 7,
+        details: {
+          phase: "delivered",
+          instruction: "handoff",
+          attempt: 1,
+          corrective: false,
+          gate: "stop_hook",
+          excerpt,
+          total_chars: 1234,
+        },
+      }),
+    ]);
+    render(<AuditSection />);
+    expect(await screen.findByText("INJECT")).toBeInTheDocument();
+    // Collapsed: the one-line summary carries the scalars but never the
+    // excerpt block.
+    expect(screen.getByText(/phase=delivered .*gate=stop_hook/)).toBeInTheDocument();
+    expect(screen.queryByText(excerpt)).toBeNull();
+
+    // Expand: the replay details appear — gate, attempt, and the excerpt
+    // with its "first N of M chars" note.
+    fireEvent.click(screen.getByText("INJECT"));
+    expect(screen.getByText(excerpt)).toBeInTheDocument();
+    expect(screen.getByText("gate")).toBeInTheDocument();
+    expect(screen.getByText("stop_hook")).toBeInTheDocument();
+    expect(screen.getByText("attempt")).toBeInTheDocument();
+    expect(
+      screen.getByText(`instruction excerpt (first ${[...excerpt].length} of 1234 chars)`),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/session 7/)).toBeInTheDocument();
+
+    // Collapse: the details disappear again.
+    fireEvent.click(screen.getByText("INJECT"));
+    expect(screen.queryByText(excerpt)).toBeNull();
+  });
+
+  it("renders and expands old-shape rows without the new fields", async () => {
+    // Rows written before issue #101: plain details, null details — both
+    // must render fine and expand without crashing (fields are optional).
+    mockInvoke([
+      auditEvent({ event: "HANDOFF", generation: 2, details: { phase: "requested" } }),
+      auditEvent({ event: "ALERT", generation: 0, details: null }),
+    ]);
+    render(<AuditSection />);
+    expect(await screen.findByText("HANDOFF")).toBeInTheDocument();
+    expect(screen.getByText("phase=requested")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("HANDOFF"));
+    expect(screen.getByText("phase")).toBeInTheDocument();
+    expect(screen.getByText("requested")).toBeInTheDocument();
+    expect(screen.queryByText(/instruction excerpt/)).toBeNull();
+
+    fireEvent.click(screen.getByText("ALERT"));
+    // Null details: only the identity line shows.
+    expect(screen.getByText(/gen-0 · session 1/)).toBeInTheDocument();
   });
 
   it("clears the log only after the user confirms", async () => {

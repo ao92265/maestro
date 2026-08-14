@@ -1,4 +1,4 @@
-import { X, GitPullRequest, Loader2 } from "lucide-react";
+import { GitPullRequest, Loader2, X } from "lucide-react";
 import { useState } from "react";
 import { MarkdownEditor } from "@/components/shared/MarkdownEditor";
 import { useGitHubStore } from "../../../stores/useGitHubStore";
@@ -60,9 +60,7 @@ export function CreatePRModal({ repoPath, onClose, onSuccess }: CreatePRModalPro
         <div className="flex items-center justify-between border-b border-maestro-border p-3">
           <div className="flex items-center gap-2">
             <GitPullRequest size={16} className="text-green-400" />
-            <span className="text-sm font-medium text-maestro-text">
-              Create pull request
-            </span>
+            <span className="text-sm font-medium text-maestro-text">Create pull request</span>
           </div>
           <button
             type="button"
@@ -77,18 +75,20 @@ export function CreatePRModal({ repoPath, onClose, onSuccess }: CreatePRModalPro
         <div className="p-3">
           {/* Error message */}
           {error && (
-            <div className="mb-3 rounded bg-red-500/10 p-2 text-xs text-red-400">
-              {error}
-            </div>
+            <div className="mb-3 rounded bg-red-500/10 p-2 text-xs text-red-400">{error}</div>
           )}
 
           {/* Branch selectors */}
           <div className="mb-3 flex items-center gap-2">
             <div className="flex-1">
-              <label className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-maestro-muted">
+              <label
+                htmlFor="pr-base-branch"
+                className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-maestro-muted"
+              >
                 Base
               </label>
               <select
+                id="pr-base-branch"
                 value={base}
                 onChange={(e) => setBase(e.target.value)}
                 className="w-full rounded border border-maestro-border bg-maestro-surface px-2 py-1 text-xs text-maestro-text"
@@ -102,10 +102,14 @@ export function CreatePRModal({ repoPath, onClose, onSuccess }: CreatePRModalPro
             </div>
             <span className="mt-4 text-maestro-muted">←</span>
             <div className="flex-1">
-              <label className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-maestro-muted">
+              <label
+                htmlFor="pr-head-branch"
+                className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-maestro-muted"
+              >
                 Head
               </label>
               <select
+                id="pr-head-branch"
                 value={head}
                 onChange={(e) => setHead(e.target.value)}
                 className="w-full rounded border border-maestro-border bg-maestro-surface px-2 py-1 text-xs text-maestro-text"
@@ -121,10 +125,14 @@ export function CreatePRModal({ repoPath, onClose, onSuccess }: CreatePRModalPro
 
           {/* Title */}
           <div className="mb-3">
-            <label className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-maestro-muted">
+            <label
+              htmlFor="pr-title"
+              className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-maestro-muted"
+            >
               Title
             </label>
             <input
+              id="pr-title"
               type="text"
               value={title}
               onChange={(e) => setTitle(e.target.value)}
@@ -135,10 +143,14 @@ export function CreatePRModal({ repoPath, onClose, onSuccess }: CreatePRModalPro
 
           {/* Body */}
           <div className="mb-3">
-            <label className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-maestro-muted">
+            <label
+              htmlFor="pr-description"
+              className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-maestro-muted"
+            >
               Description
             </label>
             <MarkdownEditor
+              id="pr-description"
               value={body}
               onChange={setBody}
               placeholder="Describe your changes..."
@@ -148,11 +160,7 @@ export function CreatePRModal({ repoPath, onClose, onSuccess }: CreatePRModalPro
 
           {/* Draft checkbox */}
           <label className="flex cursor-pointer items-center gap-2">
-            <input
-              type="checkbox"
-              checked={draft}
-              onChange={(e) => setDraft(e.target.checked)}
-            />
+            <input type="checkbox" checked={draft} onChange={(e) => setDraft(e.target.checked)} />
             <span className="text-xs text-maestro-text">Create as draft</span>
           </label>
         </div>

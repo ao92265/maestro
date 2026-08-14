@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import { normalizePath, samePath } from "../path";
 
 describe("normalizePath", () => {
@@ -7,9 +7,7 @@ describe("normalizePath", () => {
   });
 
   it("preserves UNC server paths after stripping \\\\?\\UNC\\", () => {
-    expect(normalizePath("\\\\?\\UNC\\server\\share\\folder")).toBe(
-      "//server/share/folder"
-    );
+    expect(normalizePath("\\\\?\\UNC\\server\\share\\folder")).toBe("//server/share/folder");
   });
 
   it("normalizes backslashes to forward slashes and case-folds", () => {

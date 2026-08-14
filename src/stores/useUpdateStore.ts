@@ -6,7 +6,13 @@ import { createJSONStorage, persist, type StateStorage } from "zustand/middlewar
 
 // --- Types ---
 
-export type UpdateStatus = "idle" | "checking" | "available" | "downloading" | "installing" | "error";
+export type UpdateStatus =
+  | "idle"
+  | "checking"
+  | "available"
+  | "downloading"
+  | "installing"
+  | "error";
 
 export interface UpdateInfo {
   available: boolean;

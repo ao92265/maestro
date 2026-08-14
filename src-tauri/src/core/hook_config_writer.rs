@@ -55,11 +55,18 @@ fn build_hooks_config(session_id: u32, status_port: u16, instance_id: &str) -> V
         json!([{ "hooks": [hook] }])
     };
 
+    // Notification is the only reliable signal for mid-turn waits (permission
+    // prompts, idle-prompt reminder) and UserPromptSubmit the only reliable
+    // "a turn started" signal (issue #105). Both are async fire-and-forget:
+    // they must never block or inject context into the prompt (UserPromptSubmit
+    // stdout would otherwise be appended to the user's prompt).
     json!({
         "SessionStart": make_hook("hook/session-start", false),
         "SessionEnd": make_hook("hook/session-end", false),
         "PreToolUse": make_hook("hook/pre-tool", true),
         "Stop": make_hook("hook/stop", false),
+        "Notification": make_hook("hook/notification", true),
+        "UserPromptSubmit": make_hook("hook/user-prompt", true),
     })
 }
 
@@ -376,6 +383,44 @@ mod tests {
         assert!(
             stop_hook.get("async").is_none() || stop_hook["async"].is_null(),
             "Stop should NOT have async flag"
+        );
+
+        // Notification and UserPromptSubmit are fire-and-forget: async keeps
+        // them from blocking the CLI or injecting stdout into the prompt.
+        let notification_hook = &hooks["Notification"][0]["hooks"][0];
+        assert_eq!(
+            notification_hook["async"],
+            json!(true),
+            "Notification should have async: true"
+        );
+        let user_prompt_hook = &hooks["UserPromptSubmit"][0]["hooks"][0];
+        assert_eq!(
+            user_prompt_hook["async"],
+            json!(true),
+            "UserPromptSubmit should have async: true"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_notification_and_user_prompt_hooks_target_their_routes() {
+        let hooks = build_hooks_config(9, 9911, "inst-105");
+
+        let notification_cmd = hooks["Notification"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            notification_cmd.contains("hook/notification"),
+            "Notification should POST to /hook/notification, got: {}",
+            notification_cmd
+        );
+
+        let user_prompt_cmd = hooks["UserPromptSubmit"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            user_prompt_cmd.contains("hook/user-prompt"),
+            "UserPromptSubmit should POST to /hook/user-prompt, got: {}",
+            user_prompt_cmd
         );
     }
 

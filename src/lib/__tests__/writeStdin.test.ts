@@ -52,7 +52,7 @@ describe("writeStdin", () => {
   it("serializes overlapping writes to the same session in call order", async () => {
     // Make invoke resolve slowly so the queue actually has to wait.
     const order: string[] = [];
-    let pendingResolves: (() => void)[] = [];
+    const pendingResolves: (() => void)[] = [];
     invokeMock.mockImplementation(async (_cmd: string, args: { data: string }) => {
       order.push(args.data);
       await new Promise<void>((resolve) => {

@@ -13,10 +13,10 @@ import { listen } from "@tauri-apps/api/event";
 
 import type { ClaudeEvent } from "@/types/claude-events";
 import {
-  initContextUsageListener,
-  useSessionStore,
   type BackendSessionStatus,
+  initContextUsageListener,
   type SessionConfig,
+  useSessionStore,
 } from "../useSessionStore";
 
 const listenMock = vi.mocked(listen);
@@ -25,7 +25,7 @@ const invokeMock = vi.mocked(invoke);
 function session(
   id: number,
   status: BackendSessionStatus = "Idle",
-  projectPath = "C:/proj"
+  projectPath = "C:/proj",
 ): SessionConfig {
   return {
     id,
@@ -41,7 +41,7 @@ function contextEvent(
   sessionId: number,
   percent: number,
   contextTokens: number,
-  contextWindow = 1_000_000
+  contextWindow = 1_000_000,
 ): ClaudeEvent {
   return {
     event_type: "ContextUsageUpdate",
@@ -91,10 +91,7 @@ describe("useSessionStore context usage (issue #41)", () => {
   it("the last event per session in a batch wins (latest assistant message)", () => {
     useSessionStore.setState({ sessions: [session(1)] });
 
-    emitClaudeEvents([
-      contextEvent(1, 10.1, 100_631),
-      contextEvent(1, 12.5, 125_000),
-    ]);
+    emitClaudeEvents([contextEvent(1, 10.1, 100_631), contextEvent(1, 12.5, 125_000)]);
 
     expect(useSessionStore.getState().sessions[0].contextPercent).toBe(12.5);
   });

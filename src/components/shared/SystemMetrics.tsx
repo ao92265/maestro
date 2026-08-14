@@ -33,10 +33,7 @@ export function SystemMetrics() {
   )} GB)`;
 
   return (
-    <div
-      className="flex items-center gap-3"
-      title={`CPU: ${Math.round(cpu)}%\n${ramTitle}`}
-    >
+    <div className="flex items-center gap-3" title={`CPU: ${Math.round(cpu)}%\n${ramTitle}`}>
       <Metric label="CPU" percent={cpu} detail={`${Math.round(cpu)}%`} />
       <Metric
         label="RAM"
@@ -47,15 +44,7 @@ export function SystemMetrics() {
   );
 }
 
-function Metric({
-  label,
-  percent,
-  detail,
-}: {
-  label: string;
-  percent: number;
-  detail: string;
-}) {
+function Metric({ label, percent, detail }: { label: string; percent: number; detail: string }) {
   return (
     <div className="flex flex-col gap-1 w-24">
       <div className="flex items-baseline justify-between gap-1 text-[11px] leading-none">
@@ -68,9 +57,7 @@ function Metric({
           style={{ width: `${percent}%` }}
         />
       </div>
-      <div className="text-[10px] leading-none text-maestro-muted/50 truncate">
-        {" "}
-      </div>
+      <div className="text-[10px] leading-none text-maestro-muted/50 truncate"> </div>
     </div>
   );
 }

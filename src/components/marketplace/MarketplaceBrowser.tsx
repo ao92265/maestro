@@ -1,16 +1,7 @@
+import { Grid, Layers, List, Loader2, RefreshCw, Search, Settings, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { useMarketplaceStore } from "@/stores/useMarketplaceStore";
 import type { MarketplacePlugin } from "@/types/marketplace";
-import {
-  Grid,
-  Layers,
-  List,
-  Loader2,
-  RefreshCw,
-  Search,
-  Settings,
-  X,
-} from "lucide-react";
-import { useEffect, useRef, useState } from "react";
 import { MarketplaceFilters } from "./MarketplaceFilters";
 import { MarketplacePluginCard } from "./MarketplacePluginCard";
 import { MarketplacePluginRow } from "./MarketplacePluginRow";
@@ -155,10 +146,7 @@ export function MarketplaceBrowser({ onClose, currentProjectPath }: MarketplaceB
                 className="rounded p-1.5 text-maestro-muted hover:bg-maestro-surface hover:text-maestro-text disabled:opacity-50"
                 title="Refresh marketplaces"
               >
-                <RefreshCw
-                  size={14}
-                  className={isRefreshing ? "animate-spin" : ""}
-                />
+                <RefreshCw size={14} className={isRefreshing ? "animate-spin" : ""} />
               </button>
 
               {/* Sources toggle */}

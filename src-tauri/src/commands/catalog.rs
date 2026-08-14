@@ -34,6 +34,11 @@ use crate::github::{GitHub, IssueFilter};
 const KIND: &str = "catalogs";
 /// Names this artifact in the errors the user sees ("Failed to save catalog").
 const ARTIFACT_NOUN: &str = "catalog";
+/// First line the template mandates: every catalogue opens with a `"## "`
+/// area heading (see CATALOG_PROMPT_TEMPLATE's "Shape" rules). Checked by the
+/// shared runner's save-time validation (issue #97) — a leaked personal
+/// instruction reads as prose, never as a heading.
+const EXPECTED_HEADING_PREFIX: &str = "## ";
 /// Hard ceiling on a scan. The model reads its way around the whole repo,
 /// which takes far longer than the one-pass summaries; 45 minutes is a limit
 /// on a hung run, not an expectation. The shared 5-minute default would kill a
@@ -386,6 +391,7 @@ pub async fn scan_project_catalog(project_path: String) -> Result<ProjectCatalog
                 &today,
                 CATALOG_TIMEOUT_SECS,
                 CATALOG_TOOLS,
+                Some(EXPECTED_HEADING_PREFIX),
                 ARTIFACT_NOUN,
             )
             .await
@@ -748,6 +754,16 @@ mod tests {
         assert!(a.parent().unwrap().ends_with("catalogs"));
         let leaf = a.file_name().unwrap().to_string_lossy().into_owned();
         assert!(leaf.starts_with("maestro-"), "unexpected leaf: {leaf}");
+    }
+
+    #[test]
+    fn catalog_expected_heading_matches_the_template() {
+        // The save-time validation's expected prefix must stay consistent
+        // with the shape the template actually asks the model for, and with
+        // `is_area_heading`'s own idea of what an area heading looks like.
+        assert_eq!(EXPECTED_HEADING_PREFIX, "## ");
+        assert!(CATALOG_PROMPT_TEMPLATE.contains("One \"## \" heading per area"));
+        assert!(is_area_heading("## Some area"));
     }
 
     #[test]

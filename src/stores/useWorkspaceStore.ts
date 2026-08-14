@@ -1,8 +1,8 @@
-import { LazyStore } from "@tauri-apps/plugin-store";
+import { arrayMove } from "@dnd-kit/sortable";
 import { invoke } from "@tauri-apps/api/core";
+import { LazyStore } from "@tauri-apps/plugin-store";
 import { create } from "zustand";
 import { createJSONStorage, persist, type StateStorage } from "zustand/middleware";
-import { arrayMove } from "@dnd-kit/sortable";
 import { killSession } from "@/lib/terminal";
 import { useSessionStore } from "@/stores/useSessionStore";
 
@@ -162,7 +162,7 @@ function normalizePath(path: string): string {
  */
 export function withWorkspaceRoot(
   projectPath: string,
-  repositories: RepositoryInfo[]
+  repositories: RepositoryInfo[],
 ): RepositoryInfo[] {
   if (repositories.length === 0) return repositories;
   const root = normalizePath(projectPath);
@@ -284,14 +284,15 @@ export const useWorkspaceStore = create<WorkspaceState & WorkspaceActions>()(
         // Kill all sessions belonging to this project and remove from backend
         if (tabToClose && tabToClose.sessionIds.length > 0) {
           // Kill PTY processes
-          Promise.allSettled(tabToClose.sessionIds.map((sessionId) => killSession(sessionId)))
-            .then((results) => {
+          Promise.allSettled(tabToClose.sessionIds.map((sessionId) => killSession(sessionId))).then(
+            (results) => {
               for (const result of results) {
                 if (result.status === "rejected") {
                   console.error("Failed to kill session on tab close:", result.reason);
                 }
               }
-            });
+            },
+          );
           // Remove sessions from backend SessionManager AND prune the frontend
           // session store (sessions/parkedSessionIds/flaggedSessionIds) —
           // a raw invoke here left ghost rows behind: stale parked chips in the
@@ -320,7 +321,7 @@ export const useWorkspaceStore = create<WorkspaceState & WorkspaceActions>()(
           tabs: get().tabs.map((t) =>
             t.id === tabId && !t.sessionIds.includes(sessionId)
               ? { ...t, sessionIds: [...t.sessionIds, sessionId] }
-              : t
+              : t,
           ),
         });
       },
@@ -330,16 +331,14 @@ export const useWorkspaceStore = create<WorkspaceState & WorkspaceActions>()(
           tabs: get().tabs.map((t) =>
             t.id === tabId
               ? { ...t, sessionIds: t.sessionIds.filter((id) => id !== sessionId) }
-              : t
+              : t,
           ),
         });
       },
 
       setSessionsLaunched: (tabId: string, launched: boolean) => {
         set({
-          tabs: get().tabs.map((t) =>
-            t.id === tabId ? { ...t, sessionsLaunched: launched } : t
-          ),
+          tabs: get().tabs.map((t) => (t.id === tabId ? { ...t, sessionsLaunched: launched } : t)),
         });
       },
 
@@ -349,9 +348,7 @@ export const useWorkspaceStore = create<WorkspaceState & WorkspaceActions>()(
 
       setSelectedRepo: (tabId: string, repoPath: string) => {
         set({
-          tabs: get().tabs.map((t) =>
-            t.id === tabId ? { ...t, selectedRepoPath: repoPath } : t
-          ),
+          tabs: get().tabs.map((t) => (t.id === tabId ? { ...t, selectedRepoPath: repoPath } : t)),
         });
       },
 
@@ -377,9 +374,7 @@ export const useWorkspaceStore = create<WorkspaceState & WorkspaceActions>()(
 
       setWorktreeBasePath: (tabId: string, path: string | null) => {
         set({
-          tabs: get().tabs.map((t) =>
-            t.id === tabId ? { ...t, worktreeBasePath: path } : t
-          ),
+          tabs: get().tabs.map((t) => (t.id === tabId ? { ...t, worktreeBasePath: path } : t)),
         });
       },
 
@@ -413,12 +408,14 @@ export const useWorkspaceStore = create<WorkspaceState & WorkspaceActions>()(
         await Promise.all(
           multiRepoTabs.map(async (tab) => {
             try {
-              const repos = await invoke<RepositoryInfo[]>("detect_repositories", { path: tab.projectPath });
+              const repos = await invoke<RepositoryInfo[]>("detect_repositories", {
+                path: tab.projectPath,
+              });
               get().updateRepositories(tab.id, repos);
             } catch (err) {
               console.error(`Failed to rehydrate repos for ${tab.projectPath}:`, err);
             }
-          })
+          }),
         );
       },
     }),

@@ -10,12 +10,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
-use tauri::{AppHandle, State};
+use serde_json::json;
+use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_store::StoreExt;
 
 use crate::commands::ai_runner::{artifact_base_dir, canonical_project_path};
 use crate::commands::usage::{get_claude_usage, UsageData};
-use crate::core::samurai_audit::{AuditLog, AuditReadResult};
+use crate::core::samurai_audit::{AuditEvent, AuditEventKind, AuditLog, AuditReadResult};
+use crate::core::samurai_context::SamuraiContextStore;
 use crate::core::samurai_config::{SamuraiConfig, SharedSamuraiConfig};
 use crate::core::samurai_files::{self, SamuraiFileEntry, SamuraiFilesRoots};
 use crate::core::samurai_injector::strip_extended_prefix;
@@ -26,6 +28,8 @@ use crate::core::samurai_prompts::{self, epic_slug, RunRefs};
 use crate::core::samurai_replicator::{derive_repo_pin, SamuraiReplicator};
 use crate::core::samurai_run_config::{RunConfigStatus, RunConfigStore, SamuraiRunConfig};
 use crate::core::samurai_schedule::{SamuraiSchedule, ScheduleEntry};
+use crate::core::samurai_test_gate::{self, SamuraiTestGate, TestGateProgress};
+use crate::core::samurai_workflow::{self, WorkflowGraph};
 use crate::core::supervisor::{SessionSnapshot, Supervisor, SupervisorState};
 use crate::core::worktree_manager::WorktreeManager;
 use crate::git::{Git, GitError};
@@ -364,6 +368,63 @@ async fn ensure_epic_worktree(
     }
 }
 
+/// Review F1 (issue #106): the backend-side double-launch guard. The Launch
+/// button's disabled state is component-local and dies with every utility
+/// panel switch, and the refusal matrix cannot see a launch that has not yet
+/// registered a session or written its ACTIVE config — exactly the minutes
+/// the test gate spends in npm install / cargo test. This registry holds one
+/// slot per (project, epic-slug) for the WHOLE launch sequence: a second
+/// `samurai_launch_run` for the same run is refused while the first holds
+/// it. Managed as app state (`lib.rs`), so every command invocation shares
+/// the one set of slots.
+#[derive(Default)]
+pub struct LaunchInFlight {
+    keys: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+}
+
+impl LaunchInFlight {
+    /// Claims the (project, epic) launch slot. `Err` = another launch for
+    /// this run is still in flight. The key is the epic SLUG, so "38" and
+    /// "#38" — one run everywhere else — contend for one slot here too.
+    fn acquire(self: &Arc<Self>, project: &str, epic: &str) -> Result<LaunchInFlightGuard, String> {
+        let key = (project.to_string(), epic_slug(epic));
+        let mut keys = self
+            .keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !keys.insert(key.clone()) {
+            return Err(
+                "launch refused: a launch is already in progress for this epic — its \
+                 bootstrap/test gate may still be running; wait for it to finish"
+                    .to_string(),
+            );
+        }
+        Ok(LaunchInFlightGuard {
+            registry: self.clone(),
+            key,
+        })
+    }
+}
+
+/// RAII release: dropping the guard — normal return, `?` on a red gate or
+/// bootstrap failure, a panic unwinding, or the command future being dropped
+/// — frees the slot. Nothing can leak a held key, so a crashed launch never
+/// bricks relaunching its epic.
+struct LaunchInFlightGuard {
+    registry: Arc<LaunchInFlight>,
+    key: (String, String),
+}
+
+impl Drop for LaunchInFlightGuard {
+    fn drop(&mut self) {
+        self.registry
+            .keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
+
 /// What a successful launch set up — echoed to the launcher UI.
 #[derive(Debug, Clone, Serialize)]
 pub struct SamuraiLaunchResult {
@@ -376,20 +437,20 @@ pub struct SamuraiLaunchResult {
     pub stale_timer_cancelled: bool,
 }
 
-/// The gen-1 opening brief: the launch instruction plus the issue-#72
-/// journaling rider, so the first orchestrator records its own friction in
-/// the ops journal (PRD §5.12). The journal path is resolved at this call
-/// site per the P5.1 contract (`default_journal_file`); a single space
-/// joins the two single-line instructions, keeping the brief one
-/// paste-able line.
+/// The gen-1 opening brief: the launch instruction (carrying the run's
+/// compiled workflow section, issue #91) plus the issue-#72 journaling
+/// rider, so the first orchestrator records its own friction in the ops
+/// journal (PRD §5.12). The journal path is resolved at this call site per
+/// the P5.1 contract (`default_journal_file`); a single space joins the two
+/// single-line instructions, keeping the brief one paste-able line.
 ///
 /// Issue #83: the refs arrive already split into epics and issues, so the
 /// gen-1 brief names each set for what it is instead of calling a pair of
 /// sibling issues an epic.
-fn launch_brief(refs: &RunRefs, repo_pin: Option<&str>) -> String {
+fn launch_brief(refs: &RunRefs, repo_pin: Option<&str>, workflow: &WorkflowGraph) -> String {
     format!(
         "{} {}",
-        samurai_prompts::launch_instruction(refs, repo_pin),
+        samurai_prompts::launch_instruction(refs, repo_pin, &samurai_workflow::compile(workflow)),
         samurai_prompts::journal_instruction(&default_journal_file()),
     )
 }
@@ -405,12 +466,17 @@ pub(crate) async fn launch_run_inner(
     worktrees: &WorktreeManager,
     run_configs: &RunConfigStore,
     replicator: &Arc<SamuraiReplicator>,
+    audit: &AuditLog,
+    in_flight: &Arc<LaunchInFlight>,
+    test_gate: &SamuraiTestGate,
+    skip_test_gate: bool,
     preflight: &SamuraiPreflight,
     global_config: SamuraiConfig,
     project: &str,
     refs: &RunRefs,
     model: Option<String>,
     handoff_context_pct: Option<f64>,
+    workflow: Option<WorkflowGraph>,
     worktree_base: Option<&Path>,
 ) -> Result<SamuraiLaunchResult, String> {
     // Issue #83: the refs are the launch input, and `label()` is the single
@@ -425,6 +491,13 @@ pub(crate) async fn launch_run_inner(
     let model = model
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty());
+
+    // Review F1 (issue #106): claim the run's launch slot for the WHOLE
+    // sequence below — the gate alone can run for minutes, during which no
+    // session is registered and no ACTIVE config exists for the refusal
+    // matrix to see. Held by RAII: every exit path (success, red gate,
+    // bootstrap failure, panic/cancel) releases it on drop.
+    let _launch_slot = in_flight.acquire(project, &epic)?;
 
     // The refusal matrix runs server-side regardless of what the UI showed.
     let live_session = supervisor.list_sessions().iter().any(|s| {
@@ -446,14 +519,56 @@ pub(crate) async fn launch_run_inner(
         t.validate()?;
     }
 
+    let branch = epic_branch(&epic);
+    let worktree = ensure_epic_worktree(worktrees, project, &branch, worktree_base).await?;
+    let worktree_path = strip_extended_prefix(&worktree.to_string_lossy()).to_string();
+
+    // Issue #90b: the test-suite gate — bootstrap the epic worktree, then
+    // `cargo test --workspace` inside it; red = launch blocked (the skip
+    // toggle is the explicit override, and it bypasses the bootstrap too).
+    // ORDERING IS THE CRASH-SAFETY: the gate runs BEFORE the ACTIVE run
+    // config reaches disk, and cold-start reconciliation only iterates
+    // ACTIVE configs — so a red gate or a crash mid-gate leaves nothing for
+    // reconciliation to respawn into a half-bootstrapped worktree. The
+    // leftover worktree itself is the launcher's existing
+    // crash-before-config-write case: cleanup removes it by stable path.
+    if skip_test_gate {
+        log::info!("samurai launch: test-suite gate SKIPPED by user for epic {epic} in {project}");
+    } else if let Err(failure) = test_gate
+        .run(project, &epic, Path::new(&worktree_path))
+        .await
+    {
+        // The block is a durable audit fact (ALERT, the reconciler's
+        // account-wide convention: generation 0, session 0), not just a
+        // transient UI error.
+        audit.append(
+            project,
+            AuditEvent::now(
+                &epic,
+                AuditEventKind::Alert,
+                0,
+                0,
+                json!({
+                    "kind": "launch_test_gate",
+                    "phase": failure.kind.as_str(),
+                    "error": failure.message,
+                }),
+            ),
+        );
+        return Err(failure.message);
+    }
+
     // Review F5: a stale resume timer from the epic's PREVIOUS run must not
     // survive the relaunch — left armed it would fire into the fresh run
-    // and double-spawn a generation. After the refusal matrix on purpose: a
-    // refused launch must not touch the old run's state. Cancelled by SLUG,
-    // not exact string — a relaunch typed as "38" must still cancel a timer
-    // armed under "#38": every other surface (config, worktree, handoffs)
-    // unifies spellings via epic_slug, and the timer must not be the one
-    // holdout that lets a second orchestrator spawn into the worktree.
+    // and double-spawn a generation. Cancelled only HERE, after the refusal
+    // matrix AND after the test gate (issue #106 review F3): the cancel
+    // persists schedule.json, so a refused or gate-blocked launch must
+    // leave the previous parked run's state — its resume timer above all —
+    // untouched. Cancelled by SLUG, not exact string — a relaunch typed as
+    // "38" must still cancel a timer armed under "#38": every other surface
+    // (config, worktree, handoffs) unifies spellings via epic_slug, and the
+    // timer must not be the one holdout that lets a second orchestrator
+    // spawn into the worktree.
     let mut stale_timer_cancelled = false;
     for entry in schedule.list() {
         if entry.project_path == project && epic_slug(&entry.epic) == epic_slug(&epic) {
@@ -466,10 +581,6 @@ pub(crate) async fn launch_run_inner(
         );
     }
 
-    let branch = epic_branch(&epic);
-    let worktree = ensure_epic_worktree(worktrees, project, &branch, worktree_base).await?;
-    let worktree_path = strip_extended_prefix(&worktree.to_string_lossy()).to_string();
-
     // The `--repo` pin from the worktree's origin remote (PRD §10: gen-1
     // runs with --dangerously-skip-permissions). Blocking git → blocking
     // pool; an unparseable remote yields None and the brief carries its
@@ -479,19 +590,28 @@ pub(crate) async fn launch_run_inner(
         .await
         .unwrap_or(None);
 
-    // P3.4 contract: the ACTIVE config reaches disk BEFORE gen-1 spawns. A
-    // crash between the write and the spawn leaves a config cold-start
-    // reconciliation flags as reconcile_unstartable — the human relaunches
-    // (accepted).
+    // P3.4 contract: the ACTIVE config reaches disk BEFORE gen-1 spawns —
+    // but only AFTER the test gate passed (issue #90b), so a blocked launch
+    // persists nothing: no config, and no schedule.json rewrite either (the
+    // stale-timer cancel above sits behind the gate for exactly that,
+    // review F3). A crash between the write and the spawn leaves a
+    // config cold-start reconciliation flags as reconcile_unstartable — the
+    // human relaunches (accepted).
+    // Issue #91: the run's workflow graph — the UI's edited graph, or the
+    // default template when the launch names none — SNAPSHOTTED into the
+    // run config, so successor and recovery briefs recompile exactly this
+    // workflow after every handoff.
+    let workflow = workflow.unwrap_or_default();
     let mut config =
         SamuraiRunConfig::new(project.to_string(), epic.clone(), worktree_path.clone())
             .with_refs(refs);
     config.repo_pin = repo_pin.clone();
     config.model = model;
     config.thresholds = thresholds;
+    config.workflow = Some(workflow.clone());
     run_configs.save(&config)?;
 
-    let instruction = launch_brief(refs, repo_pin.as_deref());
+    let instruction = launch_brief(refs, repo_pin.as_deref(), &workflow);
     replicator.spawn_first_generation(project, &epic, &worktree_path, instruction);
 
     log::info!(
@@ -507,26 +627,33 @@ pub(crate) async fn launch_run_inner(
 }
 
 /// Launches an epic run (PRD §5.8, §12 T+0): server-side preflight →
-/// create/reuse the epic worktree → derive the `--repo` pin → write the
-/// ACTIVE run config → spawn gen-1 with its opening brief. The SPAWN audit
-/// row lands via the existing registration path with
+/// create/reuse the epic worktree → test-suite gate in that worktree
+/// (issue #90b; `skip_test_gate` is the user's explicit override, progress
+/// streams as `samurai-test-gate-event`) → derive the `--repo` pin → write
+/// the ACTIVE run config → spawn gen-1 with its opening brief. The SPAWN
+/// audit row lands via the existing registration path with
 /// `details.trigger: "launch"`.
 // Every `State` parameter is Tauri's dependency injection: the macro resolves
 // them by type, so they cannot be bundled into one struct without losing it.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn samurai_launch_run(
+    app: AppHandle,
     supervisor: State<'_, Arc<Supervisor>>,
     schedule: State<'_, Arc<SamuraiSchedule>>,
     worktrees: State<'_, WorktreeManager>,
     run_configs: State<'_, Arc<RunConfigStore>>,
     replicator: State<'_, Arc<SamuraiReplicator>>,
+    audit: State<'_, AuditLog>,
+    in_flight: State<'_, Arc<LaunchInFlight>>,
     config: State<'_, SharedSamuraiConfig>,
     project_path: String,
     epics: Vec<String>,
     issues: Vec<String>,
     model: Option<String>,
     handoff_context_pct: Option<f64>,
+    skip_test_gate: Option<bool>,
+    workflow: Option<WorkflowGraph>,
 ) -> Result<SamuraiLaunchResult, String> {
     let project = canonical_project_path(&project_path);
     // The frontend validates its two fields, but the backend re-normalises
@@ -538,28 +665,135 @@ pub async fn samurai_launch_run(
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
+    // The real gate: system processes, progress mirrored to the frontend.
+    let gate_app = app.clone();
+    let test_gate = SamuraiTestGate::new(
+        samurai_test_gate::system_runner(),
+        Arc::new(move |p: &TestGateProgress| {
+            let _ = gate_app.emit("samurai-test-gate-event", p);
+        }),
+    );
     launch_run_inner(
         &supervisor,
         &schedule,
         &worktrees,
         &run_configs,
         &replicator,
+        &audit,
+        &in_flight,
+        &test_gate,
+        skip_test_gate.unwrap_or(false),
         &preflight,
         global_config,
         &project,
         &refs,
         model,
         handoff_context_pct,
+        workflow,
         None,
     )
     .await
 }
 
-/// Every ACTIVE run config across all projects — the launcher panel's
-/// active-runs list.
+/// The DEFAULT workflow graph (issue #91) — the single source of truth for
+/// the launcher UI's reset-to-default, and the exact template a launch
+/// without an explicit graph snapshots into its run config. Pure data.
 #[tauri::command]
-pub fn samurai_list_runs(run_configs: State<'_, Arc<RunConfigStore>>) -> Vec<SamuraiRunConfig> {
-    run_configs.load_active()
+pub fn samurai_default_workflow() -> WorkflowGraph {
+    WorkflowGraph::default()
+}
+
+/// The live orchestrator facts behind one run row (issue #102). `generation`
+/// and `session_id` come from the supervisor's session list, joined to the
+/// run by project + epic slug — the same identity `launch_refusal` and
+/// `cleanup_epic_inner` already match sessions on. `model`, `context_window`
+/// and `context_percent` come from [`SamuraiContextStore`] — the exact
+/// per-session reading the 45% handoff trigger reads (`core/samurai_context.rs`),
+/// never re-parsed here.
+///
+/// Every field is `None` when its source has nothing yet: a config with no
+/// session registered (the brief window between the config write and the
+/// frontend's `samurai_register_session` call), or a COMPLETED run whose
+/// terminal already tore down and cleared its `SamuraiContextStore` entry.
+/// The frontend renders an absent field as a dash, never a guess.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SamuraiRunOrchestrator {
+    pub generation: Option<u32>,
+    pub session_id: Option<u32>,
+    pub model: Option<String>,
+    pub context_window: Option<u64>,
+    pub context_percent: Option<f64>,
+}
+
+/// One Active Runs row: the persisted config, flattened, plus its live
+/// orchestrator details.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SamuraiRunListEntry {
+    #[serde(flatten)]
+    pub config: SamuraiRunConfig,
+    pub orchestrator: SamuraiRunOrchestrator,
+}
+
+/// The session that represents this run's CURRENT generation: every
+/// supervised session matching the run's project and epic (by slug, so
+/// "#38" and "38" find the same session). Liveness dominates generation —
+/// after a cleanup + relaunch the registry can still hold a DEAD gen-N
+/// session from the previous run, which must not outrank the new run's
+/// live gen-1. Among sessions of the same liveness the highest generation
+/// wins (a successor briefly registers before the predecessor's terminal
+/// transition lands).
+fn latest_session_for_run<'a>(
+    sessions: &'a [SessionSnapshot],
+    project: &str,
+    epic: &str,
+) -> Option<&'a SessionSnapshot> {
+    sessions
+        .iter()
+        .filter(|s| s.project == project && epic_slug(&s.epic) == epic_slug(epic))
+        .max_by_key(|s| (!s.state.is_terminal(), s.generation))
+}
+
+/// Joins run configs to their orchestrator's live details — extracted from
+/// the tauri command for testability (the `launch_run_inner` precedent), so
+/// the join logic runs against plain data without a Tauri mock context.
+pub(crate) fn build_run_list_entries(
+    configs: Vec<SamuraiRunConfig>,
+    sessions: &[SessionSnapshot],
+    context: &SamuraiContextStore,
+) -> Vec<SamuraiRunListEntry> {
+    configs
+        .into_iter()
+        .map(|config| {
+            let session = latest_session_for_run(sessions, &config.project_path, &config.epic);
+            let (generation, session_id) = match session {
+                Some(s) => (Some(s.generation), Some(s.session_id)),
+                None => (None, None),
+            };
+            let usage = session_id.and_then(|id| context.usage(id));
+            let orchestrator = SamuraiRunOrchestrator {
+                generation,
+                session_id,
+                model: usage.as_ref().map(|u| u.model.clone()),
+                context_window: usage.as_ref().map(|u| u.context_window),
+                context_percent: usage.as_ref().map(|u| u.percent),
+            };
+            SamuraiRunListEntry { config, orchestrator }
+        })
+        .collect()
+}
+
+/// Every unarchived run config across all projects — the launcher panel's
+/// runs list: ACTIVE (live) plus COMPLETED (issue #96 — verified finished,
+/// awaiting the manual cleanup that archives it). Each row is enriched with
+/// its orchestrator's live details (issue #102): model, max context window,
+/// live context %, generation, session id.
+#[tauri::command]
+pub fn samurai_list_runs(
+    run_configs: State<'_, Arc<RunConfigStore>>,
+    supervisor: State<'_, Arc<Supervisor>>,
+    context: State<'_, Arc<SamuraiContextStore>>,
+) -> Vec<SamuraiRunListEntry> {
+    build_run_list_entries(run_configs.load_unarchived(), &supervisor.list_sessions(), &context)
 }
 
 /// What one cleanup pass removed (PRD §5.9: surfaced in the UI, never
@@ -633,10 +867,11 @@ pub(crate) async fn cleanup_epic_inner(
     let timer_cancelled = schedule.cancel(project, &epic)?;
 
     // 2. Archive the run config (P3.4: an un-archived ACTIVE config makes
-    //    cold-start reconciliation respawn the epic forever). Missing or
+    //    cold-start reconciliation respawn the epic forever; a COMPLETED one
+    //    — issue #96 — would sit in the runs list forever). Missing or
     //    already ARCHIVED by an earlier pass → reported, not an error.
     let config_archived = match &config {
-        Some(c) if c.status == RunConfigStatus::Active => {
+        Some(c) if c.status != RunConfigStatus::Archived => {
             run_configs.archive(project, &epic)?;
             true
         }
@@ -948,6 +1183,31 @@ pub fn samurai_journal_list(
     journal.list()
 }
 
+/// Deletes one journal entry (issue #100), identified by the exact `raw`
+/// text `samurai_journal_list` handed back for the row the user picked
+/// (see `JournalStore::delete_entry` for the identity and duplicate
+/// semantics — byte-identical duplicate lines are deleted together, since
+/// entries carry no id to tell them apart). Destructive; the frontend
+/// confirms before calling. Consumed/archived entries are deletable the
+/// same as unconsumed ones — deleting never touches the harvest markers.
+#[tauri::command]
+pub fn samurai_journal_delete(
+    journal: State<'_, Arc<JournalStore>>,
+    raw: String,
+) -> Result<usize, String> {
+    if raw.trim().is_empty() {
+        return Err("journal entry identity must not be empty".to_string());
+    }
+    match journal.delete_entry(&raw)? {
+        0 => Err(
+            "journal entry not found — it may already be gone, or a harvest changed it since \
+             this list was loaded; refresh and try again"
+                .to_string(),
+        ),
+        removed => Ok(removed),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1080,10 +1340,12 @@ mod tests {
     fn test_launch_brief_is_launch_instruction_plus_journal_rider() {
         // Issue #72: the composed gen-1 brief = the unmodified launch
         // instruction, then the journaling rider, one paste-able line.
-        let brief = launch_brief(&RunRefs::epics_only("#38"), Some("nachogl1/maestro"));
+        let workflow = WorkflowGraph::default();
+        let brief = launch_brief(&RunRefs::epics_only("#38"), Some("nachogl1/maestro"), &workflow);
         let launch = samurai_prompts::launch_instruction(
             &RunRefs::epics_only("#38"),
             Some("nachogl1/maestro"),
+            &samurai_workflow::compile(&workflow),
         );
         assert!(
             brief.starts_with(&launch),
@@ -1098,6 +1360,174 @@ mod tests {
         }
         assert!(brief.contains("NEVER rewrite or delete existing lines"));
         assert!(!brief.contains('\n'), "brief must stay a single line");
+    }
+
+    #[test]
+    fn test_launch_brief_carries_the_compiled_workflow_section() {
+        // Issue #91: the gen-1 brief embeds the graph it is launched with —
+        // an edited node text reaches the compiled section verbatim.
+        let mut workflow = WorkflowGraph::default();
+        workflow
+            .nodes
+            .iter_mut()
+            .find(|n| n.id == "review")
+            .unwrap()
+            .text = "Custom review ritual".to_string();
+        let brief = launch_brief(&RunRefs::epics_only("#38"), None, &workflow);
+        assert!(
+            brief.contains("WORKFLOW — the process for this run"),
+            "{brief}"
+        );
+        assert!(brief.contains("Step 2: Custom review ritual"), "{brief}");
+        assert!(brief.contains("END OF WORKFLOW"), "{brief}");
+        assert!(!brief.contains('\n'), "brief must stay a single line");
+    }
+
+    #[test]
+    fn test_default_workflow_command_returns_the_template() {
+        // The UI's reset-to-default has ONE source of truth.
+        assert_eq!(samurai_default_workflow(), WorkflowGraph::default());
+    }
+
+    // --- issue #102: Active Runs orchestrator details ---
+
+    fn session_snapshot(
+        session_id: u32,
+        project: &str,
+        epic: &str,
+        generation: u32,
+        state: SupervisorState,
+    ) -> SessionSnapshot {
+        SessionSnapshot {
+            session_id,
+            project: project.to_string(),
+            epic: epic.to_string(),
+            generation,
+            state,
+            previous_state: None,
+            in_flight: None,
+            ts: "2026-08-13T00:00:00Z".to_string(),
+        }
+    }
+
+    fn context_usage_event(session_id: u32, model: &str, window: u64, percent: f64) -> crate::core::claude_event::ClaudeEvent {
+        crate::core::claude_event::ClaudeEvent::ContextUsageUpdate {
+            session_id,
+            model: model.to_string(),
+            context_tokens: (window as f64 * percent / 100.0) as u64,
+            context_window: window,
+            percent,
+            timestamp: "2026-08-13T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_latest_session_for_run_picks_highest_generation() {
+        let sessions = vec![
+            session_snapshot(1, "C:/git/x", "#38", 1, SupervisorState::Killed),
+            session_snapshot(2, "C:/git/x", "#38", 2, SupervisorState::Working),
+            // A different epic in the same project must not match.
+            session_snapshot(3, "C:/git/x", "#39", 5, SupervisorState::Working),
+        ];
+        let found = latest_session_for_run(&sessions, "C:/git/x", "#38").unwrap();
+        assert_eq!(found.session_id, 2);
+        assert_eq!(found.generation, 2);
+    }
+
+    #[test]
+    fn test_latest_session_for_run_matches_by_slug_not_exact_spelling() {
+        // The launcher/cleanup precedent: "38" and "#38" are one identity.
+        let sessions = vec![session_snapshot(7, "C:/git/x", "#38", 3, SupervisorState::Working)];
+        let found = latest_session_for_run(&sessions, "C:/git/x", "38").unwrap();
+        assert_eq!(found.session_id, 7);
+    }
+
+    #[test]
+    fn test_latest_session_for_run_ties_prefer_the_live_session() {
+        // A successor registers at the same generation number the
+        // predecessor's terminal transition hasn't landed for yet — the
+        // still-live one is the current orchestrator.
+        let sessions = vec![
+            session_snapshot(1, "C:/git/x", "#38", 2, SupervisorState::Killed),
+            session_snapshot(2, "C:/git/x", "#38", 2, SupervisorState::Working),
+        ];
+        let found = latest_session_for_run(&sessions, "C:/git/x", "#38").unwrap();
+        assert_eq!(found.session_id, 2);
+    }
+
+    #[test]
+    fn test_latest_session_for_run_liveness_beats_generation() {
+        // Cleanup + relaunch: the registry still holds the old run's DEAD
+        // gen-3 while the new run's live gen-1 registers. The live session
+        // is the current orchestrator — generation only breaks ties within
+        // the same liveness.
+        let sessions = vec![
+            session_snapshot(1, "C:/git/x", "#38", 3, SupervisorState::Killed),
+            session_snapshot(2, "C:/git/x", "#38", 1, SupervisorState::Working),
+        ];
+        let found = latest_session_for_run(&sessions, "C:/git/x", "#38").unwrap();
+        assert_eq!(found.session_id, 2);
+        assert_eq!(found.generation, 1);
+    }
+
+    #[test]
+    fn test_latest_session_for_run_no_match_is_none() {
+        let sessions = vec![session_snapshot(1, "C:/git/x", "#38", 1, SupervisorState::Working)];
+        assert!(latest_session_for_run(&sessions, "C:/git/x", "#99").is_none());
+        assert!(latest_session_for_run(&sessions, "C:/git/other", "#38").is_none());
+    }
+
+    #[test]
+    fn test_build_run_list_entries_joins_generation_session_and_live_context() {
+        let config = SamuraiRunConfig::new("C:/git/x", "#38", "C:/git/x-wt");
+        let sessions = vec![session_snapshot(9, "C:/git/x", "#38", 2, SupervisorState::Working)];
+        let context = crate::core::samurai_context::SamuraiContextStore::new();
+        context.observe(&context_usage_event(9, "claude-opus-4-6[1m]", 1_000_000, 38.5));
+
+        let entries = build_run_list_entries(vec![config], &sessions, &context);
+        assert_eq!(entries.len(), 1);
+        let orch = &entries[0].orchestrator;
+        assert_eq!(orch.generation, Some(2));
+        assert_eq!(orch.session_id, Some(9));
+        assert_eq!(orch.model.as_deref(), Some("claude-opus-4-6[1m]"));
+        assert_eq!(orch.context_window, Some(1_000_000));
+        assert_eq!(orch.context_percent, Some(38.5));
+    }
+
+    #[test]
+    fn test_build_run_list_entries_omits_fields_it_has_no_source_for() {
+        // No supervised session registered yet for this config (the window
+        // between the config write and the frontend's register call): every
+        // orchestrator field is None, never a guess.
+        let config = SamuraiRunConfig::new("C:/git/x", "#38", "C:/git/x-wt");
+        let context = crate::core::samurai_context::SamuraiContextStore::new();
+
+        let entries = build_run_list_entries(vec![config], &[], &context);
+        let orch = &entries[0].orchestrator;
+        assert_eq!(orch.generation, None);
+        assert_eq!(orch.session_id, None);
+        assert_eq!(orch.model, None);
+        assert_eq!(orch.context_window, None);
+        assert_eq!(orch.context_percent, None);
+    }
+
+    #[test]
+    fn test_build_run_list_entries_session_known_but_no_live_context_yet() {
+        // A session is registered (generation + session id known) but no
+        // assistant message has landed yet (or a COMPLETED run's session
+        // already tore down its context-store entry): the identity fields
+        // are populated, the live reading is not — never frozen into 0%.
+        let config = SamuraiRunConfig::new("C:/git/x", "#38", "C:/git/x-wt");
+        let sessions = vec![session_snapshot(9, "C:/git/x", "#38", 3, SupervisorState::Working)];
+        let context = crate::core::samurai_context::SamuraiContextStore::new();
+
+        let entries = build_run_list_entries(vec![config], &sessions, &context);
+        let orch = &entries[0].orchestrator;
+        assert_eq!(orch.generation, Some(3));
+        assert_eq!(orch.session_id, Some(9));
+        assert_eq!(orch.model, None);
+        assert_eq!(orch.context_window, None);
+        assert_eq!(orch.context_percent, None);
     }
 
     // --- worktree + cleanup (tempfile git fixtures) ---
@@ -1126,6 +1556,65 @@ mod tests {
         run(&["commit", "-q", "-m", "init"]);
     }
 
+    /// Commits extra fixture files (paths may be nested) so the launched
+    /// epic worktree contains them — the test gate detects its bootstrap
+    /// steps from files in the WORKTREE, not the repo.
+    fn commit_fixture_files(dir: &Path, files: &[(&str, &str)]) {
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .hide_console_window()
+                .output()
+                .expect("git must be runnable in tests");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        for (name, content) in files {
+            let path = dir.join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, content).unwrap();
+            run(&["add", name]);
+        }
+        run(&["commit", "-q", "-m", "fixture files"]);
+    }
+
+    /// A test gate whose runner records `"program args…"` per call and
+    /// answers from a per-command-prefix script; unscripted commands
+    /// succeed with empty output. Progress emission is discarded — the
+    /// event payloads have their own suite in `core::samurai_test_gate`.
+    fn recording_gate(
+        script: Vec<(
+            &'static str,
+            crate::core::samurai_test_gate::GateCommandOutput,
+        )>,
+    ) -> (SamuraiTestGate, Arc<std::sync::Mutex<Vec<String>>>) {
+        use crate::core::samurai_test_gate::{GateCommandOutput, GateCommandRunner};
+        let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_rec = calls.clone();
+        let runner: GateCommandRunner = Arc::new(move |_cwd, program, args, _timeout| {
+            let call = format!("{program} {}", args.join(" "));
+            calls_rec.lock().unwrap().push(call.clone());
+            for (prefix, out) in &script {
+                if call.starts_with(prefix) {
+                    return Ok(out.clone());
+                }
+            }
+            Ok(GateCommandOutput {
+                success: true,
+                timed_out: false,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+        (SamuraiTestGate::new(runner, Arc::new(|_| {})), calls)
+    }
+
     #[tokio::test]
     async fn test_ensure_epic_worktree_creates_then_reuses_the_stable_path() {
         let repo = tempdir().unwrap();
@@ -1150,7 +1639,7 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    /// Everything cleanup needs, rooted in tempdirs.
+    /// Everything cleanup (and the gated launch) needs, rooted in tempdirs.
     struct CleanupHarness {
         supervisor: Arc<Supervisor>,
         schedule: Arc<SamuraiSchedule>,
@@ -1158,6 +1647,8 @@ mod tests {
         spawns: Arc<std::sync::Mutex<Vec<crate::core::samurai_replicator::SuccessorSpawn>>>,
         run_configs: RunConfigStore,
         worktrees: WorktreeManager,
+        audit: AuditLog,
+        in_flight: Arc<LaunchInFlight>,
         project: String,
         _dirs: (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir),
         base: tempfile::TempDir,
@@ -1176,7 +1667,8 @@ mod tests {
     ) {
         use crate::core::samurai_injector::SessionDirResolver;
         use crate::core::samurai_replicator::{
-            SessionTeardown, StdinWriter, SuccessorEmitter, SuccessorSpawn, TranscriptPathResolver,
+            EnterResender, SessionTeardown, StdinWriter, SuccessorEmitter, SuccessorSpawn,
+            TranscriptPathResolver,
         };
         use std::sync::{Mutex, RwLock};
 
@@ -1188,6 +1680,7 @@ mod tests {
         let transcript_paths: TranscriptPathResolver = Arc::new(|_| None);
         let teardown: SessionTeardown = Arc::new(|_| Box::pin(async {}));
         let write_stdin: StdinWriter = Arc::new(|_, _| {});
+        let resend_enter: EnterResender = Arc::new(|_| {});
         let shared: SharedSamuraiConfig = Arc::new(RwLock::new(SamuraiConfig::default()));
         let replicator = Arc::new(SamuraiReplicator::new(
             supervisor,
@@ -1198,6 +1691,7 @@ mod tests {
             teardown,
             emit_spawn,
             write_stdin,
+            resend_enter,
         ));
         (replicator, spawns)
     }
@@ -1214,7 +1708,7 @@ mod tests {
             SamuraiSchedule::new(schedule_dir.path().to_path_buf(), Arc::new(|_| {}), None);
         let project = repo.path().to_string_lossy().into_owned();
         let supervisor = Arc::new(Supervisor::new(audit.clone(), None));
-        let (replicator, spawns) = test_replicator(supervisor.clone(), audit);
+        let (replicator, spawns) = test_replicator(supervisor.clone(), audit.clone());
         CleanupHarness {
             supervisor,
             schedule,
@@ -1222,6 +1716,8 @@ mod tests {
             spawns,
             run_configs: RunConfigStore::new(runs_dir.path().to_path_buf()),
             worktrees: WorktreeManager::new(),
+            audit,
+            in_flight: Arc::new(LaunchInFlight::default()),
             project,
             _dirs: (audit_dir, schedule_dir, runs_dir),
             base: tempdir().unwrap(),
@@ -1229,10 +1725,13 @@ mod tests {
         }
     }
 
-    /// A launch through the harness — the same collaborators cleanup uses,
-    /// with preflight forced green and the worktree base kept in the tempdir.
+    /// Launch through the harness with an all-green preflight and the
+    /// global default config — the gate/skip flag and the split refs are
+    /// what varies; the worktree base is kept in the tempdir.
     async fn run_launch(
         h: &CleanupHarness,
+        gate: &SamuraiTestGate,
+        skip_test_gate: bool,
         epics: &[&str],
         issues: &[&str],
     ) -> Result<SamuraiLaunchResult, String> {
@@ -1244,10 +1743,15 @@ mod tests {
             &h.worktrees,
             &h.run_configs,
             &h.replicator,
+            &h.audit,
+            &h.in_flight,
+            gate,
+            skip_test_gate,
             &preflight(true, true),
             SamuraiConfig::default(),
             &h.project,
             &run_refs(&epics, &issues),
+            None,
             None,
             None,
             Some(h.base.path()),
@@ -1340,6 +1844,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cleanup_archives_a_completed_config() {
+        // Issue #96: a verified-complete run sits COMPLETED until the human
+        // cleans it up — that cleanup must archive the config exactly like
+        // an ACTIVE one, or the finished run would stay listed forever.
+        let h = cleanup_harness();
+        h.run_configs
+            .save(&SamuraiRunConfig::new(
+                h.project.clone(),
+                "#38",
+                h.base.path().join("gone").to_string_lossy().into_owned(),
+            ))
+            .unwrap();
+        h.run_configs.complete(&h.project, "#38").unwrap();
+
+        let report = run_cleanup(&h, "#38").await.unwrap();
+        assert!(report.config_archived);
+        assert!(h.run_configs.load_unarchived().is_empty());
+    }
+
+    #[tokio::test]
     async fn test_launch_cancels_stale_timer_and_stores_overrides() {
         // Review F5: a relaunch must cancel the previous run's resume timer
         // (left armed it would double-spawn into the fresh run). Review F4:
@@ -1347,7 +1871,8 @@ mod tests {
         // and the gen-1 spawn event already carries the model.
         use crate::core::samurai_injector::SessionDirResolver;
         use crate::core::samurai_replicator::{
-            SessionTeardown, StdinWriter, SuccessorEmitter, SuccessorSpawn, TranscriptPathResolver,
+            EnterResender, SessionTeardown, StdinWriter, SuccessorEmitter, SuccessorSpawn,
+            TranscriptPathResolver,
         };
         use std::sync::{Arc, Mutex, RwLock};
 
@@ -1375,6 +1900,7 @@ mod tests {
         let transcript_paths: TranscriptPathResolver = Arc::new(|_| None);
         let teardown: SessionTeardown = Arc::new(|_| Box::pin(async {}));
         let write_stdin: StdinWriter = Arc::new(|_, _| {});
+        let resend_enter: EnterResender = Arc::new(|_| {});
         let shared: SharedSamuraiConfig = Arc::new(RwLock::new(SamuraiConfig::default()));
         let replicator = Arc::new(SamuraiReplicator::new(
             supervisor.clone(),
@@ -1385,6 +1911,7 @@ mod tests {
             teardown,
             emit_spawn,
             write_stdin,
+            resend_enter,
         ));
         replicator.set_run_configs(run_configs.clone());
 
@@ -1401,19 +1928,28 @@ mod tests {
             })
             .unwrap();
 
+        // The fixture repo has no Cargo.toml, so the gate is skipped here —
+        // its own launch behavior has dedicated tests below.
+        let (gate, _calls) = recording_gate(vec![]);
         let global = SamuraiConfig::default();
+        let in_flight = Arc::new(LaunchInFlight::default());
         let result = launch_run_inner(
             &supervisor,
             &schedule,
             &worktrees,
             &run_configs,
             &replicator,
+            &audit,
+            &in_flight,
+            &gate,
+            true,
             &preflight(true, true),
             global.clone(),
             &project,
             &run_refs(&["38".to_string()], &[]),
             Some("opus".to_string()),
             Some(30.0),
+            None,
             Some(base.path()),
         )
         .await
@@ -1451,10 +1987,15 @@ mod tests {
             &worktrees,
             &run_configs,
             &replicator,
+            &audit,
+            &in_flight,
+            &gate,
+            true,
             &preflight(true, true),
             global,
             &project,
             &run_refs(&["#38".to_string()], &[]),
+            None,
             None,
             None,
             Some(base.path()),
@@ -1475,6 +2016,7 @@ mod tests {
         // run's identity, and branch, worktree folder and run-config filename
         // are its slug — epics-only, issues-only and both.
         let h = cleanup_harness();
+        let (gate, _calls) = recording_gate(vec![]);
         for (epics, issues, label, slug) in [
             (vec!["5"], vec![], "epic #5", "epic-5"),
             (vec![], vec!["7", "9"], "issues #7, #9", "issues-7-9"),
@@ -1485,7 +2027,7 @@ mod tests {
                 "epic-5-issues-7-9",
             ),
         ] {
-            let result = run_launch(&h, &epics, &issues).await.unwrap();
+            let result = run_launch(&h, &gate, true, &epics, &issues).await.unwrap();
             assert_eq!(result.epic, label, "label for {epics:?} + {issues:?}");
             assert_eq!(result.branch, format!("samurai-{slug}"));
             assert!(
@@ -1510,10 +2052,13 @@ mod tests {
     #[tokio::test]
     async fn test_launch_refuses_empty_refs_and_a_live_duplicate_run() {
         let h = cleanup_harness();
+        let (gate, _calls) = recording_gate(vec![]);
 
         // Nothing usable on either side: refused before any side effect, no
         // matter what the frontend thought it validated.
-        let err = run_launch(&h, &["  ", "#"], &[","]).await.unwrap_err();
+        let err = run_launch(&h, &gate, true, &["  ", "#"], &[","])
+            .await
+            .unwrap_err();
         assert!(
             err.contains("at least one epic or issue reference"),
             "{err}"
@@ -1523,7 +2068,7 @@ mod tests {
 
         // A real launch, then a live session registered for it the way the
         // frontend does — under the run's label.
-        let result = run_launch(&h, &["5"], &["7", "9"]).await.unwrap();
+        let result = run_launch(&h, &gate, true, &["5"], &["7", "9"]).await.unwrap();
         h.supervisor
             .register_session(1, h.project.clone(), result.epic.clone(), 1)
             .unwrap();
@@ -1531,11 +2076,406 @@ mod tests {
         // Relaunching the same run is refused, and the duplicate check
         // matches by SLUG: a differently spelled but identical set of refs is
         // the same run.
-        let dup = run_launch(&h, &["#5"], &["#7", "9"]).await.unwrap_err();
+        let dup = run_launch(&h, &gate, true, &["#5"], &["#7", "9"])
+            .await
+            .unwrap_err();
         assert!(dup.contains("live supervised session"), "{dup}");
 
         // A DIFFERENT set is a different run and still launches.
-        assert!(run_launch(&h, &["5"], &["7"]).await.is_ok());
+        assert!(run_launch(&h, &gate, true, &["5"], &["7"]).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_launch_snapshots_the_workflow_graph_into_the_run_config() {
+        // Issue #91: the launch stores the graph it ran with — the caller's
+        // edited graph, or the default template when none is given — so
+        // successor briefs recompile the SAME workflow after handoffs.
+        let h = cleanup_harness();
+        let (gate, _calls) = recording_gate(vec![]);
+
+        // No explicit graph → the default template is snapshotted.
+        run_launch(&h, &gate, true, &["#38"], &[]).await.unwrap();
+        let config = h.run_configs.get(&h.project, "epic #38").unwrap();
+        assert_eq!(config.workflow, Some(WorkflowGraph::default()));
+
+        // An explicit (edited) graph is stored verbatim.
+        let mut custom = WorkflowGraph::default();
+        custom
+            .nodes
+            .iter_mut()
+            .find(|n| n.id == "review")
+            .unwrap()
+            .text = "Custom review ritual".to_string();
+        launch_run_inner(
+            &h.supervisor,
+            &h.schedule,
+            &h.worktrees,
+            &h.run_configs,
+            &h.replicator,
+            &h.audit,
+            &h.in_flight,
+            &gate,
+            true,
+            &preflight(true, true),
+            SamuraiConfig::default(),
+            &h.project,
+            &run_refs(&["#39".to_string()], &[]),
+            None,
+            None,
+            Some(custom.clone()),
+            Some(h.base.path()),
+        )
+        .await
+        .unwrap();
+        let config = h.run_configs.get(&h.project, "epic #39").unwrap();
+        assert_eq!(config.workflow, Some(custom));
+    }
+
+    // --- issue #90b: the launch test-suite gate ---
+
+    #[tokio::test]
+    async fn test_launch_gate_green_bootstraps_then_spawns() {
+        // The full maestro-shaped worktree: npm install → mcp build →
+        // cargo test, in that order, then the launch proceeds normally.
+        let h = cleanup_harness();
+        commit_fixture_files(
+            h.repo.path(),
+            &[
+                ("Cargo.toml", "[workspace]\nmembers = []\n"),
+                ("package.json", "{}"),
+                ("maestro-mcp-server/Cargo.toml", "[package]\n"),
+            ],
+        );
+        let (gate, calls) = recording_gate(vec![]);
+
+        let result = run_launch(&h, &gate, false, &["#38"], &[]).await.unwrap();
+        assert_eq!(result.branch, "samurai-epic-38");
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "npm install".to_string(),
+                "cargo build --release -p maestro-mcp-server".to_string(),
+                "cargo test --workspace".to_string(),
+            ]
+        );
+        assert_eq!(h.spawns.lock().unwrap().len(), 1, "gen-1 spawned");
+        assert_eq!(h.run_configs.load_active().len(), 1, "ACTIVE config saved");
+    }
+
+    #[tokio::test]
+    async fn test_launch_gate_red_blocks_spawn_config_and_alerts() {
+        let h = cleanup_harness();
+        commit_fixture_files(
+            h.repo.path(),
+            &[("Cargo.toml", "[workspace]\nmembers = []\n")],
+        );
+        let (gate, calls) = recording_gate(vec![(
+            "cargo test",
+            crate::core::samurai_test_gate::GateCommandOutput {
+                success: false,
+                timed_out: false,
+                stdout: "test result: FAILED. 40 passed; 2 failed; 0 ignored\n".to_string(),
+                stderr: String::new(),
+            },
+        )]);
+
+        let err = run_launch(&h, &gate, false, &["#38"], &[])
+            .await
+            .unwrap_err();
+        assert!(err.contains("launch blocked"), "{err}");
+        assert!(
+            err.contains("test result: FAILED. 40 passed; 2 failed"),
+            "the failing summary line must surface: {err}"
+        );
+
+        // Blocked means BLOCKED: no gen-1 spawn, and no ACTIVE config for
+        // cold-start reconciliation to respawn into the worktree (the
+        // config write is ordered AFTER the gate on purpose).
+        assert!(h.spawns.lock().unwrap().is_empty(), "no gen-1 spawn");
+        assert!(h.run_configs.load_active().is_empty(), "no ACTIVE config");
+
+        // …and the block is a durable ALERT audit row.
+        let read = h.audit.read(&h.project, None, None).await.unwrap();
+        let alert = read
+            .events
+            .iter()
+            .find(|e| e.event == AuditEventKind::Alert)
+            .expect("an ALERT row records the block");
+        assert_eq!(alert.epic, "epic #38");
+        assert_eq!(alert.details["kind"], "launch_test_gate");
+        assert_eq!(alert.details["phase"], "red_suite");
+
+        // No package.json in the fixture → the suite was the only command.
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["cargo test --workspace".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_launch_gate_skip_bypasses_gate_and_bootstrap_entirely() {
+        // No Cargo.toml anywhere — an armed gate would block this repo.
+        // Skip must not even probe: no bootstrap, no commands at all.
+        let h = cleanup_harness();
+        let (gate, calls) = recording_gate(vec![]);
+
+        let result = run_launch(&h, &gate, true, &["#38"], &[]).await.unwrap();
+        assert_eq!(result.epic, "epic #38");
+        assert!(calls.lock().unwrap().is_empty(), "no gate command ran");
+        assert_eq!(h.spawns.lock().unwrap().len(), 1, "gen-1 spawned");
+        assert_eq!(h.run_configs.load_active().len(), 1, "ACTIVE config saved");
+    }
+
+    #[tokio::test]
+    async fn test_launch_gate_bootstrap_failure_blocks_with_distinct_error() {
+        let h = cleanup_harness();
+        commit_fixture_files(
+            h.repo.path(),
+            &[
+                ("Cargo.toml", "[workspace]\nmembers = []\n"),
+                ("package.json", "{}"),
+            ],
+        );
+        let (gate, calls) = recording_gate(vec![(
+            "npm install",
+            crate::core::samurai_test_gate::GateCommandOutput {
+                success: false,
+                timed_out: false,
+                stdout: String::new(),
+                stderr: "npm ERR! network timeout\n".to_string(),
+            },
+        )]);
+
+        let err = run_launch(&h, &gate, false, &["#38"], &[])
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("bootstrap failed at `npm install`"),
+            "a broken bootstrap is its own error, not a red suite: {err}"
+        );
+        assert!(err.contains("npm ERR! network timeout"), "{err}");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["npm install".to_string()],
+            "the suite never ran"
+        );
+        assert!(h.spawns.lock().unwrap().is_empty());
+        assert!(h.run_configs.load_active().is_empty());
+        let read = h.audit.read(&h.project, None, None).await.unwrap();
+        let alert = read
+            .events
+            .iter()
+            .find(|e| e.event == AuditEventKind::Alert)
+            .expect("an ALERT row records the block");
+        assert_eq!(alert.details["kind"], "launch_test_gate");
+        assert_eq!(alert.details["phase"], "bootstrap");
+    }
+
+    #[tokio::test]
+    async fn test_red_gate_leaves_the_previous_runs_resume_timer_armed() {
+        // Issue #106 review F3: the stale-timer cancel persists
+        // schedule.json, so it runs only AFTER the gate passes — a blocked
+        // launch leaves the previous parked run resumable exactly as it was.
+        let h = cleanup_harness();
+        commit_fixture_files(
+            h.repo.path(),
+            &[("Cargo.toml", "[workspace]\nmembers = []\n")],
+        );
+        h.schedule
+            .arm(ScheduleEntry {
+                project_path: h.project.clone(),
+                // The previous run's identity label — what a real park armed.
+                epic: "epic #38".to_string(),
+                fire_at: "2030-01-01T00:00:00+00:00".to_string(),
+                reason: "park".to_string(),
+            })
+            .unwrap();
+
+        let (red_gate, _calls) = recording_gate(vec![(
+            "cargo test",
+            crate::core::samurai_test_gate::GateCommandOutput {
+                success: false,
+                timed_out: false,
+                stdout: "test result: FAILED. 1 passed; 1 failed\n".to_string(),
+                stderr: String::new(),
+            },
+        )]);
+        run_launch(&h, &red_gate, false, &["#38"], &[])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            h.schedule.list().len(),
+            1,
+            "a blocked launch must not destroy the previous run's resume timer"
+        );
+
+        // The gate passing is what consumes the stale timer.
+        let (green_gate, _calls) = recording_gate(vec![]);
+        let result = run_launch(&h, &green_gate, false, &["#38"], &[])
+            .await
+            .unwrap();
+        assert!(result.stale_timer_cancelled);
+        assert!(h.schedule.list().is_empty());
+    }
+
+    // --- issue #106 review F1: the in-flight launch slot ---
+
+    #[tokio::test]
+    async fn test_second_launch_refused_while_the_first_holds_the_slot() {
+        use crate::core::samurai_test_gate::{GateCommandOutput, GateCommandRunner};
+        use std::sync::{Condvar, Mutex};
+
+        let h = cleanup_harness();
+        commit_fixture_files(
+            h.repo.path(),
+            &[("Cargo.toml", "[workspace]\nmembers = []\n")],
+        );
+
+        // A gate runner that parks like a minutes-long cargo test: it
+        // signals entry, then blocks until the test releases it.
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let entered_rt = entered.clone();
+        let release_rt = release.clone();
+        let runner: GateCommandRunner = Arc::new(move |_cwd, _program, _args, _timeout| {
+            {
+                let (flag, cv) = &*entered_rt;
+                *flag.lock().unwrap() = true;
+                cv.notify_all();
+            }
+            let (flag, cv) = &*release_rt;
+            let mut released = flag.lock().unwrap();
+            while !*released {
+                released = cv.wait(released).unwrap();
+            }
+            Ok(GateCommandOutput {
+                success: true,
+                timed_out: false,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+        let slow_gate = SamuraiTestGate::new(runner, Arc::new(|_| {}));
+
+        let first = run_launch(&h, &slow_gate, false, &["38"], &[]);
+        let second = async {
+            // Wait (off the async thread) until the first launch is inside
+            // its gate — the exact window the component-local UI guard used
+            // to be the only protection for.
+            let entered_wait = entered.clone();
+            tokio::task::spawn_blocking(move || {
+                let (flag, cv) = &*entered_wait;
+                let mut in_gate = flag.lock().unwrap();
+                while !*in_gate {
+                    in_gate = cv.wait(in_gate).unwrap();
+                }
+            })
+            .await
+            .unwrap();
+
+            // The double click — spelled differently, same run: refused by
+            // the in-flight slot (slug identity) before any side effect.
+            let err = run_launch(&h, &slow_gate, false, &["#38"], &[])
+                .await
+                .unwrap_err();
+
+            // Let the first gate finish.
+            let (flag, cv) = &*release;
+            *flag.lock().unwrap() = true;
+            cv.notify_all();
+            err
+        };
+        let (first_result, second_err) = tokio::join!(first, second);
+        assert!(
+            second_err.contains("already in progress"),
+            "{second_err}"
+        );
+        first_result.expect("the first launch completes normally");
+        assert_eq!(h.spawns.lock().unwrap().len(), 1, "exactly ONE gen-1 spawn");
+        assert_eq!(h.run_configs.load_active().len(), 1, "one ACTIVE config");
+    }
+
+    #[tokio::test]
+    async fn test_launch_slot_released_after_a_red_gate() {
+        let h = cleanup_harness();
+        commit_fixture_files(
+            h.repo.path(),
+            &[("Cargo.toml", "[workspace]\nmembers = []\n")],
+        );
+        let (gate, _calls) = recording_gate(vec![(
+            "cargo test",
+            crate::core::samurai_test_gate::GateCommandOutput {
+                success: false,
+                timed_out: false,
+                stdout: "test result: FAILED. 1 passed; 1 failed\n".to_string(),
+                stderr: String::new(),
+            },
+        )]);
+
+        let err = run_launch(&h, &gate, false, &["#38"], &[]).await.unwrap_err();
+        assert!(err.contains("launch blocked"), "{err}");
+
+        // The RAII guard released the slot on the red-gate exit: the
+        // relaunch reaches the gate again instead of bouncing off the
+        // in-flight check.
+        let again = run_launch(&h, &gate, false, &["#38"], &[]).await.unwrap_err();
+        assert!(!again.contains("already in progress"), "{again}");
+        assert!(again.contains("launch blocked"), "{again}");
+    }
+
+    #[tokio::test]
+    async fn test_launch_slot_released_after_success() {
+        let h = cleanup_harness();
+        let (gate, _calls) = recording_gate(vec![]);
+        run_launch(&h, &gate, true, &["#38"], &[]).await.unwrap();
+        // Released on the success path too: a relaunch of the same epic is
+        // not refused by the in-flight slot (nothing else refuses it either
+        // — no live session is registered in this harness).
+        run_launch(&h, &gate, true, &["#38"], &[]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_launch_gate_timeout_blocks_and_releases_the_slot() {
+        // Review F2 × F1 (issue #106): a hung gate step is killed and blocks
+        // the launch like a red gate — no spawn, no ACTIVE config, a durable
+        // ALERT with its distinct phase — and the in-flight slot is released
+        // so the human can relaunch after fixing the hang.
+        let h = cleanup_harness();
+        commit_fixture_files(
+            h.repo.path(),
+            &[("Cargo.toml", "[workspace]\nmembers = []\n")],
+        );
+        let (gate, _calls) = recording_gate(vec![(
+            "cargo test",
+            crate::core::samurai_test_gate::GateCommandOutput {
+                success: false,
+                timed_out: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        )]);
+
+        let err = run_launch(&h, &gate, false, &["#38"], &[]).await.unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(err.contains("may be hung"), "{err}");
+
+        assert!(h.spawns.lock().unwrap().is_empty(), "no gen-1 spawn");
+        assert!(h.run_configs.load_active().is_empty(), "no ACTIVE config");
+        let read = h.audit.read(&h.project, None, None).await.unwrap();
+        let alert = read
+            .events
+            .iter()
+            .find(|e| e.event == AuditEventKind::Alert)
+            .expect("an ALERT row records the block");
+        assert_eq!(alert.details["kind"], "launch_test_gate");
+        assert_eq!(alert.details["phase"], "timed_out");
+
+        // Released: the relaunch reaches the gate again instead of bouncing
+        // off the in-flight check.
+        let again = run_launch(&h, &gate, false, &["#38"], &[]).await.unwrap_err();
+        assert!(!again.contains("already in progress"), "{again}");
+        assert!(again.contains("timed out"), "{again}");
     }
 
     #[test]
@@ -1605,7 +2545,11 @@ mod tests {
             &worktree.to_string_lossy(),
             "opening brief".to_string(),
         );
-        assert_eq!(h.spawns.lock().unwrap().len(), 1, "gen-1 staged and emitted");
+        assert_eq!(
+            h.spawns.lock().unwrap().len(),
+            1,
+            "gen-1 staged and emitted"
+        );
 
         // Cleaned up under a DIFFERENT spelling than it was staged with: the
         // cancel matches by slug, like every other surface.

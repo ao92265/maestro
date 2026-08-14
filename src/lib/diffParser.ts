@@ -8,13 +8,7 @@
  * lines are "added" (right side only). Context lines appear on both sides.
  */
 
-export type CellKind =
-  | "context"
-  | "added"
-  | "removed"
-  | "modified"
-  | "empty"
-  | "hunk";
+export type CellKind = "context" | "added" | "removed" | "modified" | "empty" | "hunk";
 
 export interface DiffCell {
   /** 1-based line number in that side's file; null for empty/hunk cells. */
@@ -133,8 +127,6 @@ export function parseUnifiedDiff(diff: string): DiffRow[] {
     flushPending();
     inHunk = false;
     if (!METADATA_PREFIXES.some((p) => line.startsWith(p))) {
-      // Unknown line shape — ignore rather than corrupt the alignment.
-      continue;
     }
   }
 

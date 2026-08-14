@@ -1,30 +1,39 @@
-import { CanvasAddon } from "@xterm/addon-canvas";
-import { FitAddon } from "@xterm/addon-fit";
-import { WebglAddon } from "@xterm/addon-webgl";
-import { Unicode11Addon } from "@xterm/addon-unicode11";
-import { WebLinksAddon } from "@xterm/addon-web-links";
-import { Terminal } from "@xterm/xterm";
+import { writeText as writeClipboardText } from "@tauri-apps/plugin-clipboard-manager";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { writeText as writeClipboardText } from "@tauri-apps/plugin-clipboard-manager";
+import { CanvasAddon } from "@xterm/addon-canvas";
+import { FitAddon } from "@xterm/addon-fit";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { WebLinksAddon } from "@xterm/addon-web-links";
+import { WebglAddon } from "@xterm/addon-webgl";
+import { Terminal } from "@xterm/xterm";
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import "@xterm/xterm/css/xterm.css";
 
+import { useShallow } from "zustand/react/shallow";
 import { QuickActionsManager } from "@/components/quickactions/QuickActionsManager";
 import { ActivityFeed } from "@/components/session/ActivityFeed";
 import { AgentGraph } from "@/components/session/AgentGraph";
-import { isGitWorktree } from "@/lib/git";
 import { useBranchPullRequest } from "@/hooks/useBranchPullRequest";
 import { useSessionBranch } from "@/hooks/useSessionBranch";
 import { buildFontFamily, waitForFont } from "@/lib/fonts";
+import { isGitWorktree } from "@/lib/git";
 import { describeSessionContext } from "@/lib/sessionContext";
-import { useActivityStore } from "@/stores/useActivityStore";
-import type { ClaudeEvent } from "@/types/claude-events";
-import { getBackendInfo, killSession, onPtyOutput, resizePty, savePastedImage, signalTerminalReady, writeStdin, type BackendInfo } from "@/lib/terminal";
+import {
+  type BackendInfo,
+  getBackendInfo,
+  killSession,
+  onPtyOutput,
+  resizePty,
+  savePastedImage,
+  signalTerminalReady,
+  writeStdin,
+} from "@/lib/terminal";
 import { DEFAULT_THEME, LIGHT_THEME, toXtermTheme } from "@/lib/terminalTheme";
+import { useActivityStore } from "@/stores/useActivityStore";
 import { type AiMode, type BackendSessionStatus, useSessionStore } from "@/stores/useSessionStore";
 import { DEFAULT_SCROLLBACK, useTerminalSettingsStore } from "@/stores/useTerminalSettingsStore";
-import { useShallow } from "zustand/react/shallow";
+import type { ClaudeEvent } from "@/types/claude-events";
 import { QuickActionPills } from "./QuickActionPills";
 import { type AIProvider, type SessionStatus, TerminalHeader } from "./TerminalHeader";
 
@@ -191,7 +200,7 @@ export const TerminalView = memo(function TerminalView({
         statusMessage: sess.statusMessage,
         needsInputPrompt: sess.needsInputPrompt,
       };
-    })
+    }),
   );
   const effectiveStatus = sessionData ? mapStatus(sessionData.status) : status;
   const effectiveProvider = sessionData ? mapAiMode(sessionData.mode) : "claude";
@@ -247,7 +256,12 @@ export const TerminalView = memo(function TerminalView({
 
   // For useSessionBranch: only Maestro-created worktrees have a locked branch.
   // Project-level worktrees still need polling to discover their branch.
-  const liveBranch = useSessionBranch(projectPath, hasSessionWorktree, sessionData?.branch ?? null, isActive);
+  const liveBranch = useSessionBranch(
+    projectPath,
+    hasSessionWorktree,
+    sessionData?.branch ?? null,
+    isActive,
+  );
   const effectiveBranch = liveBranch ?? "...";
   // For the UI badge: show "worktree" if either Maestro created one or the project itself is a worktree.
   const isWorktree = hasSessionWorktree || isProjectWorktree;
@@ -318,6 +332,7 @@ export const TerminalView = memo(function TerminalView({
   }, [appTheme]);
 
   // Update terminal font settings when they change
+  // biome-ignore lint/correctness/useExhaustiveDependencies: fontSize/fontFamily/zoomLevel aren't read directly (the getEffectiveFont* getters read them internally) but are the intended triggers — those getter references are stable across store updates, so this effect needs the raw values to know when to refit.
   useEffect(() => {
     if (termRef.current && fitAddonRef.current) {
       const effectiveFont = getEffectiveFontFamily();
@@ -363,12 +378,9 @@ export const TerminalView = memo(function TerminalView({
     [onKill],
   );
 
-  const handleRename = useCallback(
-    (id: number, name: string | null) => {
-      useSessionStore.getState().renameSession(id, name);
-    },
-    [],
-  );
+  const handleRename = useCallback((id: number, name: string | null) => {
+    useSessionStore.getState().renameSession(id, name);
+  }, []);
 
   /**
    * Handles quick action button clicks: pastes the prompt into the agent's
@@ -413,17 +425,23 @@ export const TerminalView = memo(function TerminalView({
     let lastHeuristicStatus: string | null = null;
 
     const MCP_GRACE_PERIOD_MS = 10_000; // Defer to MCP for 10s after last MCP update
-    const WORKING_DEBOUNCE_MS = 500;    // Sustained output before marking "Working"
-    const IDLE_TIMEOUT_MS = 5_000;      // No output before marking "Idle"
+    const WORKING_DEBOUNCE_MS = 500; // Sustained output before marking "Working"
+    const IDLE_TIMEOUT_MS = 5_000; // No output before marking "Idle"
     // Only overwrite "safe" states — never revert terminal states like Done/Error/NeedsInput/Timeout
     const SAFE_TO_OVERRIDE: BackendSessionStatus[] = ["Working", "Idle", "Starting"];
 
-    const MAX_BUFFER_CHUNKS = 100;  // Force flush at ~400KB (100 × 4KB chunks)
-    const FALLBACK_FLUSH_MS = 50;   // 20fps floor for backgrounded tabs
+    const MAX_BUFFER_CHUNKS = 100; // Force flush at ~400KB (100 × 4KB chunks)
+    const FALLBACK_FLUSH_MS = 50; // 20fps floor for backgrounded tabs
 
     const cancelPendingFlush = () => {
-      if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
-      if (fallbackTimerId !== null) { clearTimeout(fallbackTimerId); fallbackTimerId = null; }
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      if (fallbackTimerId !== null) {
+        clearTimeout(fallbackTimerId);
+        fallbackTimerId = null;
+      }
     };
 
     const flushBuffer = () => {
@@ -432,17 +450,17 @@ export const TerminalView = memo(function TerminalView({
         writeBuffer = [];
         return;
       }
-      const data = writeBuffer.join('');
-      writeBuffer = [];  // Clear BEFORE write to prevent duplicates on error
+      const data = writeBuffer.join("");
+      writeBuffer = []; // Clear BEFORE write to prevent duplicates on error
       try {
         term.write(data);
       } catch (e) {
-        console.error('[TerminalView] write error:', e);
+        console.error("[TerminalView] write error:", e);
       }
     };
 
     const scheduleFlush = () => {
-      if (rafId !== null) return;  // Already scheduled
+      if (rafId !== null) return; // Already scheduled
       rafId = requestAnimationFrame(flushBuffer);
       if (fallbackTimerId === null) {
         fallbackTimerId = setTimeout(flushBuffer, FALLBACK_FLUSH_MS);
@@ -463,7 +481,10 @@ export const TerminalView = memo(function TerminalView({
 
       if (disposed) return;
 
-      const initialTheme = document.documentElement.getAttribute("data-theme") === "light" ? LIGHT_THEME : DEFAULT_THEME;
+      const initialTheme =
+        document.documentElement.getAttribute("data-theme") === "light"
+          ? LIGHT_THEME
+          : DEFAULT_THEME;
       // Scrollback is user-configurable: every retained line costs cols × 3
       // 32-bit cells for the life of the Terminal, and every open project keeps
       // its terminals mounted, so this dominates renderer memory.
@@ -512,14 +533,18 @@ export const TerminalView = memo(function TerminalView({
           webglAddon.dispose();
           try {
             term?.loadAddon(new CanvasAddon());
-          } catch { /* DOM renderer as final fallback */ }
+          } catch {
+            /* DOM renderer as final fallback */
+          }
         });
         term.loadAddon(webglAddon);
       } catch {
         // WebGL not available — use Canvas2D renderer
         try {
           term.loadAddon(new CanvasAddon());
-        } catch { /* DOM renderer as final fallback */ }
+        } catch {
+          /* DOM renderer as final fallback */
+        }
       }
 
       // Handle OSC 52 clipboard escape sequences. TUI apps like Claude Code copy
@@ -598,18 +623,21 @@ export const TerminalView = memo(function TerminalView({
         const mediaType = imageItem.type;
         const MAX_IMAGE_SIZE = 50 * 1024 * 1024; // 50 MB
         // Save image async, then write the path to stdin
-        blob.arrayBuffer().then(async (arrayBuffer) => {
-          if (arrayBuffer.byteLength > MAX_IMAGE_SIZE) {
-            console.error("[TerminalView] Image too large to paste");
-            return;
-          }
-          // Hand the view straight to the IPC layer — building a JS array with
-          // one element per image byte first is what made large pastes freeze.
-          const filePath = await savePastedImage(new Uint8Array(arrayBuffer), mediaType);
-          await writeStdin(sessionId, filePath);
-        }).catch((err) => {
-          console.error("[TerminalView] Failed to paste image:", err);
-        });
+        blob
+          .arrayBuffer()
+          .then(async (arrayBuffer) => {
+            if (arrayBuffer.byteLength > MAX_IMAGE_SIZE) {
+              console.error("[TerminalView] Image too large to paste");
+              return;
+            }
+            // Hand the view straight to the IPC layer — building a JS array with
+            // one element per image byte first is what made large pastes freeze.
+            const filePath = await savePastedImage(new Uint8Array(arrayBuffer), mediaType);
+            await writeStdin(sessionId, filePath);
+          })
+          .catch((err) => {
+            console.error("[TerminalView] Failed to paste image:", err);
+          });
       };
       container.addEventListener("paste", pasteHandler, { capture: true });
 
@@ -674,7 +702,8 @@ export const TerminalView = memo(function TerminalView({
 
         // Cmd+C (Mac) or Ctrl+C (Linux/Windows): copy selection to clipboard
         // Only intercept if there's a selection, otherwise let SIGINT go through
-        const isCopy = event.key === "c" && (event.metaKey || event.ctrlKey) && event.type === "keydown";
+        const isCopy =
+          event.key === "c" && (event.metaKey || event.ctrlKey) && event.type === "keydown";
         if (isCopy && term?.hasSelection()) {
           const selection = term.getSelection();
           copyToClipboard(selection).catch(console.error);
@@ -683,7 +712,13 @@ export const TerminalView = memo(function TerminalView({
 
         // Cmd/Ctrl+T: add new session — block xterm so 't' isn't sent to PTY.
         // The DOM event still bubbles to window where useAppKeyboard handles it.
-        if (event.key === "t" && (event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.type === "keydown") {
+        if (
+          event.key === "t" &&
+          (event.metaKey || event.ctrlKey) &&
+          !event.altKey &&
+          !event.shiftKey &&
+          event.type === "keydown"
+        ) {
           return false;
         }
 
@@ -691,8 +726,10 @@ export const TerminalView = memo(function TerminalView({
         // block xterm so it doesn't send the corresponding control byte (NUL/SOH) to PTY.
         // Use event.code for layout independence; event.key may differ on AZERTY etc.
         if (
-          (event.code === "Digit1" || event.code === "Digit2" ||
-           event.code === "Numpad1" || event.code === "Numpad2") &&
+          (event.code === "Digit1" ||
+            event.code === "Digit2" ||
+            event.code === "Numpad1" ||
+            event.code === "Numpad2") &&
           (event.metaKey || event.ctrlKey) &&
           !event.altKey &&
           !event.shiftKey &&
@@ -702,7 +739,13 @@ export const TerminalView = memo(function TerminalView({
         }
 
         // Cmd+K (Mac) or Ctrl+K (Linux/Windows): clear terminal scrollback + viewport
-        if (event.key === "k" && (event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.type === "keydown") {
+        if (
+          event.key === "k" &&
+          (event.metaKey || event.ctrlKey) &&
+          !event.altKey &&
+          !event.shiftKey &&
+          event.type === "keydown"
+        ) {
           term?.clear();
           return false;
         }
@@ -732,17 +775,17 @@ export const TerminalView = memo(function TerminalView({
         if (disposed || !term) return;
         writeBuffer.push(data);
         if (writeBuffer.length >= MAX_BUFFER_CHUNKS) {
-          flushBuffer();  // Backpressure: immediate flush if buffer full
+          flushBuffer(); // Backpressure: immediate flush if buffer full
         } else {
           scheduleFlush();
         }
 
         // --- Activity-based status detection ---
-        const session = useSessionStore.getState().sessions.find(s => s.id === sessionId);
+        const session = useSessionStore.getState().sessions.find((s) => s.id === sessionId);
         if (!session) return; // Session was removed, skip heuristic
 
         const lastMcp = session.lastMcpUpdateTime ?? 0;
-        const mcpIsActive = (Date.now() - lastMcp) < MCP_GRACE_PERIOD_MS;
+        const mcpIsActive = Date.now() - lastMcp < MCP_GRACE_PERIOD_MS;
 
         if (!mcpIsActive) {
           // Debounce: set "Working" after sustained output
@@ -750,7 +793,7 @@ export const TerminalView = memo(function TerminalView({
             activityWorkingTimer = setTimeout(() => {
               if (disposed) return;
               activityWorkingTimer = null;
-              const current = useSessionStore.getState().sessions.find(s => s.id === sessionId);
+              const current = useSessionStore.getState().sessions.find((s) => s.id === sessionId);
               if (!current || !SAFE_TO_OVERRIDE.includes(current.status)) return;
               lastHeuristicStatus = "Working";
               useSessionStore.getState().updateSession(sessionId, {
@@ -765,7 +808,7 @@ export const TerminalView = memo(function TerminalView({
             if (disposed) return;
             activityIdleTimer = null;
             if (lastHeuristicStatus === "Working") {
-              const current = useSessionStore.getState().sessions.find(s => s.id === sessionId);
+              const current = useSessionStore.getState().sessions.find((s) => s.id === sessionId);
               if (!current || !SAFE_TO_OVERRIDE.includes(current.status)) return;
               lastHeuristicStatus = "Idle";
               useSessionStore.getState().updateSession(sessionId, {
@@ -883,7 +926,11 @@ export const TerminalView = memo(function TerminalView({
       if (activityIdleTimer) clearTimeout(activityIdleTimer);
       // Flush remaining buffered output before disposal
       if (term && writeBuffer.length > 0) {
-        try { term.write(writeBuffer.join('')); } catch { /* ignore errors during cleanup */ }
+        try {
+          term.write(writeBuffer.join(""));
+        } catch {
+          /* ignore errors during cleanup */
+        }
       }
       writeBuffer = [];
       resizeObserver?.disconnect();
@@ -895,7 +942,7 @@ export const TerminalView = memo(function TerminalView({
       termRef.current = null;
       fitAddonRef.current = null;
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- Font settings are read once at init, dynamic updates via separate effect
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- Font settings are read once at init, dynamic updates via separate effect
   }, [sessionId]);
 
   // Focus the terminal when isFocused becomes true
@@ -906,6 +953,8 @@ export const TerminalView = memo(function TerminalView({
   }, [isFocused]);
 
   return (
+    // biome-ignore lint/a11y/noStaticElementInteractions: background click-to-focus on a panel full of nested interactive controls (header buttons, tab bar, terminal itself) — not a discrete focusable widget, so there's no sensible single keyboard equivalent.
+    // biome-ignore lint/a11y/useKeyWithClickEvents: see noStaticElementInteractions above.
     <div
       className={`terminal-cell flex h-full flex-col bg-maestro-bg ${cellStatusClass(effectiveStatus)} ${isFocused ? "terminal-cell-focused" : ""}`}
       // The border is always the project's color, in every view — that is what
@@ -959,6 +1008,8 @@ export const TerminalView = memo(function TerminalView({
 
       {/* Tab bar — clicking its background or the already-active tab toggles
           the warning flag (yellow), in sync with the header above. */}
+      {/* biome-ignore lint/a11y/noStaticElementInteractions: background click-to-flag on a row full of nested interactive tab buttons — not a discrete focusable widget, so there's no sensible single keyboard equivalent. */}
+      {/* biome-ignore lint/a11y/useKeyWithClickEvents: see noStaticElementInteractions above. */}
       <div
         className={`flex shrink-0 cursor-pointer items-center gap-0.5 border-b border-neutral-800 ${isFlagged || hasAttention ? "warning-flag" : "bg-neutral-900/50"} px-2`}
         onClick={(e) => {
@@ -1009,7 +1060,10 @@ export const TerminalView = memo(function TerminalView({
       </div>
 
       {/* xterm.js container - always mounted but hidden when activity tab is active */}
-      <div ref={containerRef} className={`flex-1 overflow-hidden ${activeTab !== "terminal" ? "hidden" : ""}`} />
+      <div
+        ref={containerRef}
+        className={`flex-1 overflow-hidden ${activeTab !== "terminal" ? "hidden" : ""}`}
+      />
 
       {/* Activity feed - shown when activity tab is active */}
       {activeTab === "activity" && (

@@ -1,8 +1,8 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, cleanup } from "@testing-library/react";
-import { ActivityFeed } from "../ActivityFeed";
+import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useActivityStore } from "@/stores/useActivityStore";
 import type { ClaudeEvent } from "@/types/claude-events";
+import { ActivityFeed } from "../ActivityFeed";
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
@@ -65,17 +65,12 @@ describe("ActivityFeed auto-scroll", () => {
 
     render(<ActivityFeed sessionId={42} maxHeight="100%" />);
 
-    expect(
-      screen.getByText("Waiting for session activity...")
-    ).toBeInTheDocument();
+    expect(screen.getByText("Waiting for session activity...")).toBeInTheDocument();
   });
 
   it("assigns scrollTop on the feed's own container when events change", () => {
     const setScrollTop = vi.fn();
-    const originalScrollTop = Object.getOwnPropertyDescriptor(
-      Element.prototype,
-      "scrollTop"
-    );
+    const originalScrollTop = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop");
     Object.defineProperty(Element.prototype, "scrollTop", {
       configurable: true,
       get: () => 0,

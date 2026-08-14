@@ -145,11 +145,14 @@ export type AiMode = "Claude" | "Gemini" | "Codex" | "OpenCode" | "Plain";
 export type CliAiMode = Exclude<AiMode, "Plain">;
 
 /** CLI command configuration for each AI mode */
-export const AI_CLI_CONFIG: Record<AiMode, {
-  command: string | null;
-  installHint: string;
-  skipPermissionsFlag: string | null;
-}> = {
+export const AI_CLI_CONFIG: Record<
+  AiMode,
+  {
+    command: string | null;
+    installHint: string;
+    skipPermissionsFlag: string | null;
+  }
+> = {
   Claude: {
     command: "claude",
     installHint: "npm install -g @anthropic-ai/claude-code",
@@ -180,7 +183,7 @@ export const AI_CLI_CONFIG: Record<AiMode, {
 /** Writes hooks configuration for a Claude session to .claude/settings.local.json. */
 export async function writeSessionHooksConfig(
   workingDir: string,
-  sessionId: number
+  sessionId: number,
 ): Promise<void> {
   await invoke("write_session_hooks_config", {
     workingDir,
@@ -189,9 +192,7 @@ export async function writeSessionHooksConfig(
 }
 
 /** Removes hooks configuration from .claude/settings.local.json. */
-export async function removeSessionHooksConfig(
-  workingDir: string
-): Promise<void> {
+export async function removeSessionHooksConfig(workingDir: string): Promise<void> {
   await invoke("remove_session_hooks_config", { workingDir });
 }
 
@@ -203,7 +204,11 @@ export async function checkCliAvailable(command: string): Promise<boolean> {
 /** Info about a previous Claude Code session that can be resumed. */
 export interface ClaudeSessionInfo {
   session_id: string;
+  /** Conversation title from a transcript summary entry, when Claude wrote one. */
+  summary: string | null;
   first_prompt: string | null;
+  /** Most recent user prompt — where a long conversation left off. */
+  last_prompt: string | null;
   /** Preview of the most recent message — the opening line alone rarely identifies a long run. */
   last_activity: string | null;
   started_at: string;
@@ -213,14 +218,18 @@ export interface ClaudeSessionInfo {
   message_count: number;
   git_branch: string | null;
   /**
-   * Directory the conversation ran in, as recorded in the transcript.
+   * Directory the conversation ran in, as recorded in the transcript — kept
+   * even when the directory no longer exists so the UI can say where it ran.
    * `claude --resume` only finds a session from this directory, so a resume
-   * launch must use it as the working directory — but only when it still
-   * exists (see `cwd_exists`), otherwise the shell cannot spawn there.
+   * launch must use it as the working directory; check `resumable` first.
    */
   cwd: string | null;
   /** Whether `cwd` still exists on disk. False means warn before resuming. */
   cwd_exists: boolean;
+  /** True when the recorded directory still exists, so a resume can spawn there. */
+  resumable: boolean;
+  /** Why the conversation cannot resume, when `resumable` is false. */
+  resume_blocked_reason: string | null;
 }
 
 /** A session listing plus what it could not return, so nothing vanishes silently. */
@@ -252,7 +261,7 @@ export const EMPTY_CLAUDE_SESSION_LISTING: ClaudeSessionListing = {
  */
 export async function listClaudeSessions(
   projectPath: string,
-  extraRoots?: string[]
+  extraRoots?: string[],
 ): Promise<ClaudeSessionListing> {
   return invoke<ClaudeSessionListing>("list_claude_sessions", { projectPath, extraRoots });
 }
@@ -280,7 +289,7 @@ export async function createSession(
   id: number,
   mode: AiMode,
   projectPath: string,
-  workingDirectory?: string
+  workingDirectory?: string,
 ): Promise<SessionConfig> {
   return invoke<SessionConfig>("create_session", {
     id,
@@ -294,7 +303,7 @@ export async function createSession(
 export async function assignSessionBranch(
   sessionId: number,
   branch: string,
-  worktreePath: string | null
+  worktreePath: string | null,
 ): Promise<SessionConfig> {
   return invoke<SessionConfig>("assign_session_branch", { sessionId, branch, worktreePath });
 }
@@ -425,7 +434,11 @@ export type CliFlags = {
  * buildCliCommand("Codex", { skipPermissions: true, customFlags: "" })
  * // Returns: "codex --dangerously-bypass-approvals-and-sandbox"
  */
-export function buildCliCommand(mode: AiMode, flags?: CliFlags, resumeSessionId?: string): string | null {
+export function buildCliCommand(
+  mode: AiMode,
+  flags?: CliFlags,
+  resumeSessionId?: string,
+): string | null {
   const config = AI_CLI_CONFIG[mode];
   if (!config.command) return null;
 

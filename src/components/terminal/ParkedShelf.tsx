@@ -61,7 +61,11 @@ interface ParkedShelfProps {
  * terminals as chips (name + live status dot). Clicking a chip restores
  * the terminal to the grid. Renders nothing while no terminal is parked.
  */
-export function ParkedShelf({ projectPath, onUnpark, showProjectLabels = false }: ParkedShelfProps) {
+export function ParkedShelf({
+  projectPath,
+  onUnpark,
+  showProjectLabels = false,
+}: ParkedShelfProps) {
   const sessions = useSessionStore((s) => s.sessions);
   const parkedIds = useSessionStore((s) => s.parkedSessionIds);
   // Clash-resolved colors, so a parked chip matches the project's terminals
@@ -73,9 +77,9 @@ export function ParkedShelf({ projectPath, onUnpark, showProjectLabels = false }
       sessions.filter(
         (sess) =>
           parkedIds.includes(sess.id) &&
-          (projectPath === undefined || samePath(sess.project_path, projectPath))
+          (projectPath === undefined || samePath(sess.project_path, projectPath)),
       ),
-    [sessions, parkedIds, projectPath]
+    [sessions, parkedIds, projectPath],
   );
 
   if (parkedSessions.length === 0) return null;
@@ -111,7 +115,9 @@ export function ParkedShelf({ projectPath, onUnpark, showProjectLabels = false }
             className={`flex shrink-0 items-center gap-1.5 rounded-full border bg-maestro-card px-2.5 py-0.5 text-xs text-maestro-text transition-colors hover:border-maestro-accent ${attention}`}
             title="Restore terminal"
           >
-            <span className={`h-1.5 w-1.5 rounded-full ${STATUS_DOT[sess.status] ?? STATUS_DOT.Idle}`} />
+            <span
+              className={`h-1.5 w-1.5 rounded-full ${STATUS_DOT[sess.status] ?? STATUS_DOT.Idle}`}
+            />
             <ThinkingIndicator sessionId={sess.id} size={3} />
             {showProjectLabels && (
               <span className="font-bold" style={{ color: projectColor }}>

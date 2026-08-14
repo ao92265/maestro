@@ -86,6 +86,7 @@ export function GitGraphPanel({
   } = useGitHubStore();
 
   // Clear all selections when switching repos
+  // biome-ignore lint/correctness/useExhaustiveDependencies: repoPath is not read in the body but is the intended trigger — this effect must re-run when the repo changes to reset selections.
   useEffect(() => {
     setSelectedNode(null);
     setSelectedPRNumber(null);

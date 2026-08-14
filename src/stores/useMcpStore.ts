@@ -8,22 +8,22 @@
 import { create } from "zustand";
 
 import {
-  getProjectMcpServers,
-  refreshProjectMcpServers,
-  setSessionMcpServers as setSessionMcpServersApi,
-  saveProjectMcpDefaults,
-  loadProjectMcpDefaults,
-  getCustomMcpServers,
-  saveCustomMcpServer,
   deleteCustomMcpServer as deleteCustomMcpServerApi,
+  getCustomMcpServers,
   getMcpStatus,
-  upsertMcpServer,
-  removeMcpServer,
-  setMcpServerEnabled,
-  type McpServerConfig,
+  getProjectMcpServers,
+  loadProjectMcpDefaults,
   type McpCustomServer,
-  type McpStatusView,
   type McpManagedScope,
+  type McpServerConfig,
+  type McpStatusView,
+  refreshProjectMcpServers,
+  removeMcpServer,
+  saveCustomMcpServer,
+  saveProjectMcpDefaults,
+  setMcpServerEnabled,
+  setSessionMcpServers as setSessionMcpServersApi,
+  upsertMcpServer,
 } from "@/lib/mcp";
 
 /** Key for session-enabled lookup: "projectPath:sessionId" */
@@ -74,11 +74,7 @@ interface McpState {
    * Sets the enabled server names for a session.
    * Updates both local state and backend.
    */
-  setSessionEnabled: (
-    projectPath: string,
-    sessionId: number,
-    enabled: string[]
-  ) => Promise<void>;
+  setSessionEnabled: (projectPath: string, sessionId: number, enabled: string[]) => Promise<void>;
 
   /**
    * Toggles a specific server for a session.
@@ -86,7 +82,7 @@ interface McpState {
   toggleSessionServer: (
     projectPath: string,
     sessionId: number,
-    serverName: string
+    serverName: string,
   ) => Promise<void>;
 
   /**
@@ -140,22 +136,18 @@ interface McpState {
     scope: McpManagedScope,
     name: string,
     config: Record<string, unknown>,
-    overwrite: boolean
+    overwrite: boolean,
   ) => Promise<void>;
 
   /** Removes a server from the real config file for a scope. */
-  removeManagedServer: (
-    projectPath: string,
-    scope: McpManagedScope,
-    name: string
-  ) => Promise<void>;
+  removeManagedServer: (projectPath: string, scope: McpManagedScope, name: string) => Promise<void>;
 
   /** Enables/disables a server or connector for this project. */
   setManagedServerEnabled: (
     projectPath: string,
     scope: McpManagedScope,
     name: string,
-    enabled: boolean
+    enabled: boolean,
   ) => Promise<void>;
 }
 
@@ -242,11 +234,7 @@ export const useMcpStore = create<McpState>()((set, get) => ({
     return servers.map((s) => s.name);
   },
 
-  setSessionEnabled: async (
-    projectPath: string,
-    sessionId: number,
-    enabled: string[]
-  ) => {
+  setSessionEnabled: async (projectPath: string, sessionId: number, enabled: string[]) => {
     const key = sessionKey(projectPath, sessionId);
 
     // Update local state optimistically (both session and project defaults)
@@ -266,11 +254,7 @@ export const useMcpStore = create<McpState>()((set, get) => ({
     }
   },
 
-  toggleSessionServer: async (
-    projectPath: string,
-    sessionId: number,
-    serverName: string
-  ) => {
+  toggleSessionServer: async (projectPath: string, sessionId: number, serverName: string) => {
     const currentEnabled = get().getSessionEnabled(projectPath, sessionId);
     const isEnabled = currentEnabled.includes(serverName);
 
@@ -328,9 +312,7 @@ export const useMcpStore = create<McpState>()((set, get) => ({
 
     // Optimistically update local state
     set((state) => ({
-      customServers: state.customServers.map((s) =>
-        s.id === server.id ? server : s
-      ),
+      customServers: state.customServers.map((s) => (s.id === server.id ? server : s)),
     }));
 
     try {
@@ -415,12 +397,10 @@ export const useMcpStore = create<McpState>()((set, get) => ({
           ...state.mcpStatus,
           [projectPath]: {
             servers: status.servers.map((s) =>
-              s.name === name && s.scope === scope
-                ? { ...s, enabled, pending: false }
-                : s
+              s.name === name && s.scope === scope ? { ...s, enabled, pending: false } : s,
             ),
             connectors: status.connectors.map((c) =>
-              scope === "connector" && c.name === name ? { ...c, enabled } : c
+              scope === "connector" && c.name === name ? { ...c, enabled } : c,
             ),
           },
         },
@@ -445,15 +425,13 @@ export const useMcpStore = create<McpState>()((set, get) => ({
     const enabledCustomServers = state.customServers.filter((s) => s.isEnabled);
 
     // Convert custom servers to McpServerConfig format
-    const customServerConfigs: McpServerConfig[] = enabledCustomServers.map(
-      (custom) => ({
-        name: custom.name,
-        type: "stdio" as const,
-        command: custom.command,
-        args: custom.args,
-        env: custom.env,
-      })
-    );
+    const customServerConfigs: McpServerConfig[] = enabledCustomServers.map((custom) => ({
+      name: custom.name,
+      type: "stdio" as const,
+      command: custom.command,
+      args: custom.args,
+      env: custom.env,
+    }));
 
     return [...discoveredServers, ...customServerConfigs];
   },

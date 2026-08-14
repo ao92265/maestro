@@ -77,7 +77,9 @@ export function MaestroSettingsModal({ onClose }: MaestroSettingsModalProps) {
   const setCustomEndpoint = useUpdateStore((s) => s.setCustomEndpoint);
 
   useEffect(() => {
-    invoke<boolean>("is_cli_installed").then(setCliInstalled).catch(() => setCliInstalled(false));
+    invoke<boolean>("is_cli_installed")
+      .then(setCliInstalled)
+      .catch(() => setCliInstalled(false));
   }, []);
 
   useEffect(() => {
@@ -100,7 +102,9 @@ export function MaestroSettingsModal({ onClose }: MaestroSettingsModalProps) {
       .then(setSamuraiConfig)
       .catch((err) => {
         setSamuraiError(String(err));
-        invoke<SamuraiConfig>("samurai_get_config").then(setSamuraiConfig).catch(() => {});
+        invoke<SamuraiConfig>("samurai_get_config")
+          .then(setSamuraiConfig)
+          .catch(() => {});
       });
   };
 
@@ -174,9 +178,7 @@ export function MaestroSettingsModal({ onClose }: MaestroSettingsModalProps) {
             </div>
             <div className="flex items-center gap-2 px-1 text-xs">
               <Check size={12} className="shrink-0 text-maestro-green" />
-              <span className="text-maestro-text font-medium">
-                v{appVersion ?? "..."}
-              </span>
+              <span className="text-maestro-text font-medium">v{appVersion ?? "..."}</span>
             </div>
           </div>
 
@@ -257,10 +259,16 @@ export function MaestroSettingsModal({ onClose }: MaestroSettingsModalProps) {
             </div>
             <div className="space-y-1.5 px-1">
               <p className="text-[11px] text-maestro-muted">
-                Install the <code className="rounded bg-maestro-border/40 px-1 py-0.5 text-maestro-text">maestro</code> command to open projects from your terminal.
+                Install the{" "}
+                <code className="rounded bg-maestro-border/40 px-1 py-0.5 text-maestro-text">
+                  maestro
+                </code>{" "}
+                command to open projects from your terminal.
               </p>
               {cliStatus && (
-                <div className={`text-[11px] ${cliStatus.kind === "error" ? "text-maestro-red" : "text-maestro-green"}`}>
+                <div
+                  className={`text-[11px] ${cliStatus.kind === "error" ? "text-maestro-red" : "text-maestro-green"}`}
+                >
                   {cliStatus.message}
                 </div>
               )}
@@ -330,36 +338,32 @@ export function MaestroSettingsModal({ onClose }: MaestroSettingsModalProps) {
             </div>
             <div className="space-y-1 px-1">
               <p className="text-[11px] text-maestro-muted">
-                Low values are the test mode: set a park threshold below current
-                usage and watch the crossing land in the audit log.
+                Low values are the test mode: set a park threshold below current usage and watch the
+                crossing land in the audit log.
               </p>
-              {samuraiError && (
-                <div className="text-[11px] text-maestro-red">{samuraiError}</div>
-              )}
-              {samuraiConfig ? (
-                SAMURAI_FIELDS.map(({ key, label }) => (
-                  <div
-                    key={key}
-                    className="flex items-center gap-2 rounded-md px-2 py-1 text-xs text-maestro-text"
-                  >
-                    <span className="flex-1 text-maestro-muted">{label}</span>
-                    <input
-                      type="number"
-                      value={samuraiConfig[key]}
-                      onChange={(e) => handleSamuraiChange(key, e.target.value)}
-                      onBlur={handleSamuraiBlur}
-                      className="w-20 rounded border border-maestro-border bg-maestro-surface px-1.5 py-0.5 text-right text-[11px] text-maestro-text outline-none focus:border-maestro-accent"
-                    />
-                  </div>
-                ))
-              ) : (
-                !samuraiError && (
-                  <div className="flex items-center gap-2 px-1 text-[11px] text-maestro-muted">
-                    <Loader2 size={11} className="animate-spin" />
-                    Loading...
-                  </div>
-                )
-              )}
+              {samuraiError && <div className="text-[11px] text-maestro-red">{samuraiError}</div>}
+              {samuraiConfig
+                ? SAMURAI_FIELDS.map(({ key, label }) => (
+                    <div
+                      key={key}
+                      className="flex items-center gap-2 rounded-md px-2 py-1 text-xs text-maestro-text"
+                    >
+                      <span className="flex-1 text-maestro-muted">{label}</span>
+                      <input
+                        type="number"
+                        value={samuraiConfig[key]}
+                        onChange={(e) => handleSamuraiChange(key, e.target.value)}
+                        onBlur={handleSamuraiBlur}
+                        className="w-20 rounded border border-maestro-border bg-maestro-surface px-1.5 py-0.5 text-right text-[11px] text-maestro-text outline-none focus:border-maestro-accent"
+                      />
+                    </div>
+                  ))
+                : !samuraiError && (
+                    <div className="flex items-center gap-2 px-1 text-[11px] text-maestro-muted">
+                      <Loader2 size={11} className="animate-spin" />
+                      Loading...
+                    </div>
+                  )}
             </div>
           </div>
 
@@ -376,10 +380,14 @@ export function MaestroSettingsModal({ onClose }: MaestroSettingsModalProps) {
 
             {advancedOpen && (
               <div className="px-2 py-1.5 space-y-1.5">
-                <label className="block text-[10px] text-maestro-muted uppercase tracking-wide">
+                <label
+                  htmlFor="maestro-custom-endpoint"
+                  className="block text-[10px] text-maestro-muted uppercase tracking-wide"
+                >
                   Custom endpoint
                 </label>
                 <input
+                  id="maestro-custom-endpoint"
                   type="text"
                   value={endpointInput}
                   onChange={(e) => setEndpointInput(e.target.value)}
