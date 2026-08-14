@@ -735,16 +735,19 @@ pub fn run() {
             // session via `samurai_harvest_arm`, and the SessionStarted tap
             // in hook_emit_fn above injects the journal prompt through the
             // shared samurai PTY submit (text, gap, lone Enter — issue #103).
-            // Consumption commits AT that injection (pinned #98 decision).
+            // Consumption commits AT that injection (pinned #98 decision) —
+            // and ONLY when the body write succeeds (review F1), which is
+            // why this uses the confirmed submit variant: the closure runs
+            // on the blocking pool (the hook tap's spawn_blocking above).
             let harvest_pm = app.state::<ProcessManager>().inner().clone();
             let harvest_deliver: commands::harvest::DeliverFn =
                 Arc::new(move |session_id, prompt| {
-                    core::samurai_pty::submit_instruction(
+                    core::samurai_pty::submit_instruction_confirmed(
                         harvest_pm.clone(),
                         session_id,
                         prompt,
                         "harvest",
-                    );
+                    )
                 });
             let harvest_triage = Arc::new(commands::harvest::HarvestTriage::new(
                 journal_store.clone(),

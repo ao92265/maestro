@@ -14,12 +14,17 @@
 //! session's FIRST `SessionStarted` hook signal — claude is up at its
 //! prompt — triggers [`HarvestTriage::on_session_started`] (tapped from
 //! lib.rs's `hook_emit_fn`, the replicator's gate for successor briefs),
-//! which types the prompt in via `core::samurai_pty::submit_instruction`.
+//! which types the prompt in via
+//! `core::samurai_pty::submit_instruction_confirmed`.
 //!
 //! **Consumption:** journal entries flip to consumed AT INJECTION — the
-//! moment the prompt is handed to the session's PTY. Not at click, not on
-//! session completion: a session abandoned mid-triage does NOT restore the
-//! undiscussed entries (user-accepted trade-off, issue #98).
+//! moment the prompt's PTY write SUCCEEDS. Not at click, not on session
+//! completion: a session abandoned mid-triage does NOT restore the
+//! undiscussed entries (user-accepted trade-off, issue #98). But the
+//! trade-off is consumed-at-injection, not consumed-on-queue: a prompt
+//! whose PTY write fails was never injected, so the entries stay
+//! unconsumed and the session stays disarmed — clicking "Harvest now"
+//! again re-arms cleanly (review F1).
 //!
 //! Previously generated headless reports stay readable: the Second Brain
 //! inventory keeps listing `<app data>/harvest/*.md` and
@@ -144,11 +149,13 @@ fn render_entries_capped(entries: &[JournalEntry]) -> (String, usize) {
     }
     let withheld = entries.len().saturating_sub(rendered);
     if withheld > 0 {
+        // Rendering is oldest-first, so the cap withholds the NEWEST
+        // entries (review F3).
         log::warn!(
-            "samurai harvest: prompt cap reached — {withheld} unconsumed journal entries withheld to the next harvest"
+            "samurai harvest: prompt cap reached — the {withheld} newest unconsumed journal entries withheld to the next harvest"
         );
         block.push_str(&format!(
-            " (+{withheld} older entries withheld to the next harvest)"
+            " (+{withheld} newest entries withheld to the next harvest)"
         ));
     }
     (block, rendered)
@@ -181,10 +188,13 @@ fn unconsumed_or_refuse(journal: &JournalStore) -> Result<Vec<JournalEntry>, Str
     Ok(entries)
 }
 
-/// Delivery of the injected prompt into a session's PTY. Production wires
-/// `core::samurai_pty::submit_instruction` (the two-frame paste-then-Enter
-/// submit with the issue-#103 scaled delay); tests capture the call.
-pub type DeliverFn = Arc<dyn Fn(u32, String) + Send + Sync>;
+/// Delivery of the injected prompt into a session's PTY. `Ok` means the
+/// prompt BODY reached the PTY — the consumption gate (review F1): journal
+/// entries flip to consumed only on `Ok`. Production wires
+/// `core::samurai_pty::submit_instruction_confirmed` (the two-frame
+/// paste-then-Enter submit with the issue-#103 scaled delay, body write
+/// confirmed on the calling thread); tests capture the call.
+pub type DeliverFn = Arc<dyn Fn(u32, String) -> Result<(), String> + Send + Sync>;
 
 /// The interactive-harvest state machine: `arm` stages a just-launched
 /// session, the session's first `SessionStarted` hook signal injects the
@@ -228,11 +238,14 @@ impl HarvestTriage {
     /// an armed session this builds the triage prompt from the unconsumed
     /// entries, hands it to the PTY, and — the pinned issue-#98 decision —
     /// commits consumption AT that injection, not at click and not on
-    /// completion. Disarms first, so a later `SessionStarted` in the same
-    /// terminal (e.g. `/clear`) can never double-inject.
+    /// completion. The commit is contingent on the PTY write succeeding
+    /// (review F1): a failed write never injected anything, so nothing is
+    /// consumed and a fresh "Harvest now" click retries cleanly. Disarms
+    /// first, so a later `SessionStarted` in the same terminal (e.g.
+    /// `/clear`) can never double-inject.
     ///
-    /// Does journal file IO; lib.rs invokes it via `spawn_blocking` so the
-    /// hook chain is never parked on a commit's Windows rename retries.
+    /// Does journal file IO and a blocking PTY write; lib.rs invokes it via
+    /// `spawn_blocking` so the hook chain is never parked on either.
     pub fn on_session_started(&self, session_id: u32) {
         if !self
             .armed
@@ -243,31 +256,50 @@ impl HarvestTriage {
             return;
         }
         // Built at injection time, not arm time: entries appended while the
-        // terminal was booting are included (and consumed) too.
-        let entries = match self.journal.unconsumed() {
-            Ok(entries) => entries,
+        // terminal was booting are included (and consumed) too. The raw
+        // lines are kept alongside — they anchor the consumption commit
+        // below (review F4).
+        let listed = match self.journal.unconsumed_with_raw() {
+            Ok(listed) => listed,
             Err(e) => {
                 log::error!("samurai harvest: journal read at injection failed: {e}");
                 return;
             }
         };
-        if entries.is_empty() {
+        if listed.is_empty() {
             // E.g. a second armed session raced this one to the journal.
             log::warn!(
                 "samurai harvest: session {session_id} started but no unconsumed entries remain — nothing injected"
             );
             return;
         }
+        let entries: Vec<JournalEntry> = listed.iter().map(|l| l.entry.clone()).collect();
         let today = ai_runner::today_local();
         let (entries_block, snapshot_len) = render_entries_capped(&entries);
         let prompt = build_triage_prompt(&today, &entries_block, &self.downloads_dir);
-        // THE injection: the prompt is handed to the session's PTY here.
-        (self.deliver)(session_id, prompt);
-        // Consumption flips NOW — exactly the snapshot rendered above;
-        // cap-withheld entries stay unconsumed for the next harvest. A
-        // failed commit keeps them unconsumed (re-offered next harvest;
-        // the session already saw them — accepted over losing them).
-        if let Err(e) = self.journal.commit_harvest(&today, snapshot_len) {
+        // THE injection: the prompt is handed to the session's PTY here. A
+        // failed write means nothing was injected — entries stay unconsumed
+        // (the session is already disarmed above, so a retry click re-arms
+        // cleanly), review F1.
+        if let Err(e) = (self.deliver)(session_id, prompt) {
+            log::error!(
+                "samurai harvest: prompt injection into session {session_id} failed: {e} — journal entries stay unconsumed; click Harvest now again to retry"
+            );
+            return;
+        }
+        // Consumption flips NOW — exactly the snapshot rendered above,
+        // anchored on the snapshotted raw lines so an interleaved per-entry
+        // delete (issue #100) can never shift the marker past a
+        // never-injected entry (review F4); cap-withheld entries stay
+        // unconsumed for the next harvest. A failed commit keeps them
+        // unconsumed (re-offered next harvest; the session already saw
+        // them — accepted over losing them).
+        let rendered: Vec<String> = listed
+            .into_iter()
+            .take(snapshot_len)
+            .map(|l| l.raw)
+            .collect();
+        if let Err(e) = self.journal.commit_harvest(&today, &rendered) {
             log::error!(
                 "samurai harvest: consumption commit after injection into session {session_id} failed: {e} — entries stay unconsumed"
             );
@@ -373,6 +405,7 @@ mod tests {
         let sink = delivered.clone();
         let deliver: DeliverFn = Arc::new(move |session_id, prompt| {
             sink.lock().unwrap().push((session_id, prompt));
+            Ok(())
         });
         (
             HarvestTriage::new(journal, downloads.to_string(), deliver),
@@ -552,7 +585,9 @@ mod tests {
         assert!(block.contains("entry-0"));
         assert!(block.contains("entry-1"));
         assert!(!block.contains("entry-2"));
-        assert!(block.ends_with("(+3 older entries withheld to the next harvest)"));
+        // Oldest-first rendering: what the cap withholds is the NEWEST
+        // entries, and the data note must say so (review F3).
+        assert!(block.ends_with("(+3 newest entries withheld to the next harvest)"));
         assert!(block.chars().count() <= MAX_ENTRIES_CHARS + 100);
     }
 
@@ -600,7 +635,13 @@ mod tests {
                 None,
             ))
             .unwrap();
-        journal.commit_harvest("2026-08-07", 1).unwrap();
+        let raws: Vec<String> = journal
+            .unconsumed_with_raw()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.raw)
+            .collect();
+        journal.commit_harvest("2026-08-07", &raws).unwrap();
         assert_eq!(triage.arm(7).unwrap_err(), NOTHING_TO_HARVEST);
     }
 
@@ -644,6 +685,7 @@ mod tests {
                 .map(|e| e.status)
                 .collect();
             prompts_sink.lock().unwrap().push((session_id, prompt));
+            Ok(())
         });
         let triage = HarvestTriage::new(journal.clone(), "/downloads".to_string(), deliver);
 
@@ -684,6 +726,114 @@ mod tests {
         // same terminal never double-injects.
         triage.on_session_started(42);
         assert_eq!(prompts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_failed_pty_write_consumes_nothing_and_leaves_session_disarmed() {
+        // Review F1: the accepted trade-off is consumed-AT-injection, not
+        // consumed-on-queue. A PTY write that fails never injected anything
+        // — entries must stay unconsumed, and the session must end up
+        // disarmed so a fresh "Harvest now" click re-arms cleanly.
+        let dir = tempdir().unwrap();
+        let journal = Arc::new(JournalStore::new(dir.path().to_path_buf()));
+        journal
+            .append_entry(&JournalEntry::now(
+                JournalCategory::Error,
+                "must survive",
+                None,
+                None,
+            ))
+            .unwrap();
+        let attempts = Arc::new(Mutex::new(0u32));
+        let attempts_sink = attempts.clone();
+        let deliver: DeliverFn = Arc::new(move |_, _| {
+            *attempts_sink.lock().unwrap() += 1;
+            Err("writing instruction to session 7 failed: session not found".to_string())
+        });
+        let triage = HarvestTriage::new(journal.clone(), "/downloads".to_string(), deliver);
+
+        triage.arm(7).unwrap();
+        triage.on_session_started(7);
+        assert_eq!(*attempts.lock().unwrap(), 1, "one delivery attempt");
+        assert!(
+            statuses(&journal)
+                .iter()
+                .all(|s| *s == JournalEntryStatus::Unconsumed),
+            "a failed write must consume nothing"
+        );
+
+        // Disarmed: the same session's next SessionStarted injects nothing…
+        triage.on_session_started(7);
+        assert_eq!(*attempts.lock().unwrap(), 1);
+        // …and a retry click re-arms cleanly (the entries are still there).
+        triage.arm(7).unwrap();
+        triage.on_session_started(7);
+        assert_eq!(*attempts.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_interleaved_delete_never_consumes_a_never_injected_entry() {
+        // Review F4: a per-entry delete (issue #100) landing between the
+        // injection snapshot and the consumption commit — the deliver
+        // closure runs exactly in that window — must not shift the marker
+        // past an entry the session never saw.
+        let dir = tempdir().unwrap();
+        let journal = Arc::new(JournalStore::new(dir.path().to_path_buf()));
+        journal
+            .append_entry(&JournalEntry::now(
+                JournalCategory::Bottleneck,
+                "injected one",
+                None,
+                None,
+            ))
+            .unwrap();
+        journal
+            .append_entry(&JournalEntry::now(
+                JournalCategory::Skill,
+                "injected two",
+                None,
+                None,
+            ))
+            .unwrap();
+        let raw_one = journal.list().unwrap().entries[0].raw.clone();
+
+        let journal_in_window = journal.clone();
+        let deliver: DeliverFn = Arc::new(move |_, _| {
+            // The interleaving: one snapshotted entry deleted, one brand-new
+            // (never-injected) entry appended, both before the commit.
+            assert_eq!(journal_in_window.delete_entry(&raw_one).unwrap(), 1);
+            journal_in_window
+                .append_entry(&JournalEntry::now(
+                    JournalCategory::Concern,
+                    "never injected",
+                    None,
+                    None,
+                ))
+                .unwrap();
+            Ok(())
+        });
+        let triage = HarvestTriage::new(journal.clone(), "/downloads".to_string(), deliver);
+
+        triage.arm(1).unwrap();
+        triage.on_session_started(1);
+
+        let after: Vec<(String, JournalEntryStatus)> = journal
+            .list()
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|e| (e.entry.text, e.status))
+            .collect();
+        assert_eq!(
+            after,
+            vec![
+                ("injected two".to_string(), JournalEntryStatus::Consumed),
+                (
+                    "never injected".to_string(),
+                    JournalEntryStatus::Unconsumed
+                ),
+            ]
+        );
     }
 
     #[test]

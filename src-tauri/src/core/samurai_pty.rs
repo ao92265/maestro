@@ -99,6 +99,43 @@ pub fn submit_instruction(
     });
 }
 
+/// [`submit_instruction`] with a verdict on the frame that matters: writes
+/// the instruction body to the session's PTY ON THE CALLING THREAD and
+/// returns whether that write landed; only the delayed Enter stays
+/// fire-and-forget. For the one caller whose side effects must be contingent
+/// on the instruction actually reaching the PTY — the harvest triage, which
+/// consumes journal entries only after this returns `Ok` (a fire-and-forget
+/// submit would consume entries that were never injected). Samurai briefs
+/// keep [`submit_instruction`]: their delivery watches handle retries.
+///
+/// Only the BODY write is confirmed: an Enter lost after an `Ok` leaves the
+/// prompt sitting visibly in the input box (recoverable — the user presses
+/// Enter), unlike a lost body, which leaves nothing to recover.
+///
+/// `write_stdin` is fully blocking (std mutex + pipe write), so callers must
+/// already be on the blocking pool — the harvest injection gate runs under
+/// `spawn_blocking` (lib.rs's `hook_emit_fn` tap).
+pub fn submit_instruction_confirmed(
+    processes: ProcessManager,
+    session_id: u32,
+    text: String,
+    ctx: &'static str,
+) -> Result<(), String> {
+    let delay = submit_delay(text.len());
+    let [body, submit] = submit_frames(&text);
+    processes
+        .write_stdin(session_id, &body)
+        .map_err(|e| format!("writing instruction to session {session_id} failed: {e}"))?;
+    // The body landed — the delayed Enter follows the fire-and-forget policy
+    // of `submit_instruction` (over-waiting is free, and a swallowed Enter is
+    // user-recoverable).
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(delay).await;
+        write_frame(&processes, session_id, submit, ctx, "submit").await;
+    });
+    Ok(())
+}
+
 /// Re-sends ONLY the lone submit key (issue #103): the recovery for an Enter
 /// that was swallowed by a still-draining paste burst. NEVER re-sends any
 /// instruction body — the text already sits in the CLI's input box, and a
