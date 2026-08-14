@@ -412,17 +412,24 @@ fn scan_tail_for_recent_entries(
     };
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
     let start = len.saturating_sub(TAIL_SCAN_BYTES);
-    if file.seek(SeekFrom::Start(start)).is_err() {
+    // Over-read by one byte: if the window happens to start exactly at a line
+    // start, the extra byte is the previous line's '\n' and the buffer's first
+    // "line" is an empty artifact — so dropping the first line is correct in
+    // every case. (Seeking to `start` itself dropped a COMPLETE first line
+    // whenever the seek landed right after a newline.)
+    let read_from = start.saturating_sub(1);
+    if file.seek(SeekFrom::Start(read_from)).is_err() {
         return (None, None);
     }
-    let mut buf = Vec::with_capacity((len - start) as usize);
+    let mut buf = Vec::with_capacity((len - read_from) as usize);
     if file.read_to_end(&mut buf).is_err() {
         return (None, None);
     }
     let text = String::from_utf8_lossy(&buf);
     let mut lines: Vec<&str> = text.lines().collect();
-    // When the read started mid-file the first line is almost certainly a
-    // fragment of a larger JSON line; parsing it would fail anyway, drop it.
+    // When the read started mid-file the first line is the empty artifact of
+    // the over-read '\n', or a genuine fragment of a line that began before
+    // the window; either way it carries nothing parseable, drop it.
     if start > 0 && !lines.is_empty() {
         lines.remove(0);
     }
@@ -586,13 +593,18 @@ fn scan_tail(file: &mut fs::File, len: u64) -> TailInfo {
     }
 
     let start = len.saturating_sub(TAIL_SCAN_BYTES);
-    if file.seek(SeekFrom::Start(start)).is_err() {
+    // Over-read by one byte (same boundary rule as
+    // `scan_tail_for_recent_entries`): a window that starts exactly at a line
+    // start then yields a leading empty artifact instead of losing the
+    // complete first line.
+    let read_from = start.saturating_sub(1);
+    if file.seek(SeekFrom::Start(read_from)).is_err() {
         return info;
     }
     let mut buf = Vec::new();
     if file
         .by_ref()
-        .take(TAIL_SCAN_BYTES)
+        .take(len - read_from)
         .read_to_end(&mut buf)
         .is_err()
     {
@@ -601,7 +613,7 @@ fn scan_tail(file: &mut fs::File, len: u64) -> TailInfo {
 
     let text = String::from_utf8_lossy(&buf);
     let mut lines: Vec<&str> = text.split('\n').collect();
-    // The window almost certainly starts mid-line; that fragment is not JSON.
+    // The first line is the over-read '\n' artifact or a mid-line fragment.
     if start > 0 && !lines.is_empty() {
         lines.remove(0);
     }
@@ -739,8 +751,19 @@ fn parse_session_file(path: &Path) -> Option<ClaudeSessionInfo> {
         .unwrap_or_else(|| metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH).into());
 
     // The newest last-prompt (and any late summary) lives near EOF — a bounded
-    // tail read, not a second pass over the whole file.
-    let (tail_summary, last_prompt) = scan_tail_for_recent_entries(path, Some(session_id.as_str()));
+    // tail read, not a second pass over the whole file. The foreign-entry
+    // filter keys on the FILENAME stem, not the head sessionId: a resumed
+    // transcript opens with history copied from the ORIGINAL session (head
+    // entries stamped with the old id) while its own entries carry the id
+    // Claude named the file after — keying on the head id rejected the file's
+    // own newest last-prompt as foreign. Non-id-shaped stems (rare, hand-made
+    // files) fall back to the parsed session id.
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned());
+    let expected = stem
+        .as_deref()
+        .filter(|s| is_safe_session_id(s))
+        .unwrap_or(session_id.as_str());
+    let (tail_summary, last_prompt) = scan_tail_for_recent_entries(path, Some(expected));
     let summary = head.summary.or(tail_summary);
 
     let cwd = head.cwd.or(tail.cwd);
@@ -1412,6 +1435,57 @@ mod tests {
         fs::write(&path, &jsonl).unwrap();
         let info = parse_session_file(&path).expect("parsed");
         assert_eq!(info.last_prompt.as_deref(), Some("the closing ask"));
+    }
+
+    #[test]
+    fn tail_scan_takes_the_own_last_prompt_of_a_resumed_transcript() {
+        // Resumed conversations START with history copied from the ORIGINAL
+        // session — head entries (copied last-prompts included) are stamped
+        // with the old id, while the file's own entries carry the id the file
+        // is named after. Keying the foreign filter on the head sessionId
+        // rejected the file's own newest last-prompt; the filename stem is
+        // the transcript's authoritative identity.
+        let tmp = tempfile::tempdir().unwrap();
+        let old_id = "aaaaaaaa-0000-0000-0000-000000000001";
+        let new_id = "bbbbbbbb-0000-0000-0000-000000000002";
+        let path = tmp.path().join(format!("{new_id}.jsonl"));
+        let jsonl = format!(
+            "{{\"sessionId\":\"{old_id}\",\"type\":\"user\",\"message\":{{\"content\":\"copied history\"}}}}\n\
+             {{\"type\":\"last-prompt\",\"lastPrompt\":\"copied ask\",\"leafUuid\":\"a\",\"sessionId\":\"{old_id}\"}}\n\
+             {{\"type\":\"last-prompt\",\"lastPrompt\":\"the resumed ask\",\"leafUuid\":\"b\",\"sessionId\":\"{new_id}\"}}\n"
+        );
+        fs::write(&path, &jsonl).unwrap();
+        let info = parse_session_file(&path).expect("parsed");
+        assert_eq!(info.last_prompt.as_deref(), Some("the resumed ask"));
+    }
+
+    #[test]
+    fn tail_scan_keeps_a_complete_first_window_line_on_the_newline_boundary() {
+        // When `len - TAIL_SCAN_BYTES` lands exactly on a line START (the
+        // byte before it is '\n'), the window's first line is COMPLETE and
+        // must be scanned — it used to be dropped unconditionally. The only
+        // last-prompt (and the only timestamp) sit exactly on that boundary.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("abc.jsonl");
+        let head = "{\"sessionId\":\"abc\",\"type\":\"user\",\"message\":{\"content\":\"start\"}}\n";
+        let boundary = "{\"type\":\"last-prompt\",\"lastPrompt\":\"the boundary ask\",\"leafUuid\":\"z\",\"sessionId\":\"abc\",\"timestamp\":\"2021-05-05T05:05:05.000Z\"}\n";
+        // One filler line padded so the boundary line's first byte lands
+        // exactly at `len - TAIL_SCAN_BYTES`.
+        let skeleton = "{\"type\":\"progress\",\"sessionId\":\"abc\",\"payload\":\"\"}\n";
+        let padding = TAIL_SCAN_BYTES as usize - boundary.len() - skeleton.len();
+        let filler = format!(
+            "{{\"type\":\"progress\",\"sessionId\":\"abc\",\"payload\":\"{}\"}}\n",
+            "x".repeat(padding)
+        );
+        let jsonl = format!("{head}{boundary}{filler}");
+        assert_eq!(jsonl.len() - head.len(), TAIL_SCAN_BYTES as usize);
+        fs::write(&path, &jsonl).unwrap();
+        let info = parse_session_file(&path).expect("parsed");
+        // scan_tail_for_recent_entries kept the boundary line…
+        assert_eq!(info.last_prompt.as_deref(), Some("the boundary ask"));
+        // …and so did scan_tail (this timestamp exists nowhere else — the
+        // old code fell back to the file's mtime).
+        assert_eq!(info.last_active, "2021-05-05T05:05:05.000Z");
     }
 
     #[test]

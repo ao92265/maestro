@@ -736,10 +736,12 @@ pub struct SamuraiRunListEntry {
 
 /// The session that represents this run's CURRENT generation: every
 /// supervised session matching the run's project and epic (by slug, so
-/// "#38" and "38" find the same session), highest generation wins. Ties
-/// (a successor briefly registered before the predecessor's terminal
-/// transition lands) prefer the non-terminal one — the live session is the
-/// current orchestrator, not the one about to be superseded.
+/// "#38" and "38" find the same session). Liveness dominates generation —
+/// after a cleanup + relaunch the registry can still hold a DEAD gen-N
+/// session from the previous run, which must not outrank the new run's
+/// live gen-1. Among sessions of the same liveness the highest generation
+/// wins (a successor briefly registers before the predecessor's terminal
+/// transition lands).
 fn latest_session_for_run<'a>(
     sessions: &'a [SessionSnapshot],
     project: &str,
@@ -748,7 +750,7 @@ fn latest_session_for_run<'a>(
     sessions
         .iter()
         .filter(|s| s.project == project && epic_slug(&s.epic) == epic_slug(epic))
-        .max_by_key(|s| (s.generation, !s.state.is_terminal()))
+        .max_by_key(|s| (!s.state.is_terminal(), s.generation))
 }
 
 /// Joins run configs to their orchestrator's live details — extracted from
@@ -1451,6 +1453,21 @@ mod tests {
         ];
         let found = latest_session_for_run(&sessions, "C:/git/x", "#38").unwrap();
         assert_eq!(found.session_id, 2);
+    }
+
+    #[test]
+    fn test_latest_session_for_run_liveness_beats_generation() {
+        // Cleanup + relaunch: the registry still holds the old run's DEAD
+        // gen-3 while the new run's live gen-1 registers. The live session
+        // is the current orchestrator — generation only breaks ties within
+        // the same liveness.
+        let sessions = vec![
+            session_snapshot(1, "C:/git/x", "#38", 3, SupervisorState::Killed),
+            session_snapshot(2, "C:/git/x", "#38", 1, SupervisorState::Working),
+        ];
+        let found = latest_session_for_run(&sessions, "C:/git/x", "#38").unwrap();
+        assert_eq!(found.session_id, 2);
+        assert_eq!(found.generation, 1);
     }
 
     #[test]
