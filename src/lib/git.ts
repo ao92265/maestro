@@ -6,6 +6,10 @@ export interface BranchInfo {
   name: string;
   is_remote: boolean;
   is_current: boolean;
+  /** ISO-8601 commit date of the branch tip. Absent for a rare empty ref. */
+  lastCommitDate?: string;
+  /** Author name of the branch tip's commit. Absent for a rare empty ref. */
+  lastCommitAuthor?: string;
 }
 
 /** Extended branch info with worktree status for UI display. */

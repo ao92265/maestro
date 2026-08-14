@@ -35,6 +35,14 @@ pub struct BranchInfo {
     pub name: String,
     pub is_remote: bool,
     pub is_current: bool,
+    /// ISO-8601 commit date of the branch tip, when git could report one.
+    /// Additive field — omitted from the wire payload when unavailable, so
+    /// older frontend builds ignore it and never see a stray `null`.
+    #[serde(rename = "lastCommitDate", skip_serializing_if = "Option::is_none")]
+    pub last_commit_date: Option<String>,
+    /// Author name of the branch tip's commit, when git could report one.
+    #[serde(rename = "lastCommitAuthor", skip_serializing_if = "Option::is_none")]
+    pub last_commit_author: Option<String>,
 }
 
 /// Metadata for a single git worktree, parsed from `git worktree list --porcelain`.
@@ -205,19 +213,25 @@ impl Git {
     /// Parses `git branch -a` with a custom format using `|` delimiters.
     /// Symbolic refs (e.g. `origin/HEAD`, whose short name is just `origin`)
     /// are skipped via the `%(symref)` field, which is empty for real branches.
+    /// The trailing `%(committerdate:iso-strict)` / `%(authorname)` fields feed
+    /// `lastCommitDate` / `lastCommitAuthor` — the "who touched this last, and
+    /// when" the clean-resources view needs to judge whether a branch is safe
+    /// to delete. `authorname` is intentionally last: it's the only field that
+    /// could itself contain a `|`, and `splitn` leaves the remainder intact
+    /// only for the final piece.
     pub async fn list_branches(&self) -> Result<Vec<BranchInfo>, GitError> {
         let output = self
             .run(&[
                 "branch",
                 "-a",
                 "--no-color",
-                "--format=%(HEAD)|%(refname:short)|%(refname)|%(symref)",
+                "--format=%(HEAD)|%(refname:short)|%(refname)|%(symref)|%(committerdate:iso-strict)|%(authorname)",
             ])
             .await?;
 
         let mut branches = Vec::new();
         for line in output.lines() {
-            let parts: Vec<&str> = line.splitn(4, '|').collect();
+            let parts: Vec<&str> = line.splitn(6, '|').collect();
             if parts.len() < 3 {
                 continue;
             }
@@ -233,11 +247,23 @@ impl Git {
             }
 
             let is_remote = full_ref.starts_with("refs/remotes/");
+            let last_commit_date = parts
+                .get(4)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            let last_commit_author = parts
+                .get(5)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
 
             branches.push(BranchInfo {
                 name,
                 is_remote,
                 is_current,
+                last_commit_date,
+                last_commit_author,
             });
         }
         Ok(branches)
@@ -1584,6 +1610,25 @@ mod tests {
             .collect();
 
         assert!(local_names.contains(&"local-test"));
+    }
+
+    #[tokio::test]
+    async fn test_list_branches_includes_last_commit_metadata() {
+        let (_dir, git) = create_test_repo().await;
+
+        let branches = git.list_branches().await.unwrap();
+        let current = branches
+            .iter()
+            .find(|b| b.is_current && !b.is_remote)
+            .expect("the initial commit's branch must be present");
+
+        let date = current
+            .last_commit_date
+            .as_deref()
+            .expect("last_commit_date must be populated for a real branch tip");
+        // `%(committerdate:iso-strict)` looks like 2024-01-02T03:04:05+00:00.
+        assert!(date.contains('T'), "expected an ISO-8601 date, got {date}");
+        assert_eq!(current.last_commit_author.as_deref(), Some("Test"));
     }
 
     #[tokio::test]
