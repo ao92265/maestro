@@ -31,7 +31,7 @@ import { HistorySection } from "../HistorySection";
 const invokeMock = vi.mocked(invoke);
 
 const REPO = "C:\\git\\maestro";
-const WORKTREE = "C:\\data\\worktrees\\maestro-abc\\samurai-78";
+const WORKTREE = "C:\\data\\worktrees\\maestro-abc\\maestro-78";
 
 function buildTab(overrides: Partial<WorkspaceTab> = {}): WorkspaceTab {
   return {
@@ -86,7 +86,7 @@ function worktree(overrides: Partial<WorktreeInfo> = {}): WorktreeInfo {
   return {
     path: WORKTREE,
     head: "abc1234",
-    branch: "samurai-78",
+    branch: "maestro-78",
     is_bare: false,
     is_main_worktree: false,
     ...overrides,
@@ -159,7 +159,7 @@ describe("HistorySection (issue #78)", () => {
           first_prompt: "Rebuild the history rows",
           last_activity: "Opened the PR",
           cwd: WORKTREE,
-          git_branch: "samurai-78",
+          git_branch: "maestro-78",
           message_count: 7,
           last_active: "2026-08-11T08:00:00Z",
         }),
@@ -192,7 +192,7 @@ describe("HistorySection (issue #78)", () => {
     // Scoped to the row: this worktree's directory is named after its branch,
     // so the label also matches the group header.
     const worktreeRow = within(branch).getByTitle(`Resume this conversation in ${WORKTREE}`);
-    expect(within(worktreeRow).getByText("samurai-78")).toBeInTheDocument();
+    expect(within(worktreeRow).getByText("maestro-78")).toBeInTheDocument();
     // Absolute time on hover, next to the relative label.
     expect(
       within(branch).getByTitle(new Date("2026-08-11T08:00:00Z").toLocaleString()),
@@ -204,7 +204,7 @@ describe("HistorySection (issue #78)", () => {
       tabId: "tab-1",
       resumeSessionId: null,
       workingDirOverride: WORKTREE,
-      branch: "samurai-78",
+      branch: "maestro-78",
     });
   });
 

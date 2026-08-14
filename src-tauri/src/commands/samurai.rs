@@ -24,14 +24,14 @@ use crate::core::samurai_injector::strip_extended_prefix;
 use crate::core::samurai_journal::{
     default_journal_file, JournalCategory, JournalEntry, JournalListResult, JournalStore,
 };
-use crate::core::samurai_prompts::{self, epic_slug, RunRefs};
+use crate::core::samurai_prompts::{self, epic_slug, ref_slug, RunRefs};
 use crate::core::samurai_replicator::{derive_repo_pin, SamuraiReplicator};
 use crate::core::samurai_run_config::{RunConfigStatus, RunConfigStore, SamuraiRunConfig};
 use crate::core::samurai_schedule::{SamuraiSchedule, ScheduleEntry};
 use crate::core::samurai_test_gate::{self, SamuraiTestGate, TestGateProgress};
 use crate::core::samurai_workflow::{self, WorkflowGraph};
 use crate::core::supervisor::{SessionSnapshot, Supervisor, SupervisorState};
-use crate::core::worktree_manager::WorktreeManager;
+use crate::core::worktree_manager::{project_name, WorktreeManager};
 use crate::git::{Git, GitError};
 use crate::github::{AuthStatus, GitHub};
 
@@ -269,17 +269,26 @@ pub async fn samurai_preflight(project_path: String) -> Result<SamuraiPreflight,
     Ok(run_preflight(&project).await)
 }
 
-/// The epic's dedicated branch: `samurai-<epic_slug>` (PRD §5.9 — one stable
-/// worktree per epic; the slug is the same identity the handoff files and run
-/// configs use).
+/// The epic's dedicated branch: `<project>-<epic_slug>` (PRD §5.9 — one
+/// stable worktree per epic; the slug is the same identity the handoff files
+/// and run configs use). Project-prefixed, not `samurai-<slug>` — Samurai
+/// runs across many projects, and a bare `samurai-<slug>` gives two epics
+/// with the same number in different repos the same branch name.
+/// `project` is derived the same way [`crate::core::worktree_manager`] names
+/// worktree directories (last path component, lowercased), then
+/// re-sanitized for ref safety; an unusable result (e.g. a project
+/// directory named only in symbols) falls back to `samurai` so the branch
+/// is never a bare `-<slug>`.
 ///
 /// A HYPHEN, not a slash, on purpose. Git stores each branch as a file under
-/// `refs/heads/`, so `samurai/38` needs `samurai` to be a DIRECTORY — which
-/// is impossible while the repo also has a branch literally named `samurai`.
-/// The PRD mandates that staging branch (§9), so the run branches are the
-/// side that has to move out of the namespace.
-fn epic_branch(epic: &str) -> String {
-    format!("samurai-{}", epic_slug(epic))
+/// `refs/heads/`, so `<project>/<slug>` needs `<project>` to be a DIRECTORY —
+/// impossible while the repo also has a branch literally named `<project>`
+/// (exactly the shape of the `samurai` staging branch the PRD mandates, §9,
+/// and plausible for any project-named branch a human might create).
+/// Keeping the whole thing hyphenated sidesteps that class of collision.
+fn epic_branch(project: &str, epic: &str) -> String {
+    let project_slug = ref_slug(&project_name(Path::new(project)), "samurai");
+    format!("{project_slug}-{}", epic_slug(epic))
 }
 
 /// The run's refs, built from the launcher's two fields (issue #83): parent
@@ -519,7 +528,7 @@ pub(crate) async fn launch_run_inner(
         t.validate()?;
     }
 
-    let branch = epic_branch(&epic);
+    let branch = epic_branch(project, &epic);
     let worktree = ensure_epic_worktree(worktrees, project, &branch, worktree_base).await?;
     let worktree_path = strip_extended_prefix(&worktree.to_string_lossy()).to_string();
 
@@ -882,15 +891,29 @@ pub(crate) async fn cleanup_epic_inner(
     //    else the stable deterministic path. Already gone → reported (stale
     //    refs still pruned so the branch delete below cannot trip on a
     //    half-removed worktree).
+    //
+    //    Back-compat: a run launched before the project-prefixed rename left
+    //    its worktree under the flat `samurai-<slug>` branch name. When
+    //    there's no config to read the real path from and the new-format
+    //    path isn't there, try the legacy path too, so pre-rename runs stay
+    //    cleanable.
     let repo = PathBuf::from(project);
     let git = Git::new(&repo);
-    let branch = epic_branch(&epic);
+    let branch = epic_branch(project, &epic);
+    let legacy_branch = format!("samurai-{}", epic_slug(&epic));
     let wt_path = match &config {
         Some(c) => PathBuf::from(strip_extended_prefix(&c.worktree_path)),
         None => {
-            worktrees
+            let candidate = worktrees
                 .worktree_path_with_base(&repo, &branch, worktree_base)
-                .await
+                .await;
+            if candidate.exists() {
+                candidate
+            } else {
+                worktrees
+                    .worktree_path_with_base(&repo, &legacy_branch, worktree_base)
+                    .await
+            }
         }
     };
     let (worktree_removed, worktree_path) = if wt_path.exists() {
@@ -908,20 +931,30 @@ pub(crate) async fn cleanup_epic_inner(
         (false, None)
     };
 
-    // 4. Delete the samurai-<slug> branch. `-D` on purpose: by the time a
-    //    human confirms this destructive cleanup, completed work lives in
-    //    PRs on the fork (PRD §5.9/§12). Already gone → reported.
+    // 4. Delete the epic's branch. `-D` on purpose: by the time a human
+    //    confirms this destructive cleanup, completed work lives in PRs on
+    //    the fork (PRD §5.9/§12). Already gone → reported. Same back-compat
+    //    as step 3: a pre-rename run's branch is `samurai-<slug>`, not
+    //    `<project>-<slug>` — checked as a fallback so it still deletes.
     let branches = git
         .list_branches()
         .await
         .map_err(|e| format!("could not list branches: {e}"))?;
-    let branch_deleted = if branches.iter().any(|b| !b.is_remote && b.name == branch) {
+    let (branch, branch_deleted) = if branches.iter().any(|b| !b.is_remote && b.name == branch) {
         git.delete_branch(&branch, true)
             .await
             .map_err(|e| format!("could not delete branch {branch}: {e}"))?;
-        true
+        (branch, true)
+    } else if branches
+        .iter()
+        .any(|b| !b.is_remote && b.name == legacy_branch)
+    {
+        git.delete_branch(&legacy_branch, true)
+            .await
+            .map_err(|e| format!("could not delete branch {legacy_branch}: {e}"))?;
+        (legacy_branch, true)
     } else {
-        false
+        (branch, false)
     };
 
     log::info!(
@@ -940,7 +973,8 @@ pub(crate) async fn cleanup_epic_inner(
 }
 
 /// One-click epic cleanup (PRD §5.9): cancel the resume timer, archive the
-/// run config, remove the epic worktree, delete the `samurai-<slug>` branch.
+/// run config, remove the epic worktree, delete the `<project>-<slug>`
+/// branch (or its pre-rename `samurai-<slug>` form, as a fallback).
 /// Refuses while a live supervised session exists; idempotent otherwise —
 /// already-gone pieces are reported in the [`SamuraiCleanupReport`], never
 /// errors. The UI confirms before calling (destructive, never silent).
@@ -1299,12 +1333,21 @@ mod tests {
 
     #[test]
     fn test_epic_branch_shape() {
-        assert_eq!(epic_branch("#38"), "samurai-38");
-        assert_eq!(epic_branch("Epic 12: Auth"), "samurai-epic-12-auth");
+        assert_eq!(epic_branch("/repos/floo", "#38"), "floo-38");
+        assert_eq!(
+            epic_branch("/repos/floo", "Epic 12: Auth"),
+            "floo-epic-12-auth"
+        );
+        // The project name is lowercased and spaces collapse to one dash.
+        assert_eq!(epic_branch("/repos/My Cool Repo", "#38"), "my-cool-repo-38");
+        assert_eq!(epic_branch("/repos/Floo", "#38"), "floo-38");
         // The empty-ref fallback still yields a legal branch name.
-        assert_eq!(epic_branch(""), "samurai-epic");
+        assert_eq!(epic_branch("/repos/floo", ""), "floo-epic");
         // A comma-separated list is one run, so it is one branch.
-        assert_eq!(epic_branch("77, 78"), "samurai-77-78");
+        assert_eq!(epic_branch("/repos/floo", "77, 78"), "floo-77-78");
+        // A project component with nothing usable (e.g. symbols only) falls
+        // back to `samurai` rather than a bare "-38".
+        assert_eq!(epic_branch("/repos/***", "#38"), "samurai-38");
     }
 
     #[test]
@@ -2017,6 +2060,7 @@ mod tests {
         // are its slug — epics-only, issues-only and both.
         let h = cleanup_harness();
         let (gate, _calls) = recording_gate(vec![]);
+        let project_slug = ref_slug(&project_name(Path::new(&h.project)), "samurai");
         for (epics, issues, label, slug) in [
             (vec!["5"], vec![], "epic #5", "epic-5"),
             (vec![], vec!["7", "9"], "issues #7, #9", "issues-7-9"),
@@ -2029,9 +2073,10 @@ mod tests {
         ] {
             let result = run_launch(&h, &gate, true, &epics, &issues).await.unwrap();
             assert_eq!(result.epic, label, "label for {epics:?} + {issues:?}");
-            assert_eq!(result.branch, format!("samurai-{slug}"));
+            let expected_branch = format!("{project_slug}-{slug}");
+            assert_eq!(result.branch, expected_branch);
             assert!(
-                Path::new(&result.worktree_path).ends_with(format!("samurai-{slug}")),
+                Path::new(&result.worktree_path).ends_with(&expected_branch),
                 "worktree {} must use the combined slug",
                 result.worktree_path
             );
@@ -2149,7 +2194,8 @@ mod tests {
         let (gate, calls) = recording_gate(vec![]);
 
         let result = run_launch(&h, &gate, false, &["#38"], &[]).await.unwrap();
-        assert_eq!(result.branch, "samurai-epic-38");
+        let project_slug = ref_slug(&project_name(Path::new(&h.project)), "samurai");
+        assert_eq!(result.branch, format!("{project_slug}-epic-38"));
 
         assert_eq!(
             *calls.lock().unwrap(),
@@ -2606,6 +2652,42 @@ mod tests {
         assert!(report.worktree_removed);
         assert!(report.branch_deleted);
         assert!(!worktree.exists());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_finds_a_pre_rename_run_via_the_legacy_branch_name() {
+        // Same crash-before-config-write shape as the test above, but spelled
+        // out to prove it: a run launched before the project-prefixed rename
+        // left its worktree/branch as flat `samurai-<slug>`, which the
+        // project-prefixed name this test's harness would compute today does
+        // NOT match — cleanup must still find and remove it via the legacy
+        // fallback.
+        let h = cleanup_harness();
+        let canonical_branch = epic_branch(&h.project, "#38");
+        assert_ne!(
+            canonical_branch, "samurai-38",
+            "sanity: the harness project's real name must differ from the legacy prefix \
+             for this test to actually exercise the fallback"
+        );
+        let worktree =
+            ensure_epic_worktree(&h.worktrees, &h.project, "samurai-38", Some(h.base.path()))
+                .await
+                .unwrap();
+
+        let report = run_cleanup(&h, "#38").await.unwrap();
+        assert_eq!(report.branch, "samurai-38", "reports the branch it actually deleted");
+        assert!(report.worktree_removed);
+        assert!(report.branch_deleted);
+        assert!(!worktree.exists());
+        let git = Git::new(h.repo.path());
+        assert!(
+            !git.list_branches()
+                .await
+                .unwrap()
+                .iter()
+                .any(|b| b.name == "samurai-38"),
+            "the legacy branch is really gone"
+        );
     }
 
     // --- issue #82: guarded read of any listed Samurai file ---
