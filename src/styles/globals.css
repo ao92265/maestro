@@ -118,11 +118,16 @@
    text/icons forced dark for contrast (inputs excluded — the rename field has
    its own dark background). */
 .warning-flag {
+  /* biome-ignore lint/complexity/noImportantStyles: must outrank the Tailwind
+     utility classes applied via className on the same terminal chrome elements. */
   background-color: rgb(var(--maestro-yellow)) !important;
+  /* biome-ignore lint/complexity/noImportantStyles: same as background-color above. */
   border-color: rgb(var(--maestro-yellow)) !important;
 }
 .warning-flag,
 .warning-flag *:not(input) {
+  /* biome-ignore lint/complexity/noImportantStyles: must outrank descendants' own
+     Tailwind text-color utility classes for contrast on the yellow background. */
   color: rgb(20 20 24 / 0.9) !important;
 }
 
@@ -509,12 +514,18 @@
 
 /* Sidebar card shadows */
 .platform-linux .sidebar-card-link {
+  /* biome-ignore lint/complexity/noImportantStyles: must outrank the component's own
+     Tailwind shadow/transition utility classes to kill GPU compositing on Linux. */
   box-shadow: none !important;
+  /* biome-ignore lint/complexity/noImportantStyles: same as box-shadow above. */
   transition: border-color 200ms ease !important;
 }
 
 /* Pod grid card shadows */
 .platform-linux .pod-grid-card {
+  /* biome-ignore lint/complexity/noImportantStyles: must outrank the component's own
+     Tailwind shadow/transition utility classes to kill GPU compositing on Linux. */
   box-shadow: none !important;
+  /* biome-ignore lint/complexity/noImportantStyles: same as box-shadow above. */
   transition: border-color 200ms ease !important;
 }

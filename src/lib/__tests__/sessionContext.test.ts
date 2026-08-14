@@ -109,8 +109,9 @@ describe("describeSessionContext", () => {
       events: [userMessage(`${"alpha ".repeat(40)}omega`)],
     });
     expect(line).not.toBeNull();
-    expect(line!.length).toBeLessThanOrEqual(111);
-    expect(line!.endsWith("…")).toBe(true);
-    expect(line!).not.toContain("  ");
+    if (!line) throw new Error("expected describeSessionContext to return a line");
+    expect(line.length).toBeLessThanOrEqual(111);
+    expect(line.endsWith("…")).toBe(true);
+    expect(line).not.toContain("  ");
   });
 });

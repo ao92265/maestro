@@ -221,8 +221,6 @@ export function GitGraphPanel({
     [repoPath, checkoutBranch],
   );
 
-  const hasRepo = Boolean(repoPath);
-
   // Count open PRs and issues for badges
   const openPRCount = pullRequests.filter((pr) => pr.state === "OPEN").length;
   const openIssueCount = issues.filter((i) => i.state === "OPEN").length;
@@ -309,7 +307,7 @@ export function GitGraphPanel({
               />
 
               {/* Content */}
-              {!hasRepo ? (
+              {!repoPath ? (
                 // Empty state - no repo
                 <div className="flex flex-1 items-center justify-center px-4 text-center">
                   <div className="flex flex-col items-center gap-3">
@@ -365,7 +363,7 @@ export function GitGraphPanel({
                 <GitPanelContent
                   activeTab={activeTab}
                   open={open}
-                  repoPath={repoPath!}
+                  repoPath={repoPath}
                   currentBranch={currentBranch}
                   onSelectCommit={handleSelectCommit}
                   selectedCommitHash={selectedNode?.commit.hash ?? null}

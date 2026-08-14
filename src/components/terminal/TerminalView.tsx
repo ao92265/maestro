@@ -587,7 +587,9 @@ export const TerminalView = memo(function TerminalView({
       // prior text remains in the textarea, it extracts the wrong substring — e.g.
       // sending "測試" instead of "這是". We capture the correct text from the
       // compositionend event and replace whatever xterm sends via onData.
-      const textarea = term.textarea!;
+      // term.open() above always creates the hidden textarea synchronously.
+      const textarea = term.textarea;
+      if (!textarea) throw new Error("expected xterm to have created its textarea on open()");
       let pendingCompositionData: string | null = null;
 
       textarea.addEventListener("compositionend", (e) => {

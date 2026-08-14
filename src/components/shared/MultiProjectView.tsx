@@ -39,6 +39,16 @@ const EMPTY_SESSION_NAMES: Record<number, string> = {};
 /** Stable empty array so the parked selector doesn't re-render grids outside eagle view. */
 const EMPTY_PARKED: number[] = [];
 
+/**
+ * Reads a per-tab callback built from the same `tabs` array being rendered —
+ * every tab id is guaranteed to be a key, so a miss means the two fell out of sync.
+ */
+function mustCallback<T>(callbacks: Map<string, T>, tabId: string): T {
+  const cb = callbacks.get(tabId);
+  if (!cb) throw new Error(`no callback registered for tab "${tabId}"`);
+  return cb;
+}
+
 interface MultiProjectViewProps {
   onSessionCountChange?: (tabId: string, slotCount: number, launchedCount: number) => void;
   /**
@@ -593,7 +603,7 @@ export const MultiProjectView = forwardRef<MultiProjectViewHandle, MultiProjectV
                   eagleTileCount={liveSessionCount}
                 />
               ) : (
-                <IdleLandingView onAdd={launchCallbacks.get(tab.id)!} />
+                <IdleLandingView onAdd={mustCallback(launchCallbacks, tab.id)} />
               )}
             </div>
           ))}

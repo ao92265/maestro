@@ -55,6 +55,13 @@ function agent(
   };
 }
 
+/** Every agent card renders as a <button>; fail loudly if that ever stops being true. */
+function closestButton(el: HTMLElement): HTMLElement {
+  const button = el.closest("button");
+  if (!button) throw new Error(`expected an ancestor <button> for "${el.textContent}"`);
+  return button;
+}
+
 /** Seed the activity store the way a claude-events batch would. */
 function seedActivity(sessionId: number, events: ClaudeEvent[]) {
   useActivityStore.setState((state) => ({
@@ -158,8 +165,8 @@ describe("AgentGraph", () => {
       ],
     });
     const { container } = render(<AgentGraph sessionId={1} />);
-    const parentNode = screen.getByText("Orchestrator").closest("button")!;
-    const childNode = screen.getByText("NestedExplore").closest("button")!;
+    const parentNode = closestButton(screen.getByText("Orchestrator"));
+    const childNode = closestButton(screen.getByText("NestedExplore"));
     const left = (el: HTMLElement) => Number.parseFloat(el.style.left);
     expect(left(childNode)).toBeGreaterThan(left(parentNode));
     // One edge per agent, nested or not.

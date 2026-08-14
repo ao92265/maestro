@@ -185,9 +185,9 @@ export function McpServerEditorModal({
       .join(" ");
 
     let preview = "";
-    if (envPrefix) preview += envPrefix + " ";
+    if (envPrefix) preview += `${envPrefix} `;
     preview += command || "<command>";
-    if (args.length > 0) preview += " " + args.join(" ");
+    if (args.length > 0) preview += ` ${args.join(" ")}`;
     return preview;
   };
 
@@ -204,7 +204,7 @@ export function McpServerEditorModal({
 
     if (transport === "http") {
       // Preserve an original "sse" type; default new URL servers to "http".
-      base.type = managedIsUrl ? (managedServer!.config.type ?? "http") : "http";
+      base.type = managedIsUrl ? (managedConfig.type ?? "http") : "http";
       base.url = url.trim();
       delete base.command;
       delete base.args;

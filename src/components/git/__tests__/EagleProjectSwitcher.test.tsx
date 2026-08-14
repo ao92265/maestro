@@ -13,6 +13,13 @@ function positionDots(container: HTMLElement) {
   return Array.from(container.querySelectorAll("span.h-1\\.5.w-1\\.5"));
 }
 
+/** The switcher always renders a single root element; fail loudly if that ever changes. */
+function rootOf(container: HTMLElement): Element {
+  const root = container.firstElementChild;
+  if (!root) throw new Error("expected EagleProjectSwitcher to render a root element");
+  return root;
+}
+
 describe("EagleProjectSwitcher", () => {
   it("shows the current project's name", () => {
     render(
@@ -46,7 +53,7 @@ describe("EagleProjectSwitcher", () => {
   it("disables both arrows and hides the dots with a single project", () => {
     const { container } = render(
       <EagleProjectSwitcher
-        projects={[projects[0]!]}
+        projects={[projects[0]]}
         index={0}
         onPrev={() => {}}
         onNext={() => {}}
@@ -62,7 +69,7 @@ describe("EagleProjectSwitcher", () => {
     const { container } = render(
       <EagleProjectSwitcher projects={projects} index={0} onPrev={() => {}} onNext={onNext} />,
     );
-    const strip = container.firstElementChild!;
+    const strip = rootOf(container);
     fireEvent.wheel(strip, { deltaX: 40, deltaY: 0 });
     // Burst of momentum events within the cooldown must not re-fire.
     fireEvent.wheel(strip, { deltaX: 40, deltaY: 0 });
@@ -74,7 +81,7 @@ describe("EagleProjectSwitcher", () => {
     const { container } = render(
       <EagleProjectSwitcher projects={projects} index={1} onPrev={onPrev} onNext={() => {}} />,
     );
-    fireEvent.wheel(container.firstElementChild!, { deltaX: -40, deltaY: 0 });
+    fireEvent.wheel(rootOf(container), { deltaX: -40, deltaY: 0 });
     expect(onPrev).toHaveBeenCalledTimes(1);
   });
 
@@ -84,7 +91,7 @@ describe("EagleProjectSwitcher", () => {
     const { container } = render(
       <EagleProjectSwitcher projects={projects} index={0} onPrev={onPrev} onNext={onNext} />,
     );
-    fireEvent.wheel(container.firstElementChild!, { deltaX: 10, deltaY: 40 });
+    fireEvent.wheel(rootOf(container), { deltaX: 10, deltaY: 40 });
     expect(onPrev).not.toHaveBeenCalled();
     expect(onNext).not.toHaveBeenCalled();
   });

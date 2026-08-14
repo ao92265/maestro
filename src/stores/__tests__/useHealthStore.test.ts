@@ -298,7 +298,8 @@ describe("useHealthStore", () => {
     // read the state it later writes back, which is the window a stale
     // snapshot would silently undo.
     mockBackend(sprawlingProject());
-    const backend = invokeMock.getMockImplementation()!;
+    const backend = invokeMock.getMockImplementation();
+    if (!backend) throw new Error("expected invokeMock to have a base implementation");
     invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
       if (cmd === "list_dev_processes") useHealthStore.getState().dismissFlag(key);
       return backend(cmd, args);

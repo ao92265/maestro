@@ -122,8 +122,10 @@ function superviseSession(sessionId: number, state: string) {
 async function renderLaunchedGrid() {
   const ref = createRef<TerminalGridHandle>();
   render(<TerminalGrid ref={ref} projectPath="C:/proj" tabId="tab-1" isActive />);
+  const handle = ref.current;
+  if (!handle) throw new Error("expected TerminalGrid ref to be attached");
   await act(async () => {
-    await ref.current!.launchAll();
+    await handle.launchAll();
   });
   await waitFor(() => expect(useSessionStore.getState().sessions).toHaveLength(1));
   return useSessionStore.getState().sessions[0].id;

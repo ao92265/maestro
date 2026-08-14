@@ -439,7 +439,7 @@ export const useWorkspaceStore = create<WorkspaceState & WorkspaceActions>()(
       },
       migrate: (persistedState, version) => {
         const state = persistedState as WorkspaceState;
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        // biome-ignore lint/suspicious/noExplicitAny: migrates persisted state of unknown historical shape across schema versions; fields are read defensively with `??` fallbacks below.
         let tabs = state.tabs as any[];
 
         // v1 -> v2: Add sessionIds and sessionsLaunched

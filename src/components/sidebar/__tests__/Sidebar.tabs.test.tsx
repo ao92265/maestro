@@ -258,7 +258,8 @@ describe("Sidebar tab bar", () => {
     // `claude --resume` only works from the transcript's own directory.
     // Override only the History reads — other sections feed shared stores that
     // outlive the test, so they must keep their well-formed shapes.
-    const base = invokeMock.getMockImplementation()!;
+    const base = invokeMock.getMockImplementation();
+    if (!base) throw new Error("expected invokeMock to have a base implementation");
     invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
       if (cmd === "list_claude_sessions") {
         return {
@@ -309,7 +310,8 @@ describe("Sidebar tab bar", () => {
 
   it("History tab shows the summary as title, plus branch and folder, on resumable rows", async () => {
     usePendingLaunchStore.setState({ pending: [] });
-    const base = invokeMock.getMockImplementation()!;
+    const base = invokeMock.getMockImplementation();
+    if (!base) throw new Error("expected invokeMock to have a base implementation");
     invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
       if (cmd === "list_claude_sessions") {
         return {

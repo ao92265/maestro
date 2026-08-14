@@ -94,7 +94,8 @@ describe("usePendingLaunchStore", () => {
       resumeSessionId: null,
       samurai: { project: "C:/p", epic: "#37", generation: 2 },
     };
-    const gen3 = { ...gen2, samurai: { ...gen2.samurai!, generation: 3 } };
+    if (!gen2.samurai) throw new Error("expected gen2 to carry samurai info");
+    const gen3 = { ...gen2, samurai: { ...gen2.samurai, generation: 3 } };
     usePendingLaunchStore.getState().request(gen2);
     usePendingLaunchStore.getState().request(gen3);
 

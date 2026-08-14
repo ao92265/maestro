@@ -13,6 +13,13 @@ function circularDistance(a: number, b: number): number {
   return d > 180 ? 360 - d : d;
 }
 
+/** Reads a resolved color, failing loudly if the name has none. */
+function colorOf(colors: Map<string, string>, name: string): string {
+  const color = colors.get(name);
+  if (!color) throw new Error(`no resolved color for "${name}"`);
+  return color;
+}
+
 /** Two generated names whose raw hash hues land within 30° of each other. */
 function findClashingPair(): [string, string] {
   const names = Array.from({ length: 60 }, (_, i) => `project-${i}`);
@@ -58,8 +65,8 @@ describe("resolveProjectColors", () => {
   it("re-seats one of two different names whose hues clash", () => {
     const [first, second] = findClashingPair();
     const colors = resolveProjectColors([first, second]);
-    const resolvedA = hueOf(colors.get(first)!);
-    const resolvedB = hueOf(colors.get(second)!);
+    const resolvedA = hueOf(colorOf(colors, first));
+    const resolvedB = hueOf(colorOf(colors, second));
     expect(circularDistance(resolvedA, resolvedB)).toBeGreaterThanOrEqual(30);
   });
 
@@ -74,7 +81,7 @@ describe("resolveProjectColors", () => {
   it("keeps every pair of a realistic project set distinguishable", () => {
     const names = ["maestro", "dreadnought", "web", "api", "docs", "infra"];
     const colors = resolveProjectColors(names);
-    const hues = names.map((n) => hueOf(colors.get(n)!));
+    const hues = names.map((n) => hueOf(colorOf(colors, n)));
     for (let i = 0; i < hues.length; i++) {
       for (let j = i + 1; j < hues.length; j++) {
         expect(circularDistance(hues[i], hues[j])).toBeGreaterThanOrEqual(30);

@@ -128,7 +128,9 @@ async function withProjectLock<T>(projectPath: string, fn: () => Promise<T>): Pr
   }
 
   // Now we're guaranteed to be the only one proceeding
-  let resolve: () => void;
+  // The Promise executor runs synchronously, so `resolve` is always assigned
+  // before this function can reach the `finally` block below.
+  let resolve!: () => void;
   const newLock = new Promise<void>((r) => {
     resolve = r;
   });
@@ -137,7 +139,7 @@ async function withProjectLock<T>(projectPath: string, fn: () => Promise<T>): Pr
   try {
     return await fn();
   } finally {
-    resolve!();
+    resolve();
     if (projectLaunchLocks.get(projectPath) === newLock) {
       projectLaunchLocks.delete(projectPath);
     }
@@ -768,7 +770,11 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
    */
   const debouncedSaveBranchConfig = useCallback(
     (slot: SessionSlot) => {
-      if (!effectiveRepoPath || !slot.branch) return;
+      // Slots are replaced wholesale on update (never mutated in place), so
+      // this branch stays valid for the life of this specific slot object —
+      // safe to capture now for the callback that fires after the debounce.
+      const branch = slot.branch;
+      if (!effectiveRepoPath || !branch) return;
 
       // Clear existing timer for this slot
       const existingTimer = branchConfigSaveTimers.current.get(slot.id);
@@ -778,7 +784,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
 
       // Set new timer
       const timer = setTimeout(() => {
-        saveBranchConfig(effectiveRepoPath, slot.branch!, {
+        saveBranchConfig(effectiveRepoPath, branch, {
           enabled_plugins: slot.enabledPlugins,
           enabled_skills: slot.enabledSkills,
           enabled_mcp_servers: slot.enabledMcpServers,
@@ -1318,7 +1324,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
           })
             .then((confirmed) => {
               if (confirmed) {
-                cleanupSessionWorktree(effectiveRepoPath, worktreePath!, worktreeBasePath)
+                cleanupSessionWorktree(effectiveRepoPath, worktreePath, worktreeBasePath)
                   .then(() => refreshBranches())
                   .catch(console.error);
               }
@@ -2238,6 +2244,9 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     >
       {zoomActive &&
         (() => {
+          // zoomActive's own definition already guarantees this, but narrowing
+          // doesn't survive through it into this closure — check directly.
+          if (zoomedSlotId === null) return null;
           const orderedSlots = visibleDisplaySlotIds
             .map((id) => slots.find((s) => s.id === id))
             .filter(Boolean) as SessionSlot[];
@@ -2267,8 +2276,11 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
                   >
                     {orderedSlots.map((slot, index) => {
                       const isTabActive = slot.id === zoomedSlotId;
+                      // Slots are replaced wholesale on update (never mutated in place),
+                      // so this stays valid for the onToggleFlag closure below.
+                      const sessionId = slot.sessionId;
                       const liveName =
-                        slot.sessionId !== null ? sessionNameById.get(slot.sessionId) : undefined;
+                        sessionId !== null ? sessionNameById.get(sessionId) : undefined;
                       const label =
                         liveName?.trim() || slot.customName.trim() || `Terminal ${index + 1}`;
 
@@ -2279,12 +2291,12 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
                           index={index}
                           isActive={isTabActive}
                           label={label}
-                          hasSession={slot.sessionId !== null}
-                          sessionId={slot.sessionId}
+                          hasSession={sessionId !== null}
+                          sessionId={sessionId}
                           onSelect={() => handleToggleZoom(slot.id)}
                           onToggleFlag={
-                            slot.sessionId !== null
-                              ? () => useSessionStore.getState().toggleSessionFlag(slot.sessionId!)
+                            sessionId !== null
+                              ? () => useSessionStore.getState().toggleSessionFlag(sessionId)
                               : undefined
                           }
                         />
@@ -2295,7 +2307,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
               </div>
               <button
                 type="button"
-                onClick={() => handleToggleZoom(zoomedSlotId!)}
+                onClick={() => handleToggleZoom(zoomedSlotId)}
                 className="rounded p-0.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text"
                 title="Exit zoom"
               >

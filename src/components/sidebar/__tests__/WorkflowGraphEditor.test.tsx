@@ -45,7 +45,6 @@ beforeAll(() => {
     "DOMMatrixReadOnly",
     class {
       m22 = 1;
-      constructor(_transform?: string) {}
     },
   );
   Object.defineProperty(HTMLElement.prototype, "getBoundingClientRect", {

@@ -19,7 +19,7 @@
 export function normalizePath(path: string): string {
   let p = path;
   if (p.startsWith("\\\\?\\UNC\\")) {
-    p = "\\\\" + p.slice(8);
+    p = `\\\\${p.slice(8)}`;
   } else if (p.startsWith("\\\\?\\")) {
     p = p.slice(4);
   }

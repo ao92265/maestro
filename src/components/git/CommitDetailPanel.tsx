@@ -101,10 +101,12 @@ export function CommitDetailPanel({
       const parts = file.path.split("/");
       const dir = parts.length > 1 ? parts.slice(0, -1).join("/") : "(root)";
 
-      if (!groups.has(dir)) {
-        groups.set(dir, []);
+      let group = groups.get(dir);
+      if (!group) {
+        group = [];
+        groups.set(dir, group);
       }
-      groups.get(dir)!.push(file);
+      group.push(file);
     }
 
     // Sort directories

@@ -65,7 +65,8 @@ describe("useNotesStore", () => {
     } finally {
       vi.restoreAllMocks();
     }
-    const note = useNotesStore.getState().notes.find((n) => n.id === id)!;
+    const note = useNotesStore.getState().notes.find((n) => n.id === id);
+    if (!note) throw new Error(`expected a note with id "${id}"`);
     expect(note.content).toBe("hello");
     expect(note.updatedAt).toBe(before + 1000);
   });

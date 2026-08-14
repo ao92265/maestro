@@ -97,6 +97,7 @@ describe("swapSlots", () => {
 
     const after = removeLeaf(tree, "b");
     expect(after).not.toBeNull();
-    expect(collectSlotIds(after!)).toEqual(["c", "a"]);
+    if (!after) throw new Error("expected removeLeaf to return a tree");
+    expect(collectSlotIds(after)).toEqual(["c", "a"]);
   });
 });

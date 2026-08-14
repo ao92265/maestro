@@ -10,9 +10,17 @@ import {
   projectNodeId,
   TERMINAL_W,
   terminalNodeId,
+  type XY,
 } from "../layout";
 
 const leaf = (id: string): LayoutAgent => ({ id, children: [] });
+
+/** Look up a node's position, failing loudly if the layout didn't place it. */
+function getPos(positions: Map<string, XY>, id: string): XY {
+  const pos = positions.get(id);
+  if (!pos) throw new Error(`no layout position for "${id}"`);
+  return pos;
+}
 
 const oneProject: LayoutProject[] = [
   {
@@ -43,26 +51,26 @@ describe("layoutLandscape", () => {
 
   it("orders the columns project -> terminal -> agent, left to right", () => {
     const positions = layoutLandscape(oneProject);
-    const project = positions.get(projectNodeId("tab-1"))!;
-    const terminal = positions.get(terminalNodeId(1))!;
-    const agent = positions.get(agentNodeId(1, "a1"))!;
+    const project = getPos(positions, projectNodeId("tab-1"));
+    const terminal = getPos(positions, terminalNodeId(1));
+    const agent = getPos(positions, agentNodeId(1, "a1"));
     expect(terminal.x).toBeGreaterThanOrEqual(project.x + PROJECT_W);
     expect(agent.x).toBeGreaterThanOrEqual(terminal.x + TERMINAL_W);
   });
 
   it("stacks a terminal's agents without overlapping", () => {
     const positions = layoutLandscape(oneProject);
-    const first = positions.get(agentNodeId(1, "a1"))!;
-    const second = positions.get(agentNodeId(1, "a2"))!;
+    const first = getPos(positions, agentNodeId(1, "a1"));
+    const second = getPos(positions, agentNodeId(1, "a2"));
     expect(second.x).toBe(first.x);
     expect(second.y - first.y).toBeGreaterThanOrEqual(AGENT_H);
   });
 
   it("keeps a terminal's own agents beside it and the next terminal below", () => {
     const positions = layoutLandscape(oneProject);
-    const busyTerminal = positions.get(terminalNodeId(1))!;
-    const idleTerminal = positions.get(terminalNodeId(2))!;
-    const lastAgent = positions.get(agentNodeId(1, "a2"))!;
+    const busyTerminal = getPos(positions, terminalNodeId(1));
+    const idleTerminal = getPos(positions, terminalNodeId(2));
+    const lastAgent = getPos(positions, agentNodeId(1, "a2"));
     expect(idleTerminal.x).toBe(busyTerminal.x);
     // The second terminal must clear the first terminal's whole agent stack.
     expect(idleTerminal.y).toBeGreaterThan(lastAgent.y);
@@ -81,10 +89,10 @@ describe("layoutLandscape", () => {
       },
     ];
     const positions = layoutLandscape(nested);
-    const parent = positions.get(agentNodeId(1, "parent"))!;
-    const kid1 = positions.get(agentNodeId(1, "kid1"))!;
-    const kid2 = positions.get(agentNodeId(1, "kid2"))!;
-    const solo = positions.get(agentNodeId(1, "solo"))!;
+    const parent = getPos(positions, agentNodeId(1, "parent"));
+    const kid1 = getPos(positions, agentNodeId(1, "kid1"));
+    const kid2 = getPos(positions, agentNodeId(1, "kid2"));
+    const solo = getPos(positions, agentNodeId(1, "solo"));
     // Children sit one full column to the right of their parent.
     expect(kid1.x).toBeGreaterThanOrEqual(parent.x + AGENT_W);
     expect(kid2.x).toBe(kid1.x);
@@ -103,8 +111,8 @@ describe("layoutLandscape", () => {
       terminals: [{ sessionId: Number(tabId.charCodeAt(0)), agents: [] }],
     }));
     const positions = layoutLandscape(projects);
-    const xs = projects.map((p) => positions.get(projectNodeId(p.tabId))!.x);
-    const ys = projects.map((p) => positions.get(projectNodeId(p.tabId))!.y);
+    const xs = projects.map((p) => getPos(positions, projectNodeId(p.tabId)).x);
+    const ys = projects.map((p) => getPos(positions, projectNodeId(p.tabId)).y);
     // Every project node shares the same x; rows descend without overlapping.
     expect(new Set(xs).size).toBe(1);
     expect(new Set(ys).size).toBe(4);
