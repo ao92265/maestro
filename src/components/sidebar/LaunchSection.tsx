@@ -1,4 +1,3 @@
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import {
   AlertTriangle,
@@ -26,6 +25,11 @@ import {
   samuraiPreflight,
 } from "@/lib/samurai";
 import type { UsageData } from "@/lib/usageParser";
+import {
+  initSamuraiGateListener,
+  latestGateForProject,
+  useSamuraiGateStore,
+} from "@/stores/useSamuraiGateStore";
 import { workflowGraphForLaunch } from "@/stores/useSamuraiWorkflowStore";
 import {
   SAMURAI_TILE_CLOSE_STATES,
@@ -528,9 +532,11 @@ export function LaunchSection({
   // Issue #90b: the explicit red-baseline override. Default OFF — the gate
   // runs and a red `cargo test --workspace` blocks the launch.
   const [skipGate, setSkipGate] = useState(false);
-  // The latest test-gate tick plus when it arrived, so the elapsed display
-  // keeps counting between backend ticks (cargo test is one long step).
-  const [gate, setGate] = useState<{ progress: SamuraiTestGateProgress; at: number } | null>(null);
+  // Issue #109: gate progress + verdict live in a store fed by a module-
+  // level subscription, so a sidebar-panel switch mid-gate loses nothing —
+  // this remount re-reads the current step (or the failure) below.
+  const gates = useSamuraiGateStore((s) => s.gates);
+  const clearGates = useSamuraiGateStore((s) => s.clearProject);
   // 1 Hz re-render while the gate line is showing (drives the elapsed time).
   const [, setGateTick] = useState(0);
   const [preflight, setPreflight] = useState<SamuraiPreflight | null>(null);
@@ -562,49 +568,39 @@ export function LaunchSection({
   }, [refreshRuns]);
 
   // Preflight results are project-scoped — a stale pass must not leak onto
-  // another project's form.
+  // another project's form. Gate state is NOT reset here: it lives in the
+  // per-project store, so each project's line follows its own tab.
   useEffect(() => {
     currentProjectRef.current = projectPath;
     setPreflight(null);
     setError(null);
     setNotice(null);
-    setGate(null);
   }, [projectPath]);
 
-  // Issue #90b: live test-gate progress. The backend streams one tick per
-  // gate step during the launch; other projects' ticks are skipped (the
-  // AuditSection subscription pattern).
+  // Issue #90b / #109: live test-gate progress rides a module-level
+  // subscription into the store (never detached on unmount, so ticks and
+  // the verdict land while this panel is closed). Idempotent per mount.
   useEffect(() => {
-    let disposed = false;
-    let unlisten: UnlistenFn | null = null;
-    listen<SamuraiTestGateProgress>("samurai-test-gate-event", (e) => {
-      if (!samePath(e.payload.project, currentProjectRef.current)) return;
-      setGate({ progress: e.payload, at: Date.now() });
-    })
-      .then((fn) => {
-        if (disposed) {
-          fn();
-          return;
-        }
-        unlisten = fn;
-      })
-      .catch(() => {
-        // Event system unavailable (tests) — the launch still resolves.
-      });
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
+    void initSamuraiGateListener();
   }, []);
 
+  // The active project's newest gate entry — progress or verdict.
+  const gate = latestGateForProject(gates, projectPath);
+
   // Tick the elapsed display once a second while a gate step is running.
-  const gateRunning =
-    phase === "spawning" && gate !== null && GATE_RUNNING_STEPS.includes(gate.progress.step);
+  const gateRunning = gate !== null && GATE_RUNNING_STEPS.includes(gate.progress.step);
   useEffect(() => {
     if (!gateRunning) return;
     const id = setInterval(() => setGateTick((t) => t + 1), 1000);
     return () => clearInterval(id);
   }, [gateRunning]);
+
+  /** `detail · 12s` — the tick's elapsed reading plus the time since it. */
+  const gateLine = gate
+    ? `${gate.progress.detail} · ${
+        gate.progress.elapsed_secs + Math.floor((Date.now() - gate.at) / 1000)
+      }s`
+    : "";
 
   const epicRefs = useMemo(() => refParts(epics), [epics]);
   const issueRefs = useMemo(() => refParts(issues), [issues]);
@@ -652,7 +648,9 @@ export function LaunchSection({
     setError(null);
     setNotice(null);
     setPreflight(null);
-    setGate(null);
+    // A fresh launch must not resurface the previous run's gate line or
+    // failure verdict (issue #109 — the store outlives launches).
+    clearGates(target);
 
     // Phase 1 — preflight. The backend re-runs it inside the launch anyway;
     // running it here first is what lets a failure render as pass/fail rows
@@ -705,12 +703,15 @@ export function LaunchSection({
       setIssues("");
       setHandoffPct("");
       setPreflight(null);
+      // The gate passed and the run is live — its progress line is done.
+      // (A REJECTED launch keeps the store entry: the backend's `failed`
+      // tick is what a remounted panel re-surfaces — issue #109.)
+      clearGates(target);
       await refreshRuns();
     } catch (err) {
       if (currentProjectRef.current === target) setError(String(err));
     } finally {
       setPhase(null);
-      setGate(null);
     }
   };
 
@@ -896,16 +897,34 @@ export function LaunchSection({
                 {/* Issue #90b: while the test gate runs, its live step (with
                     elapsed time, ticking between backend events) replaces
                     the generic spawning label. */}
-                {gateRunning && gate
-                  ? `${gate.progress.detail} · ${
-                      gate.progress.elapsed_secs + Math.floor((Date.now() - gate.at) / 1000)
-                    }s`
-                  : PHASE_LABEL[phase]}
+                {gateRunning && phase === "spawning" ? gateLine : PHASE_LABEL[phase]}
               </span>
             ) : (
               "Launch"
             )}
           </button>
+
+          {/* Issue #109: a remount mid-gate (sidebar panel switch) re-reads
+              the running step from the store — the launching mount's phase
+              state died with it, so the line renders on its own here. The
+              backend's launch registry guards a double launch either way. */}
+          {phase === null && gateRunning && (
+            <p className="flex items-center gap-1.5 text-[11px] text-maestro-muted">
+              <Loader2 size={11} className="shrink-0 animate-spin" />
+              <span className="min-w-0 flex-1 truncate">{gateLine}</span>
+            </p>
+          )}
+          {/* Issue #109: a gate FAILURE that landed while this panel was
+              unmounted re-surfaces from the store; while mounted, the launch
+              rejection already renders the same verdict through `error`. */}
+          {gate?.progress.step === "failed" && !error && (
+            <p className="flex items-center gap-1 text-[11px] text-maestro-red">
+              <XCircle size={11} className="shrink-0" />
+              <span className="min-w-0 flex-1 truncate" title={gate.progress.detail}>
+                {gate.progress.detail}
+              </span>
+            </p>
+          )}
 
           {preflight && (
             <div className="space-y-1 rounded border border-maestro-border/40 bg-maestro-surface/60 p-1.5">

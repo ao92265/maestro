@@ -36,6 +36,7 @@ import type {
   SamuraiWorkflowGraph,
 } from "@/lib/samurai";
 import type { UsageData } from "@/lib/usageParser";
+import { stopSamuraiGateListener, useSamuraiGateStore } from "@/stores/useSamuraiGateStore";
 import { useSamuraiWorkflowStore } from "@/stores/useSamuraiWorkflowStore";
 import { type SamuraiSessionInfo, useSessionStore } from "@/stores/useSessionStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
@@ -258,6 +259,11 @@ describe("LaunchSection (issue #63)", () => {
     // Untouched workflow editor by default — launches send workflow: null.
     useSamuraiWorkflowStore.setState({ graph: null });
     useSessionStore.setState({ samuraiBySessionId: {} });
+    // Issue #109: the gate listener + store are module-level (they outlive
+    // mounts on purpose) — detach and drain them between tests so each test
+    // captures a fresh handler from ITS listen mock.
+    stopSamuraiGateListener();
+    useSamuraiGateStore.setState({ gates: {} });
   });
 
   it("renders the form with the active project and a disabled Launch button", async () => {
@@ -538,6 +544,110 @@ describe("LaunchSection (issue #63)", () => {
     });
     expect(await screen.findByText(/Run launched: #38/)).toBeInTheDocument();
     expect(screen.queryByText(/cargo test: running/)).not.toBeInTheDocument();
+  });
+
+  it("keeps the gate progress line across a panel switch mid-gate (issue #109)", async () => {
+    // The launch stays pending the whole test (the gate is mid-run).
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "samurai_preflight":
+          return passPreflight();
+        case "samurai_list_runs":
+          return [];
+        case "get_claude_usage":
+          return buildUsage();
+        case "samurai_launch_run":
+          return new Promise(() => {});
+        case "samurai_default_workflow":
+          return workflowGraph();
+        default:
+          return undefined;
+      }
+    });
+    const first = render(<LaunchSection />);
+    fireEvent.change(screen.getByLabelText("Issues"), { target: { value: "#38" } });
+    fireEvent.click(screen.getByRole("button", { name: "Launch" }));
+    await waitFor(() => expect(callsOf("samurai_launch_run")).toHaveLength(1));
+
+    act(() => {
+      emitGateEvent({
+        project: "C:\\git\\maestro",
+        epic: "#38",
+        step: "cargo_test",
+        detail: "cargo test: running the workspace suite…",
+        elapsed_secs: 12,
+      });
+    });
+    expect(screen.getByText(/cargo test: running the workspace suite… · \d+s/)).toBeInTheDocument();
+
+    // The user switches sidebar panels: the section unmounts mid-gate. A
+    // later backend tick lands while nothing is mounted — the store-level
+    // subscription still records it.
+    first.unmount();
+    act(() => {
+      emitGateEvent({
+        project: "C:\\git\\maestro",
+        epic: "#38",
+        step: "cargo_test",
+        detail: "cargo test: running the workspace suite…",
+        elapsed_secs: 30,
+      });
+    });
+
+    // Remount: the running step (with elapsed time) is back, read from the
+    // store — this used to come back blank (component state died).
+    render(<LaunchSection />);
+    expect(
+      await screen.findByText(/cargo test: running the workspace suite… · \d+s/),
+    ).toBeInTheDocument();
+    await screen.findByText("No active runs. Launch one above.");
+  });
+
+  it("surfaces a gate failure that landed while the panel was unmounted (issue #109)", async () => {
+    let rejectLaunch: (err: unknown) => void = () => {};
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "samurai_preflight":
+          return passPreflight();
+        case "samurai_list_runs":
+          return [];
+        case "get_claude_usage":
+          return buildUsage();
+        case "samurai_launch_run":
+          return new Promise((_, reject) => {
+            rejectLaunch = reject;
+          });
+        case "samurai_default_workflow":
+          return workflowGraph();
+        default:
+          return undefined;
+      }
+    });
+    const first = render(<LaunchSection />);
+    fireEvent.change(screen.getByLabelText("Issues"), { target: { value: "#38" } });
+    fireEvent.click(screen.getByRole("button", { name: "Launch" }));
+    await waitFor(() => expect(callsOf("samurai_launch_run")).toHaveLength(1));
+
+    // Panel switched away mid-gate; the red verdict lands while unmounted.
+    first.unmount();
+    act(() => {
+      emitGateEvent({
+        project: "C:\\git\\maestro",
+        epic: "#38",
+        step: "failed",
+        detail: "test gate failed: cargo test exited 101",
+        elapsed_secs: 40,
+      });
+    });
+    await act(async () => {
+      rejectLaunch("launch refused: the test gate is red");
+    });
+
+    // Remount: the failure is visible in the panel (it used to live only in
+    // the audit log — the rejection's setError died with the old mount).
+    render(<LaunchSection />);
+    expect(await screen.findByText(/test gate failed: cargo test exited 101/)).toBeInTheDocument();
+    await screen.findByText("No active runs. Launch one above.");
   });
 
   it("stops at failing preflight rows and never reaches the launch", async () => {
