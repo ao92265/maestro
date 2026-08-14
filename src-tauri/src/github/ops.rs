@@ -33,6 +33,10 @@ pub struct PullRequestInfo {
     pub merged_at: Option<String>,
     #[serde(default)]
     pub closed_at: Option<String>,
+    #[serde(default)]
+    pub review_decision: Option<String>,
+    #[serde(default)]
+    pub checks_summary: ChecksSummary,
 }
 
 /// Pull request author.
@@ -46,6 +50,121 @@ pub struct PrAuthor {
 pub struct PrLabel {
     pub name: String,
     pub color: String,
+}
+
+/// Compact summary of a PR's CI check runs, computed in Rust from
+/// `statusCheckRollup` so the list payload doesn't have to carry every
+/// individual check (that array can be large; the raw array is kept only on
+/// [`PullRequestDetail`], for a later "show me the failing checks" view).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChecksSummary {
+    pub success: u64,
+    pub failure: u64,
+    pub pending: u64,
+    pub total: u64,
+    /// `"success"` | `"failure"` | `"pending"` | `"none"` — failure beats
+    /// pending beats success, `"none"` only when there are no checks at all.
+    pub verdict: String,
+}
+
+impl Default for ChecksSummary {
+    fn default() -> Self {
+        Self {
+            success: 0,
+            failure: 0,
+            pending: 0,
+            total: 0,
+            verdict: "none".to_string(),
+        }
+    }
+}
+
+/// One entry of `statusCheckRollup`. `gh` reports two different shapes here:
+/// a CheckRun (`status` + `conclusion`, e.g. a GitHub Actions job) or a
+/// StatusContext (`state`, e.g. a third-party CI posting the legacy Status
+/// API). Both sets of fields are optional so one struct deserializes either
+/// shape; [`classify_check`] resolves whichever is present.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckRollupEntry {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+}
+
+/// The three buckets a check run collapses into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckOutcome {
+    Success,
+    Failure,
+    Pending,
+}
+
+/// Classifies one `statusCheckRollup` entry per the `gh` state mapping:
+/// SUCCESS/NEUTRAL/SKIPPED → success; FAILURE/ERROR/TIMED_OUT/CANCELLED/
+/// ACTION_REQUIRED/STARTUP_FAILURE → failure; anything else (queued,
+/// in-progress, pending, expected, …) → pending.
+fn classify_check(entry: &CheckRollupEntry) -> CheckOutcome {
+    if let Some(status) = entry.status.as_deref() {
+        if !status.eq_ignore_ascii_case("COMPLETED") {
+            return CheckOutcome::Pending;
+        }
+        return entry
+            .conclusion
+            .as_deref()
+            .map(classify_state)
+            .unwrap_or(CheckOutcome::Pending);
+    }
+    entry
+        .state
+        .as_deref()
+        .map(classify_state)
+        .unwrap_or(CheckOutcome::Pending)
+}
+
+fn classify_state(value: &str) -> CheckOutcome {
+    match value.to_ascii_uppercase().as_str() {
+        "SUCCESS" | "NEUTRAL" | "SKIPPED" => CheckOutcome::Success,
+        "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE" => {
+            CheckOutcome::Failure
+        }
+        _ => CheckOutcome::Pending,
+    }
+}
+
+/// Folds a PR's `statusCheckRollup` entries into a [`ChecksSummary`].
+fn summarize_checks(entries: &[CheckRollupEntry]) -> ChecksSummary {
+    let mut success = 0u64;
+    let mut failure = 0u64;
+    let mut pending = 0u64;
+    for entry in entries {
+        match classify_check(entry) {
+            CheckOutcome::Success => success += 1,
+            CheckOutcome::Failure => failure += 1,
+            CheckOutcome::Pending => pending += 1,
+        }
+    }
+    let total = entries.len() as u64;
+    let verdict = if total == 0 {
+        "none"
+    } else if failure > 0 {
+        "failure"
+    } else if pending > 0 {
+        "pending"
+    } else {
+        "success"
+    };
+    ChecksSummary {
+        success,
+        failure,
+        pending,
+        total,
+        verdict: verdict.to_string(),
+    }
 }
 
 /// The little a terminal header needs to link a branch to its pull request.
@@ -153,6 +272,12 @@ pub struct PullRequestDetail {
     pub mergeable: String,
     #[serde(default)]
     pub review_decision: Option<String>,
+    /// Raw `statusCheckRollup` entries, kept as-is (unlike the list payload)
+    /// so a future detail view can show individual failing check names.
+    #[serde(default)]
+    pub status_check_rollup: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub checks_summary: ChecksSummary,
     #[serde(default)]
     pub comments: Vec<Comment>,
 }
@@ -360,7 +485,7 @@ impl GitHub {
     ) -> Result<Vec<PullRequestInfo>, GitHubError> {
         let mut args = vec![
             "pr", "list",
-            "--json", "number,title,state,author,createdAt,updatedAt,headRefName,baseRefName,isDraft,additions,deletions,url,labels,mergedAt,closedAt",
+            "--json", "number,title,state,author,createdAt,updatedAt,headRefName,baseRefName,isDraft,additions,deletions,url,labels,mergedAt,closedAt,reviewDecision,statusCheckRollup",
         ];
 
         let state_arg;
@@ -383,7 +508,59 @@ impl GitHub {
             args.push(&search_arg);
         }
 
-        self.run_json(&args).await
+        // `statusCheckRollup` can be a large array of individual check runs;
+        // summarize it into `checksSummary` here and drop the raw rollup so
+        // the list payload stays small (the detail fetch keeps the raw form).
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PrListRow {
+            number: u64,
+            title: String,
+            state: String,
+            author: PrAuthor,
+            created_at: String,
+            updated_at: String,
+            head_ref_name: String,
+            base_ref_name: String,
+            is_draft: bool,
+            additions: u64,
+            deletions: u64,
+            url: String,
+            #[serde(default)]
+            labels: Vec<PrLabel>,
+            #[serde(default)]
+            merged_at: Option<String>,
+            #[serde(default)]
+            closed_at: Option<String>,
+            #[serde(default)]
+            review_decision: Option<String>,
+            #[serde(default)]
+            status_check_rollup: Vec<CheckRollupEntry>,
+        }
+
+        let rows: Vec<PrListRow> = self.run_json(&args).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PullRequestInfo {
+                number: row.number,
+                title: row.title,
+                state: row.state,
+                author: row.author,
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+                head_ref_name: row.head_ref_name,
+                base_ref_name: row.base_ref_name,
+                is_draft: row.is_draft,
+                additions: row.additions,
+                deletions: row.deletions,
+                url: row.url,
+                labels: row.labels,
+                merged_at: row.merged_at,
+                closed_at: row.closed_at,
+                review_decision: row.review_decision,
+                checks_summary: summarize_checks(&row.status_check_rollup),
+            })
+            .collect())
     }
 
     /// Finds the pull request opened from `branch`, if there is one.
@@ -415,7 +592,7 @@ impl GitHub {
         let number_str = number.to_string();
         let args = vec![
             "pr", "view", &number_str,
-            "--json", "number,title,body,state,author,createdAt,updatedAt,headRefName,baseRefName,isDraft,additions,deletions,changedFiles,url,labels,mergedAt,closedAt,mergeable,reviewDecision,comments",
+            "--json", "number,title,body,state,author,createdAt,updatedAt,headRefName,baseRefName,isDraft,additions,deletions,changedFiles,url,labels,mergedAt,closedAt,mergeable,reviewDecision,statusCheckRollup,comments",
         ];
 
         #[derive(Deserialize)]
@@ -445,6 +622,8 @@ impl GitHub {
             mergeable: String,
             #[serde(default)]
             review_decision: Option<String>,
+            #[serde(default)]
+            status_check_rollup: Vec<serde_json::Value>,
             #[serde(default)]
             comments: Vec<PrCommentRaw>,
         }
@@ -513,6 +692,18 @@ impl GitHub {
             }
         }).collect();
 
+        // Re-parse the raw rollup entries to compute the same summary the
+        // list payload carries; the raw form is also kept on the detail for
+        // a future "show me the failing checks" view.
+        let checks_summary = {
+            let entries: Vec<CheckRollupEntry> = response
+                .status_check_rollup
+                .iter()
+                .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                .collect();
+            summarize_checks(&entries)
+        };
+
         Ok(PullRequestDetail {
             number: response.number,
             title: response.title,
@@ -533,6 +724,8 @@ impl GitHub {
             closed_at: response.closed_at,
             mergeable: response.mergeable,
             review_decision: response.review_decision,
+            status_check_rollup: response.status_check_rollup,
+            checks_summary,
             comments,
         })
     }
@@ -646,6 +839,8 @@ impl GitHub {
             labels: detail.labels,
             merged_at: detail.merged_at,
             closed_at: detail.closed_at,
+            review_decision: detail.review_decision,
+            checks_summary: detail.checks_summary,
         })
     }
 
@@ -1322,6 +1517,124 @@ mod tests {
         assert_eq!(pr.number, 123);
         assert_eq!(pr.title, "Test PR");
         assert_eq!(pr.author.login, "testuser");
+        // reviewDecision/checksSummary absent from the payload (older gh, or
+        // a repo with no CI/review data) fall back sanely.
+        assert_eq!(pr.review_decision, None);
+        assert_eq!(pr.checks_summary.total, 0);
+        assert_eq!(pr.checks_summary.verdict, "none");
+    }
+
+    #[test]
+    fn checks_summary_defaults_to_the_none_verdict() {
+        let summary = ChecksSummary::default();
+        assert_eq!(summary.total, 0);
+        assert_eq!(summary.verdict, "none");
+    }
+
+    #[test]
+    fn classify_check_reads_the_check_run_shape() {
+        let completed_success: CheckRollupEntry =
+            serde_json::from_str(r#"{"status": "COMPLETED", "conclusion": "SUCCESS"}"#).unwrap();
+        assert_eq!(classify_check(&completed_success), CheckOutcome::Success);
+
+        let completed_neutral: CheckRollupEntry =
+            serde_json::from_str(r#"{"status": "COMPLETED", "conclusion": "NEUTRAL"}"#).unwrap();
+        assert_eq!(classify_check(&completed_neutral), CheckOutcome::Success);
+
+        let completed_failure: CheckRollupEntry =
+            serde_json::from_str(r#"{"status": "COMPLETED", "conclusion": "FAILURE"}"#).unwrap();
+        assert_eq!(classify_check(&completed_failure), CheckOutcome::Failure);
+
+        let completed_cancelled: CheckRollupEntry =
+            serde_json::from_str(r#"{"status": "COMPLETED", "conclusion": "CANCELLED"}"#).unwrap();
+        assert_eq!(classify_check(&completed_cancelled), CheckOutcome::Failure);
+
+        let in_progress: CheckRollupEntry =
+            serde_json::from_str(r#"{"status": "IN_PROGRESS"}"#).unwrap();
+        assert_eq!(classify_check(&in_progress), CheckOutcome::Pending);
+
+        let queued: CheckRollupEntry = serde_json::from_str(r#"{"status": "QUEUED"}"#).unwrap();
+        assert_eq!(classify_check(&queued), CheckOutcome::Pending);
+    }
+
+    #[test]
+    fn classify_check_reads_the_status_context_shape() {
+        let success: CheckRollupEntry = serde_json::from_str(r#"{"state": "SUCCESS"}"#).unwrap();
+        assert_eq!(classify_check(&success), CheckOutcome::Success);
+
+        let error: CheckRollupEntry = serde_json::from_str(r#"{"state": "ERROR"}"#).unwrap();
+        assert_eq!(classify_check(&error), CheckOutcome::Failure);
+
+        let pending: CheckRollupEntry = serde_json::from_str(r#"{"state": "PENDING"}"#).unwrap();
+        assert_eq!(classify_check(&pending), CheckOutcome::Pending);
+    }
+
+    #[test]
+    fn summarize_checks_verdict_prioritizes_failure_over_pending_over_success() {
+        let all_success: Vec<CheckRollupEntry> = serde_json::from_str(
+            r#"[{"status": "COMPLETED", "conclusion": "SUCCESS"}, {"state": "SUCCESS"}]"#,
+        )
+        .unwrap();
+        let summary = summarize_checks(&all_success);
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.success, 2);
+        assert_eq!(summary.verdict, "success");
+
+        let mixed: Vec<CheckRollupEntry> = serde_json::from_str(
+            r#"[{"status": "COMPLETED", "conclusion": "SUCCESS"}, {"status": "IN_PROGRESS"}]"#,
+        )
+        .unwrap();
+        let summary = summarize_checks(&mixed);
+        assert_eq!(summary.verdict, "pending");
+
+        let with_failure: Vec<CheckRollupEntry> = serde_json::from_str(
+            r#"[{"status": "COMPLETED", "conclusion": "FAILURE"}, {"status": "IN_PROGRESS"}, {"state": "SUCCESS"}]"#,
+        )
+        .unwrap();
+        let summary = summarize_checks(&with_failure);
+        assert_eq!(summary.failure, 1);
+        assert_eq!(summary.pending, 1);
+        assert_eq!(summary.success, 1);
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.verdict, "failure");
+    }
+
+    #[test]
+    fn summarize_checks_verdict_is_none_when_there_are_no_checks() {
+        let summary = summarize_checks(&[]);
+        assert_eq!(summary.total, 0);
+        assert_eq!(summary.verdict, "none");
+    }
+
+    #[test]
+    fn test_pull_request_detail_deserializes_review_decision_and_defaults_checks() {
+        // PullRequestDetail's own Deserialize impl (used directly only in
+        // tests here; get_pull_request goes through the raw PrViewResponse)
+        // still needs to accept the gh field names and default sanely when
+        // check/review data is absent.
+        let json = r#"{
+            "number": 7,
+            "title": "Add feature",
+            "body": "",
+            "state": "OPEN",
+            "author": {"login": "testuser"},
+            "createdAt": "2024-01-01T00:00:00Z",
+            "updatedAt": "2024-01-02T00:00:00Z",
+            "headRefName": "feature",
+            "baseRefName": "main",
+            "isDraft": false,
+            "additions": 1,
+            "deletions": 1,
+            "changedFiles": 1,
+            "url": "https://github.com/owner/repo/pull/7",
+            "labels": [],
+            "reviewDecision": "APPROVED"
+        }"#;
+
+        let detail: PullRequestDetail = serde_json::from_str(json).unwrap();
+        assert_eq!(detail.review_decision, Some("APPROVED".to_string()));
+        assert!(detail.status_check_rollup.is_empty());
+        assert_eq!(detail.checks_summary.verdict, "none");
     }
 
     #[test]
