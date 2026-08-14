@@ -30,8 +30,9 @@ const MAX_VISIBLE_TOASTS = 5;
  * Every background notification Maestro raises, in one bottom-right stack:
  *
  * - GitHub watchdog: one card per newly-appeared review request / assigned
- *   issue, tinted with the project's color. Clicking opens it in the browser
- *   (simpler than driving the git panel to the right project + tab).
+ *   issue, tinted with the project's color, kicker "<Project> — <Type>".
+ *   Clicking opens it in the browser (simpler than driving the git panel to
+ *   the right project + tab).
  * - Health checker: one card per newly-raised memory/process/Second Brain
  *   flag. These have no destination — the badge and the section highlight
  *   carry the detail — so they are dismiss-only.
@@ -55,13 +56,18 @@ export function NotificationToasts() {
 
   return (
     <ToastStack>
+      {/*
+       * Every kicker reads "<what raised it> — <what happened>" so a glance
+       * answers "which project, what kind of event" before the title (the
+       * subject) is even read. Health toasts have no project, so "Health"
+       * stands in for it.
+       */}
       {watchdogShown.map((toast) => (
         <Toast
           key={toast.id}
           accentColor={projectColors.get(toast.projectName) ?? projectColorFor(toast.projectName)}
-          kicker={toast.kind === "pr" ? "Review requested" : "Issue assigned"}
+          kicker={`${toast.projectName} — ${toast.kind === "pr" ? "Review requested" : "Issue assigned"}`}
           title={`#${toast.number} ${toast.title}`}
-          detail={toast.projectName}
           onClick={() => {
             openUrl(toast.url).catch((err) => console.error("Failed to open URL:", err));
             dismissWatchdogToast(toast.id);
@@ -73,7 +79,7 @@ export function NotificationToasts() {
         <Toast
           key={toast.id}
           accentColor={HEALTH_ACCENT}
-          kicker={HEALTH_AREA_TITLES[toast.area]}
+          kicker={`Health — ${HEALTH_AREA_TITLES[toast.area]}`}
           title={toast.target}
           detail={toast.reason}
           onDismiss={() => dismissHealthToast(toast.id)}
