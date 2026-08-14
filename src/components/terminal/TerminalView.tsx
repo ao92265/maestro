@@ -35,6 +35,7 @@ import { type AiMode, type BackendSessionStatus, useSessionStore } from "@/store
 import { DEFAULT_SCROLLBACK, useTerminalSettingsStore } from "@/stores/useTerminalSettingsStore";
 import type { ClaudeEvent } from "@/types/claude-events";
 import { QuickActionPills } from "./QuickActionPills";
+import { SamuraiHandoffBanner } from "./SamuraiHandoffBanner";
 import { type AIProvider, type SessionStatus, TerminalHeader } from "./TerminalHeader";
 
 /**
@@ -993,6 +994,10 @@ export const TerminalView = memo(function TerminalView({
         onToggleFlag={handleToggleFlag}
         showShortcutHints={showShortcutHints}
       />
+
+      {/* Can't-miss attention strip: Maestro is about to hand off or park
+          this agent. Renders nothing outside those states. */}
+      <SamuraiHandoffBanner sessionId={sessionId} />
 
       {/* What this terminal is about, in one line. Rendered only when the
           session has produced something to say, so an empty shell keeps its
