@@ -1020,7 +1020,9 @@ export function LaunchSection({
       </div>
 
       {/* Issue #91: the run workflow the briefs compile from — edited here,
-          persisted across restarts, sent with the launch above. */}
+          persisted across restarts, sent with the launch above. Its own mode
+          toggle also edits the PR review workflow (the PR monitor's
+          checkboxes), so nothing extra is mounted here. */}
       <WorkflowGraphEditor />
     </div>
   );

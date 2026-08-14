@@ -15,13 +15,16 @@ vi.mock("@tauri-apps/plugin-store", () => ({
   },
 }));
 
+import { DEFAULT_PR_WORKFLOW, prWorkflowStepsInOrder } from "@/lib/prWorkflow";
 import type { SamuraiWorkflowGraph } from "@/lib/samurai";
+import { usePrWorkflowStore } from "@/stores/usePrWorkflowStore";
 import { useSamuraiWorkflowStore } from "@/stores/useSamuraiWorkflowStore";
 import {
   addWorkflowNode,
   connectWorkflow,
   removeWorkflowEdge,
   removeWorkflowNode,
+  setWorkflowNodeLabel,
   setWorkflowStart,
   WorkflowGraphEditor,
   workflowWalkOrder,
@@ -107,6 +110,7 @@ describe("WorkflowGraphEditor (issue #91)", () => {
       return undefined;
     });
     useSamuraiWorkflowStore.setState({ graph: null });
+    usePrWorkflowStore.setState({ graph: null });
   });
 
   it("renders the backend default template's boxes with compiled step numbers", async () => {
@@ -223,7 +227,141 @@ describe("WorkflowGraphEditor (issue #91)", () => {
   });
 });
 
+describe("WorkflowGraphEditor — PR review mode", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "samurai_default_workflow") return defaultGraph();
+      return undefined;
+    });
+    useSamuraiWorkflowStore.setState({ graph: null });
+    usePrWorkflowStore.setState({ graph: null });
+  });
+
+  /** Switches the canvas to the PR review workflow. */
+  async function switchToPr() {
+    render(<WorkflowGraphEditor />);
+    // Samurai is the default mode — its boxes are what render first.
+    expect(await screen.findByDisplayValue("Do the implement work.")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Edit step implement label")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: "PR review" }));
+    await screen.findByLabelText("Edit step check label");
+  }
+
+  it("the toggle swaps the canvas to the PR default, labels and all", async () => {
+    await switchToPr();
+
+    for (const [id, label] of [
+      ["check", "Check status"],
+      ["review", "Review & post"],
+      ["fix", "Fix issues"],
+      ["merge", "Merge if green"],
+    ]) {
+      expect(screen.getByLabelText(`Edit step ${id} label`)).toHaveValue(label);
+    }
+    // Four boxes, all on the walk, and none of the Samurai ones.
+    for (let step = 1; step <= 4; step++) {
+      expect(screen.getByText(`Step ${step}`)).toBeInTheDocument();
+    }
+    expect(screen.queryByText("Step 5")).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue("Do the implement work.")).not.toBeInTheDocument();
+    // Nothing is stored until the user edits — in EITHER store.
+    expect(usePrWorkflowStore.getState().graph).toBeNull();
+    expect(useSamuraiWorkflowStore.getState().graph).toBeNull();
+  });
+
+  it("editing a label lands in the PR store only, never the Samurai one", async () => {
+    await switchToPr();
+
+    fireEvent.change(screen.getByLabelText("Edit step check label"), {
+      target: { value: "Status check" },
+    });
+
+    const graph = usePrWorkflowStore.getState().graph;
+    if (!graph) throw new Error("expected an edited PR graph in the store");
+    expect(graph.nodes.find((n) => n.id === "check")?.label).toBe("Status check");
+    // The text is carried over untouched, and Samurai is not involved at all.
+    expect(graph.nodes.find((n) => n.id === "check")?.text).toBe(DEFAULT_PR_WORKFLOW.nodes[0].text);
+    expect(useSamuraiWorkflowStore.getState().graph).toBeNull();
+    // What the PR dropdown renders follows the edit.
+    expect(prWorkflowStepsInOrder(graph).map((s) => s.label)).toEqual([
+      "Status check",
+      "Review & post",
+      "Fix issues",
+      "Merge if green",
+    ]);
+  });
+
+  it("a box added in PR mode arrives labelled and becomes another checkbox", async () => {
+    await switchToPr();
+
+    fireEvent.click(screen.getByRole("button", { name: "Add workflow step" }));
+
+    const graph = usePrWorkflowStore.getState().graph;
+    if (!graph) throw new Error("expected an edited PR graph in the store");
+    expect(graph.nodes).toHaveLength(5);
+    expect(graph.edges).toContainEqual({ from: "merge", to: "step-1" });
+    expect(await screen.findByLabelText("Edit step step-1 label")).toHaveValue("New step");
+    // The dropdown's checkbox list is derived from the graph, so it grew too.
+    expect(prWorkflowStepsInOrder(graph).map((s) => s.id)).toEqual([
+      "check",
+      "review",
+      "fix",
+      "merge",
+      "step-1",
+    ]);
+  });
+
+  it("switching back leaves the Samurai canvas and its store untouched", async () => {
+    await switchToPr();
+    fireEvent.change(screen.getByLabelText("Edit step fix label"), {
+      target: { value: "Patch it" },
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: "Samurai" }));
+
+    expect(await screen.findByDisplayValue("Do the implement work.")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Edit step implement label")).not.toBeInTheDocument();
+    expect(useSamuraiWorkflowStore.getState().graph).toBeNull();
+    expect(usePrWorkflowStore.getState().graph?.nodes.find((n) => n.id === "fix")?.label).toBe(
+      "Patch it",
+    );
+  });
+
+  it("reset in PR mode returns the PR store to null-means-default", async () => {
+    await switchToPr();
+    fireEvent.click(screen.getByRole("button", { name: "Remove step fix" }));
+    expect(usePrWorkflowStore.getState().graph?.nodes).toHaveLength(3);
+
+    fireEvent.click(screen.getByRole("button", { name: "Reset workflow to default" }));
+
+    await waitFor(() => expect(usePrWorkflowStore.getState().graph).toBeNull());
+    expect(await screen.findByLabelText("Edit step fix label")).toHaveValue("Fix issues");
+  });
+});
+
 describe("workflow graph edits (pure rules)", () => {
+  it("setWorkflowNodeLabel replaces one node's label and nothing else", () => {
+    const next = setWorkflowNodeLabel(chain(), "b", "Bee");
+    expect(next.nodes).toEqual([
+      { id: "a", text: "A" },
+      { id: "b", text: "B", label: "Bee" },
+      { id: "c", text: "C" },
+    ]);
+    expect(next.edges).toEqual(chain().edges);
+  });
+
+  it("added boxes only carry a label when one is asked for", () => {
+    // Samurai boxes stay label-free, so their graphs serialize as before.
+    expect(addWorkflowNode(chain()).nodes[3]).toEqual({ id: "step-1", text: "" });
+    expect(addWorkflowNode(chain(), "New step").nodes[3]).toEqual({
+      id: "step-1",
+      text: "",
+      label: "New step",
+    });
+  });
+
   it("walk order follows the first outgoing edge and guards against cycles", () => {
     const graph: SamuraiWorkflowGraph = {
       ...chain(),
