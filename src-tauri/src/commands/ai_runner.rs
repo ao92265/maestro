@@ -335,19 +335,52 @@ pub async fn run_claude_print_with_timeout(
 /// consumer's template actually asks for. `expected_heading`, when a
 /// consumer's template mandates one (harvest's literal `"## Recurring
 /// themes"`, the catalogue's generic `"## "` area heading), is checked
-/// against the first non-empty line too; the standup and the daily plan have
-/// no fixed heading (their templates explicitly forbid one), so callers pass
-/// `None` and only the line-count check applies.
+/// against the first non-empty line too — those consumers also always
+/// reject a single line. The standup and the daily plan have no fixed
+/// heading (their templates explicitly forbid one) and CAN legitimately
+/// answer in one line on a quiet day ("No agent activity yesterday —
+/// nothing to report."), so for `None` a single line is accepted unless it
+/// reads as a chat opener ([`looks_conversational`], review F5).
 fn looks_like_artifact(body: &str, expected_heading: Option<&str>) -> bool {
     let mut lines = body.lines().filter(|l| !l.trim().is_empty());
     let first = match lines.next() {
         Some(l) => l.trim(),
         None => return false,
     };
-    if lines.next().is_none() {
-        return false; // a single non-empty line is a chat reply, not a report
+    let single_line = lines.next().is_none();
+    match expected_heading {
+        // A mandated heading implies the multi-section template — a single
+        // line is never that shape.
+        Some(heading) => !single_line && first.starts_with(heading),
+        None => !single_line || !looks_conversational(first),
     }
-    expected_heading.is_none_or(|heading| first.starts_with(heading))
+}
+
+/// The one shape a single-line heading-less reply is NOT allowed to take
+/// (issue #97's fixture): a chat opener — a leaked personal-canary/greeting
+/// vocative ("Nacho, …", "Hi,") or a first-person conversational lead-in
+/// ("I've saved…", "Sure, here's…"). Deliberately narrow: a false accept
+/// only saves a chatty line to disk, while a false reject eats a
+/// legitimate quiet-day answer.
+fn looks_conversational(first_line: &str) -> bool {
+    let Some(first_word) = first_line.split_whitespace().next() else {
+        return false;
+    };
+    // "Nacho," / "Hello," — a single leading alphabetic word ending in a
+    // comma is the canary's exact vocative shape.
+    if first_word
+        .strip_suffix(',')
+        .is_some_and(|w| !w.is_empty() && w.chars().all(char::is_alphabetic))
+    {
+        return true;
+    }
+    // Two-word openers checked on the raw line; single-word ones on the
+    // first word with trailing punctuation stripped ("Sure!" / "Hi.").
+    if first_line.starts_with("I have ") || first_line.starts_with("Here is ") {
+        return true;
+    }
+    let bare = first_word.trim_end_matches(['!', '.', ':']);
+    ["I've", "Sure", "Here's", "Hi", "Hello", "Hey"].contains(&bare)
 }
 
 /// Run the prompt and persist the cleaned answer as `<dir>/<date>.md`.
@@ -503,6 +536,42 @@ mod tests {
         // lines of prose/bullets.
         let standup = "- shipped the login fix\n- picking up the harvest validator next\nOverall the project is on track.";
         assert!(looks_like_artifact(standup, None));
+    }
+
+    #[test]
+    fn looks_like_artifact_accepts_a_quiet_day_one_liner_without_heading() {
+        // Review F5: a heading-less consumer (standup/daily plan) can
+        // legitimately answer in ONE line on a quiet day — a single line is
+        // only rejected when it reads as a chat opener.
+        for quiet in [
+            "No agent activity yesterday — nothing to report.",
+            "- nothing shipped yesterday; queue was empty",
+            "Nothing planned for today: the backlog is clear.",
+        ] {
+            assert!(looks_like_artifact(quiet, None), "{quiet}");
+        }
+        // A mandated heading still implies the multi-section template — a
+        // single line is never that shape.
+        assert!(!looks_like_artifact(
+            "## Recurring themes",
+            Some("## Recurring themes")
+        ));
+    }
+
+    #[test]
+    fn looks_like_artifact_still_rejects_single_line_chat_openers() {
+        // The issue-#97 canary shape must keep failing the None-heading
+        // branch even as a single line.
+        for chatty in [
+            "Nacho, nothing happened yesterday so there is no standup today.",
+            "I've written the standup below.",
+            "I have nothing to report for yesterday.",
+            "Sure! Here is the plan for today.",
+            "Here's the standup you asked for.",
+            "Hi! The plan for today is to rest.",
+        ] {
+            assert!(!looks_like_artifact(chatty, None), "{chatty}");
+        }
     }
 
     #[test]
