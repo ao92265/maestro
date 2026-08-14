@@ -465,6 +465,8 @@ mod tests {
             name: name.to_string(),
             is_remote: false,
             is_current: false,
+            last_commit_date: None,
+            last_commit_author: None,
         }
     }
 

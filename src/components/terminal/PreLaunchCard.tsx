@@ -83,6 +83,12 @@ export interface SessionSlot {
    * created slots.
    */
   harvest?: boolean;
+  /**
+   * Generic initial prompt: arms the backend's one-shot prompt injection
+   * right before the CLI launches (Claude mode only). Never set for manually
+   * created slots.
+   */
+  initialPrompt?: string | null;
 }
 
 interface PreLaunchCardProps {

@@ -44,6 +44,20 @@ export interface Comment {
   isAnswer: boolean;
 }
 
+/**
+ * Compact summary of a PR's CI check runs, computed on the Rust side from
+ * `statusCheckRollup` so the list payload doesn't carry every individual
+ * check.
+ */
+export interface ChecksSummary {
+  success: number;
+  failure: number;
+  pending: number;
+  total: number;
+  /** "success" | "failure" | "pending" | "none" */
+  verdict: string;
+}
+
 /** Pull request information from GitHub. */
 export interface PullRequestInfo {
   number: number;
@@ -61,6 +75,13 @@ export interface PullRequestInfo {
   labels: PrLabel[];
   mergedAt: string | null;
   closedAt: string | null;
+  /**
+   * Optional (rather than `| null`) so existing fixtures/mocks that predate
+   * this field keep compiling — `gh`/the Rust layer always sends it, this
+   * is not an "absent in some payloads" case.
+   */
+  reviewDecision?: string | null;
+  checksSummary?: ChecksSummary;
 }
 
 /** Detailed pull request info including body. */
@@ -68,7 +89,13 @@ export interface PullRequestDetail extends PullRequestInfo {
   body: string;
   changedFiles: number;
   mergeable: string;
-  reviewDecision: string | null;
+  /**
+   * Raw `statusCheckRollup` entries from `gh pr view`, kept as-is (unlike
+   * `checksSummary`) for a future "show me the failing checks" view. Left
+   * untyped since `gh` reports two different shapes here (CheckRun vs
+   * StatusContext).
+   */
+  statusCheckRollup?: unknown[];
   comments: Comment[];
 }
 
@@ -212,8 +239,10 @@ interface GitHubState {
  * The quick chips in PullRequestFilters/IssueFilters derive their active
  * state from these clauses, so "Mine"/"Assigned" light up automatically.
  * Clearing the search box still shows everything.
+ * PRs default to empty (= all open PRs): the PR tab is a monitoring tower
+ * over the whole repo, not just the current user's own PRs.
  */
-const DEFAULT_PR_SEARCH = "author:@me";
+const DEFAULT_PR_SEARCH = "";
 const DEFAULT_ISSUE_SEARCH = "assignee:@me";
 
 /**

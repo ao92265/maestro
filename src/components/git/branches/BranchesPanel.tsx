@@ -1,12 +1,48 @@
 import { ask } from "@tauri-apps/plugin-dialog";
-import { Check, Cloud, GitBranch, Loader2, Pencil, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import {
+  AlertTriangle,
+  ArrowDown,
+  ArrowUp,
+  Check,
+  Cloud,
+  FolderGit2,
+  GitBranch,
+  GitMerge,
+  GitPullRequest,
+  Loader2,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Trash2,
+  X,
+  XCircle,
+} from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import {
+  type BranchPr,
+  fetchBranchPrAudit,
+  findPrForBranch,
+  formatRelativeTime,
+  type PrBadgeTone,
+  prBadge,
+} from "../../../lib/branchPrAudit";
+import type { BranchInfo } from "../../../lib/git";
+import { getWorktreesStatus, isWorktreeAtRisk, type WorktreeStatus } from "../../../lib/git";
+import { removeSessionWorktree } from "../../../lib/worktreeManager";
+import { useGitHubStore } from "../../../stores/useGitHubStore";
 import { useGitStore } from "../../../stores/useGitStore";
 
 /**
- * Branches tab: full management of local and remote branches — checkout,
- * create, rename, delete local (with force fallback for unmerged branches),
- * and delete on the remote. Remote refs refresh via `git fetch --all --prune`.
+ * Branches tab: the "clean resources" view for a repo. Shows local branches,
+ * remote branches, and worktrees together, each with what's needed to decide
+ * whether it's safe to delete — last commit author/date, and (when `gh` is
+ * authenticated) whether its PR was merged, by whom, and when. Deletion for
+ * all three resource kinds happens right here.
+ *
+ * Branch actions: checkout, create, rename, delete local (with force
+ * fallback for unmerged branches), and delete on the remote. Remote refs
+ * refresh via `git fetch --all --prune`. Worktree deletion goes through
+ * `git worktree remove`, with the same "not clean — force?" fallback.
  */
 export function BranchesPanel({ repoPath }: { repoPath: string }) {
   const {
@@ -22,6 +58,17 @@ export function BranchesPanel({ repoPath }: { repoPath: string }) {
     renameBranch,
     deleteRemoteBranch,
   } = useGitStore();
+  // The store's own BranchInfo type predates the backend's additive
+  // lastCommitDate/lastCommitAuthor fields; the runtime payload already
+  // carries them (same `git_branches` call), so widen the view here rather
+  // than touch the shared store's type.
+  const typedBranches: BranchInfo[] = branches;
+
+  // gh PR audit is best-effort and entirely optional: this tab isn't
+  // gh-gated, so a missing/unauthenticated `gh` must never block anything
+  // here — just skip the badges.
+  const { authStatus, checkAuth } = useGitHubStore();
+  const [prs, setPrs] = useState<BranchPr[]>([]);
 
   const [newBranchName, setNewBranchName] = useState("");
   const [isCreating, setIsCreating] = useState(false);
@@ -31,23 +78,70 @@ export function BranchesPanel({ repoPath }: { repoPath: string }) {
   /** Branch name with an action (checkout/delete/rename) in flight. */
   const [busyBranch, setBusyBranch] = useState<string | null>(null);
 
+  const [worktrees, setWorktrees] = useState<WorktreeStatus[]>([]);
+  const [worktreesLoading, setWorktreesLoading] = useState(true);
+  /** Worktree path with a delete in flight. */
+  const [busyWorktree, setBusyWorktree] = useState<string | null>(null);
+  const [worktreeError, setWorktreeError] = useState<string | null>(null);
+
   const refresh = useCallback(() => {
     fetchBranches(repoPath);
     fetchCurrentBranch(repoPath);
   }, [repoPath, fetchBranches, fetchCurrentBranch]);
 
+  const refreshWorktrees = useCallback(async () => {
+    try {
+      const data = await getWorktreesStatus(repoPath);
+      setWorktrees(data);
+    } catch {
+      setWorktrees([]);
+    } finally {
+      setWorktreesLoading(false);
+    }
+  }, [repoPath]);
+
   useEffect(() => {
     refresh();
-  }, [refresh]);
+    void refreshWorktrees();
+  }, [refresh, refreshWorktrees]);
 
-  const localBranches = branches.filter((b) => !b.is_remote);
-  const remoteBranches = branches.filter((b) => b.is_remote);
+  // Check gh auth once per repo. Branches isn't a gh-gated tab, so nothing
+  // else triggers this — but the PR badges need to know whether it's worth
+  // asking at all.
+  useEffect(() => {
+    if (!repoPath) return;
+    checkAuth(repoPath);
+  }, [repoPath, checkAuth]);
+
+  // Fetch the PR audit once gh is confirmed authenticated (and again if the
+  // repo changes while already authenticated). Silently empties out if auth
+  // is lost or absent — badges just disappear, nothing surfaces as an error.
+  useEffect(() => {
+    if (!repoPath || !authStatus?.logged_in) {
+      setPrs([]);
+      return;
+    }
+    let cancelled = false;
+    fetchBranchPrAudit(repoPath).then((result) => {
+      if (!cancelled) setPrs(result);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [repoPath, authStatus]);
+
+  const localBranches = typedBranches.filter((b) => !b.is_remote);
+  const remoteBranches = typedBranches.filter((b) => b.is_remote);
 
   const handleSync = async () => {
     setIsSyncing(true);
     try {
       await fetchAllRemoteRefs(repoPath);
       refresh();
+      void refreshWorktrees();
+      if (authStatus?.logged_in) {
+        fetchBranchPrAudit(repoPath).then(setPrs);
+      }
     } finally {
       setIsSyncing(false);
     }
@@ -143,11 +237,51 @@ export function BranchesPanel({ repoPath }: { repoPath: string }) {
     }
   };
 
+  const handleDeleteWorktree = async (wt: WorktreeStatus) => {
+    const branchLabel = wt.branch ?? "(detached)";
+    const atRisk = isWorktreeAtRisk(wt);
+    const confirmed = await ask(
+      atRisk
+        ? `Delete worktree "${branchLabel}" at ${wt.path}? It has uncommitted or unpushed work that will be lost.`
+        : `Delete worktree "${branchLabel}" at ${wt.path}?`,
+      { title: "Delete Worktree", kind: "warning" },
+    ).catch(() => false);
+    if (!confirmed) return;
+
+    setWorktreeError(null);
+    setBusyWorktree(wt.path);
+    try {
+      await removeSessionWorktree(repoPath, wt.path, false);
+      await refreshWorktrees();
+    } catch (err) {
+      // `git worktree remove` refuses a dirty/not-fully-pushed worktree;
+      // offer the --force fallback, mirroring the branch delete pattern.
+      const force = await ask(
+        `"${branchLabel}" could not be removed cleanly — it likely has uncommitted or unpushed work. Force delete and lose it?`,
+        { title: "Worktree Not Clean", kind: "warning" },
+      ).catch(() => false);
+      if (force) {
+        try {
+          await removeSessionWorktree(repoPath, wt.path, true);
+          await refreshWorktrees();
+        } catch (forceErr) {
+          setWorktreeError(String(forceErr));
+        }
+      } else {
+        setWorktreeError(String(err));
+      }
+    } finally {
+      setBusyWorktree(null);
+    }
+  };
+
   const rowButtonClass =
     "shrink-0 rounded p-0.5 opacity-0 transition-opacity group-hover:opacity-100 hover:bg-maestro-border/60";
 
-  const renderBranchRow = (name: string, isRemote: boolean, isCurrent: boolean) => {
+  const renderBranchRow = (branch: BranchInfo, isRemote: boolean, isCurrent: boolean) => {
+    const name = branch.name;
     const busy = busyBranch === name;
+    const matchedPr = findPrForBranch(prs, name, isRemote);
 
     if (!isRemote && renaming?.name === name) {
       return (
@@ -185,67 +319,83 @@ export function BranchesPanel({ repoPath }: { repoPath: string }) {
       );
     }
 
+    const metaLabel = [
+      branch.lastCommitAuthor,
+      branch.lastCommitDate && formatRelativeTime(branch.lastCommitDate),
+    ]
+      .filter(Boolean)
+      .join(" · ");
+
     return (
-      <div
-        key={name}
-        className="group flex items-center gap-1.5 rounded-md px-2 py-1 hover:bg-maestro-border/40"
-      >
-        {isRemote ? (
-          <Cloud size={12} className="shrink-0 text-maestro-muted" />
-        ) : (
-          <GitBranch
-            size={12}
-            className={`shrink-0 ${isCurrent ? "text-maestro-accent" : "text-maestro-muted"}`}
-          />
-        )}
-        <span
-          className={`min-w-0 flex-1 truncate text-xs ${
-            isCurrent ? "font-semibold text-maestro-accent" : "text-maestro-text"
-          }`}
-          title={name}
-        >
-          {name}
-        </span>
-        {isCurrent && (
-          <span className="shrink-0 rounded bg-maestro-accent/20 px-1 text-[9px] font-bold text-maestro-accent">
-            CURRENT
+      <div key={name} className="group rounded-md px-2 py-1 hover:bg-maestro-border/40">
+        <div className="flex items-center gap-1.5">
+          {isRemote ? (
+            <Cloud size={12} className="shrink-0 text-maestro-muted" />
+          ) : (
+            <GitBranch
+              size={12}
+              className={`shrink-0 ${isCurrent ? "text-maestro-accent" : "text-maestro-muted"}`}
+            />
+          )}
+          <span
+            className={`min-w-0 flex-1 truncate text-xs ${
+              isCurrent ? "font-semibold text-maestro-accent" : "text-maestro-text"
+            }`}
+            title={name}
+          >
+            {name}
           </span>
-        )}
-        {busy ? (
-          <Loader2 size={12} className="shrink-0 animate-spin text-maestro-muted" />
-        ) : (
-          <>
-            {!isCurrent && (
-              <button
-                type="button"
-                onClick={() => void handleCheckout(name)}
-                className={rowButtonClass}
-                title={isRemote ? "Checkout (creates a local tracking branch)" : "Checkout"}
-              >
-                <Check size={12} className="text-maestro-green" />
-              </button>
+          {isCurrent && (
+            <span className="shrink-0 rounded bg-maestro-accent/20 px-1 text-[9px] font-bold text-maestro-accent">
+              CURRENT
+            </span>
+          )}
+          {busy ? (
+            <Loader2 size={12} className="shrink-0 animate-spin text-maestro-muted" />
+          ) : (
+            <>
+              {!isCurrent && (
+                <button
+                  type="button"
+                  onClick={() => void handleCheckout(name)}
+                  className={rowButtonClass}
+                  title={isRemote ? "Checkout (creates a local tracking branch)" : "Checkout"}
+                >
+                  <Check size={12} className="text-maestro-green" />
+                </button>
+              )}
+              {!isRemote && (
+                <button
+                  type="button"
+                  onClick={() => setRenaming({ name, draft: name })}
+                  className={rowButtonClass}
+                  title="Rename branch"
+                >
+                  <Pencil size={12} className="text-maestro-muted" />
+                </button>
+              )}
+              {!isCurrent && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    void (isRemote ? handleDeleteRemote(name) : handleDeleteLocal(name))
+                  }
+                  className={`${rowButtonClass} hover:bg-maestro-red/10`}
+                  title={isRemote ? "Delete branch on the remote" : "Delete local branch"}
+                >
+                  <Trash2 size={12} className="text-maestro-red" />
+                </button>
+              )}
+            </>
+          )}
+        </div>
+        {(metaLabel || matchedPr) && (
+          <div className="flex items-center gap-1.5 pl-[18px]">
+            {metaLabel && (
+              <span className="min-w-0 truncate text-[10px] text-maestro-muted">{metaLabel}</span>
             )}
-            {!isRemote && (
-              <button
-                type="button"
-                onClick={() => setRenaming({ name, draft: name })}
-                className={rowButtonClass}
-                title="Rename branch"
-              >
-                <Pencil size={12} className="text-maestro-muted" />
-              </button>
-            )}
-            {!isCurrent && (
-              <button
-                type="button"
-                onClick={() => void (isRemote ? handleDeleteRemote(name) : handleDeleteLocal(name))}
-                className={`${rowButtonClass} hover:bg-maestro-red/10`}
-                title={isRemote ? "Delete branch on the remote" : "Delete local branch"}
-              >
-                <Trash2 size={12} className="text-maestro-red" />
-              </button>
-            )}
-          </>
+            {matchedPr && <PrBadgeChip pr={matchedPr} />}
+          </div>
         )}
       </div>
     );
@@ -301,7 +451,7 @@ export function BranchesPanel({ repoPath }: { repoPath: string }) {
           <p className="px-2 pb-2 text-[11px] italic text-maestro-muted">No local branches</p>
         ) : (
           localBranches.map((b) =>
-            renderBranchRow(b.name, false, b.is_current || b.name === currentBranch),
+            renderBranchRow(b, false, b.is_current || b.name === currentBranch),
           )
         )}
 
@@ -314,9 +464,125 @@ export function BranchesPanel({ repoPath }: { repoPath: string }) {
             No remote branches — try fetching
           </p>
         ) : (
-          remoteBranches.map((b) => renderBranchRow(b.name, true, false))
+          remoteBranches.map((b) => renderBranchRow(b, true, false))
+        )}
+
+        {/* Worktrees */}
+        <p className="px-2 pb-1 pt-3 text-[10px] font-semibold uppercase tracking-wider text-maestro-muted">
+          Worktrees ({worktrees.length})
+        </p>
+        {worktreeError && <p className="px-2 pb-1 text-[10px] text-maestro-red">{worktreeError}</p>}
+        {worktreesLoading && worktrees.length === 0 ? (
+          <p className="px-2 pb-2 text-[11px] italic text-maestro-muted">Loading worktrees…</p>
+        ) : worktrees.length === 0 ? (
+          <p className="px-2 pb-2 text-[11px] italic text-maestro-muted">No worktrees</p>
+        ) : (
+          worktrees.map((wt) => (
+            <WorktreeRow
+              key={wt.path}
+              status={wt}
+              busy={busyWorktree === wt.path}
+              onDelete={() => void handleDeleteWorktree(wt)}
+            />
+          ))
         )}
       </div>
+    </div>
+  );
+}
+
+/** Compact PR badge chip rendered under a branch row when a matching PR exists. */
+function PrBadgeChip({ pr }: { pr: BranchPr }) {
+  const { label, tone } = prBadge(pr, formatRelativeTime);
+  const toneClass: Record<PrBadgeTone, string> = {
+    merged: "bg-maestro-green/15 text-maestro-green",
+    open: "bg-maestro-accent/15 text-maestro-accent",
+    closed: "bg-maestro-muted/15 text-maestro-muted",
+  };
+  const Icon = tone === "merged" ? GitMerge : tone === "closed" ? XCircle : GitPullRequest;
+  return (
+    <a
+      href={pr.url}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={label}
+      className={`inline-flex min-w-0 shrink-0 items-center gap-1 truncate rounded px-1 py-0.5 text-[9px] font-medium ${toneClass[tone]} hover:opacity-80`}
+    >
+      <Icon size={9} className="shrink-0" />
+      <span className="truncate">{label}</span>
+    </a>
+  );
+}
+
+/** One row in the Worktrees section: branch, short path, risk indicator, delete. */
+function WorktreeRow({
+  status,
+  busy,
+  onDelete,
+}: {
+  status: WorktreeStatus;
+  busy: boolean;
+  onDelete: () => void;
+}) {
+  const branchLabel = status.branch ?? "(detached)";
+  const atRisk = isWorktreeAtRisk(status);
+
+  return (
+    <div className="group flex items-center gap-1.5 rounded-md px-2 py-1 hover:bg-maestro-border/40">
+      <FolderGit2
+        size={12}
+        className={`shrink-0 ${status.is_main_worktree ? "text-maestro-accent" : "text-maestro-muted"}`}
+      />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-1.5">
+          <span className="truncate text-xs text-maestro-text" title={branchLabel}>
+            {branchLabel}
+          </span>
+          {status.is_main_worktree && (
+            <span className="shrink-0 rounded bg-maestro-accent/20 px-1 text-[9px] font-bold text-maestro-accent">
+              MAIN
+            </span>
+          )}
+          {status.ahead > 0 && (
+            <span className="flex shrink-0 items-center gap-0.5 text-[9px] text-maestro-orange">
+              <ArrowUp size={9} />
+              {status.ahead}
+            </span>
+          )}
+          {status.behind > 0 && (
+            <span className="flex shrink-0 items-center gap-0.5 text-[9px] text-maestro-accent">
+              <ArrowDown size={9} />
+              {status.behind}
+            </span>
+          )}
+          {atRisk && (
+            <span
+              title="Uncommitted, unpushed, or stashed work would be lost"
+              className="flex shrink-0 items-center gap-0.5 rounded bg-maestro-red/15 px-1 text-[9px] font-medium uppercase tracking-wide text-maestro-red"
+            >
+              <AlertTriangle size={9} />
+              at risk
+            </span>
+          )}
+        </div>
+        <p className="truncate text-[10px] text-maestro-muted" title={status.path}>
+          {status.path}
+        </p>
+      </div>
+      {busy ? (
+        <Loader2 size={12} className="shrink-0 animate-spin text-maestro-muted" />
+      ) : (
+        !status.is_main_worktree && (
+          <button
+            type="button"
+            onClick={onDelete}
+            className="shrink-0 rounded p-0.5 opacity-0 transition-opacity hover:bg-maestro-red/10 group-hover:opacity-100"
+            title="Delete worktree"
+          >
+            <Trash2 size={12} className="text-maestro-red" />
+          </button>
+        )
+      )}
     </div>
   );
 }

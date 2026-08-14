@@ -1,14 +1,67 @@
-import { FileEdit, GitMerge, GitPullRequest, XCircle } from "lucide-react";
+import { CheckCircle2, GitMerge, GitPullRequest, Loader2, XCircle } from "lucide-react";
 import { useMemo } from "react";
-import type { PullRequestInfo } from "../../../stores/useGitHubStore";
+import type { ChecksSummary, PullRequestInfo } from "../../../stores/useGitHubStore";
+import { PrActionsMenu } from "./PrActionsMenu";
 
 interface PullRequestRowProps {
   pr: PullRequestInfo;
+  /** Repository the PR belongs to — the actions menu names it in its prompt. */
+  repoPath: string;
   isSelected: boolean;
   onClick: () => void;
 }
 
-export function PullRequestRow({ pr, isSelected, onClick }: PullRequestRowProps) {
+/** How a `reviewDecision` value is shown. Anything else renders no badge. */
+const REVIEW_BADGES: Record<string, { label: string; title: string; className: string }> = {
+  APPROVED: {
+    label: "Approved",
+    title: "Review approved",
+    className: "bg-maestro-green/15 text-maestro-green",
+  },
+  CHANGES_REQUESTED: {
+    label: "Changes",
+    title: "Changes requested",
+    className: "bg-maestro-red/15 text-maestro-red",
+  },
+  REVIEW_REQUIRED: {
+    label: "Review",
+    title: "Review required",
+    className: "bg-maestro-muted/15 text-maestro-muted",
+  },
+};
+
+/**
+ * The CI verdict as one icon. Nothing renders when the PR has no checks
+ * ("none"), so a repo without CI does not grow an empty column.
+ */
+function ChecksBadge({ checks }: { checks?: ChecksSummary }) {
+  if (!checks) return null;
+  const tip = `Checks: ${checks.success} passed, ${checks.failure} failed, ${checks.pending} pending (${checks.total} total)`;
+  switch (checks.verdict) {
+    case "success":
+      return (
+        <span role="img" title={tip} aria-label={tip}>
+          <CheckCircle2 size={11} className="text-maestro-green" />
+        </span>
+      );
+    case "failure":
+      return (
+        <span role="img" title={tip} aria-label={tip}>
+          <XCircle size={11} className="text-maestro-red" />
+        </span>
+      );
+    case "pending":
+      return (
+        <span role="img" title={tip} aria-label={tip}>
+          <Loader2 size={11} className="animate-spin text-maestro-orange" />
+        </span>
+      );
+    default:
+      return null;
+  }
+}
+
+export function PullRequestRow({ pr, repoPath, isSelected, onClick }: PullRequestRowProps) {
   // Format relative time
   const relativeTime = useMemo(() => {
     const now = Date.now();
@@ -58,50 +111,70 @@ export function PullRequestRow({ pr, isSelected, onClick }: PullRequestRowProps)
   }, [pr.state, pr.isDraft]);
 
   const StateIcon = stateInfo.icon;
+  const review = REVIEW_BADGES[(pr.reviewDecision ?? "").toUpperCase()];
 
+  // The row is a container, not a button: the actions menu's trigger is a
+  // button of its own and cannot legally nest inside another one.
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`flex w-full items-center gap-2 border-b border-maestro-border/30 px-3 py-2 text-left transition-colors ${
+    <div
+      className={`flex w-full items-center border-b border-maestro-border/30 transition-colors ${
         isSelected ? "bg-maestro-accent/20 hover:bg-maestro-accent/25" : "hover:bg-maestro-card/50"
       }`}
     >
-      {/* State icon */}
-      <div className={`shrink-0 rounded p-1 ${stateInfo.bgColor}`}>
-        <StateIcon size={14} className={stateInfo.color} />
-      </div>
+      <button
+        type="button"
+        onClick={onClick}
+        className="flex min-w-0 flex-1 items-center gap-2 py-2 pl-3 pr-1 text-left"
+      >
+        {/* State icon */}
+        <div className={`shrink-0 rounded p-1 ${stateInfo.bgColor}`}>
+          <StateIcon size={14} className={stateInfo.color} />
+        </div>
 
-      {/* Title and branch info */}
-      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <div className="flex items-center gap-1.5">
-          {pr.isDraft && (
-            <span className="shrink-0 rounded bg-maestro-muted/20 px-1 py-0.5 text-[10px] font-medium text-maestro-muted">
-              Draft
+        {/* Title, author and branch info */}
+        <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+          <div className="flex items-center gap-1.5">
+            {pr.isDraft && (
+              <span className="shrink-0 rounded bg-maestro-muted/20 px-1 py-0.5 text-[10px] font-medium text-maestro-muted">
+                Draft
+              </span>
+            )}
+            <span className="truncate text-xs text-maestro-text">{pr.title}</span>
+          </div>
+          <div className="flex min-w-0 items-center gap-1.5 text-[10px] text-maestro-muted">
+            <span className="shrink-0 font-mono">#{pr.number}</span>
+            {/* A deleted GitHub account comes back without an author. */}
+            {pr.author?.login && <span className="shrink-0 truncate">by {pr.author.login}</span>}
+            <span className="truncate">
+              {pr.headRefName} → {pr.baseRefName}
             </span>
-          )}
-          <span className="truncate text-xs text-maestro-text">{pr.title}</span>
+          </div>
         </div>
-        <div className="flex items-center gap-2 text-[10px] text-maestro-muted">
-          <span className="font-mono">#{pr.number}</span>
-          <span className="truncate">
-            {pr.headRefName} → {pr.baseRefName}
-          </span>
-          {pr.author?.login && <span className="shrink-0">by {pr.author.login}</span>}
+
+        {/* Status column: CI verdict + review decision, then size and age */}
+        <div className="flex shrink-0 flex-col items-end gap-0.5">
+          <div className="flex items-center gap-1">
+            <ChecksBadge checks={pr.checksSummary} />
+            {review && (
+              <span
+                title={review.title}
+                className={`rounded px-1 py-0.5 text-[10px] font-medium ${review.className}`}
+              >
+                {review.label}
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-1 text-[10px]">
+            <span className="text-green-400">+{pr.additions}</span>
+            <span className="text-red-400">-{pr.deletions}</span>
+            <span className="text-maestro-muted/60">{relativeTime}</span>
+          </div>
         </div>
-      </div>
+      </button>
 
-      {/* Changes indicator */}
-      <div className="flex shrink-0 items-center gap-1 text-[10px]">
-        <FileEdit size={10} className="text-maestro-muted" />
-        <span className="text-green-400">+{pr.additions}</span>
-        <span className="text-red-400">-{pr.deletions}</span>
+      <div className="flex shrink-0 items-center pr-1.5">
+        <PrActionsMenu pr={pr} repoPath={repoPath} />
       </div>
-
-      {/* Relative time */}
-      <span className="w-8 shrink-0 text-right text-[10px] text-maestro-muted/60">
-        {relativeTime}
-      </span>
-    </button>
+    </div>
   );
 }
