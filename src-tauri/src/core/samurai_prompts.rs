@@ -97,10 +97,13 @@ pub fn soft_winddown_ack_value(generation: u32) -> String {
 
 /// The run-completion declaration tag (issue #96). The orchestrator replies
 /// with `<samurai-run-complete>issues #a #b pr #n</samurai-run-complete>`
-/// once every issue the run works is closed and the run's PR is open; the
-/// scanner (`samurai_completion`) verifies exactly those claims via `gh`
-/// before the run config flips ACTIVE → COMPLETED. Built here so instruction
-/// and scanner can never drift (the `handoff_ack_value` discipline).
+/// once the run's PR is OPEN with every issue CLOSED or linked for close by
+/// it, or the PR was MERGED with every issue CLOSED (review F3 — the run's
+/// own process closes issues via `Closes #N` on the HUMAN merge, so the
+/// open-PR-with-links state is the normal declarable end); the scanner
+/// (`samurai_completion`) verifies exactly those claims via `gh` before the
+/// run config flips ACTIVE → COMPLETED. Built here so instruction and
+/// scanner can never drift (the `handoff_ack_value` discipline).
 pub const RUN_COMPLETE_TAG: &str = "samurai-run-complete";
 
 /// The execution-order deviation alert tag (issue #93). When an orchestrator
@@ -122,8 +125,11 @@ pub const ORDER_ALERT_TAG: &str = "samurai-order-alert";
 /// construction (see module doc).
 fn completion_declaration_clause() -> String {
     format!(
-        " COMPLETION: when EVERY issue this run works is CLOSED on GitHub and the run's pull \
-         request is OPEN, declare completion by replying with a message that contains exactly \
+        " COMPLETION: the run is finished when the run's pull request is OPEN and EVERY issue \
+         this run works is either CLOSED on GitHub or linked for close by that PR (a \
+         `Closes #N`/`Fixes #N` reference in its body — the human's merge then closes it), or \
+         when the PR was already MERGED and every issue is CLOSED. At that moment declare \
+         completion by replying with a message that contains exactly \
          <{tag}>issues #<a> #<b> pr #<n></{tag}> with the real numbers — list every issue \
          number this run worked, then the pull request number (for example: issues #77 #78 \
          pr #85, inside the tag). Maestro verifies each claimed issue and the PR against \
@@ -788,23 +794,26 @@ pub fn launch_instruction(refs: &RunRefs, repo_pin: Option<&str>, compiled_workf
     };
     // Progress comments land on the epic whenever there is one (issue #83:
     // "comment progress on the epic"); an issues-only run has no epic to
-    // gather them on, so each issue carries its own.
+    // gather them on, so each issue carries its own. Review F6: the run
+    // ships ONE batch PR (the workflow's "Open or finalize the run's pull
+    // request" step and the COMPLETION clause both assume it), so this step
+    // speaks of the singular run PR — never "open pull requests" per issue.
     let progress_subject = match (has_epics, has_issues) {
         (false, true) if many_issues => {
-            "comment progress on EACH of those GitHub issues as they complete, and open pull \
-             requests for finished work"
+            "comment progress on EACH of those GitHub issues as they complete, and open the \
+             run's pull request for finished work and keep it updated"
         }
         (false, true) => {
-            "comment progress on that GitHub issue as work completes, and open pull requests \
-             for finished work"
+            "comment progress on that GitHub issue as work completes, and open the run's pull \
+             request for finished work and keep it updated"
         }
         _ if many_epics => {
-            "comment progress on the epics' GitHub issues as issues complete, and open pull \
-             requests for finished work"
+            "comment progress on the epics' GitHub issues as issues complete, and open the \
+             run's pull request for finished work and keep it updated"
         }
         _ => {
-            "comment progress on the epic's GitHub issue as issues complete, and open pull \
-             requests for finished work"
+            "comment progress on the epic's GitHub issue as issues complete, and open the \
+             run's pull request for finished work and keep it updated"
         }
     };
     // Same reasoning for where a NOT-ready issue gets reported.
@@ -1490,9 +1499,13 @@ mod tests {
         assert!(text.contains("SMALL idempotent subagent tasks"));
         assert!(text.contains("stage named paths only"));
         assert!(text.contains("Conventional Commit"));
-        // Progress comments + PRs, and the hard containment rule.
+        // Progress comments + the ONE batch PR (review F6 — the workflow
+        // and the COMPLETION clause assume a single run PR), and the hard
+        // containment rule.
         assert!(text.contains("comment progress"));
-        assert!(text.contains("open pull requests"));
+        assert!(text.contains("open the run's pull request"));
+        assert!(text.contains("keep it updated"));
+        assert!(!text.contains("open pull requests"));
         assert!(text.contains("NEVER switch to, commit to, or push any other branch"));
         assert!(text.contains("NEVER touch any repository other than this one"));
         // No successor/recovery language: there is nothing to hand off from.
@@ -1930,8 +1943,13 @@ mod tests {
             );
             assert!(text.contains(&format!("</{RUN_COMPLETE_TAG}>")));
             assert!(text.contains("pr #<n>"));
-            assert!(text.contains("CLOSED on GitHub"));
+            // The corrected completion matrix (review F3): the open batch
+            // PR with close links is declarable — issues need not all be
+            // CLOSED while the PR is open — and so is the merged-PR +
+            // all-closed state.
             assert!(text.contains("pull request is OPEN"));
+            assert!(text.contains("CLOSED on GitHub or linked for close"));
+            assert!(text.contains("MERGED and every issue is CLOSED"));
             // Maestro verifies — an unverified declaration never flips.
             assert!(text.contains("verifies"));
             // Marker hygiene rides here too (fresh-eyes finding J).

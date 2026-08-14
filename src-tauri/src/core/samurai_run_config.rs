@@ -52,9 +52,11 @@ use super::status_server::StatusServer;
 pub enum RunConfigStatus {
     Active,
     /// Verified complete (issue #96): the orchestrator declared completion
-    /// and Maestro confirmed via `gh` that every batch issue is closed and
-    /// the batch PR is open. Finished-awaiting-cleanup — the manual 🗑
-    /// cleanup (PRD §5.9) flips it on to ARCHIVED.
+    /// and Maestro confirmed via `gh` that the batch PR is open with every
+    /// batch issue closed or linked for close by it — or already merged
+    /// with every issue closed (PRD §5.9, review F3).
+    /// Finished-awaiting-cleanup — the manual 🗑 cleanup (PRD §5.9) flips
+    /// it on to ARCHIVED.
     Completed,
     Archived,
 }
