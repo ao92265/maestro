@@ -494,7 +494,7 @@ export function SecondBrainSection() {
             <Loader2 size={12} className="animate-spin" /> Loading…
           </div>
         ) : (
-          <div className="space-y-2">
+          <div className="max-h-[45vh] overflow-y-auto space-y-2">
             {GROUPS.map(({ kind, label, hideWhenEmpty }) => {
               const entries = files.filter((f) => f.kind === kind);
               if (entries.length === 0 && hideWhenEmpty) return null;
