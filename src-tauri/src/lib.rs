@@ -324,9 +324,32 @@ pub fn run() {
             // Create TranscriptWatcher
             let transcript_watcher = Arc::new(TranscriptWatcher::new(event_bus.clone()));
 
+            // Generic initial prompt: a launch that carries prompt text arms
+            // the session via `terminal_arm_initial_prompt` right before the
+            // CLI command is typed, and the session's first SessionStarted
+            // hook signal types the prompt in. Same delivery as the harvest
+            // triage below — the confirmed body write, then the scaled gap
+            // and the lone Enter (issue #103). No late-bound slot: this
+            // depends only on the ProcessManager, already managed.
+            let initial_prompt_pm = app.state::<ProcessManager>().inner().clone();
+            let initial_prompt_deliver: commands::harvest::DeliverFn =
+                Arc::new(move |session_id, prompt| {
+                    core::samurai_pty::submit_instruction_confirmed(
+                        initial_prompt_pm.clone(),
+                        session_id,
+                        prompt,
+                        "initial-prompt",
+                    )
+                });
+            let initial_prompt = Arc::new(commands::initial_prompt::InitialPromptInjector::new(
+                initial_prompt_deliver,
+            ));
+            app.manage(initial_prompt.clone());
+
             // Create hook emit callback
             // When SessionStarted events arrive via hooks, start watching the transcript
             let event_bus_for_hooks = event_bus.clone();
+            let initial_prompt_for_hooks = initial_prompt.clone();
             let transcript_watcher_for_hooks = transcript_watcher.clone();
             let samurai_injector_for_hooks = samurai_injector.clone();
             let harvest_triage_for_hooks = harvest_triage_slot.clone();
@@ -348,6 +371,14 @@ pub fn run() {
                             triage.on_session_started(session_id);
                         });
                     }
+                    // Generic initial prompt: same gate, same policy — the
+                    // PTY write is fully blocking, so it leaves the hook
+                    // chain via the blocking pool. A session nobody armed is
+                    // a no-op inside the injector.
+                    let initial_prompt_injector = initial_prompt_for_hooks.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        initial_prompt_injector.on_session_started(session_id);
+                    });
                 }
                 // Samurai (issue #53): idle-gate signal (Stop hook →
                 // SessionEnded reason "stop"). Tapped here, pre-dedup: the
@@ -1156,6 +1187,8 @@ pub fn run() {
             // read command keeps serving previously generated reports)
             commands::harvest::samurai_harvest_arm,
             commands::harvest::samurai_harvest_read,
+            // Generic "launch a terminal with an initial prompt" injection
+            commands::initial_prompt::terminal_arm_initial_prompt,
             // CLI commands
             commands::cli::install_cli,
             commands::cli::uninstall_cli,

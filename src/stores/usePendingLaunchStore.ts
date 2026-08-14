@@ -48,6 +48,16 @@ export interface PendingLaunch {
    * SessionStarted. Never set for manually created slots.
    */
   harvest?: boolean;
+  /**
+   * Generic "launch a terminal with an initial prompt": the grid arms the
+   * session via `terminal_arm_initial_prompt` right before the CLI launches,
+   * and the backend types this text into the PTY on the session's first
+   * SessionStarted hook signal. Claude-mode launches only — no other CLI
+   * emits that hook. May be multi-line; the backend collapses every
+   * whitespace run to a single space before typing (a newline inside an
+   * injected prompt submits a partial message).
+   */
+  initialPrompt?: string | null;
 }
 
 interface PendingLaunchState {
@@ -82,7 +92,8 @@ function sameLaunch(a: PendingLaunch, b: PendingLaunch): boolean {
     (a.samurai?.project ?? null) === (b.samurai?.project ?? null) &&
     (a.samurai?.epic ?? null) === (b.samurai?.epic ?? null) &&
     (a.samurai?.generation ?? null) === (b.samurai?.generation ?? null) &&
-    (a.harvest ?? false) === (b.harvest ?? false)
+    (a.harvest ?? false) === (b.harvest ?? false) &&
+    (a.initialPrompt ?? null) === (b.initialPrompt ?? null)
   );
 }
 
