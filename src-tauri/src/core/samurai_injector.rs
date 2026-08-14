@@ -2387,6 +2387,67 @@ mod tests {
         );
     }
 
+    /// The whole production chain, from a transcript APPEND to the requested
+    /// handoff: watcher → parser → EventBus → context store → trigger. Every
+    /// link is unit-tested in isolation, but nothing exercised them together,
+    /// so a break in a seam (the `lib.rs` tee's shape, the notify wake-path
+    /// match, the session-id key shared by watcher and supervisor) could not
+    /// fail a test. Numbers are a real run's: `claude-opus-5` at 441,033
+    /// context tokens = 44.1% of the 1M window, past the 40% default.
+    #[tokio::test]
+    async fn test_transcript_append_drives_the_trigger_end_to_end() {
+        let dir = tempdir().unwrap();
+        let (injector, _audit, supervisor, context, _dirs) = harness(dir.path());
+
+        // The bus callback is the one `lib.rs` installs: the context store
+        // observes every deduped event before anything else sees it.
+        let context_for_bus = context.clone();
+        let bus = Arc::new(crate::core::event_bus::EventBus::new(Arc::new(
+            move |event: ClaudeEvent| context_for_bus.observe(&event),
+        )));
+        let watcher = crate::core::transcript_watcher::TranscriptWatcher::new(bus);
+
+        let transcript = dir.path().join("session.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let transcript = transcript.canonicalize().unwrap();
+        watcher.start_watching(13, transcript.clone());
+
+        supervisor
+            .register_session(13, "C:/git/proj-e2e".into(), "EPic #2".into(), 1)
+            .unwrap();
+        injector.tick();
+        assert_eq!(
+            injector.session_state(13),
+            Some(Working),
+            "no context reading yet: the session stays WORKING"
+        );
+
+        // 4 + 1_029 + 440_000 = 441_033 tokens.
+        let line = r#"{"parentUuid":"u-1","isSidechain":false,"type":"assistant","message":{"model":"claude-opus-5","id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"working"}],"usage":{"input_tokens":4,"output_tokens":120,"cache_creation_input_tokens":1029,"cache_read_input_tokens":440000}},"uuid":"u-2","timestamp":"2026-08-14T13:58:09.201Z"}"#;
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            writeln!(f, "{line}").unwrap();
+        }
+
+        wait_until(|| context.percent(13).is_some()).await;
+        assert_eq!(
+            context.percent(13),
+            Some(44.1),
+            "the watcher-derived percentage must match Claude Code's /context"
+        );
+
+        injector.tick();
+        assert_eq!(
+            injector.session_state(13),
+            Some(HandoffRequested),
+            "44.1% is past the 40% default: the tick must request the handoff"
+        );
+    }
+
     #[tokio::test]
     async fn test_below_threshold_or_unknown_percent_never_triggers() {
         let dir = tempdir().unwrap();
