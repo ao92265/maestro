@@ -1876,7 +1876,6 @@ impl SamuraiReplicator {
         // session shows no turn activity within the window gets the lone
         // Enter re-sent (NEVER the body — it already sits in the input box),
         // bounded by MAX_ENTER_RESENDS, then a final ALERT.
-        let mut resend_ids: Vec<u32> = Vec::new();
         let mut rows: Vec<(String, AuditEvent)> = Vec::new();
         {
             let mut delivered = self.lock_delivered();
@@ -1892,7 +1891,21 @@ impl SamuraiReplicator {
                         d.resends += 1;
                         // Re-stamp so each resend gets a full window.
                         d.delivered_at = AgeableInstant::now();
-                        resend_ids.push(d.session_id);
+                        log::warn!(
+                            "samurai replicator: no turn activity from session {} since its instruction was typed in — re-sending the lone Enter (swallowed-submit recovery, issue #103)",
+                            d.session_id
+                        );
+                        // Issue #106 review F4: fire WHILE HOLDING the
+                        // delivered lock. Deciding under the lock but firing
+                        // after release left a gap where turn evidence could
+                        // release the watch (`note_turn_activity` takes this
+                        // same lock) and the queued `\r` still fired into the
+                        // already-started turn. Verdict and fire are atomic
+                        // now: a released watch can never resend. Safe to
+                        // hold: the resender is fire-and-forget (production
+                        // spawns an async task; tests push to a Vec) and
+                        // never re-enters the replicator.
+                        (self.resend_enter)(d.session_id);
                         rows.push((
                             d.project.clone(),
                             AuditEvent::now(
@@ -1929,13 +1942,7 @@ impl SamuraiReplicator {
                 }
             });
         }
-        // I/O outside the lock, like every other tick pass.
-        for session_id in resend_ids {
-            log::warn!(
-                "samurai replicator: no turn activity from session {session_id} since its instruction was typed in — re-sending the lone Enter (swallowed-submit recovery, issue #103)"
-            );
-            (self.resend_enter)(session_id);
-        }
+        // Audit I/O outside the lock, like every other tick pass.
         for (project, row) in rows {
             self.audit.append(&project, row);
         }
@@ -3874,6 +3881,40 @@ mod tests {
         assert_eq!(unconfirmed[0].session_id, 5);
         assert_eq!(unconfirmed[0].details["resends"], 2);
         assert_eq!(unconfirmed[0].details["launch"], true);
+    }
+
+    #[tokio::test]
+    async fn test_evidence_on_an_expired_watch_wins_over_the_due_resend() {
+        // Issue #106 review F4: the watch has already EXPIRED — the resend
+        // is due on the very next tick — when turn evidence arrives. The
+        // release must win: the Enter never fires (it would land in an
+        // already-started turn), no retry bookkeeping is written, and the
+        // body is (as always) never re-sent. With the resend now fired
+        // under the delivered lock, the release and the verdict+fire are
+        // atomic — this pins the observable contract.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-106-f4-gap";
+        deliver_launch_brief(&h, project);
+
+        h.replicator
+            .backdate_delivered(5, ENTER_RESEND_WINDOW + Duration::from_secs(1));
+        // Evidence lands between the expiry and the tick.
+        h.replicator.observe(&user_message(5));
+        assert_eq!(h.replicator.delivered_count(), 0, "watch released");
+
+        h.replicator.tick();
+        assert!(
+            h.resends.lock().unwrap().is_empty(),
+            "a released watch never resends"
+        );
+        assert_eq!(h.writes.lock().unwrap().len(), 1, "body never re-sent");
+        let rows = h.audit.read(project, None, None).await.unwrap().events;
+        assert!(
+            !rows.iter().any(|r| r.details["kind"] == "submit_retry"
+                || r.details["kind"] == "submit_unconfirmed"),
+            "no retry bookkeeping for a confirmed submit"
+        );
     }
 
     #[tokio::test]

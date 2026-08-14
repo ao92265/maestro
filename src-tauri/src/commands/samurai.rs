@@ -519,26 +519,6 @@ pub(crate) async fn launch_run_inner(
         t.validate()?;
     }
 
-    // Review F5: a stale resume timer from the epic's PREVIOUS run must not
-    // survive the relaunch — left armed it would fire into the fresh run
-    // and double-spawn a generation. After the refusal matrix on purpose: a
-    // refused launch must not touch the old run's state. Cancelled by SLUG,
-    // not exact string — a relaunch typed as "38" must still cancel a timer
-    // armed under "#38": every other surface (config, worktree, handoffs)
-    // unifies spellings via epic_slug, and the timer must not be the one
-    // holdout that lets a second orchestrator spawn into the worktree.
-    let mut stale_timer_cancelled = false;
-    for entry in schedule.list() {
-        if entry.project_path == project && epic_slug(&entry.epic) == epic_slug(&epic) {
-            stale_timer_cancelled |= schedule.cancel(&entry.project_path, &entry.epic)?;
-        }
-    }
-    if stale_timer_cancelled {
-        log::info!(
-            "samurai launch: cancelled a stale resume timer for epic {epic} in {project} before relaunch"
-        );
-    }
-
     let branch = epic_branch(&epic);
     let worktree = ensure_epic_worktree(worktrees, project, &branch, worktree_base).await?;
     let worktree_path = strip_extended_prefix(&worktree.to_string_lossy()).to_string();
@@ -578,6 +558,29 @@ pub(crate) async fn launch_run_inner(
         return Err(failure.message);
     }
 
+    // Review F5: a stale resume timer from the epic's PREVIOUS run must not
+    // survive the relaunch — left armed it would fire into the fresh run
+    // and double-spawn a generation. Cancelled only HERE, after the refusal
+    // matrix AND after the test gate (issue #106 review F3): the cancel
+    // persists schedule.json, so a refused or gate-blocked launch must
+    // leave the previous parked run's state — its resume timer above all —
+    // untouched. Cancelled by SLUG, not exact string — a relaunch typed as
+    // "38" must still cancel a timer armed under "#38": every other surface
+    // (config, worktree, handoffs) unifies spellings via epic_slug, and the
+    // timer must not be the one holdout that lets a second orchestrator
+    // spawn into the worktree.
+    let mut stale_timer_cancelled = false;
+    for entry in schedule.list() {
+        if entry.project_path == project && epic_slug(&entry.epic) == epic_slug(&epic) {
+            stale_timer_cancelled |= schedule.cancel(&entry.project_path, &entry.epic)?;
+        }
+    }
+    if stale_timer_cancelled {
+        log::info!(
+            "samurai launch: cancelled a stale resume timer for epic {epic} in {project} before relaunch"
+        );
+    }
+
     // The `--repo` pin from the worktree's origin remote (PRD §10: gen-1
     // runs with --dangerously-skip-permissions). Blocking git → blocking
     // pool; an unparseable remote yields None and the brief carries its
@@ -589,7 +592,9 @@ pub(crate) async fn launch_run_inner(
 
     // P3.4 contract: the ACTIVE config reaches disk BEFORE gen-1 spawns —
     // but only AFTER the test gate passed (issue #90b), so a blocked launch
-    // persists nothing. A crash between the write and the spawn leaves a
+    // persists nothing: no config, and no schedule.json rewrite either (the
+    // stale-timer cancel above sits behind the gate for exactly that,
+    // review F3). A crash between the write and the spawn leaves a
     // config cold-start reconciliation flags as reconcile_unstartable — the
     // human relaunches (accepted).
     // Issue #91: the run's workflow graph — the UI's edited graph, or the
@@ -2248,6 +2253,53 @@ mod tests {
             .expect("an ALERT row records the block");
         assert_eq!(alert.details["kind"], "launch_test_gate");
         assert_eq!(alert.details["phase"], "bootstrap");
+    }
+
+    #[tokio::test]
+    async fn test_red_gate_leaves_the_previous_runs_resume_timer_armed() {
+        // Issue #106 review F3: the stale-timer cancel persists
+        // schedule.json, so it runs only AFTER the gate passes — a blocked
+        // launch leaves the previous parked run resumable exactly as it was.
+        let h = cleanup_harness();
+        commit_fixture_files(
+            h.repo.path(),
+            &[("Cargo.toml", "[workspace]\nmembers = []\n")],
+        );
+        h.schedule
+            .arm(ScheduleEntry {
+                project_path: h.project.clone(),
+                // The previous run's identity label — what a real park armed.
+                epic: "epic #38".to_string(),
+                fire_at: "2030-01-01T00:00:00+00:00".to_string(),
+                reason: "park".to_string(),
+            })
+            .unwrap();
+
+        let (red_gate, _calls) = recording_gate(vec![(
+            "cargo test",
+            crate::core::samurai_test_gate::GateCommandOutput {
+                success: false,
+                timed_out: false,
+                stdout: "test result: FAILED. 1 passed; 1 failed\n".to_string(),
+                stderr: String::new(),
+            },
+        )]);
+        run_launch(&h, &red_gate, false, &["#38"], &[])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            h.schedule.list().len(),
+            1,
+            "a blocked launch must not destroy the previous run's resume timer"
+        );
+
+        // The gate passing is what consumes the stale timer.
+        let (green_gate, _calls) = recording_gate(vec![]);
+        let result = run_launch(&h, &green_gate, false, &["#38"], &[])
+            .await
+            .unwrap();
+        assert!(result.stale_timer_cancelled);
+        assert!(h.schedule.list().is_empty());
     }
 
     // --- issue #106 review F1: the in-flight launch slot ---
