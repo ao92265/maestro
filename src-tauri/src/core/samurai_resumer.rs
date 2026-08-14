@@ -334,18 +334,22 @@ impl SamuraiResumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::allowance_watcher::{AllowanceEvent, AllowanceWindow, ThresholdKind};
+    use crate::core::claude_event::ClaudeEvent;
     use crate::core::samurai_config::{SamuraiConfig, SharedSamuraiConfig};
     use crate::core::samurai_context::SamuraiContextStore;
     use crate::core::samurai_injector::SamuraiInjector;
+    use crate::core::samurai_injector::SessionDirResolver;
     use crate::core::samurai_replicator::{
         EnterResender, SessionTeardown, StdinWriter, SuccessorEmitter, SuccessorSpawn,
         TranscriptPathResolver,
     };
-    use crate::core::samurai_injector::SessionDirResolver;
     use crate::core::samurai_run_config::SamuraiRunConfig;
+    use crate::core::samurai_schedule::jitter_secs;
     use crate::core::supervisor::SupervisorState;
     use crate::core::windows_process::StdCommandExt;
-    use chrono::DateTime;
+    use chrono::{DateTime, Duration as ChronoDuration};
+    use std::collections::HashMap;
     use std::sync::{Mutex, RwLock};
     use std::time::Duration;
     use tempfile::tempdir;
@@ -465,6 +469,16 @@ mod tests {
         schedule: Arc<SamuraiSchedule>,
         audit: AuditLog,
         spawns: Arc<Mutex<Vec<SuccessorSpawn>>>,
+        /// The park half of the seam test: the injector delivers the park
+        /// ladder, the context store orders the sweep, the parker arms the
+        /// timer this module's resumer then fires.
+        injector: Arc<SamuraiInjector>,
+        context: Arc<SamuraiContextStore>,
+        parker: Arc<SamuraiParker>,
+        /// session id → working dir, for the park validation's file+WIP
+        /// checks. Empty for every test that never registers one, which is
+        /// the previous `|_| None` behaviour unchanged.
+        dirs: Arc<Mutex<HashMap<u32, String>>>,
     }
 
     fn harness(dir: &Path) -> Harness {
@@ -476,7 +490,10 @@ mod tests {
         // The replicator/injector still resolve session dirs; the resumer no
         // longer does (review F2 — the working dir comes from the gated run
         // config alone).
-        let session_dirs: SessionDirResolver = Arc::new(|_| None);
+        let dirs: Arc<Mutex<HashMap<u32, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        let dirs_for_resolver = dirs.clone();
+        let session_dirs: SessionDirResolver =
+            Arc::new(move |id| dirs_for_resolver.lock().unwrap().get(&id).cloned());
         let transcript_paths: TranscriptPathResolver = Arc::new(|_| None);
         let teardown: SessionTeardown = Arc::new(|_| Box::pin(async {}));
         let spawns: Arc<Mutex<Vec<SuccessorSpawn>>> = Arc::new(Mutex::new(Vec::new()));
@@ -523,14 +540,14 @@ mod tests {
         );
         let parker = SamuraiParker::new(
             supervisor.clone(),
-            context,
+            context.clone(),
             injector.clone(),
             schedule.clone(),
             audit.clone(),
             teardown,
         );
         injector.set_parker(parker.clone());
-        resumer.bind(schedule.clone(), parker);
+        resumer.bind(schedule.clone(), parker.clone());
         Harness {
             resumer,
             supervisor,
@@ -539,6 +556,10 @@ mod tests {
             schedule,
             audit,
             spawns,
+            injector,
+            context,
+            parker,
+            dirs,
         }
     }
 
@@ -862,5 +883,166 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(h.spawns.lock().unwrap().is_empty());
         assert!(h.schedule.list().is_empty());
+    }
+
+    // --- the park → armed timer → fire → resume seam ---
+
+    /// `git init` + one commit + the epic's handoff file for `generation`,
+    /// so the park ladder's file+WIP validation passes (the handoff lands
+    /// untracked, which `validate_handoff` accepts — only modified/staged
+    /// TRACKED files count as uncommitted WIP).
+    fn init_parkable_repo(dir: &Path, epic: &str, generation: u32) {
+        init_repo(dir);
+        write_handoff(dir, epic, generation);
+    }
+
+    /// Drives session `id` through the park ladder's happy path: the Stop
+    /// hook injects the instruction, then the ACK, then the written marker.
+    fn complete_park(h: &Harness, id: u32, generation: u32) {
+        h.injector.observe_hook(&ClaudeEvent::SessionEnded {
+            session_id: id,
+            reason: "stop".into(),
+            timestamp: "t".into(),
+        });
+        let msg = |text: String| ClaudeEvent::AssistantMessage {
+            session_id: id,
+            uuid: format!("uuid-{id}-{}", text.len()),
+            text,
+            model: "claude-opus-4".to_string(),
+            token_usage: None,
+            timestamp: "t".to_string(),
+        };
+        h.injector.observe(&msg(format!(
+            "<samurai-ack>park gen-{generation}</samurai-ack>"
+        )));
+        h.injector.observe(&msg(format!(
+            "<samurai-handoff-written>gen-{generation} park</samurai-handoff-written>"
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_hard_crossing_parks_then_the_armed_timer_fires_and_resumes_the_epic() {
+        // The seam neither half's tests cover: the parker's own tests stop at
+        // "timer armed" and every resumer test above hands `on_fire` an entry
+        // by hand. This one runs the whole chain through the real components
+        // — allowance event → sweep → park ladder → armed timer → the
+        // schedule's own due check → resume spawn — so a break anywhere in
+        // between (a fire_at nobody can parse, a reason mismatch, an epic
+        // spelling that stops matching) fails here instead of in production.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-seam";
+        let epic = "#42";
+        let repo = tempdir().unwrap();
+        init_parkable_repo(repo.path(), epic, 1);
+        let worktree = repo.path().to_string_lossy().into_owned();
+        h.dirs.lock().unwrap().insert(1, worktree.clone());
+        // The ACTIVE run config is what lets the fired timer spawn at all
+        // (the F2 gate) and where the successor's working dir comes from.
+        h.run_configs
+            .save(&SamuraiRunConfig::new(project, epic, worktree.clone()))
+            .unwrap();
+        h.supervisor
+            .register_session(1, project.into(), epic.into(), 1)
+            .unwrap();
+        h.context.observe(&ClaudeEvent::ContextUsageUpdate {
+            session_id: 1,
+            model: "claude-opus-4".to_string(),
+            context_tokens: 90_000,
+            context_window: 200_000,
+            percent: 55.0,
+            timestamp: "2026-08-06T00:00:00Z".to_string(),
+        });
+
+        // A reset time chosen so the parker's REAL arithmetic
+        // (`resets_at + 5 min + per-epic jitter`) lands ~1s from now: the
+        // wait is compressed, the computation is not faked.
+        // 300 = the parker's own `RESUME_DELAY_SECS` (PRD §7's 5 minutes),
+        // pinned there by `test_fire_at_adds_five_minutes_plus_epic_jitter`
+        // — so a drift in that constant fails loudly rather than silently
+        // skewing this test's fire time.
+        let lead = ChronoDuration::seconds(1);
+        let resets_at = Utc::now() + lead - ChronoDuration::seconds(300 + jitter_secs(epic) as i64);
+        h.parker
+            .on_allowance_event(&AllowanceEvent::ThresholdCrossed {
+                window: AllowanceWindow::FiveHour,
+                threshold_kind: ThresholdKind::Hard,
+                value: 91.0,
+                threshold: 90.0,
+                resets_at: Some(resets_at.to_rfc3339()),
+            });
+
+        // --- park half ---
+        assert!(
+            h.parker.parking_engaged(),
+            "hard crossing engages the sweep"
+        );
+        assert_eq!(
+            h.supervisor
+                .list_sessions()
+                .iter()
+                .find(|s| s.session_id == 1)
+                .map(|s| s.state),
+            Some(SupervisorState::ParkRequested)
+        );
+        complete_park(&h, 1, 1);
+        wait_until(|| {
+            h.supervisor
+                .list_sessions()
+                .iter()
+                .any(|s| s.session_id == 1 && s.state == SupervisorState::Parked)
+        })
+        .await;
+        // Sweep completion is what arms the timer — never the park itself.
+        wait_until(|| !h.parker.parking_engaged()).await;
+
+        let timers = h.schedule.list();
+        assert_eq!(timers.len(), 1, "exactly one resume timer armed");
+        assert_eq!(timers[0].epic, epic);
+        assert_eq!(timers[0].project_path, project);
+        assert_eq!(timers[0].reason, REASON_PARK);
+        wait_for_row(&h.audit, project, |r| {
+            r.event == AuditEventKind::Park && r.details["phase"] == "timer_armed"
+        })
+        .await;
+        // Nothing has resumed yet: the timer is armed, not due.
+        h.schedule.fire_due();
+        assert!(
+            h.spawns.lock().unwrap().is_empty(),
+            "a future timer must not fire early"
+        );
+
+        // --- the wait, compressed ---
+        let fire_at = DateTime::parse_from_rfc3339(&timers[0].fire_at).unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            Utc::now() >= fire_at.with_timezone(&Utc),
+            "the armed fire time must have passed before the tick"
+        );
+
+        // --- resume half: the schedule's own due check drives it ---
+        h.schedule.fire_due();
+        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
+        let spawns = h.spawns.lock().unwrap().clone();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].epic, epic);
+        assert_eq!(spawns[0].generation, 2, "gen-1 handoff on disk + 1");
+        assert_eq!(spawns[0].working_dir, worktree);
+
+        let rows = wait_for_row(&h.audit, project, |r| r.event == AuditEventKind::Resume).await;
+        let resume: Vec<_> = rows
+            .iter()
+            .filter(|r| r.event == AuditEventKind::Resume)
+            .collect();
+        assert_eq!(resume.len(), 1);
+        assert_eq!(resume[0].epic, epic);
+        assert_eq!(resume[0].generation, 2);
+        assert_eq!(resume[0].details["trigger"], "resume_timer");
+        assert_eq!(resume[0].details["fire_at"], timers[0].fire_at);
+        // Self-clean: a fired timer leaves no countdown behind.
+        assert!(
+            h.schedule.list().is_empty(),
+            "the fired timer must self-clean"
+        );
     }
 }
