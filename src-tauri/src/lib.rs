@@ -197,6 +197,12 @@ pub fn run() {
         .manage(WorktreeManager::new())
         .manage(commands::system::SystemMetricsState::new())
         .manage(commands::processes::ProcessScanState::new())
+        // Issue #106 review F1: the per-(project, epic) in-flight launch
+        // slots — the backend guard against a double Launch click while the
+        // test gate still runs.
+        .manage(std::sync::Arc::new(
+            commands::samurai::LaunchInFlight::default(),
+        ))
         .setup(|app| {
             // Generate a unique instance ID for this Maestro run
             // This prevents status pollution between different app instances

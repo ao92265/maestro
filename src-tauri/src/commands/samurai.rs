@@ -368,6 +368,63 @@ async fn ensure_epic_worktree(
     }
 }
 
+/// Review F1 (issue #106): the backend-side double-launch guard. The Launch
+/// button's disabled state is component-local and dies with every utility
+/// panel switch, and the refusal matrix cannot see a launch that has not yet
+/// registered a session or written its ACTIVE config — exactly the minutes
+/// the test gate spends in npm install / cargo test. This registry holds one
+/// slot per (project, epic-slug) for the WHOLE launch sequence: a second
+/// `samurai_launch_run` for the same run is refused while the first holds
+/// it. Managed as app state (`lib.rs`), so every command invocation shares
+/// the one set of slots.
+#[derive(Default)]
+pub struct LaunchInFlight {
+    keys: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+}
+
+impl LaunchInFlight {
+    /// Claims the (project, epic) launch slot. `Err` = another launch for
+    /// this run is still in flight. The key is the epic SLUG, so "38" and
+    /// "#38" — one run everywhere else — contend for one slot here too.
+    fn acquire(self: &Arc<Self>, project: &str, epic: &str) -> Result<LaunchInFlightGuard, String> {
+        let key = (project.to_string(), epic_slug(epic));
+        let mut keys = self
+            .keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !keys.insert(key.clone()) {
+            return Err(
+                "launch refused: a launch is already in progress for this epic — its \
+                 bootstrap/test gate may still be running; wait for it to finish"
+                    .to_string(),
+            );
+        }
+        Ok(LaunchInFlightGuard {
+            registry: self.clone(),
+            key,
+        })
+    }
+}
+
+/// RAII release: dropping the guard — normal return, `?` on a red gate or
+/// bootstrap failure, a panic unwinding, or the command future being dropped
+/// — frees the slot. Nothing can leak a held key, so a crashed launch never
+/// bricks relaunching its epic.
+struct LaunchInFlightGuard {
+    registry: Arc<LaunchInFlight>,
+    key: (String, String),
+}
+
+impl Drop for LaunchInFlightGuard {
+    fn drop(&mut self) {
+        self.registry
+            .keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
+
 /// What a successful launch set up — echoed to the launcher UI.
 #[derive(Debug, Clone, Serialize)]
 pub struct SamuraiLaunchResult {
@@ -410,6 +467,7 @@ pub(crate) async fn launch_run_inner(
     run_configs: &RunConfigStore,
     replicator: &Arc<SamuraiReplicator>,
     audit: &AuditLog,
+    in_flight: &Arc<LaunchInFlight>,
     test_gate: &SamuraiTestGate,
     skip_test_gate: bool,
     preflight: &SamuraiPreflight,
@@ -433,6 +491,13 @@ pub(crate) async fn launch_run_inner(
     let model = model
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty());
+
+    // Review F1 (issue #106): claim the run's launch slot for the WHOLE
+    // sequence below — the gate alone can run for minutes, during which no
+    // session is registered and no ACTIVE config exists for the refusal
+    // matrix to see. Held by RAII: every exit path (success, red gate,
+    // bootstrap failure, panic/cancel) releases it on drop.
+    let _launch_slot = in_flight.acquire(project, &epic)?;
 
     // The refusal matrix runs server-side regardless of what the UI showed.
     let live_session = supervisor.list_sessions().iter().any(|s| {
@@ -575,6 +640,7 @@ pub async fn samurai_launch_run(
     run_configs: State<'_, Arc<RunConfigStore>>,
     replicator: State<'_, Arc<SamuraiReplicator>>,
     audit: State<'_, AuditLog>,
+    in_flight: State<'_, Arc<LaunchInFlight>>,
     config: State<'_, SharedSamuraiConfig>,
     project_path: String,
     epics: Vec<String>,
@@ -609,6 +675,7 @@ pub async fn samurai_launch_run(
         &run_configs,
         &replicator,
         &audit,
+        &in_flight,
         &test_gate,
         skip_test_gate.unwrap_or(false),
         &preflight,
@@ -1558,6 +1625,7 @@ mod tests {
         run_configs: RunConfigStore,
         worktrees: WorktreeManager,
         audit: AuditLog,
+        in_flight: Arc<LaunchInFlight>,
         project: String,
         _dirs: (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir),
         base: tempfile::TempDir,
@@ -1626,6 +1694,7 @@ mod tests {
             run_configs: RunConfigStore::new(runs_dir.path().to_path_buf()),
             worktrees: WorktreeManager::new(),
             audit,
+            in_flight: Arc::new(LaunchInFlight::default()),
             project,
             _dirs: (audit_dir, schedule_dir, runs_dir),
             base: tempdir().unwrap(),
@@ -1652,6 +1721,7 @@ mod tests {
             &h.run_configs,
             &h.replicator,
             &h.audit,
+            &h.in_flight,
             gate,
             skip_test_gate,
             &preflight(true, true),
@@ -1839,6 +1909,7 @@ mod tests {
         // its own launch behavior has dedicated tests below.
         let (gate, _calls) = recording_gate(vec![]);
         let global = SamuraiConfig::default();
+        let in_flight = Arc::new(LaunchInFlight::default());
         let result = launch_run_inner(
             &supervisor,
             &schedule,
@@ -1846,6 +1917,7 @@ mod tests {
             &run_configs,
             &replicator,
             &audit,
+            &in_flight,
             &gate,
             true,
             &preflight(true, true),
@@ -1893,6 +1965,7 @@ mod tests {
             &run_configs,
             &replicator,
             &audit,
+            &in_flight,
             &gate,
             true,
             &preflight(true, true),
@@ -2017,6 +2090,7 @@ mod tests {
             &h.run_configs,
             &h.replicator,
             &h.audit,
+            &h.in_flight,
             &gate,
             true,
             &preflight(true, true),
@@ -2171,6 +2245,120 @@ mod tests {
             .expect("an ALERT row records the block");
         assert_eq!(alert.details["kind"], "launch_test_gate");
         assert_eq!(alert.details["phase"], "bootstrap");
+    }
+
+    // --- issue #106 review F1: the in-flight launch slot ---
+
+    #[tokio::test]
+    async fn test_second_launch_refused_while_the_first_holds_the_slot() {
+        use crate::core::samurai_test_gate::{GateCommandOutput, GateCommandRunner};
+        use std::sync::{Condvar, Mutex};
+
+        let h = cleanup_harness();
+        commit_fixture_files(
+            h.repo.path(),
+            &[("Cargo.toml", "[workspace]\nmembers = []\n")],
+        );
+
+        // A gate runner that parks like a minutes-long cargo test: it
+        // signals entry, then blocks until the test releases it.
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let entered_rt = entered.clone();
+        let release_rt = release.clone();
+        let runner: GateCommandRunner = Arc::new(move |_cwd, _program, _args| {
+            {
+                let (flag, cv) = &*entered_rt;
+                *flag.lock().unwrap() = true;
+                cv.notify_all();
+            }
+            let (flag, cv) = &*release_rt;
+            let mut released = flag.lock().unwrap();
+            while !*released {
+                released = cv.wait(released).unwrap();
+            }
+            Ok(GateCommandOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+        let slow_gate = SamuraiTestGate::new(runner, Arc::new(|_| {}));
+
+        let first = run_launch(&h, &slow_gate, false, &["38"], &[]);
+        let second = async {
+            // Wait (off the async thread) until the first launch is inside
+            // its gate — the exact window the component-local UI guard used
+            // to be the only protection for.
+            let entered_wait = entered.clone();
+            tokio::task::spawn_blocking(move || {
+                let (flag, cv) = &*entered_wait;
+                let mut in_gate = flag.lock().unwrap();
+                while !*in_gate {
+                    in_gate = cv.wait(in_gate).unwrap();
+                }
+            })
+            .await
+            .unwrap();
+
+            // The double click — spelled differently, same run: refused by
+            // the in-flight slot (slug identity) before any side effect.
+            let err = run_launch(&h, &slow_gate, false, &["#38"], &[])
+                .await
+                .unwrap_err();
+
+            // Let the first gate finish.
+            let (flag, cv) = &*release;
+            *flag.lock().unwrap() = true;
+            cv.notify_all();
+            err
+        };
+        let (first_result, second_err) = tokio::join!(first, second);
+        assert!(
+            second_err.contains("already in progress"),
+            "{second_err}"
+        );
+        first_result.expect("the first launch completes normally");
+        assert_eq!(h.spawns.lock().unwrap().len(), 1, "exactly ONE gen-1 spawn");
+        assert_eq!(h.run_configs.load_active().len(), 1, "one ACTIVE config");
+    }
+
+    #[tokio::test]
+    async fn test_launch_slot_released_after_a_red_gate() {
+        let h = cleanup_harness();
+        commit_fixture_files(
+            h.repo.path(),
+            &[("Cargo.toml", "[workspace]\nmembers = []\n")],
+        );
+        let (gate, _calls) = recording_gate(vec![(
+            "cargo test",
+            crate::core::samurai_test_gate::GateCommandOutput {
+                success: false,
+                stdout: "test result: FAILED. 1 passed; 1 failed\n".to_string(),
+                stderr: String::new(),
+            },
+        )]);
+
+        let err = run_launch(&h, &gate, false, &["#38"], &[]).await.unwrap_err();
+        assert!(err.contains("launch blocked"), "{err}");
+
+        // The RAII guard released the slot on the red-gate exit: the
+        // relaunch reaches the gate again instead of bouncing off the
+        // in-flight check.
+        let again = run_launch(&h, &gate, false, &["#38"], &[]).await.unwrap_err();
+        assert!(!again.contains("already in progress"), "{again}");
+        assert!(again.contains("launch blocked"), "{again}");
+    }
+
+    #[tokio::test]
+    async fn test_launch_slot_released_after_success() {
+        let h = cleanup_harness();
+        let (gate, _calls) = recording_gate(vec![]);
+        run_launch(&h, &gate, true, &["#38"], &[]).await.unwrap();
+        // Released on the success path too: a relaunch of the same epic is
+        // not refused by the in-flight slot (nothing else refuses it either
+        // — no live session is registered in this harness).
+        run_launch(&h, &gate, true, &["#38"], &[]).await.unwrap();
     }
 
     #[test]
