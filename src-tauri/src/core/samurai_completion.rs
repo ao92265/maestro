@@ -33,6 +33,11 @@
 //!    and lands the PRD §5.10 `COMPLETE` audit row. Verification failure
 //!    leaves the config ACTIVE and lands an `ALERT` instead. Neither an
 //!    unverified declaration nor GitHub state alone ever flips the config.
+//! 4. **Kill** — a COMPLETED run's agent is terminated: an orchestrator with
+//!    nothing left to do must not sit idle burning the allowance with
+//!    `--dangerously-skip-permissions`. Only the PROCESS dies — the terminal
+//!    tile keeps its scrollback, and the worktree, branch and run config all
+//!    survive for the manual 🗑 cleanup. See [`apply_verdict`].
 //!
 //! COMPLETED configs vanish from `load_active()`, so cold-start
 //! reconciliation (`samurai_reconciler`) skips them entirely; the manual 🗑
@@ -71,8 +76,9 @@ use serde_json::json;
 use super::claude_event::ClaudeEvent;
 use super::samurai_audit::{AuditEvent, AuditEventKind, AuditLog};
 use super::samurai_prompts::{ORDER_ALERT_TAG, RUN_COMPLETE_TAG};
+use super::samurai_replicator::SessionTeardown;
 use super::samurai_run_config::{RunConfigStatus, RunConfigStore};
-use super::supervisor::{SessionSnapshot, Supervisor};
+use super::supervisor::{SessionSnapshot, Supervisor, KILL_CAUSE_RUN_COMPLETE};
 
 /// `details.kind` of the ALERT row a failed verification lands.
 pub const VERIFICATION_FAILED_KIND: &str = "completion_verification_failed";
@@ -246,6 +252,11 @@ pub struct SamuraiCompletionWatcher {
     audit: AuditLog,
     issue_state: IssueStateProbe,
     pr_state: PrStateProbe,
+    /// Ends the finished run's agent — the same four-step teardown the
+    /// replicator and parker use (PTY tree kill, status unregister,
+    /// transcript-watcher release, stale-context drop). Injected, so tests
+    /// record the kill instead of touching a PTY.
+    kill: SessionTeardown,
     /// (session, claim) pairs already handled — a transcript replay must not
     /// re-run a verification or duplicate an ALERT (module doc). `Arc`ed so
     /// the spawned verification task can RELEASE a claim again when its
@@ -261,6 +272,7 @@ impl SamuraiCompletionWatcher {
         audit: AuditLog,
         issue_state: IssueStateProbe,
         pr_state: PrStateProbe,
+        kill: SessionTeardown,
     ) -> Self {
         Self {
             supervisor,
@@ -268,6 +280,7 @@ impl SamuraiCompletionWatcher {
             audit,
             issue_state,
             pr_state,
+            kill,
             seen: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -408,6 +421,8 @@ impl SamuraiCompletionWatcher {
         let issue_state = self.issue_state.clone();
         let pr_state = self.pr_state.clone();
         let seen = self.seen.clone();
+        let supervisor = self.supervisor.clone();
+        let kill = self.kill.clone();
         tauri::async_runtime::spawn(async move {
             let config = run_configs.get(&session.project, &session.epic);
             match config.as_ref().map(|c| c.status) {
@@ -467,18 +482,49 @@ impl SamuraiCompletionWatcher {
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(&(session.session_id, raw));
             }
-            apply_verdict(&run_configs, &audit, &session, &claim, failures);
+            apply_verdict(
+                &run_configs,
+                &audit,
+                &supervisor,
+                &kill,
+                &session,
+                &claim,
+                failures,
+            )
+            .await;
         });
     }
 }
 
-/// Applies one verification verdict: verified → flip the config and land the
+/// Applies one verification verdict: verified → flip the config, land the
 /// PRD §5.10 `COMPLETE` row (in that order — the row must never claim a flip
-/// that did not happen); failed → the config stays ACTIVE and an `ALERT`
-/// names every failed check for the human.
-fn apply_verdict(
+/// that did not happen), then END THE AGENT; failed → the config stays ACTIVE
+/// and an `ALERT` names every failed check for the human.
+///
+/// The kill is the last step and deliberately shaped like the manual tile
+/// close, not like a `KILLED` transition:
+///
+/// - the teardown closure kills the PTY tree and releases the session's
+///   status/watcher/context entries — the run is over, and an idle agent
+///   running with `--dangerously-skip-permissions` must not outlive it;
+/// - the TILE stays: `remove_session` emits no `samurai-supervisor-event`,
+///   and the frontend only closes tiles for KILLED/PARKED, so the finished
+///   terminal keeps its scrollback for the human to read;
+/// - dropping the supervisor entry is what stops the watchdog from later
+///   declaring the (now processless) session DEAD and chaining a recovery
+///   successor into the finished worktree;
+/// - it lands the `KILL` row (cause [`KILL_CAUSE_RUN_COMPLETE`]) AFTER the
+///   kill, so the row records an accomplished fact (the replicator's
+///   discipline).
+///
+/// Nothing else is touched: worktree, branch and run config all stay — the
+/// manual 🗑 cleanup remains the only deleter (PRD §5.9).
+#[allow(clippy::too_many_arguments)]
+async fn apply_verdict(
     run_configs: &Arc<RunConfigStore>,
     audit: &AuditLog,
+    supervisor: &Arc<Supervisor>,
+    kill: &SessionTeardown,
     session: &SessionSnapshot,
     claim: &CompletionClaim,
     failures: Vec<String>,
@@ -512,6 +558,15 @@ fn apply_verdict(
                     "pr": claim.pr,
                 }),
             ),
+        );
+        // The run is over — end its agent (see this function's doc comment).
+        kill(session.session_id).await;
+        supervisor.remove_session_with_cause(session.session_id, KILL_CAUSE_RUN_COMPLETE);
+        log::info!(
+            "samurai completion: agent for epic {} (session {}, gen-{}) terminated — its terminal keeps its scrollback, and the worktree/branch/run config are untouched",
+            session.epic,
+            session.session_id,
+            session.generation,
         );
     } else {
         log::warn!(
@@ -695,6 +750,8 @@ mod tests {
         /// Every (kind, number, repo pin) probe call, for count and
         /// pin-threading assertions (review F1).
         calls: Arc<Mutex<Vec<(&'static str, u64, Option<String>)>>>,
+        /// Session ids the completion kill tore down, in order.
+        killed: Arc<Mutex<Vec<u32>>>,
         _dir: tempfile::TempDir,
     }
 
@@ -712,12 +769,21 @@ mod tests {
         tokio::spawn(task);
         let supervisor = Arc::new(Supervisor::new(audit.clone(), None));
         let run_configs = Arc::new(RunConfigStore::new(dir.path().join("runs")));
+        let killed: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let killed_rec = killed.clone();
+        let kill: SessionTeardown = Arc::new(move |session_id| {
+            let killed = killed_rec.clone();
+            Box::pin(async move {
+                killed.lock().unwrap().push(session_id);
+            })
+        });
         let watcher = SamuraiCompletionWatcher::new(
             supervisor.clone(),
             run_configs.clone(),
             audit.clone(),
             issue_state,
             pr_state,
+            kill,
         );
         Harness {
             watcher,
@@ -725,6 +791,7 @@ mod tests {
             run_configs,
             audit,
             calls,
+            killed,
             _dir: dir,
         }
     }
@@ -855,6 +922,65 @@ mod tests {
             .unwrap()
             .iter()
             .all(|(_, _, pin)| pin.is_none()));
+    }
+
+    #[tokio::test]
+    async fn test_verified_completion_kills_the_agent_and_records_it() {
+        // A finished run's agent must not sit idle in its terminal: the
+        // process is torn down, the supervisor entry is dropped (so the
+        // watchdog can never declare it DEAD and chain a recovery
+        // successor), and a KILL row records the death. The run config keeps
+        // its COMPLETED status — nothing is deleted.
+        let h = harness(
+            HashMap::from([(77, Ok("CLOSED".to_string()))]),
+            HashMap::from([(85, pr_probe("OPEN", &[]))]),
+        );
+        launch_epic(&h, 4, "#38", 3);
+
+        h.watcher.observe(&reply(4, &declared("issues #77 pr #85")));
+
+        wait_until(|| !h.killed.lock().unwrap().is_empty()).await;
+        assert_eq!(*h.killed.lock().unwrap(), vec![4], "the PTY was torn down");
+        wait_until(|| h.supervisor.list_sessions().is_empty()).await;
+
+        let rows = rows(&h.audit, AuditEventKind::Kill).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].details["cause"], KILL_CAUSE_RUN_COMPLETE);
+        assert_eq!(rows[0].details["from"], "WORKING");
+        assert_eq!(rows[0].epic, "#38");
+        assert_eq!(rows[0].generation, 3);
+        assert_eq!(rows[0].session_id, 4);
+        // The COMPLETE row precedes the kill — the trail reads flip, then death.
+        let all = h.audit.read(PROJECT, None, None).await.unwrap().events;
+        let kinds: Vec<AuditEventKind> = all.iter().map(|e| e.event).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                AuditEventKind::Spawn,
+                AuditEventKind::Complete,
+                AuditEventKind::Kill
+            ]
+        );
+        assert_eq!(status(&h, "#38"), RunConfigStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn test_failed_verification_leaves_the_agent_alive() {
+        // The run is NOT over: the orchestrator keeps working in its
+        // terminal, so nothing is killed and no KILL row lands.
+        let h = harness(
+            HashMap::from([(77, Ok("OPEN".to_string()))]),
+            HashMap::from([(85, pr_probe("OPEN", &[]))]),
+        );
+        launch_epic(&h, 4, "#38", 1);
+
+        h.watcher.observe(&reply(4, &declared("issues #77 pr #85")));
+
+        wait_for_alerts(&h.audit).await;
+        assert!(h.killed.lock().unwrap().is_empty());
+        assert!(rows(&h.audit, AuditEventKind::Kill).await.is_empty());
+        assert_eq!(h.supervisor.list_sessions().len(), 1);
+        assert_eq!(status(&h, "#38"), RunConfigStatus::Active);
     }
 
     #[tokio::test]

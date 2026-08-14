@@ -25,6 +25,7 @@ const KIND_BADGES: Record<SamuraiAuditEventKind, string> = {
   COMPLETE: "bg-maestro-green/20 text-maestro-green",
   ALERT: "bg-red-500/15 text-red-400",
   INJECT: "bg-maestro-orange/20 text-maestro-orange",
+  KILL: "bg-maestro-red/20 text-maestro-red",
 };
 
 /**

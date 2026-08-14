@@ -204,9 +204,11 @@ struct PendingRitual {
     /// `trigger: "launch"` instead of predecessor linkage.
     launch: bool,
     /// What started this generation (issue #101): `"handoff"` (validated
-    /// handoff chain), `"watchdog"` (DEAD recovery), `"resume_timer"` /
-    /// `"cold_start"` (fresh spawns) or `"launch"`. Rides into the SPAWN
-    /// audit row's details so the trail explains why gen-N+1 exists.
+    /// handoff chain), `"watchdog"` (DEAD recovery), `"resume_timer"` (a
+    /// park timer armed this session) or `"launch"`. Rides into the SPAWN
+    /// audit row's details so the trail explains why gen-N+1 exists. App
+    /// startup produces none of them: cold-start reconciliation alerts
+    /// instead of spawning (`samurai_reconciler`).
     trigger: &'static str,
     queued_at: AgeableInstant,
     /// Set when the frontend registered the successor: (session id, when).
@@ -1543,7 +1545,7 @@ impl SamuraiReplicator {
                     "predecessor_session_id": p.predecessor_session_id,
                     "predecessor_generation": p.predecessor_generation,
                     // Issue #101: WHY this generation exists — handoff,
-                    // watchdog recovery, resume timer or cold start.
+                    // watchdog recovery or resume timer.
                     "trigger": p.trigger,
                 });
                 // Issue #56: mark RECOVERY successors on their SPAWN row;
@@ -2422,21 +2424,21 @@ mod tests {
         // Full teardown ran, once, before the transition.
         assert_eq!(*h.torn_down.lock().unwrap(), vec![1]);
 
-        // The audit trail carries the killed phase.
+        // The agent death is on the audit trail as a KILL row.
         let mut rows = Vec::new();
         for _ in 0..200 {
             rows = h.audit.read(project, None, None).await.unwrap().events;
             if rows
                 .iter()
-                .any(|r| r.event == AuditEventKind::Handoff && r.details["phase"] == "killed")
+                .any(|r| r.event == AuditEventKind::Kill && r.details["phase"] == "killed")
             {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(rows
-            .iter()
-            .any(|r| r.event == AuditEventKind::Handoff && r.details["phase"] == "killed"));
+        assert!(rows.iter().any(|r| r.event == AuditEventKind::Kill
+            && r.details["phase"] == "killed"
+            && r.details["cause"] == crate::core::supervisor::KILL_CAUSE_HANDOFF));
 
         // The spawn event names the successor and its stable working dir.
         let spawns = h.spawns.lock().unwrap();
@@ -3668,7 +3670,8 @@ mod tests {
         assert!(!instruction.contains('\n'));
 
         // Issue #101: a fresh spawn's SPAWN linkage names its trigger (the
-        // resumer passes "resume_timer", the reconciler "cold_start").
+        // resumer passes "resume_timer" — the only caller left, now that
+        // cold-start reconciliation alerts instead of spawning).
         let details = h
             .replicator
             .spawn_details("C:/git/proj-sg-match", "epic-9", 4)

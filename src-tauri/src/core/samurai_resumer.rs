@@ -12,6 +12,12 @@
 //!   self-cleans) with an `ALERT (resume_run_not_active)` audit note
 //!   instead of spawning into a finished worktree, mirroring the guarantee
 //!   cold-start reconciliation gets from `RunConfigStore::load_active`.
+//! - **Restored-timer gate:** a timer that was already in `schedule.json`
+//!   when the app started never spawns — it lands an
+//!   `ALERT (resume_interrupted_restart)` and dies. Reopening Maestro must
+//!   not start work nobody asked for (the same rule cold-start
+//!   reconciliation follows). Timers armed during THIS session are
+//!   untouched. See [`SamuraiResumer::mark_restored`].
 //! - **Guard rails next:** while a hard park sweep is still engaged, or a
 //!   non-terminal supervised session already exists for the (project, epic),
 //!   spawning would fight the parker or duplicate a live orchestrator — the
@@ -50,6 +56,7 @@
 //!
 //! [`bind`]: SamuraiResumer::bind
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
@@ -74,6 +81,10 @@ const DEFER_DELAY_SECS: i64 = 600;
 /// The timer reason the parker arms (`samurai_parker`); the only reason a
 /// fire currently means anything.
 const REASON_PARK: &str = "park";
+
+/// `details.kind` of the ALERT a timer RESTORED FROM DISK lands instead of
+/// spawning (see [`SamuraiResumer::mark_restored`]).
+pub const RESUME_INTERRUPTED_KIND: &str = "resume_interrupted_restart";
 
 // ---------------------------------------------------------------------------
 // Pure decisions (table-tested)
@@ -139,6 +150,10 @@ pub struct SamuraiResumer {
     /// before setup finishes — a fire that early is dropped with an error.
     schedule: OnceLock<Arc<SamuraiSchedule>>,
     parker: OnceLock<Arc<SamuraiParker>>,
+    /// `(project, epic, fire_at)` of the timers `schedule.json` held at
+    /// startup — see [`Self::mark_restored`]. Unset in tests that never call
+    /// it, which reads as "every timer was armed this session".
+    restored: OnceLock<HashSet<(String, String, String)>>,
 }
 
 impl SamuraiResumer {
@@ -155,6 +170,47 @@ impl SamuraiResumer {
             audit,
             schedule: OnceLock::new(),
             parker: OnceLock::new(),
+            restored: OnceLock::new(),
+        })
+    }
+
+    /// Records the timers `schedule.json` already held when the app started,
+    /// so [`on_fire`](Self::on_fire) can tell them apart from the ones this
+    /// session armed.
+    ///
+    /// **Nothing auto-starts on app reopen.** A park timer is persisted, and
+    /// the schedule's first tick fires every entry whose `fire_at` passed
+    /// during downtime — which meant simply reopening Maestro could spawn
+    /// agents nobody asked for, hours or days later. A RESTORED timer now
+    /// lands an `ALERT` and dies instead; the human resumes the run when
+    /// they want it running. Timers armed DURING this session (a park, a
+    /// deferral re-arm) are untouched and still resume normally: `arm`
+    /// always writes a fresh `fire_at`, which is not in this set.
+    ///
+    /// Called from the setup closure with the same pre-fire-loop snapshot
+    /// cold-start reconciliation gets, and before the fire loop is spawned.
+    pub fn mark_restored(&self, entries: &[ScheduleEntry]) {
+        let set = entries
+            .iter()
+            .map(|e| {
+                (
+                    e.project_path.clone(),
+                    e.epic.clone(),
+                    e.fire_at.clone(),
+                )
+            })
+            .collect();
+        let _ = self.restored.set(set);
+    }
+
+    /// Whether this exact timer was already on disk when the app started.
+    fn is_restored(&self, entry: &ScheduleEntry) -> bool {
+        self.restored.get().is_some_and(|set| {
+            set.contains(&(
+                entry.project_path.clone(),
+                entry.epic.clone(),
+                entry.fire_at.clone(),
+            ))
         })
     }
 
@@ -215,6 +271,34 @@ impl SamuraiResumer {
             );
             return;
         };
+
+        // Nothing auto-starts on app reopen (see `mark_restored`): a timer
+        // that was already on disk at startup ALERTS instead of spawning.
+        // Placed after the run-config gate so a stale timer for a finished
+        // run still gets its accurate `resume_run_not_active` note, and
+        // before the defer/spawn path so a restored timer can never become a
+        // deferred one and spawn ten minutes later.
+        if self.is_restored(&entry) {
+            log::warn!(
+                "samurai resumer: run {} in {} had a resume timer ({}) from before this app launch — NOT spawning, the run waits for a manual resume",
+                entry.epic,
+                entry.project_path,
+                entry.fire_at,
+            );
+            self.append_alert(
+                &entry,
+                json!({
+                    "kind": RESUME_INTERRUPTED_KIND,
+                    "epic": entry.epic,
+                    "fire_at": entry.fire_at,
+                    "message": format!(
+                        "run {} was interrupted — resume it manually",
+                        entry.epic
+                    ),
+                }),
+            );
+            return;
+        }
 
         let sessions = self.supervisor.list_sessions();
         if should_defer(
@@ -320,9 +404,10 @@ impl SamuraiResumer {
 
     /// Epic-level ALERT row (generation/session 0, like the parker's
     /// `park_no_reset_time`). Deliberately NOT re-armed: every alert path
-    /// here either needs a human (`resume_no_handoff`) or documents a stale
-    /// timer for a run that is over (`resume_run_not_active`) — a rearmed
-    /// timer would alert again forever.
+    /// here either needs a human (`resume_no_handoff`,
+    /// `resume_interrupted_restart`) or documents a stale timer for a run
+    /// that is over (`resume_run_not_active`) — a rearmed timer would alert
+    /// again forever.
     fn append_alert(&self, entry: &ScheduleEntry, details: serde_json::Value) {
         self.audit.append(
             &entry.project_path,
@@ -663,6 +748,60 @@ mod tests {
         assert_eq!(staged["predecessor_generation"], 2);
         assert_eq!(staged["predecessor_session_id"], 0);
         assert_eq!(staged["trigger"], "resume_timer");
+    }
+
+    #[tokio::test]
+    async fn test_restored_timer_alerts_instead_of_spawning() {
+        // Nothing auto-starts on app reopen: a timer that was already in
+        // schedule.json at startup ALERTS and dies. A timer armed during the
+        // session (a fresh fire_at) still resumes exactly as before.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-res-restored";
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        write_handoff(repo.path(), "#37", 2);
+        h.run_configs
+            .save(&SamuraiRunConfig::new(
+                project,
+                "#37",
+                repo.path().to_string_lossy().into_owned(),
+            ))
+            .unwrap();
+
+        let restored = entry(project, "#37");
+        h.resumer.mark_restored(std::slice::from_ref(&restored));
+        h.resumer.on_fire(restored);
+
+        let rows = wait_for_row(&h.audit, project, |r| {
+            r.details["kind"] == RESUME_INTERRUPTED_KIND
+        })
+        .await;
+        let alert = rows
+            .iter()
+            .find(|r| r.details["kind"] == RESUME_INTERRUPTED_KIND)
+            .unwrap();
+        assert_eq!(alert.event, AuditEventKind::Alert);
+        assert_eq!(alert.epic, "#37");
+        assert_eq!(alert.generation, 0);
+        assert_eq!(
+            alert.details["message"],
+            "run #37 was interrupted — resume it manually"
+        );
+        assert!(
+            h.spawns.lock().unwrap().is_empty(),
+            "reopening the app must never spawn an agent"
+        );
+        assert!(!rows.iter().any(|r| r.event == AuditEventKind::Resume));
+
+        // Same epic, a fire_at this session armed → normal resume.
+        let armed_now = ScheduleEntry {
+            fire_at: "2026-08-06T13:00:00+00:00".to_string(),
+            ..entry(project, "#37")
+        };
+        h.resumer.on_fire(armed_now);
+        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
+        assert_eq!(h.spawns.lock().unwrap()[0].generation, 3);
     }
 
     #[tokio::test]
