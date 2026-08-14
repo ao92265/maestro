@@ -28,6 +28,7 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
+import { formatFireDateTime } from "@/lib/parkTime";
 import type {
   SamuraiPreflight,
   SamuraiRunListEntry,
@@ -38,7 +39,11 @@ import type {
 import type { UsageData } from "@/lib/usageParser";
 import { stopSamuraiGateListener, useSamuraiGateStore } from "@/stores/useSamuraiGateStore";
 import { useSamuraiWorkflowStore } from "@/stores/useSamuraiWorkflowStore";
-import { type SamuraiSessionInfo, useSessionStore } from "@/stores/useSessionStore";
+import {
+  type SamuraiScheduleEntry,
+  type SamuraiSessionInfo,
+  useSessionStore,
+} from "@/stores/useSessionStore";
 import { useWorkflowsViewStore } from "@/stores/useWorkflowsViewStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 import { LaunchSection } from "../LaunchSection";
@@ -205,6 +210,18 @@ function supervised(overrides: Partial<SamuraiSessionInfo> = {}): SamuraiSession
 /** The per-run "open the agent" button of a run labelled `epic`. */
 const OPEN_LABEL = (epic: string) => `Open the agent for run ${epic}`;
 
+/** One pending resume timer, as the backend broadcasts it (issue #61). */
+function timer(overrides: Partial<SamuraiScheduleEntry> = {}): SamuraiScheduleEntry {
+  return {
+    project_path: "C:\\git\\maestro",
+    epic: "#38",
+    // 7d 1h 30m out — the shape a 7-day-allowance park really has.
+    fire_at: new Date(Date.now() + 7 * 86_400_000 + 90 * 60_000).toISOString(),
+    reason: "park",
+    ...overrides,
+  };
+}
+
 describe("LaunchSection (issue #63)", () => {
   beforeEach(() => {
     invokeMock.mockReset();
@@ -221,7 +238,7 @@ describe("LaunchSection (issue #63)", () => {
     useWorkspaceStore.setState({ tabs: [buildTab()] });
     // Untouched workflow editor by default — launches send workflow: null.
     useSamuraiWorkflowStore.setState({ graph: null });
-    useSessionStore.setState({ samuraiBySessionId: {} });
+    useSessionStore.setState({ samuraiBySessionId: {}, samuraiSchedule: [] });
     // Issue #109: the gate listener + store are module-level (they outlive
     // mounts on purpose) — detach and drain them between tests so each test
     // captures a fresh handler from ITS listen mock.
@@ -778,6 +795,62 @@ describe("LaunchSection (issue #63)", () => {
     expect(screen.getByText("FINISHED").getAttribute("title")).toContain("Awaiting cleanup");
     // Cleanup stays the separate manual step (PRD §5.9) — still offered.
     expect(screen.getByRole("button", { name: "Clean up run #39" })).toBeInTheDocument();
+  });
+
+  it("badges a parked run with its dated resume time and countdown (issue #61)", async () => {
+    // Before this, a parked run read "ACTIVE / No live agent for this run" —
+    // the park itself, and when it ends, appeared nowhere on the row.
+    const pending = timer();
+    mockInvoke({ runs: [run(), run({ epic: "#39" })] });
+    useSessionStore.setState({ samuraiSchedule: [pending] });
+    render(<LaunchSection />);
+
+    const badge = await screen.findByText(/^PARKED · resumes /);
+    expect(badge.textContent).toContain(formatFireDateTime(pending.fire_at));
+    expect(badge.textContent).toMatch(/· in 7d 1h \d+m$/);
+    // Only the run that actually has a timer is badged.
+    expect(screen.getAllByText(/^PARKED/)).toHaveLength(1);
+  });
+
+  it("matches the timer to the run by project path + epic slug", async () => {
+    mockInvoke({
+      runs: [
+        run({ epic: "epic #5 · issues #7, #9" }),
+        // Same epic ref, different project — must never borrow the badge.
+        run({ project_path: "C:\\git\\other", epic: "epic #5 · issues #7, #9" }),
+      ],
+    });
+    useSessionStore.setState({
+      samuraiSchedule: [
+        timer({
+          // The backend's canonical `\\?\` spelling of the same directory, and
+          // the identity string padded/punctuated differently from the config.
+          project_path: "\\\\?\\C:\\git\\maestro",
+          epic: " epic #5 - issues #7 #9 ",
+        }),
+      ],
+    });
+    render(<LaunchSection />);
+
+    expect(await screen.findByText(/^PARKED · resumes /)).toBeInTheDocument();
+    expect(screen.getAllByText(/^PARKED/)).toHaveLength(1);
+  });
+
+  it("still badges PARKED when the fire time does not parse, and clears on resume", async () => {
+    mockInvoke({ runs: [run()] });
+    useSessionStore.setState({ samuraiSchedule: [timer({ fire_at: "garbage" })] });
+    render(<LaunchSection />);
+
+    // No time to show, but the parked state must never be hidden.
+    const badge = await screen.findByText("PARKED");
+    expect(badge.getAttribute("title")).toContain("fire time unreadable");
+
+    // The timer fires: the backend broadcasts the full remaining list, and the
+    // badge goes with it — no refresh, no stale "parked" on a live run.
+    act(() => {
+      useSessionStore.setState({ samuraiSchedule: [] });
+    });
+    expect(screen.queryByText(/^PARKED/)).not.toBeInTheDocument();
   });
 
   it("shows the orchestrator's live details on a run row (issue #102)", async () => {

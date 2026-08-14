@@ -1,18 +1,8 @@
 import { memo } from "react";
 import { useShallow } from "zustand/react/shallow";
+import { formatResumeAt, useCountdownNow } from "@/lib/parkTime";
 import { samePath } from "@/lib/path";
 import { type SamuraiScheduleEntry, useSessionStore } from "@/stores/useSessionStore";
-
-/**
- * `HH:MM` in the user's locale for an RFC 3339 fire time; null when the
- * timestamp does not parse (the chip then shows "parked" without a time —
- * a broken timestamp must not hide the fact that the project is parked).
- */
-export function formatFireTime(fireAt: string): string | null {
-  const d = new Date(fireAt);
-  if (Number.isNaN(d.getTime())) return null;
-  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
 
 /**
  * The earliest-firing entry — what a project-level chip counts down to when
@@ -31,12 +21,16 @@ export function earliestEntry(entries: SamuraiScheduleEntry[]): SamuraiScheduleE
 }
 
 /**
- * Project-level park countdown (issue #61; PRD §9): "parked · resumes 14:32"
- * while the project has pending Samurai resume timers. Lives at PROJECT
- * level on purpose — a parked epic's terminal tile auto-closes (PRD decision
- * #6: every wake-up is a fresh spawn), so there is no session to badge.
- * Renders nothing when no timer is pending, so every existing view stays
- * visually unchanged. Reads the store directly by project path (same
+ * Project-level park countdown (issue #61; PRD §9): "parked · resumes
+ * 06/08/2026, 14:32 · in 6d 3h 12m" while the project has pending Samurai
+ * resume timers. The date and the countdown both ride the chip on purpose —
+ * a park can be governed by the 7-day allowance window, and a bare `HH:MM`
+ * read as "this afternoon" no matter how far out the resume really was.
+ *
+ * Lives at PROJECT level — a parked epic's terminal tile auto-closes (PRD
+ * decision #6: every wake-up is a fresh spawn), so there is no session to
+ * badge. Renders nothing when no timer is pending, so every existing view
+ * stays visually unchanged. Reads the store directly by project path (same
  * pattern as SamuraiBadge).
  */
 export const SamuraiScheduleChip = memo(function SamuraiScheduleChip({
@@ -50,17 +44,22 @@ export const SamuraiScheduleChip = memo(function SamuraiScheduleChip({
     useShallow((s) => s.samuraiSchedule.filter((e) => samePath(e.project_path, projectPath))),
   );
   const soonest = earliestEntry(entries);
+  // Hooks run unconditionally; the tick only arms while something is parked.
+  const now = useCountdownNow(soonest !== null);
   if (!soonest) return null;
 
-  const time = formatFireTime(soonest.fire_at);
-  const label = time ? `parked · resumes ${time}` : "parked";
+  const resume = formatResumeAt(soonest.fire_at, now);
+  const label = resume ? `parked · resumes ${resume}` : "parked";
   const detail = entries
-    .map((e) => `${e.epic}: ${formatFireTime(e.fire_at) ?? e.fire_at}`)
+    .map((e) => `${e.epic}: ${formatResumeAt(e.fire_at, now) ?? e.fire_at}`)
     .join(", ");
   return (
     <span
       title={`Samurai park countdown — work resumes automatically (${detail})`}
-      className={`shrink-0 whitespace-nowrap rounded px-1 py-px text-[9px] font-bold tracking-wide bg-maestro-purple/20 text-maestro-purple ${className}`}
+      // Wraps rather than clipping: the full date + countdown is the whole
+      // point of the chip, so a narrow sidebar takes a second line instead of
+      // truncating the reading away.
+      className={`min-w-0 rounded px-1 py-px text-[9px] font-bold leading-tight tracking-wide bg-maestro-purple/20 text-maestro-purple ${className}`}
     >
       {label}
     </span>
