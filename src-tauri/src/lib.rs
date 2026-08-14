@@ -646,6 +646,9 @@ pub fn run() {
             // same closure — a PARKED terminal serves no purpose, every
             // wake-up is a fresh spawn (PRD decision #6).
             let teardown_for_parker = teardown.clone();
+            // …and so does the completion watcher (issue #96): a verified
+            // run ends its agent instead of leaving it idle.
+            let teardown_for_completion = teardown.clone();
             let replicator = Arc::new(core::samurai_replicator::SamuraiReplicator::new(
                 supervisor.clone(),
                 audit_log.clone(),
@@ -761,6 +764,13 @@ pub fn run() {
                             .map_err(|e| e.to_string())
                     })
                 });
+            // A verified completion ENDS the run's agent: same teardown
+            // closure the replicator and parker use (PTY tree kill, status
+            // unregister, watcher release, context drop). The tile is left
+            // alone on purpose — the completion path removes the supervisor
+            // entry instead of transitioning to KILLED, so no
+            // `samurai-supervisor-event` fires and the frontend keeps the
+            // finished terminal with its scrollback.
             let _ = samurai_completion.set(Arc::new(
                 core::samurai_completion::SamuraiCompletionWatcher::new(
                     supervisor.clone(),
@@ -768,6 +778,7 @@ pub fn run() {
                     audit_log.clone(),
                     issue_state_probe,
                     pr_state_probe,
+                    teardown_for_completion,
                 ),
             ));
             // Samurai journal (Phase 5, issue #69): the ops-journal store —
@@ -876,6 +887,12 @@ pub fn run() {
             // resumer can now re-arm deferred timers and consult the
             // parking-engaged guard.
             samurai_resumer.bind(samurai_schedule, samurai_parker.clone());
+            // Nothing auto-starts on app reopen: the timers `schedule.json`
+            // already held at startup ALERT instead of spawning when they
+            // fire (the same rule the reconciler follows). Uses the same
+            // pre-fire-loop snapshot, and must run BEFORE that loop is
+            // spawned below or a past-due entry could spawn in the gap.
+            samurai_resumer.mark_restored(&reconcile_timers);
             // Ordering invariant (review F2): the schedule's fire loop is
             // spawned only AFTER the bind above — its first tick fires every
             // past-due timer immediately, and a fire before the bind would
@@ -915,10 +932,12 @@ pub fn run() {
             // Samurai (issue #62): cold-start reconciliation — PRD §5.6's
             // first-class flow. Runs ONCE, after every samurai component
             // above is constructed: for each ACTIVE run config, skip epics a
-            // pending timer or live session already owns, alert on probable
-            // pre-restart survivors, and fresh-spawn the next generation for
-            // the rest (the replicator's spawn-retry tolerates the frontend
-            // not being mounted yet). The probes are the watchdog's process
+            // pending timer or live session already owns, and ALERT on the
+            // rest (probable pre-restart survivor, interrupted run, or
+            // nothing to resume from). It NEVER spawns an agent — reopening
+            // the app must not start work nobody asked for, so resuming an
+            // interrupted run is an explicit human act. It is not even
+            // handed the replicator. The probes are the watchdog's process
             // scan and the project's newest transcript age — both real IO,
             // injected so the module stays harness-testable.
             let transcript_ages: core::samurai_reconciler::TranscriptAgeProbe =
@@ -929,15 +948,13 @@ pub fn run() {
             let claude_alive: core::samurai_reconciler::ClaudeAliveProbe = Arc::new(|| {
                 !core::samurai_watchdog::scan_claude_ancestor_pids().is_empty()
             });
-            // The auth probe gates the resume side: an epic parked because gh
-            // auth died must not be respawned before gh is healthy again
-            // (PRD §5.8) — otherwise a restart resurrects it straight into
-            // the same failure.
+            // The auth probe refines the interrupted-run alert: an epic
+            // parked because gh auth died is exactly the one whose manual
+            // resume would fail preflight (PRD §5.8), so the row says so.
             tauri::async_runtime::spawn(core::samurai_reconciler::reconcile_with_auth(
                 run_configs,
                 reconcile_timers,
                 supervisor,
-                replicator,
                 audit_log,
                 transcript_ages,
                 claude_alive,

@@ -86,6 +86,23 @@ impl std::str::FromStr for SupervisorState {
     }
 }
 
+/// `details.cause` on a `KILL` audit row — WHY the agent died. The audit log
+/// had no death event at all before this, so a killed agent's last row stayed
+/// `SPAWN` forever in the Second Brain audit panel.
+///
+/// - [`KILL_CAUSE_HANDOFF`] — the replicator killed gen-N after a validated
+///   handoff (`HANDOFF_WRITTEN → KILLED`).
+/// - [`KILL_CAUSE_PROCESS_DIED`] — the watchdog observed a silent death
+///   (`any → DEAD`); Maestro killed nothing, it recorded a death.
+/// - [`KILL_CAUSE_USER_KILL`] — the human closed the tile / the project / the
+///   frontend reloaded: teardown through [`Supervisor::remove_session`].
+/// - [`KILL_CAUSE_RUN_COMPLETE`] — the completion watcher verified the run
+///   and terminated its agent (`samurai_completion`).
+pub const KILL_CAUSE_HANDOFF: &str = "handoff";
+pub const KILL_CAUSE_PROCESS_DIED: &str = "process_died";
+pub const KILL_CAUSE_USER_KILL: &str = "user_kill";
+pub const KILL_CAUSE_RUN_COMPLETE: &str = "run_complete";
+
 /// The instruction a `*_REQUESTED` state represents. Phase 2 turns these into
 /// real terminal injections; Phase 1 only tracks that one is in flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,17 +349,43 @@ impl Supervisor {
     /// closed outside the samurai pipeline (manual kill, project close,
     /// frontend reload), so no `samurai-supervisor-event` is emitted — the
     /// frontend initiated the close and already dropped its entry, and an
-    /// event for a gone session would only confuse late listeners. No audit
-    /// row either, deliberately: the kill paths are user-driven, visible in
-    /// the UI as they happen, and the audit log records the *supervisor's*
-    /// lifecycle decisions — a row per manual tile close would be noise.
+    /// event for a gone session would only confuse late listeners.
+    ///
+    /// It DOES land a `KILL` audit row ([`KILL_CAUSE_USER_KILL`]): teardown
+    /// is how most agents actually end, and with no row the panel showed
+    /// them as `SPAWN` forever. Only a session still in a LIVE state records
+    /// one — a terminal entry (KILLED/PARKED/DEAD) already has its death on
+    /// the trail, and the tile close that follows must not double-count it.
     /// Returns whether an entry existed (idempotent otherwise).
     pub fn remove_session(&self, session_id: u32) -> bool {
-        self.sessions
+        self.remove_session_with_cause(session_id, KILL_CAUSE_USER_KILL)
+    }
+
+    /// [`remove_session`](Self::remove_session) with an explicit
+    /// `details.cause` for the `KILL` row — the samurai-internal teardowns
+    /// (a verified run completion, issue #96) are not user kills.
+    pub fn remove_session_with_cause(&self, session_id: u32, cause: &str) -> bool {
+        let removed = self
+            .sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&session_id)
-            .is_some()
+            .remove(&session_id);
+        let Some(entry) = removed else {
+            return false;
+        };
+        if !entry.state.is_terminal() {
+            self.audit.append(
+                &entry.project,
+                AuditEvent::now(
+                    entry.epic.clone(),
+                    AuditEventKind::Kill,
+                    entry.generation,
+                    session_id,
+                    json!({ "cause": cause, "from": entry.state.as_str() }),
+                ),
+            );
+        }
+        true
     }
 
     /// Snapshots of every supervised session, ordered by session id.
@@ -452,8 +495,9 @@ fn validate_transition(
 }
 
 /// Maps an applied transition to its audit row. Every transition is an audit
-/// event (PRD §5.2); the six PRD kinds are kept and the transition detail
-/// (phase, from-state) rides in `details`.
+/// event (PRD §5.2); the PRD kinds are kept — plus `KILL` for the two death
+/// states — and the transition detail (phase, cause, from-state) rides in
+/// `details`.
 fn audit_for_transition(snapshot: &SessionSnapshot, from: SupervisorState) -> AuditEvent {
     use SupervisorState::*;
     let (kind, details) = match snapshot.state {
@@ -465,9 +509,13 @@ fn audit_for_transition(snapshot: &SessionSnapshot, from: SupervisorState) -> Au
             AuditEventKind::Handoff,
             json!({ "phase": "written", "from": from.as_str() }),
         ),
+        // KILLED and DEAD are the agent's death: they land a `KILL` row, not
+        // a HANDOFF/ALERT one, so the audit panel shows every agent's end.
+        // The old sub-kind keys (`phase`, `kind`) ride along untouched — the
+        // trail readers that keyed off them still resolve.
         Killed => (
-            AuditEventKind::Handoff,
-            json!({ "phase": "killed", "from": from.as_str() }),
+            AuditEventKind::Kill,
+            json!({ "phase": "killed", "cause": KILL_CAUSE_HANDOFF, "from": from.as_str() }),
         ),
         ParkRequested => (
             AuditEventKind::Park,
@@ -478,8 +526,8 @@ fn audit_for_transition(snapshot: &SessionSnapshot, from: SupervisorState) -> Au
             json!({ "phase": "parked", "from": from.as_str() }),
         ),
         Dead => (
-            AuditEventKind::Alert,
-            json!({ "kind": "dead", "from": from.as_str() }),
+            AuditEventKind::Kill,
+            json!({ "kind": "dead", "cause": KILL_CAUSE_PROCESS_DIED, "from": from.as_str() }),
         ),
         // WORKING is only ever entered by registration (SPAWN), which does
         // not go through transition() — unreachable, but never panic.
@@ -567,7 +615,8 @@ mod tests {
         assert_eq!(s.generation, 3);
         assert_eq!(s.epic, "epic-1");
 
-        // Audit trail: SPAWN, then one HANDOFF row per transition.
+        // Audit trail: SPAWN, two HANDOFF rows, then the KILL row that ends
+        // the agent (the death is a KILL kind, not a third HANDOFF).
         let rows = audit.read(project, None, None).await.unwrap().events;
         let kinds: Vec<AuditEventKind> = rows.iter().map(|r| r.event).collect();
         assert_eq!(
@@ -576,12 +625,13 @@ mod tests {
                 AuditEventKind::Spawn,
                 AuditEventKind::Handoff,
                 AuditEventKind::Handoff,
-                AuditEventKind::Handoff,
+                AuditEventKind::Kill,
             ]
         );
         assert_eq!(rows[1].details["phase"], "requested");
         assert_eq!(rows[2].details["phase"], "written");
         assert_eq!(rows[3].details["phase"], "killed");
+        assert_eq!(rows[3].details["cause"], KILL_CAUSE_HANDOFF);
         assert!(rows.iter().all(|r| r.generation == 3 && r.session_id == 1));
 
         // Frontend notified for the registration + all three transitions.
@@ -646,11 +696,14 @@ mod tests {
         }
 
         let rows = audit.read(project, None, None).await.unwrap().events;
-        let dead_alerts: Vec<_> = rows
+        let dead_rows: Vec<_> = rows
             .iter()
-            .filter(|r| r.event == AuditEventKind::Alert && r.details["kind"] == "dead")
+            .filter(|r| r.event == AuditEventKind::Kill && r.details["kind"] == "dead")
             .collect();
-        assert_eq!(dead_alerts.len(), live.len());
+        assert_eq!(dead_rows.len(), live.len());
+        assert!(dead_rows
+            .iter()
+            .all(|r| r.details["cause"] == KILL_CAUSE_PROCESS_DIED));
     }
 
     #[tokio::test]
@@ -902,9 +955,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remove_session_is_silent_teardown() {
-        // Fresh-eyes finding H: removal is teardown, not a state change —
-        // no frontend event, no audit row, and the entry is simply gone.
+    async fn test_remove_session_is_eventless_teardown_with_kill_row() {
+        // Fresh-eyes finding H: removal is teardown, not a state change — no
+        // frontend event, and the entry is simply gone. It does land a KILL
+        // row: a manual tile close is how most agents die, and without it the
+        // audit panel showed them as SPAWN forever.
         let dir = tempdir().unwrap();
         let (supervisor, audit, seen) = harness(dir.path());
         let project = "C:/git/proj-remove";
@@ -912,7 +967,6 @@ mod tests {
             .register_session(1, project.into(), "epic-r".into(), 2)
             .unwrap();
         let notifications_before = seen.lock().unwrap().len();
-        let rows_before = audit.read(project, None, None).await.unwrap().events.len();
 
         assert!(supervisor.remove_session(1));
         assert!(supervisor.list_sessions().is_empty());
@@ -922,7 +976,12 @@ mod tests {
             "no event for teardown"
         );
         let rows = audit.read(project, None, None).await.unwrap().events;
-        assert_eq!(rows.len(), rows_before, "no audit row for teardown");
+        let kill = rows.last().unwrap();
+        assert_eq!(kill.event, AuditEventKind::Kill);
+        assert_eq!(kill.details["cause"], KILL_CAUSE_USER_KILL);
+        assert_eq!(kill.details["from"], "WORKING");
+        assert_eq!(kill.generation, 2);
+        assert_eq!(kill.session_id, 1);
 
         // Idempotent, and the session is genuinely unsupervised afterwards.
         assert!(!supervisor.remove_session(1));
@@ -930,6 +989,64 @@ mod tests {
             .transition(1, SupervisorState::HandoffRequested)
             .unwrap_err();
         assert!(err.contains("not under supervision"));
+        let rows_after = audit.read(project, None, None).await.unwrap().events;
+        assert_eq!(
+            rows_after
+                .iter()
+                .filter(|r| r.event == AuditEventKind::Kill)
+                .count(),
+            1,
+            "removing a gone session records nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_session_after_a_terminal_state_adds_no_second_kill_row() {
+        // The replicator kills gen-N (KILLED → its own KILL row); the human
+        // then closes the dead tile. That teardown must not double-count the
+        // death.
+        let dir = tempdir().unwrap();
+        let (supervisor, audit, _seen) = harness(dir.path());
+        let project = "C:/git/proj-remove-terminal";
+        supervisor
+            .register_session(1, project.into(), "epic-k".into(), 1)
+            .unwrap();
+        supervisor
+            .transition(1, SupervisorState::HandoffRequested)
+            .unwrap();
+        supervisor
+            .transition(1, SupervisorState::HandoffWritten)
+            .unwrap();
+        supervisor.transition(1, SupervisorState::Killed).unwrap();
+
+        assert!(supervisor.remove_session(1));
+        let rows = audit.read(project, None, None).await.unwrap().events;
+        let kills: Vec<_> = rows
+            .iter()
+            .filter(|r| r.event == AuditEventKind::Kill)
+            .collect();
+        assert_eq!(kills.len(), 1);
+        assert_eq!(kills[0].details["cause"], KILL_CAUSE_HANDOFF);
+    }
+
+    #[tokio::test]
+    async fn test_remove_session_with_cause_names_the_killer() {
+        // Issue #96's completion kill removes the session itself — its KILL
+        // row must say `run_complete`, not `user_kill`.
+        let dir = tempdir().unwrap();
+        let (supervisor, audit, _seen) = harness(dir.path());
+        let project = "C:/git/proj-remove-cause";
+        supervisor
+            .register_session(3, project.into(), "epic-c".into(), 4)
+            .unwrap();
+
+        assert!(supervisor.remove_session_with_cause(3, KILL_CAUSE_RUN_COMPLETE));
+        let rows = audit.read(project, None, None).await.unwrap().events;
+        let kill = rows.last().unwrap();
+        assert_eq!(kill.event, AuditEventKind::Kill);
+        assert_eq!(kill.details["cause"], KILL_CAUSE_RUN_COMPLETE);
+        assert_eq!(kill.generation, 4);
+        assert_eq!(kill.session_id, 3);
     }
 
     #[tokio::test]

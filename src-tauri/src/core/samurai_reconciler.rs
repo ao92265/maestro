@@ -7,54 +7,59 @@
 //! (`samurai_run_config`), the resume timers (`samurai_schedule`), the
 //! handoff files in each epic's worktree, and the audit log. [`reconcile`]
 //! runs ONCE at startup (spawned at the end of the lib.rs setup closure,
-//! after every samurai component is constructed) and rebuilds the world from
-//! those four sources: for each ACTIVE run config it either leaves the epic
-//! to an owner that already exists, alerts a human, or spawns the next
-//! generation through the replicator's ritual. COMPLETED configs (issue #96
-//! — the orchestrator declared completion and Maestro verified it via `gh`)
-//! and ARCHIVED ones never enter the scan at all:
-//! `RunConfigStore::load_active` filters them, so a finished run can never
-//! be respawned into its finished worktree.
+//! after every samurai component is constructed) and reports the world it
+//! finds in those four sources: for each ACTIVE run config it either leaves
+//! the epic to an owner that already exists or ALERTS a human. COMPLETED
+//! configs (issue #96 — the orchestrator declared completion and Maestro
+//! verified it via `gh`) and ARCHIVED ones never enter the scan at all:
+//! `RunConfigStore::load_active` filters them.
+//!
+//! **Reconciliation NEVER spawns an agent.** It used to fresh-spawn the next
+//! generation for every ownerless ACTIVE epic, which meant reopening the app
+//! could start agents nobody asked for — a reboot, an auto-update, or simply
+//! quitting and coming back resurrected multi-day runs unattended. Resuming
+//! an interrupted run is now an explicit human act; reconciliation's whole
+//! job is to make sure the human is TOLD which runs are waiting. (Runtime
+//! behaviour while the app stays open is untouched: handoffs still chain
+//! into successors, and park timers armed during the session still resume.)
 //!
 //! Decision order per epic (first match wins — see [`decide`]):
 //!
 //! 1. **Timer pending** → skip, audit nothing. The schedule/resumer own the
 //!    epic: a future timer re-arms on its own, and a fire time that passed
-//!    during downtime fires on the loop's FIRST 30s tick (P3.1), producing a
-//!    `RESUME`/defer trail from there. The timer set is a SNAPSHOT taken in
-//!    the setup closure BEFORE the schedule's fire loop is spawned — reading
-//!    `schedule.list()` from this async task instead would race the first
-//!    tick: a past-due entry can fire and self-clean before we look, and the
-//!    resumer's freshly appended RESUME row would then inflate the audit
-//!    generation source into a double spawn.
+//!    during downtime fires on the loop's FIRST 30s tick (P3.1) — where the
+//!    resumer applies the same no-startup-spawn rule and alerts instead
+//!    (`samurai_resumer`'s restored-timer gate). The timer set is a SNAPSHOT
+//!    taken in the setup closure BEFORE the schedule's fire loop is spawned;
+//!    reading `schedule.list()` from this async task instead would race the
+//!    first tick, which can fire and self-clean an entry before we look.
 //! 2. **Non-terminal supervised session** for the (project, epic) → skip. At
 //!    a true cold start the registry is empty by construction, so this guard
 //!    never fires then — it is what makes `reconcile` safely re-callable and
-//!    tolerant of a crash-refire after a successor already registered.
+//!    tolerant of a crash-refire.
 //! 3. **Living orphan** ([`orphan_verdict`]) → `ALERT (reconcile_orphan)`
 //!    and skip. A claude that survived the app restart may still be working
-//!    in the epic's worktree; never double-spawn over a survivor — the human
-//!    decides (kill it, or archive the config). The verdict is a guess, so a
-//!    pass that produced one is retried ONCE a staleness window later
+//!    in the epic's worktree, and the human decides what to do with it (kill
+//!    it, or archive the config). The verdict is a guess, so a pass that
+//!    produced one is retried ONCE a staleness window later
 //!    ([`reconcile_gated`]) instead of stranding the epic for the app run.
 //! 4. **Prior generation found** (handoff filenames in the worktree, or the
 //!    audit tail — rows persist across restarts, a legitimate source when
-//!    handoff files are missing) → `RESUME {trigger: "cold_start"}` row,
-//!    then [`SamuraiReplicator::spawn_generation`] with `prior + 1`. The
-//!    replicator picks the ritual (handoff present → successor, missing →
-//!    recovery + digest), retries the spawn event while the frontend is not
-//!    ready yet, and its per-(project, epic, generation) staging guard makes
-//!    a repeated call idempotent. Gated on `gh auth status` when the probe
-//!    is wired ([`reconcile_with_auth`]): a spawn into a dead `gh` is
-//!    `ALERT (reconcile_gh_auth)` instead — the launcher's preflight refuses
-//!    the same state, and an epic parked for `gh_auth_lost` reaches exactly
-//!    here (that park arms no timer and leaves the config ACTIVE by design).
+//!    handoff files are missing) → `ALERT (reconcile_interrupted)`: the run
+//!    was interrupted at gen-`prior` and is waiting for the human to resume
+//!    it from the Launch panel. Nothing is spawned, nothing is written to
+//!    the worktree, and the run config stays ACTIVE, so the same alert
+//!    reappears at the next launch until the human acts. Refined by
+//!    `gh auth status` when the probe is wired ([`reconcile_with_auth`]):
+//!    with `gh` logged out the epic gets `ALERT (reconcile_gh_auth)` instead
+//!    — a manual resume would fail its preflight anyway, and an epic parked
+//!    for `gh_auth_lost` reaches exactly here (that park arms no timer and
+//!    leaves the config ACTIVE by design).
 //! 5. **No generation anywhere** → `ALERT (reconcile_unstartable)`. An
 //!    active config whose run never produced a handoff, an audit row, or a
 //!    registration (e.g. a crash between the launcher's config write and the
-//!    gen-1 spawn) has nothing on disk to resume from; inventing a gen-1
-//!    brief is the P3.5 launcher's job, not reconciliation's — the human
-//!    relaunches.
+//!    gen-1 spawn) has nothing on disk to resume from at all — the human
+//!    relaunches it from scratch.
 //!
 //! Shape: the `allowance_watcher` split — pure decision functions
 //! ([`decide`], [`orphan_verdict`]) over pre-gathered facts, table-tested
@@ -74,7 +79,6 @@ use serde_json::json;
 use super::samurai_audit::{AuditEvent, AuditEventKind, AuditLog};
 use super::samurai_auth_watch::AuthProbe;
 use super::samurai_injector::strip_extended_prefix;
-use super::samurai_replicator::SamuraiReplicator;
 use super::samurai_resumer::latest_handoff_generation;
 use super::samurai_run_config::{RunConfigStore, SamuraiRunConfig};
 use super::samurai_schedule::ScheduleEntry;
@@ -99,6 +103,10 @@ pub type ClaudeAliveProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 /// between two launches.
 const AUDIT_TAIL: usize = 500;
 
+/// `details.kind` of the ALERT an ownerless ACTIVE run lands at startup —
+/// the row that replaced the old cold-start auto-spawn.
+pub const RECONCILE_INTERRUPTED_KIND: &str = "reconcile_interrupted";
+
 // ---------------------------------------------------------------------------
 // Pure decisions (table-tested)
 // ---------------------------------------------------------------------------
@@ -112,9 +120,11 @@ enum ReconcileAction {
     SkipLiveSession,
     /// A pre-restart claude is probably still alive — alert, never spawn.
     AlertOrphan { transcript_age_secs: u64 },
-    /// Spawn gen-`next` (= `prior + 1`) via the replicator's ritual.
-    Spawn { prior: u32, next: u32 },
-    /// A spawn is due but `gh` is not authenticated — alert, never spawn.
+    /// The run was interrupted at gen-`prior` and has no owner: alert, so
+    /// the human resumes it. Startup NEVER spawns (module doc).
+    AlertInterrupted { prior: u32 },
+    /// Same as [`Self::AlertInterrupted`], but `gh` is not authenticated —
+    /// a manual resume needs that fixed first.
     AlertNoGhAuth,
     /// Active config but no generation evidence anywhere — human relaunches.
     AlertUnstartable,
@@ -148,10 +158,7 @@ fn decide(facts: &EpicFacts) -> ReconcileAction {
         };
     }
     match facts.prior_generation {
-        Some(prior) => ReconcileAction::Spawn {
-            prior,
-            next: prior + 1,
-        },
+        Some(prior) => ReconcileAction::AlertInterrupted { prior },
         None => ReconcileAction::AlertUnstartable,
     }
 }
@@ -184,8 +191,11 @@ fn orphan_verdict(
 /// snapshot taken BEFORE the schedule's fire loop was spawned — see decision
 /// order step 1 for why it cannot be read here.
 ///
-/// Without a `gh` probe the spawn decision is not auth-gated; prefer
-/// [`reconcile_with_auth`].
+/// Without a `gh` probe the interrupted-run alert is not auth-refined;
+/// prefer [`reconcile_with_auth`].
+//
+// No replicator reaches this module by design (module doc): startup cannot
+// spawn an agent if it has no way to ask for one.
 // Startup calls `reconcile_with_auth`; this ungated entry point is what the
 // tests drive so they never shell out to `gh`.
 #[allow(dead_code)]
@@ -193,7 +203,6 @@ pub async fn reconcile(
     run_configs: Arc<RunConfigStore>,
     timers: Vec<ScheduleEntry>,
     supervisor: Arc<Supervisor>,
-    replicator: Arc<SamuraiReplicator>,
     audit: AuditLog,
     transcript_ages: TranscriptAgeProbe,
     claude_alive: ClaudeAliveProbe,
@@ -202,7 +211,6 @@ pub async fn reconcile(
         run_configs,
         timers,
         supervisor,
-        replicator,
         audit,
         transcript_ages,
         claude_alive,
@@ -212,20 +220,18 @@ pub async fn reconcile(
     .await
 }
 
-/// [`reconcile`] with the auth watcher's `gh auth status` probe wired in:
-/// an epic parked for `gh_auth_lost` keeps its ACTIVE run config and arms NO
-/// resume timer by design, so at the next launch reconciliation is the only
-/// thing that would resurrect it — and it must not resurrect it into a dead
-/// `gh` (the successor could not read issues, comment, or open PRs). The
-/// launcher refuses exactly this state via preflight; this is the same gate
-/// on the cold-start path. Data-gap policy is the auth watcher's:
-/// `Ok(false)` blocks, `Err` (gh missing/timeout) does not.
+/// [`reconcile`] with the auth watcher's `gh auth status` probe wired in: an
+/// epic parked for `gh_auth_lost` keeps its ACTIVE run config and arms NO
+/// resume timer by design, so it lands on the interrupted-run alert — and
+/// that alert should tell the human the truth, that a manual resume needs
+/// `gh` fixed first (the launcher's preflight refuses the same state). Data-
+/// gap policy is the auth watcher's: `Ok(false)` counts as logged out, `Err`
+/// (gh missing/timeout) does not.
 #[allow(clippy::too_many_arguments)]
 pub async fn reconcile_with_auth(
     run_configs: Arc<RunConfigStore>,
     timers: Vec<ScheduleEntry>,
     supervisor: Arc<Supervisor>,
-    replicator: Arc<SamuraiReplicator>,
     audit: AuditLog,
     transcript_ages: TranscriptAgeProbe,
     claude_alive: ClaudeAliveProbe,
@@ -235,7 +241,6 @@ pub async fn reconcile_with_auth(
         run_configs,
         timers,
         supervisor,
-        replicator,
         audit,
         transcript_ages,
         claude_alive,
@@ -251,28 +256,26 @@ pub async fn reconcile_with_auth(
 /// nothing re-evaluates it: `reconcile` has a single caller in the setup
 /// closure and the watchdog skips its scan when nothing is supervised. Costing
 /// it one staleness window instead makes the second pass self-resolving: a
-/// truly dead orchestrator's transcript is stale by then (so it spawns), a
-/// real survivor has written again (so it ALERTs and stays skipped). The
-/// live-session guard at step 2 is what makes the second pass idempotent.
-/// `retry_after` is injected for the tests; production is always
-/// [`TRANSCRIPT_STALE_AFTER`].
+/// truly dead orchestrator's transcript is stale by then (so the human gets
+/// the interrupted-run alert), a real survivor has written again (so it
+/// stays an orphan alert). The live-session guard at step 2 is what makes
+/// the second pass idempotent. `retry_after` is injected for the tests;
+/// production is always [`TRANSCRIPT_STALE_AFTER`].
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_gated(
     run_configs: Arc<RunConfigStore>,
     timers: Vec<ScheduleEntry>,
     supervisor: Arc<Supervisor>,
-    replicator: Arc<SamuraiReplicator>,
     audit: AuditLog,
     transcript_ages: TranscriptAgeProbe,
     claude_alive: ClaudeAliveProbe,
     auth: Option<AuthProbe>,
     retry_after: Duration,
 ) {
-    let (orphaned, spawned) = reconcile_pass(
+    let (orphaned, handled) = reconcile_pass(
         &run_configs,
         &timers,
         &supervisor,
-        &replicator,
         &audit,
         &transcript_ages,
         &claude_alive,
@@ -288,23 +291,18 @@ async fn reconcile_gated(
         retry_after.as_secs()
     );
     tokio::time::sleep(retry_after).await;
-    // `spawned` is what makes the retry idempotent for the epics pass 1
-    // already acted on. The live-session guard alone cannot: registration
-    // only happens when the frontend consumes the spawn event, and a spawn
-    // event that nobody consumed is only re-emitted after `ack_timeout_secs`
-    // (180s) — longer than `retry_after` (120s). Without this the retry
-    // re-reads pass 1's OWN `RESUME` row as the prior generation and stages a
-    // SECOND orchestrator, generation+1, into the same worktree.
+    // `handled` keeps the retry from alerting twice for the epics pass 1
+    // already decided: nothing about them changes in one staleness window,
+    // and a duplicate "resume it manually" row is pure noise.
     reconcile_pass(
         &run_configs,
         &timers,
         &supervisor,
-        &replicator,
         &audit,
         &transcript_ages,
         &claude_alive,
         auth.as_ref(),
-        &spawned,
+        &handled,
     )
     .await;
 }
@@ -312,32 +310,29 @@ async fn reconcile_gated(
 /// One reconciliation pass over every ACTIVE run config. Returns whether any
 /// epic ended in [`ReconcileAction::AlertOrphan`] — the only verdict worth
 /// retrying (see [`reconcile_gated`]) — plus the (project, epic) pairs this
-/// pass actually spawned.
+/// pass already decided.
 ///
-/// `already_spawned` are pairs an EARLIER pass staged a generation for. They
-/// are treated exactly like a live session: this pass must not re-decide
-/// them, because the audit row the earlier pass wrote would be read back as
-/// their prior generation and produce a second, higher-numbered orchestrator
-/// in the same worktree.
+/// `already_handled` are pairs an EARLIER pass alerted on. They are treated
+/// exactly like a live session: this pass must not re-decide them, or the
+/// human gets the same alert twice for one launch.
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_pass(
     run_configs: &Arc<RunConfigStore>,
     timers: &[ScheduleEntry],
     supervisor: &Arc<Supervisor>,
-    replicator: &Arc<SamuraiReplicator>,
     audit: &AuditLog,
     transcript_ages: &TranscriptAgeProbe,
     claude_alive: &ClaudeAliveProbe,
     auth: Option<&AuthProbe>,
-    already_spawned: &HashSet<(String, String)>,
+    already_handled: &HashSet<(String, String)>,
 ) -> (bool, HashSet<(String, String)>) {
-    let mut spawned: HashSet<(String, String)> = HashSet::new();
+    let mut handled: HashSet<(String, String)> = HashSet::new();
     let configs = run_configs.load_active();
     if configs.is_empty() {
         // The normal state until the P3.5 launcher exists, and afterwards
         // whenever no epic is live. No process scan, no audit noise.
         log::info!("samurai reconciler: no active run configs — nothing to reconcile");
-        return (false, spawned);
+        return (false, handled);
     }
     log::info!(
         "samurai reconciler: reconciling {} active run config(s)",
@@ -351,9 +346,9 @@ async fn reconcile_pass(
     let sessions = supervisor.list_sessions();
     let guards = |config: &SamuraiRunConfig| -> (bool, bool) {
         let timer_pending = timered.contains(&(config.project_path.clone(), config.epic.clone()));
-        // An epic an earlier pass already spawned counts as live even though
-        // nothing has registered yet — see `already_spawned`.
-        let live_session = already_spawned
+        // An epic an earlier pass already decided is treated as settled —
+        // see `already_handled`.
+        let live_session = already_handled
             .contains(&(config.project_path.clone(), config.epic.clone()))
             || sessions.iter().any(|s| {
                 s.project == config.project_path && s.epic == config.epic && !s.state.is_terminal()
@@ -380,8 +375,9 @@ async fn reconcile_pass(
     };
 
     // The `gh auth status` verdict for this pass: probed at most once, and
-    // only when some epic actually reaches the Spawn decision (the
-    // `needs_scan` discipline — no subprocess for a pass that spawns nothing).
+    // only when some epic actually reaches the interrupted-run alert (the
+    // `needs_scan` discipline — no subprocess for a pass with nothing to
+    // report).
     let mut gh_ok: Option<bool> = None;
     let mut orphaned = false;
 
@@ -426,7 +422,7 @@ async fn reconcile_pass(
         };
         let mut action = decide(&facts);
         orphaned |= matches!(action, ReconcileAction::AlertOrphan { .. });
-        if matches!(action, ReconcileAction::Spawn { .. }) {
+        if matches!(action, ReconcileAction::AlertInterrupted { .. }) {
             let ok = match gh_ok {
                 Some(ok) => ok,
                 None => {
@@ -447,12 +443,15 @@ async fn reconcile_pass(
                 action = ReconcileAction::AlertNoGhAuth;
             }
         }
-        if matches!(action, ReconcileAction::Spawn { .. }) {
-            spawned.insert((config.project_path.clone(), config.epic.clone()));
+        // Exactly the verdict the retry pass must not repeat. AlertOrphan is
+        // deliberately NOT recorded — re-deciding those epics IS the retry's
+        // purpose (see `reconcile_gated`).
+        if matches!(action, ReconcileAction::AlertInterrupted { .. }) {
+            handled.insert((config.project_path.clone(), config.epic.clone()));
         }
-        apply(replicator, audit, config, action);
+        apply(audit, config, action);
     }
-    (orphaned, spawned)
+    (orphaned, handled)
 }
 
 /// Highest generation either persisted source knows: the epic's handoff
@@ -497,7 +496,6 @@ async fn audit_max_generation(audit: &AuditLog, project: &str, epic: &str) -> Op
 /// Acts on one decision: one structured log line each (the spec's per-epic
 /// trail); the audit rows carry the user-facing story.
 fn apply(
-    replicator: &Arc<SamuraiReplicator>,
     audit: &AuditLog,
     config: &SamuraiRunConfig,
     action: ReconcileAction,
@@ -540,40 +538,35 @@ fn apply(
                 ),
             );
         }
-        ReconcileAction::Spawn { prior, next } => {
-            log::info!(
-                "samurai reconciler: epic {} in {} has no owner — spawning gen-{next} (prior gen-{prior}) in {}",
+        ReconcileAction::AlertInterrupted { prior } => {
+            log::warn!(
+                "samurai reconciler: run {} in {} was interrupted at gen-{prior} and has no owner — resume it manually (startup never spawns an agent); worktree {}",
                 config.epic,
                 config.project_path,
                 config.worktree_path,
             );
-            // The RESUME row BEFORE the spawn, so the trail always explains
-            // the SPAWN row that follows (the resumer's discipline).
-            // `predecessor_generation` names what gen-N+1 resumes from
-            // (issue #101).
             audit.append(
                 &config.project_path,
                 AuditEvent::now(
                     config.epic.clone(),
-                    AuditEventKind::Resume,
-                    next,
-                    // 0 sentinel: the successor session does not exist yet.
+                    AuditEventKind::Alert,
                     0,
-                    json!({ "trigger": "cold_start", "predecessor_generation": prior }),
+                    0,
+                    json!({
+                        "kind": RECONCILE_INTERRUPTED_KIND,
+                        "epic": config.epic,
+                        "prior_generation": prior,
+                        "message": format!(
+                            "run {} was interrupted — resume it manually",
+                            config.epic
+                        ),
+                    }),
                 ),
-            );
-            replicator.spawn_generation(
-                &config.project_path,
-                &config.epic,
-                &config.worktree_path,
-                next,
-                Some(prior),
-                "cold_start",
             );
         }
         ReconcileAction::AlertNoGhAuth => {
             log::error!(
-                "samurai reconciler: epic {} in {} is due a generation but `gh` is not authenticated — NOT spawning (a successor could not read issues, comment, or open PRs); fix auth and relaunch",
+                "samurai reconciler: run {} in {} was interrupted AND `gh` is not authenticated — fix auth before resuming it manually (a successor could not read issues, comment, or open PRs)",
                 config.epic,
                 config.project_path,
             );
@@ -584,7 +577,14 @@ fn apply(
                     AuditEventKind::Alert,
                     0,
                     0,
-                    json!({ "kind": "reconcile_gh_auth", "epic": config.epic }),
+                    json!({
+                        "kind": "reconcile_gh_auth",
+                        "epic": config.epic,
+                        "message": format!(
+                            "run {} was interrupted — fix `gh` auth, then resume it manually",
+                            config.epic
+                        ),
+                    }),
                 ),
             );
         }
@@ -611,16 +611,10 @@ fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::samurai_config::{SamuraiConfig, SharedSamuraiConfig};
-    use crate::core::samurai_replicator::{
-        EnterResender, SessionTeardown, StdinWriter, SuccessorEmitter, SuccessorSpawn,
-        TranscriptPathResolver,
-    };
     use crate::core::samurai_run_config::SamuraiRunConfig;
     use crate::core::supervisor::SupervisorState;
-    use crate::core::windows_process::StdCommandExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Mutex, RwLock};
+    use std::sync::Mutex;
     use tempfile::tempdir;
 
     // --- pure decisions ---
@@ -648,10 +642,11 @@ mod tests {
             // 1. Timer pending beats everything.
             (facts(true, false, None, None), SkipTimer),
             (facts(true, true, Some(3), Some(7)), SkipTimer),
-            // 2. Live session beats orphan + spawn.
+            // 2. Live session beats orphan + the interrupted alert.
             (facts(false, true, None, None), SkipLiveSession),
             (facts(false, true, Some(3), Some(7)), SkipLiveSession),
-            // 3. Orphan beats spawn, even with a known prior generation.
+            // 3. Orphan wins over the interrupted alert, even with a known
+            //    prior generation.
             (
                 facts(false, false, Some(5), Some(2)),
                 AlertOrphan {
@@ -664,14 +659,15 @@ mod tests {
                     transcript_age_secs: 0,
                 },
             ),
-            // 4. Prior generation → spawn prior + 1.
+            // 4. Prior generation → the run was interrupted at that gen and
+            //    waits for a MANUAL resume. Startup never spawns.
             (
                 facts(false, false, None, Some(2)),
-                Spawn { prior: 2, next: 3 },
+                AlertInterrupted { prior: 2 },
             ),
             (
                 facts(false, false, None, Some(1)),
-                Spawn { prior: 1, next: 2 },
+                AlertInterrupted { prior: 1 },
             ),
             // 5. Nothing anywhere → unstartable.
             (facts(false, false, None, None), AlertUnstartable),
@@ -790,72 +786,27 @@ mod tests {
     }
 
     // --- IO shell (harness like the resumer's, minus schedule/parker) ---
+    //
+    // No replicator, deliberately: reconciliation cannot spawn an agent
+    // because it is never handed anything that could. What the tests check
+    // is the audit trail the human actually reads.
 
     struct Harness {
         supervisor: Arc<Supervisor>,
-        replicator: Arc<SamuraiReplicator>,
         run_configs: Arc<RunConfigStore>,
         audit: AuditLog,
-        spawns: Arc<Mutex<Vec<SuccessorSpawn>>>,
     }
 
     fn harness(dir: &Path) -> Harness {
         let (audit, task) = AuditLog::new(dir.join("audit"), None);
         tokio::spawn(task);
         let supervisor = Arc::new(Supervisor::new(audit.clone(), None));
-        let config: SharedSamuraiConfig = Arc::new(RwLock::new(SamuraiConfig::default()));
-        let session_dirs: crate::core::samurai_injector::SessionDirResolver = Arc::new(|_| None);
-        let transcript_paths: TranscriptPathResolver = Arc::new(|_| None);
-        let teardown: SessionTeardown = Arc::new(|_| Box::pin(async {}));
-        let spawns: Arc<Mutex<Vec<SuccessorSpawn>>> = Arc::new(Mutex::new(Vec::new()));
-        let spawns_rec = spawns.clone();
-        let emit_spawn: SuccessorEmitter = Arc::new(move |s| {
-            spawns_rec.lock().unwrap().push(s.clone());
-        });
-        let write_stdin: StdinWriter = Arc::new(|_, _, outcome| outcome(Ok(())));
-        let resend_enter: EnterResender = Arc::new(|_| {});
-        let replicator = Arc::new(SamuraiReplicator::new(
-            supervisor.clone(),
-            audit.clone(),
-            config,
-            session_dirs,
-            transcript_paths,
-            teardown,
-            emit_spawn,
-            write_stdin,
-            resend_enter,
-        ));
         let run_configs = Arc::new(RunConfigStore::new(dir.join("runs")));
         Harness {
             supervisor,
-            replicator,
             run_configs,
             audit,
-            spawns,
         }
-    }
-
-    /// `git init` + one commit, so the spawn ritual's HEAD gate has a repo.
-    fn init_repo(dir: &Path) {
-        let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .hide_console_window()
-                .output()
-                .expect("git must be runnable in tests");
-            assert!(
-                out.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "Test"]);
-        std::fs::write(dir.join("tracked.txt"), "v1\n").unwrap();
-        run(&["add", "tracked.txt"]);
-        run(&["commit", "-q", "-m", "init"]);
     }
 
     fn ages(age: Option<Duration>) -> TranscriptAgeProbe {
@@ -886,12 +837,21 @@ mod tests {
         }
     }
 
+    fn save_config(h: &Harness, project: &str, epic: &str, worktree: &Path) {
+        h.run_configs
+            .save(&SamuraiRunConfig::new(
+                project,
+                epic,
+                worktree.to_string_lossy().into_owned(),
+            ))
+            .unwrap();
+    }
+
     async fn run(h: &Harness, timers: Vec<ScheduleEntry>, age: Option<Duration>, live: bool) {
         reconcile_gated(
             h.run_configs.clone(),
             timers,
             h.supervisor.clone(),
-            h.replicator.clone(),
             h.audit.clone(),
             ages(age),
             alive(live),
@@ -901,20 +861,17 @@ mod tests {
         .await;
     }
 
-    /// Polls until `cond` holds or ~2s pass (spawn staging finishes on the
-    /// tauri runtime, not this test's).
-    async fn wait_until(mut cond: impl FnMut() -> bool) {
-        for _ in 0..200 {
-            if cond() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("condition not reached within 2s");
-    }
-
     async fn rows(audit: &AuditLog, project: &str) -> Vec<AuditEvent> {
         audit.read(project, None, None).await.unwrap().events
+    }
+
+    /// The epic's interrupted-run alerts, in order.
+    async fn interrupted(audit: &AuditLog, project: &str) -> Vec<AuditEvent> {
+        rows(audit, project)
+            .await
+            .into_iter()
+            .filter(|r| r.details["kind"] == RECONCILE_INTERRUPTED_KIND)
+            .collect()
     }
 
     #[tokio::test]
@@ -932,14 +889,12 @@ mod tests {
             h.run_configs.clone(),
             Vec::new(),
             h.supervisor.clone(),
-            h.replicator.clone(),
             h.audit.clone(),
             ages(None),
             probe,
         )
         .await;
 
-        assert!(h.spawns.lock().unwrap().is_empty());
         assert!(
             !scanned.load(Ordering::SeqCst),
             "an empty store must not trigger the machine-wide process scan"
@@ -947,29 +902,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_timered_epic_skipped_while_its_neighbour_spawns() {
+    async fn test_interrupted_run_alerts_and_never_spawns() {
+        // The behaviour change: an ownerless ACTIVE run used to be
+        // fresh-spawned at startup. Reopening the app must not start work
+        // nobody asked for, so it lands an ALERT naming the interrupted
+        // generation, and the config stays ACTIVE for a manual resume.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-recon-interrupted";
+        let repo = tempdir().unwrap();
+        write_handoff(repo.path(), "#37", 2); // WOULD have spawned gen-3
+        save_config(&h, project, "#37", repo.path());
+
+        run(&h, Vec::new(), None, false).await;
+
+        let alerts = interrupted(&h.audit, project).await;
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].event, AuditEventKind::Alert);
+        assert_eq!(alerts[0].epic, "#37");
+        assert_eq!(alerts[0].details["epic"], "#37");
+        assert_eq!(alerts[0].details["prior_generation"], 2);
+        assert_eq!(
+            alerts[0].details["message"],
+            "run #37 was interrupted — resume it manually"
+        );
+        assert_eq!(alerts[0].generation, 0);
+        assert_eq!(alerts[0].session_id, 0);
+        // No RESUME row either: nothing resumed, so nothing may claim it did.
+        assert!(!rows(&h.audit, project)
+            .await
+            .iter()
+            .any(|r| r.event == AuditEventKind::Resume));
+        // The run stays ACTIVE — reconciliation deletes and flips nothing.
+        assert!(h.run_configs.get(project, "#37").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_timered_epic_skipped_while_its_neighbour_alerts() {
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         let project = "C:/git/proj-recon-timer";
         let repo_a = tempdir().unwrap();
         let repo_b = tempdir().unwrap();
-        init_repo(repo_b.path());
         write_handoff(repo_a.path(), "#1", 7);
         write_handoff(repo_b.path(), "#2", 1);
-        for (epic, repo) in [("#1", &repo_a), ("#2", &repo_b)] {
-            h.run_configs
-                .save(&SamuraiRunConfig::new(
-                    project,
-                    epic,
-                    repo.path().to_string_lossy().into_owned(),
-                ))
-                .unwrap();
-        }
+        save_config(&h, project, "#1", repo_a.path());
+        save_config(&h, project, "#2", repo_b.path());
 
         // A PAST-DUE timer for #1: still in the snapshot (it fires on the
-        // loop's first tick, seconds after reconciliation) — the resumer
-        // owns it, reconciliation must not race it. #2 has no timer and a
-        // machine-wide claude alive but NO fresh transcript → spawns.
+        // schedule loop's first tick, seconds after reconciliation) — the
+        // resumer owns it and applies the same no-startup-spawn rule there.
         run(
             &h,
             vec![timer(project, "#1", "2020-01-01T00:00:00+00:00")],
@@ -978,27 +960,10 @@ mod tests {
         )
         .await;
 
-        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
-        let spawns = h.spawns.lock().unwrap().clone();
-        assert_eq!(spawns.len(), 1, "only the timerless epic spawns");
-        assert_eq!(spawns[0].epic, "#2");
-        assert_eq!(spawns[0].generation, 2, "latest handoff gen 1 + 1");
-
-        let rows = rows(&h.audit, project).await;
-        let resumes: Vec<_> = rows
-            .iter()
-            .filter(|r| r.event == AuditEventKind::Resume)
-            .collect();
-        assert_eq!(resumes.len(), 1, "the timered epic gets NO audit row");
-        assert_eq!(resumes[0].epic, "#2");
-        assert_eq!(resumes[0].generation, 2);
-        assert_eq!(resumes[0].session_id, 0);
-        assert_eq!(resumes[0].details["trigger"], "cold_start");
-        // Issue #101: the row names the generation it resumes from, and the
-        // staged spawn's SPAWN linkage carries the same trigger.
-        assert_eq!(resumes[0].details["predecessor_generation"], 1);
-        let staged = h.replicator.spawn_details(project, "#2", 2).unwrap();
-        assert_eq!(staged["trigger"], "cold_start");
+        let alerts = interrupted(&h.audit, project).await;
+        assert_eq!(alerts.len(), 1, "the timered epic gets NO audit row");
+        assert_eq!(alerts[0].epic, "#2");
+        assert_eq!(alerts[0].details["prior_generation"], 1);
     }
 
     #[tokio::test]
@@ -1008,18 +973,10 @@ mod tests {
         let project = "C:/git/proj-recon-live";
         let repo_live = tempdir().unwrap();
         let repo_parked = tempdir().unwrap();
-        init_repo(repo_parked.path());
         write_handoff(repo_live.path(), "#1", 3);
         write_handoff(repo_parked.path(), "#2", 3);
-        for (epic, repo) in [("#1", &repo_live), ("#2", &repo_parked)] {
-            h.run_configs
-                .save(&SamuraiRunConfig::new(
-                    project,
-                    epic,
-                    repo.path().to_string_lossy().into_owned(),
-                ))
-                .unwrap();
-        }
+        save_config(&h, project, "#1", repo_live.path());
+        save_config(&h, project, "#2", repo_parked.path());
         // #1: a WORKING session (the re-call / crash-refire case). #2: a
         // PARKED leftover tile nobody closed — terminal, not an owner.
         h.supervisor
@@ -1035,35 +992,20 @@ mod tests {
 
         run(&h, Vec::new(), None, false).await;
 
-        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
-        let spawns = h.spawns.lock().unwrap().clone();
-        assert_eq!(spawns.len(), 1, "the live epic must not double-spawn");
-        assert_eq!(spawns[0].epic, "#2");
-        assert_eq!(spawns[0].generation, 4, "handoff gen 3 + 1");
-        let rows = rows(&h.audit, project).await;
-        assert!(
-            !rows
-                .iter()
-                .any(|r| r.event == AuditEventKind::Resume && r.epic == "#1"),
-            "no RESUME row for the live epic"
-        );
+        let alerts = interrupted(&h.audit, project).await;
+        assert_eq!(alerts.len(), 1, "the live epic is left alone");
+        assert_eq!(alerts[0].epic, "#2");
+        assert_eq!(alerts[0].details["prior_generation"], 3);
     }
 
     #[tokio::test]
-    async fn test_probable_orphan_alerts_and_never_spawns() {
+    async fn test_probable_orphan_alerts_and_stays_skipped() {
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         let project = "C:/git/proj-recon-orphan";
         let repo = tempdir().unwrap();
-        init_repo(repo.path());
-        write_handoff(repo.path(), "#37", 2); // WOULD spawn gen-3 otherwise
-        h.run_configs
-            .save(&SamuraiRunConfig::new(
-                project,
-                "#37",
-                repo.path().to_string_lossy().into_owned(),
-            ))
-            .unwrap();
+        write_handoff(repo.path(), "#37", 2);
+        save_config(&h, project, "#37", repo.path());
 
         // Fresh transcript + a live claude: probably a survivor.
         run(&h, Vec::new(), Some(Duration::from_secs(5)), true).await;
@@ -1078,11 +1020,8 @@ mod tests {
         assert_eq!(alert.details["epic"], "#37");
         assert_eq!(alert.details["transcript_age_secs"], 5);
         assert_eq!(alert.generation, 0);
-        assert!(
-            h.spawns.lock().unwrap().is_empty(),
-            "never double-spawn over a probable survivor"
-        );
-        assert!(!rows.iter().any(|r| r.event == AuditEventKind::Resume));
+        // The orphan verdict wins outright — no interrupted alert on top.
+        assert!(interrupted(&h.audit, project).await.is_empty());
     }
 
     #[tokio::test]
@@ -1090,20 +1029,13 @@ mod tests {
         // The verdict is a guess (machine-wide process scan): a wrong one
         // must cost ONE staleness window, not the whole app run — nothing
         // else re-evaluates it. Second pass: the transcript is stale by
-        // then, so the epic spawns instead of staying dead.
+        // then, so the human finally gets the interrupted-run alert.
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         let project = "C:/git/proj-recon-retry";
         let repo = tempdir().unwrap();
-        init_repo(repo.path());
         write_handoff(repo.path(), "#37", 2);
-        h.run_configs
-            .save(&SamuraiRunConfig::new(
-                project,
-                "#37",
-                repo.path().to_string_lossy().into_owned(),
-            ))
-            .unwrap();
+        save_config(&h, project, "#37", repo.path());
 
         // Fresh on the first pass, stale on every later one.
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1117,7 +1049,6 @@ mod tests {
             h.run_configs.clone(),
             Vec::new(),
             h.supervisor.clone(),
-            h.replicator.clone(),
             h.audit.clone(),
             probe,
             alive(true),
@@ -1127,10 +1058,6 @@ mod tests {
         .await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 2, "exactly two passes");
-        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
-        let spawns = h.spawns.lock().unwrap().clone();
-        assert_eq!(spawns.len(), 1, "the retry pass spawns exactly once");
-        assert_eq!(spawns[0].generation, 3, "handoff gen 2 + 1");
         // The first pass' ALERT stays in the trail; the retry explains it.
         let rows = rows(&h.audit, project).await;
         assert_eq!(
@@ -1139,42 +1066,25 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(
-            rows.iter()
-                .filter(|r| r.event == AuditEventKind::Resume)
-                .count(),
-            1
-        );
+        let alerts = interrupted(&h.audit, project).await;
+        assert_eq!(alerts.len(), 1, "the retry pass alerts exactly once");
+        assert_eq!(alerts[0].details["prior_generation"], 2);
     }
 
     #[tokio::test]
-    async fn test_retry_pass_does_not_respawn_an_epic_pass_one_already_spawned() {
+    async fn test_retry_pass_does_not_realert_an_epic_pass_one_already_decided() {
         // Two ACTIVE configs: epic A looks like a probable orphan (which is
-        // what arms the retry pass at all), epic B is stale and spawns on
-        // pass 1. The retry pass must NOT re-decide B — its only guard used
-        // to be a live supervised session, and registration cannot arrive in
-        // time (the frontend registers on consuming the spawn event, and an
-        // unconsumed event is only re-emitted after ack_timeout_secs = 180s,
-        // longer than the 120s retry delay). Left unguarded, the retry reads
-        // pass 1's OWN Resume row back as B's prior generation and stages a
-        // SECOND orchestrator, one generation higher, into the same worktree.
+        // what arms the retry pass at all), epic B is stale and gets its
+        // interrupted alert on pass 1. The retry must NOT re-decide B — the
+        // same "resume it manually" row twice for one launch is pure noise.
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         let project = "C:/git/proj-recon-double";
         let repo_a = tempdir().unwrap();
         let repo_b = tempdir().unwrap();
-        init_repo(repo_a.path());
-        init_repo(repo_b.path());
         write_handoff(repo_b.path(), "#78", 3);
-        for (epic, repo) in [("#77", repo_a.path()), ("#78", repo_b.path())] {
-            h.run_configs
-                .save(&SamuraiRunConfig::new(
-                    project,
-                    epic,
-                    repo.to_string_lossy().into_owned(),
-                ))
-                .unwrap();
-        }
+        save_config(&h, project, "#77", repo_a.path());
+        save_config(&h, project, "#78", repo_b.path());
 
         // Epic A's transcript stays fresh (with a live claude machine-wide it
         // reads as a probable orphan → AlertOrphan → the retry is armed);
@@ -1188,7 +1098,6 @@ mod tests {
             h.run_configs.clone(),
             Vec::new(),
             h.supervisor.clone(),
-            h.replicator.clone(),
             h.audit.clone(),
             probe,
             alive(true),
@@ -1197,48 +1106,28 @@ mod tests {
         )
         .await;
 
-        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
-        let spawns = h.spawns.lock().unwrap().clone();
-        assert_eq!(spawns.len(), 1, "epic #78 spawns exactly once, not twice");
-        assert_eq!(spawns[0].epic, "#78");
-        assert_eq!(spawns[0].generation, 4, "handoff gen 3 + 1");
-
-        // …and exactly one RESUME row, so a later pass cannot inflate the
-        // generation off its own audit trail either.
-        let rows = rows(&h.audit, project).await;
-        assert_eq!(
-            rows.iter()
-                .filter(|r| r.event == AuditEventKind::Resume)
-                .count(),
-            1,
-            "one RESUME row for the one spawn"
-        );
+        let alerts = interrupted(&h.audit, project).await;
+        assert_eq!(alerts.len(), 1, "epic #78 alerts exactly once, not twice");
+        assert_eq!(alerts[0].epic, "#78");
+        assert_eq!(alerts[0].details["prior_generation"], 3);
     }
 
     #[tokio::test]
-    async fn test_gh_auth_loss_blocks_the_cold_start_spawn() {
+    async fn test_gh_auth_loss_refines_the_interrupted_alert() {
         // An epic parked for gh_auth_lost keeps its ACTIVE config and gets no
-        // resume timer, so reconciliation is what would resurrect it — into a
-        // `gh` that still cannot read issues, comment, or open PRs.
+        // resume timer, so it lands here — and a manual resume would fail the
+        // launcher's preflight until `gh` is healthy, which the row says.
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         let project = "C:/git/proj-recon-ghauth";
         let repo = tempdir().unwrap();
-        init_repo(repo.path());
-        write_handoff(repo.path(), "#37", 2); // WOULD spawn gen-3 otherwise
-        h.run_configs
-            .save(&SamuraiRunConfig::new(
-                project,
-                "#37",
-                repo.path().to_string_lossy().into_owned(),
-            ))
-            .unwrap();
+        write_handoff(repo.path(), "#37", 2);
+        save_config(&h, project, "#37", repo.path());
 
         reconcile_gated(
             h.run_configs.clone(),
             Vec::new(),
             h.supervisor.clone(),
-            h.replicator.clone(),
             h.audit.clone(),
             ages(None),
             alive(false),
@@ -1256,31 +1145,27 @@ mod tests {
         assert_eq!(alert.epic, "#37");
         assert_eq!(alert.details["epic"], "#37");
         assert_eq!(alert.generation, 0);
+        assert!(alert.details["message"]
+            .as_str()
+            .unwrap()
+            .contains("resume it manually"));
         assert!(
-            h.spawns.lock().unwrap().is_empty(),
-            "never spawn a successor into a dead gh"
+            interrupted(&h.audit, project).await.is_empty(),
+            "the gh-auth row REPLACES the plain interrupted row"
         );
-        assert!(!rows.iter().any(|r| r.event == AuditEventKind::Resume));
 
         // A transient probe failure is a data gap, not an auth loss (the auth
-        // watcher's policy): it must NOT block the recovery spawn.
+        // watcher's policy): the plain interrupted alert stands.
         let dir2 = tempdir().unwrap();
         let h2 = harness(dir2.path());
+        let project2 = "C:/git/proj-recon-ghgap";
         let repo2 = tempdir().unwrap();
-        init_repo(repo2.path());
         write_handoff(repo2.path(), "#37", 2);
-        h2.run_configs
-            .save(&SamuraiRunConfig::new(
-                "C:/git/proj-recon-ghgap",
-                "#37",
-                repo2.path().to_string_lossy().into_owned(),
-            ))
-            .unwrap();
+        save_config(&h2, project2, "#37", repo2.path());
         reconcile_gated(
             h2.run_configs.clone(),
             Vec::new(),
             h2.supervisor.clone(),
-            h2.replicator.clone(),
             h2.audit.clone(),
             ages(None),
             alive(false),
@@ -1288,8 +1173,9 @@ mod tests {
             TEST_RETRY,
         )
         .await;
-        wait_until(|| !h2.spawns.lock().unwrap().is_empty()).await;
-        assert_eq!(h2.spawns.lock().unwrap()[0].generation, 3);
+        let alerts = interrupted(&h2.audit, project2).await;
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].details["prior_generation"], 2);
     }
 
     #[tokio::test]
@@ -1300,15 +1186,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         let repo = tempdir().unwrap();
-        init_repo(repo.path());
         write_handoff(repo.path(), "#37", 1);
-        h.run_configs
-            .save(&SamuraiRunConfig::new(
-                "C:/git/proj-recon-blocking",
-                "#37",
-                repo.path().to_string_lossy().into_owned(),
-            ))
-            .unwrap();
+        save_config(&h, "C:/git/proj-recon-blocking", "#37", repo.path());
 
         let probe_thread: Arc<Mutex<Option<std::thread::ThreadId>>> = Arc::new(Mutex::new(None));
         let probe_thread_rec = probe_thread.clone();
@@ -1320,7 +1199,6 @@ mod tests {
             h.run_configs.clone(),
             Vec::new(),
             h.supervisor.clone(),
-            h.replicator.clone(),
             h.audit.clone(),
             probe,
             alive(false),
@@ -1344,7 +1222,6 @@ mod tests {
         let h = harness(dir.path());
         let project = "C:/git/proj-recon-probe";
         let repo = tempdir().unwrap();
-        init_repo(repo.path());
         write_handoff(repo.path(), "#37", 2);
         // Stored with the Windows `\\?\` verbatim prefix (fs::canonicalize
         // spelling) — the probe must receive the STRIPPED worktree path.
@@ -1363,7 +1240,6 @@ mod tests {
             h.run_configs.clone(),
             Vec::new(),
             h.supervisor.clone(),
-            h.replicator.clone(),
             h.audit.clone(),
             probe,
             alive(true),
@@ -1378,75 +1254,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_spawn_from_audit_rows_only_uses_recovery() {
+    async fn test_audit_rows_alone_are_generation_evidence() {
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         let project = "C:/git/proj-recon-auditgen";
-        let repo = tempdir().unwrap();
-        init_repo(repo.path()); // no handoff files at all
-        h.run_configs
-            .save(&SamuraiRunConfig::new(
-                project,
-                "#37",
-                repo.path().to_string_lossy().into_owned(),
-            ))
-            .unwrap();
+        let repo = tempdir().unwrap(); // no handoff files at all
+        save_config(&h, project, "#37", repo.path());
         // The only generation evidence: audit rows from before the restart.
         h.audit
             .append(project, audit_row("#37", AuditEventKind::Spawn, 4));
 
         run(&h, Vec::new(), None, false).await;
 
-        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
-        let spawns = h.spawns.lock().unwrap().clone();
-        assert_eq!(spawns[0].generation, 5, "audit gen 4 + 1");
-        // Gen-4 wrote no handoff → the replicator stages RECOVERY.
-        let details = h.replicator.spawn_details(project, "#37", 5).unwrap();
-        assert_eq!(details["recovery"], true);
-        assert_eq!(details["predecessor_generation"], 4);
-        let rows = rows(&h.audit, project).await;
-        let resume = rows
-            .iter()
-            .find(|r| r.event == AuditEventKind::Resume)
-            .expect("RESUME row must precede the spawn");
-        assert_eq!(resume.generation, 5);
-        assert_eq!(resume.details["trigger"], "cold_start");
+        let alerts = interrupted(&h.audit, project).await;
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].details["prior_generation"], 4);
     }
 
     #[tokio::test]
     async fn test_completed_config_is_skipped_entirely() {
         // Issue #96: a verified-complete run keeps its config on disk as
         // COMPLETED until the human's cleanup archives it. Reconciliation
-        // must not touch it — no spawn, no audit row — even though the
-        // handoff evidence WOULD otherwise spawn the next generation into
-        // the finished worktree (the exact regression observed after the
-        // #76–#84 run, when completion did not exist).
+        // must not touch it — not even an alert.
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         let project = "C:/git/proj-recon-completed";
         let repo = tempdir().unwrap();
-        init_repo(repo.path());
-        write_handoff(repo.path(), "#37", 2); // WOULD spawn gen-3 otherwise
-        h.run_configs
-            .save(&SamuraiRunConfig::new(
-                project,
-                "#37",
-                repo.path().to_string_lossy().into_owned(),
-            ))
-            .unwrap();
+        write_handoff(repo.path(), "#37", 2);
+        save_config(&h, project, "#37", repo.path());
         h.run_configs.complete(project, "#37").unwrap();
 
         run(&h, Vec::new(), None, false).await;
 
-        // Give any (wrong) spawn staging a moment to surface before judging.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            h.spawns.lock().unwrap().is_empty(),
-            "a completed run must never respawn"
-        );
         assert!(
             rows(&h.audit, project).await.is_empty(),
-            "no RESUME/ALERT trail for a completed run"
+            "no trail at all for a completed run"
         );
     }
 
@@ -1456,13 +1298,7 @@ mod tests {
         let h = harness(dir.path());
         let project = "C:/git/proj-recon-unstartable";
         let repo = tempdir().unwrap(); // no handoffs, no audit, no registry
-        h.run_configs
-            .save(&SamuraiRunConfig::new(
-                project,
-                "#37",
-                repo.path().to_string_lossy().into_owned(),
-            ))
-            .unwrap();
+        save_config(&h, project, "#37", repo.path());
 
         run(&h, Vec::new(), None, false).await;
 
@@ -1474,7 +1310,6 @@ mod tests {
         assert_eq!(alert.event, AuditEventKind::Alert);
         assert_eq!(alert.details["epic"], "#37");
         assert_eq!(alert.generation, 0);
-        assert!(h.spawns.lock().unwrap().is_empty(), "never guess a gen-1");
         assert!(!rows.iter().any(|r| r.event == AuditEventKind::Resume));
     }
 }

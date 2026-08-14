@@ -2,7 +2,7 @@ import type { SamuraiWorkflowEdge, SamuraiWorkflowGraph, SamuraiWorkflowNode } f
 
 /**
  * Pure graph edits behind the workflow editor canvas
- * (`src/components/sidebar/WorkflowGraphEditor.tsx`), kept in their own
+ * (`src/components/workflows/WorkflowsView.tsx`), kept in their own
  * module so consumers that only need the walk rule — the PR monitor's step
  * checkboxes, for one — do not pull React Flow into their bundle.
  *

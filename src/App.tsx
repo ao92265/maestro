@@ -65,6 +65,7 @@ import { useGitStore } from "./stores/useGitStore";
 import { useHealthStore } from "./stores/useHealthStore";
 import { useTerminalSettingsStore } from "./stores/useTerminalSettingsStore";
 import { useUpdateStore } from "./stores/useUpdateStore";
+import { useWorkflowsViewStore } from "./stores/useWorkflowsViewStore";
 
 /**
  * Landscape graph, loaded on demand: it pulls in React Flow, which would
@@ -74,6 +75,15 @@ import { useUpdateStore } from "./stores/useUpdateStore";
  */
 const LandscapeView = lazy(() =>
   import("./components/landscape/LandscapeView").then((m) => ({ default: m.LandscapeView })),
+);
+
+/**
+ * Full-screen workflow editor, loaded on demand for the same reason as
+ * LandscapeView above — its own React Flow canvas, opened from the Launch
+ * tab via `useWorkflowsViewStore` rather than a prop passed down.
+ */
+const WorkflowsView = lazy(() =>
+  import("./components/workflows/WorkflowsView").then((m) => ({ default: m.WorkflowsView })),
 );
 
 /** Header title for each git-panel tab. */
@@ -134,6 +144,11 @@ function App() {
   // Landscape view: every project, terminal and subagent on one graph. Rendered
   // over the terminals rather than instead of them, so nothing is torn down.
   const [landscapeView, setLandscapeView] = useState(false);
+  // Full-screen workflow editor (Launch tab → "Open workflow editor"):
+  // opened via a store rather than local state, since the trigger lives deep
+  // inside the sidebar rather than a prop App can pass down.
+  const workflowsViewOpen = useWorkflowsViewStore((s) => s.isOpen);
+  const closeWorkflowsView = useWorkflowsViewStore((s) => s.close);
   // Marks the landscape button while a terminal anywhere is blocked on you.
   const needsInputAnywhere = useSessionStore((s) =>
     s.sessions.some((session) => session.status === "NeedsInput"),
@@ -936,6 +951,20 @@ function App() {
                     onNavigate={handleLandscapeNavigate}
                     onClose={() => setLandscapeView(false)}
                   />
+                </Suspense>
+              )}
+
+              {/* Workflow editor — an overlay, same shell as the landscape
+                  graph above (both z-50; not expected to be open together). */}
+              {workflowsViewOpen && (
+                <Suspense
+                  fallback={
+                    <div className="absolute inset-0 z-50 flex items-center justify-center bg-maestro-bg text-xs text-maestro-muted">
+                      Loading…
+                    </div>
+                  }
+                >
+                  <WorkflowsView onClose={closeWorkflowsView} />
                 </Suspense>
               )}
             </main>

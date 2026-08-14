@@ -422,9 +422,9 @@ mod tests {
 
     /// The watchdog's DEAD path end-to-end against a real supervisor: the
     /// verdict-driven transition must land the session in DEAD and put the
-    /// `kind: "dead"` ALERT on the audit trail.
+    /// `kind: "dead"` KILL row (cause `process_died`) on the audit trail.
     #[tokio::test]
-    async fn test_dead_verdict_drives_supervisor_to_dead_with_alert() {
+    async fn test_dead_verdict_drives_supervisor_to_dead_with_kill_row() {
         let dir = tempdir().unwrap();
         let (audit, task) = AuditLog::new(dir.path().to_path_buf(), None);
         tokio::spawn(task);
@@ -443,10 +443,14 @@ mod tests {
         assert_eq!(snapshot.state, SupervisorState::Dead);
 
         let rows = audit.read(project, None, None).await.unwrap().events;
-        let alert = rows.last().unwrap();
-        assert_eq!(alert.event, AuditEventKind::Alert);
-        assert_eq!(alert.details["kind"], "dead");
-        assert_eq!(alert.session_id, 1);
-        assert_eq!(alert.generation, 2);
+        let death = rows.last().unwrap();
+        assert_eq!(death.event, AuditEventKind::Kill);
+        assert_eq!(death.details["kind"], "dead");
+        assert_eq!(
+            death.details["cause"],
+            crate::core::supervisor::KILL_CAUSE_PROCESS_DIED
+        );
+        assert_eq!(death.session_id, 1);
+        assert_eq!(death.generation, 2);
     }
 }

@@ -339,7 +339,7 @@ export function JournalSection() {
       ) : rows.length === 0 ? (
         <p className="px-1 py-2 text-[11px] italic text-maestro-muted">No journal entries yet.</p>
       ) : (
-        <div className="space-y-0.5">
+        <div className="max-h-[45vh] overflow-y-auto space-y-0.5">
           {rows.map((row, i) => (
             <JournalRow
               key={`${row.entry.ts}-${i}`}

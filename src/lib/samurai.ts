@@ -41,6 +41,9 @@ export interface SamuraiSessionSnapshot {
  * Audit row kinds (PRD §5.10). Sub-kinds live in `details.kind`.
  * `INJECT` (issue #101) records every instruction Maestro typed into an
  * orchestrator terminal — `details.phase` is `"delivered"` or `"acked"`.
+ * `KILL` records an agent's DEATH — `details.cause` says which path ended
+ * it (`handoff` / `process_died` / `user_kill` / `run_complete`). Without
+ * it a long-dead agent's newest row stayed `SPAWN` forever.
  */
 export type SamuraiAuditEventKind =
   | "SPAWN"
@@ -49,7 +52,8 @@ export type SamuraiAuditEventKind =
   | "RESUME"
   | "COMPLETE"
   | "ALERT"
-  | "INJECT";
+  | "INJECT"
+  | "KILL";
 
 /** One audit JSONL row — mirrors the Rust `AuditEvent`. */
 export interface SamuraiAuditEvent {
@@ -383,8 +387,8 @@ export function samuraiListRuns(): Promise<SamuraiRunListEntry[]> {
 /**
  * One-click epic cleanup (destructive — confirm before calling): cancels the
  * resume timer, archives the run config, removes the epic worktree, deletes
- * the `samurai-<slug>` branch. Idempotent; refuses while a live supervised
- * session exists.
+ * the `<project>-<slug>` branch (or its pre-rename `samurai-<slug>` form, as
+ * a fallback). Idempotent; refuses while a live supervised session exists.
  */
 export function samuraiCleanupEpic(
   projectPath: string,

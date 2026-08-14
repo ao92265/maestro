@@ -29,7 +29,11 @@ async fn repo_hash(repo_path: &Path) -> String {
 
 /// Extracts the project name from a repo path (last path component, lowercased).
 /// Falls back to "project" if the path has no file name component.
-fn project_name(repo_path: &Path) -> String {
+///
+/// `pub(crate)` — also reused by `commands::samurai::epic_branch` (the
+/// Samurai launch branch is `<project>-<epic_slug>`) so the two derivations
+/// of "this repo's name" never drift apart.
+pub(crate) fn project_name(repo_path: &Path) -> String {
     repo_path
         .file_name()
         .and_then(|n| n.to_str())

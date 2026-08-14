@@ -143,7 +143,8 @@ export function PullRequestRow({ pr, repoPath, isSelected, onClick }: PullReques
           </div>
           <div className="flex min-w-0 items-center gap-1.5 text-[10px] text-maestro-muted">
             <span className="shrink-0 font-mono">#{pr.number}</span>
-            <span className="shrink-0 truncate">@{pr.author.login}</span>
+            {/* A deleted GitHub account comes back without an author. */}
+            {pr.author?.login && <span className="shrink-0 truncate">by {pr.author.login}</span>}
             <span className="truncate">
               {pr.headRefName} → {pr.baseRefName}
             </span>
