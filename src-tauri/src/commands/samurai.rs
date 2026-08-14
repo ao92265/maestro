@@ -1575,7 +1575,7 @@ mod tests {
         use crate::core::samurai_test_gate::{GateCommandOutput, GateCommandRunner};
         let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let calls_rec = calls.clone();
-        let runner: GateCommandRunner = Arc::new(move |_cwd, program, args| {
+        let runner: GateCommandRunner = Arc::new(move |_cwd, program, args, _timeout| {
             let call = format!("{program} {}", args.join(" "));
             calls_rec.lock().unwrap().push(call.clone());
             for (prefix, out) in &script {
@@ -1585,6 +1585,7 @@ mod tests {
             }
             Ok(GateCommandOutput {
                 success: true,
+                timed_out: false,
                 stdout: String::new(),
                 stderr: String::new(),
             })
@@ -2151,6 +2152,7 @@ mod tests {
             "cargo test",
             crate::core::samurai_test_gate::GateCommandOutput {
                 success: false,
+                timed_out: false,
                 stdout: "test result: FAILED. 40 passed; 2 failed; 0 ignored\n".to_string(),
                 stderr: String::new(),
             },
@@ -2217,6 +2219,7 @@ mod tests {
             "npm install",
             crate::core::samurai_test_gate::GateCommandOutput {
                 success: false,
+                timed_out: false,
                 stdout: String::new(),
                 stderr: "npm ERR! network timeout\n".to_string(),
             },
@@ -2266,7 +2269,7 @@ mod tests {
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let entered_rt = entered.clone();
         let release_rt = release.clone();
-        let runner: GateCommandRunner = Arc::new(move |_cwd, _program, _args| {
+        let runner: GateCommandRunner = Arc::new(move |_cwd, _program, _args, _timeout| {
             {
                 let (flag, cv) = &*entered_rt;
                 *flag.lock().unwrap() = true;
@@ -2279,6 +2282,7 @@ mod tests {
             }
             Ok(GateCommandOutput {
                 success: true,
+                timed_out: false,
                 stdout: String::new(),
                 stderr: String::new(),
             })
@@ -2334,6 +2338,7 @@ mod tests {
             "cargo test",
             crate::core::samurai_test_gate::GateCommandOutput {
                 success: false,
+                timed_out: false,
                 stdout: "test result: FAILED. 1 passed; 1 failed\n".to_string(),
                 stderr: String::new(),
             },
@@ -2359,6 +2364,49 @@ mod tests {
         // not refused by the in-flight slot (nothing else refuses it either
         // — no live session is registered in this harness).
         run_launch(&h, &gate, true, &["#38"], &[]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_launch_gate_timeout_blocks_and_releases_the_slot() {
+        // Review F2 × F1 (issue #106): a hung gate step is killed and blocks
+        // the launch like a red gate — no spawn, no ACTIVE config, a durable
+        // ALERT with its distinct phase — and the in-flight slot is released
+        // so the human can relaunch after fixing the hang.
+        let h = cleanup_harness();
+        commit_fixture_files(
+            h.repo.path(),
+            &[("Cargo.toml", "[workspace]\nmembers = []\n")],
+        );
+        let (gate, _calls) = recording_gate(vec![(
+            "cargo test",
+            crate::core::samurai_test_gate::GateCommandOutput {
+                success: false,
+                timed_out: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        )]);
+
+        let err = run_launch(&h, &gate, false, &["#38"], &[]).await.unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(err.contains("may be hung"), "{err}");
+
+        assert!(h.spawns.lock().unwrap().is_empty(), "no gen-1 spawn");
+        assert!(h.run_configs.load_active().is_empty(), "no ACTIVE config");
+        let read = h.audit.read(&h.project, None, None).await.unwrap();
+        let alert = read
+            .events
+            .iter()
+            .find(|e| e.event == AuditEventKind::Alert)
+            .expect("an ALERT row records the block");
+        assert_eq!(alert.details["kind"], "launch_test_gate");
+        assert_eq!(alert.details["phase"], "timed_out");
+
+        // Released: the relaunch reaches the gate again instead of bouncing
+        // off the in-flight check.
+        let again = run_launch(&h, &gate, false, &["#38"], &[]).await.unwrap_err();
+        assert!(!again.contains("already in progress"), "{again}");
+        assert!(again.contains("timed out"), "{again}");
     }
 
     #[test]
