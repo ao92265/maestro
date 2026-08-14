@@ -19,9 +19,10 @@ Written per session into `.claude/settings.local.json` by
 | --- | --- | --- | --- |
 | `SessionStart` | `/hook/session-start` | `Idle` | CLI (re)started and sits at its prompt. It is *not* working yet. |
 | `UserPromptSubmit` | `/hook/user-prompt` | `Working` | A prompt was submitted (typed by the human or injected by Maestro). Authoritative turn start. |
-| `PreToolUse` (any tool) | `/hook/pre-tool` | `Working` ("Running {tool}") | The agent is executing a tool. Also repairs state after a permission prompt approved via digit shortcut. |
-| `PreToolUse` (`AskUserQuestion`) | `/hook/pre-tool` | `NeedsInput` | The agent opened an interactive question dialog mid-turn. |
-| `Notification` | `/hook/notification` | `NeedsInput` | The CLI is waiting on the human: permission prompt, or the 60s idle-prompt reminder. The notification text becomes the needs-input prompt. |
+| `PreToolUse` (any tool) | `/hook/pre-tool` | `Working` ("Running {tool}") | The agent is executing a tool. **Window rule (issue #109):** within 2s of a `Notification` for the same session the `Working` is suppressed — PreToolUse is async fire-and-forget, so a gated tool's `Working` can land *after* the permission prompt's `NeedsInput`; a later PreToolUse (fresh tool start after approval) repaints normally. |
+| `PreToolUse` (`AskUserQuestion`) | `/hook/pre-tool` | `NeedsInput` | The agent opened an interactive question dialog mid-turn. Never suppressed by the window rule. |
+| `PostToolUse` (any tool) | `/hook/post-tool` | `Working` ("Finished {tool}") | A tool ran to completion — proof any permission prompt was answered (issue #109). Clears `NeedsInput` *unconditionally* (deliberately exempt from the window rule: this is exactly the fresh after-approval signal) and closes the digit-shortcut gap where approving the turn's LAST long tool left `NeedsInput` painted until Stop. |
+| `Notification` | `/hook/notification` | `NeedsInput` | The CLI is waiting on the human: permission prompt, or the 60s idle-prompt reminder. The notification text becomes the needs-input prompt. Also arms the 2s PreToolUse shield above. |
 | `Stop` | `/hook/stop` | `AwaitingInput` (wire-only) | Turn ended, control returned to the user. |
 | `SessionEnd` | `/hook/session-end` | `SessionEnded` (wire-only) | The claude process exited (`/exit`, `/clear`, logout). |
 
@@ -119,6 +120,21 @@ Run `npm run tauri dev`, open a project, start a Claude session.
    **Correct:** stays red (the idle reminder re-asserts needs-input); a
    session that reported Done stays green.
 
+### Class 5 — permission-prompt repaints (issue #109 — pending human sign-off)
+
+1. Ask the agent to run a command that needs permission approval. Wait for
+   the permission dialog. **Correct:** the indicator turns red and STAYS red
+   while the dialog is up — the gated tool's own late async `PreToolUse`
+   (Working) no longer repaints it blue within the 2s window rule.
+2. Approve the prompt with a **digit shortcut** (press the option's number,
+   no Enter) when the approved command is the turn's LAST, long-running tool
+   (e.g. "run `npm install` and then stop"). **Correct:** the indicator
+   flips to blue as soon as the tool *finishes* (the new `PostToolUse` hook)
+   — not only at the turn's Stop as before.
+3. Approve a prompt normally mid-turn and let the agent continue with more
+   tools. **Correct:** blue from the next tool start (a `PreToolUse` later
+   than 2s after the notification repaints normally).
+
 ## Known residual gaps (documented, not silently ignored)
 
 - **Esc-interrupt:** interrupting a turn fires no Stop hook. The status stays
@@ -127,17 +143,6 @@ Run `npm run tauri dev`, open a project, start a Claude session.
 - **Hard kill:** a `kill -9`/crash fires no SessionEnd hook. Samurai-supervised
   sessions are covered by the watchdog (→ Error); unsupervised sessions keep
   their last status until PTY output resumes.
-- **PreToolUse/Notification ordering:** both are near-simultaneous localhost
-  POSTs when a gated tool starts, and PreToolUse is async (fire-and-forget),
-  so a `Working` can in principle land after the permission `NeedsInput`.
-  Self-corrects on the next signal; the 60s idle reminder is the backstop.
-- **Digit-shortcut approval of the turn's last tool:** approving a permission
-  prompt with a digit shortcut just runs the tool — no hook fires on the
-  approval itself, and no PostToolUse hook exists to report the tool
-  finishing. A later tool's PreToolUse or the turn's Stop normally repaints,
-  but when the approved tool is the turn's LAST long-running one, the status
-  stays red (NeedsInput) for that tool's whole runtime and only corrects at
-  the turn's Stop.
 - **Empty-Enter flip:** pressing Enter on an empty prompt while red flips the
   indicator to blue even though no turn starts (the flip cannot distinguish a
   submit from a nudge). The next real signal corrects it.

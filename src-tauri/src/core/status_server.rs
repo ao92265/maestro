@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::State,
@@ -32,6 +33,30 @@ const MAX_PENDING_STATUSES: usize = 100;
 /// (see [`handle_hook_stop`]), and maps to the `AwaitingInput` status the
 /// frontend normalizes into `NeedsInput`.
 const AWAITING_INPUT_STATE: &str = "awaiting_input";
+
+/// Issue #109 (item 4): how long a Notification's `NeedsInput` shields a
+/// session from a LATE async PreToolUse `Working` repaint.
+///
+/// Both hooks are near-simultaneous localhost POSTs when a gated tool
+/// starts, and PreToolUse is fire-and-forget — so the tool's `Working`
+/// could land AFTER the permission prompt's `NeedsInput` and paint the
+/// session blue while the dialog is up. Within this window a PreToolUse for
+/// the same session does not downgrade the status; a LATER PreToolUse (a
+/// fresh tool start, i.e. the prompt was approved) does. Two seconds is an
+/// order of magnitude above the observed localhost race (<100ms) and well
+/// under any human approve-and-continue turnaround.
+const NOTIFICATION_SHIELD_WINDOW: Duration = Duration::from_secs(2);
+
+/// The issue #109 window rule, pure for the table test: may a PreToolUse
+/// `Working` overwrite the status, given when the session's last
+/// Notification (`NeedsInput`) fired? Strict boundary (`>`), matching every
+/// samurai timeout.
+fn pre_tool_may_downgrade(notified_at: Option<Instant>, now: Instant) -> bool {
+    match notified_at {
+        None => true,
+        Some(at) => now.saturating_duration_since(at) > NOTIFICATION_SHIELD_WINDOW,
+    }
+}
 
 /// Callback for emitting status events. In production this wraps `AppHandle::emit`;
 /// in tests it captures events into a `Vec`.
@@ -93,6 +118,12 @@ struct ServerState {
     session_projects: Arc<RwLock<HashMap<u32, String>>>,
     /// Buffers status requests that arrive before session registration
     pending_statuses: Arc<RwLock<HashMap<u32, StatusRequest>>>,
+    /// When each session's last Notification (`NeedsInput`) fired — the
+    /// issue #109 shield against a late async PreToolUse repainting the
+    /// permission dialog blue (see [`NOTIFICATION_SHIELD_WINDOW`]). Entries
+    /// are cleared by the signals that genuinely end the wait (PostToolUse,
+    /// UserPromptSubmit, Stop, SessionEnd), so the map stays session-bounded.
+    notified_at: Arc<RwLock<HashMap<u32, Instant>>>,
 }
 
 /// HTTP status server that receives status updates from MCP servers.
@@ -111,6 +142,7 @@ fn build_router(state: Arc<ServerState>) -> Router {
         .route("/hook/session-start", post(handle_hook_session_start))
         .route("/hook/session-end", post(handle_hook_session_end))
         .route("/hook/pre-tool", post(handle_hook_pre_tool))
+        .route("/hook/post-tool", post(handle_hook_post_tool))
         .route("/hook/stop", post(handle_hook_stop))
         .route("/hook/notification", post(handle_hook_notification))
         .route("/hook/user-prompt", post(handle_hook_user_prompt_submit))
@@ -171,6 +203,7 @@ impl StatusServer {
             instance_id: instance_id.clone(),
             session_projects: session_projects.clone(),
             pending_statuses: pending_statuses.clone(),
+            notified_at: Arc::new(RwLock::new(HashMap::new())),
         });
 
         let app = build_router(state);
@@ -529,6 +562,9 @@ async fn handle_hook_session_end(
         maestro_session_id, reason
     );
 
+    // The session is gone — drop its issue #109 notification shield stamp.
+    state.notified_at.write().await.remove(&maestro_session_id);
+
     let event = ClaudeEvent::SessionEnded {
         session_id: maestro_session_id,
         reason,
@@ -647,6 +683,20 @@ async fn handle_hook_pre_tool(
         )
         .await;
     } else {
+        // Issue #109 window rule: this hook is async fire-and-forget, so a
+        // gated tool's Working can arrive AFTER the permission prompt's
+        // Notification NeedsInput. Within the shield window the repaint is
+        // suppressed (the dialog is up — the session IS waiting); a later
+        // PreToolUse is a fresh tool start after approval and paints
+        // Working as before.
+        let notified = { state.notified_at.read().await.get(&maestro_session_id).copied() };
+        if !pre_tool_may_downgrade(notified, Instant::now()) {
+            info!(
+                "[HOOK] pre-tool: session {} showed a permission prompt <{:?} ago — keeping NeedsInput (issue #109)",
+                maestro_session_id, NOTIFICATION_SHIELD_WINDOW
+            );
+            return StatusCode::OK;
+        }
         emit_hook_status(
             &state,
             maestro_session_id,
@@ -656,6 +706,62 @@ async fn handle_hook_pre_tool(
         )
         .await;
     }
+
+    StatusCode::OK
+}
+
+/// Handle the PostToolUse hook callback (issue #109).
+///
+/// Fires when a tool finishes. Its one status job is closing the
+/// digit-shortcut gap: approving a permission prompt with a digit shortcut
+/// just runs the tool — no hook fires on the approval itself — so when the
+/// approved tool is the turn's LAST one, the status stayed `NeedsInput` for
+/// that tool's whole runtime. The tool having RUN to completion is proof
+/// the prompt was answered, so this clears `NeedsInput` unconditionally —
+/// deliberately not consulting the issue-#109 notification shield (a
+/// PostToolUse is exactly the "fresh signal after approval" the shield must
+/// let through) and clearing the shield stamp itself.
+async fn handle_hook_post_tool(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<HookGenericRequest>,
+) -> StatusCode {
+    if !instance_id_matches(&headers, &state.instance_id) {
+        eprintln!("[HOOK] post-tool: rejected - missing/invalid X-Maestro-Instance");
+        return StatusCode::FORBIDDEN;
+    }
+
+    let maestro_session_id = match extract_maestro_session_id(&headers) {
+        Some(id) => id,
+        None => {
+            eprintln!("[HOOK] post-tool: missing or invalid X-Maestro-Session header");
+            return StatusCode::BAD_REQUEST;
+        }
+    };
+
+    let tool_name = payload
+        .extra
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    info!(
+        "[HOOK] post-tool: maestro_session={}, tool={}",
+        maestro_session_id, tool_name
+    );
+
+    // The wait (if any) is over — a later PreToolUse must repaint freely.
+    state.notified_at.write().await.remove(&maestro_session_id);
+
+    emit_hook_status(
+        &state,
+        maestro_session_id,
+        "Working",
+        &format!("Finished {}", tool_name),
+        None,
+    )
+    .await;
 
     StatusCode::OK
 }
@@ -698,6 +804,14 @@ async fn handle_hook_notification(
         "[HOOK] notification: maestro_session={}, message={}",
         maestro_session_id, message
     );
+
+    // Issue #109: stamp the shield BEFORE emitting, so the gated tool's late
+    // async PreToolUse can never slip between the emit and the stamp.
+    state
+        .notified_at
+        .write()
+        .await
+        .insert(maestro_session_id, Instant::now());
 
     emit_hook_status(
         &state,
@@ -743,6 +857,10 @@ async fn handle_hook_user_prompt_submit(
         maestro_session_id, payload.session_id
     );
 
+    // A submitted prompt ends whatever wait the last Notification announced
+    // (issue #109 shield hygiene).
+    state.notified_at.write().await.remove(&maestro_session_id);
+
     emit_hook_status(
         &state,
         maestro_session_id,
@@ -778,6 +896,9 @@ async fn handle_hook_stop(
         "[HOOK] stop: maestro_session={}, claude_session={}",
         maestro_session_id, payload.session_id
     );
+
+    // Turn over — drop the issue #109 notification shield stamp.
+    state.notified_at.write().await.remove(&maestro_session_id);
 
     let event = ClaudeEvent::SessionEnded {
         session_id: maestro_session_id,
@@ -869,6 +990,32 @@ mod tests {
         }
     }
 
+    /// Spin up a real HTTP server backed by our handler, returning its
+    /// address and the full shared state (the issue #109 shield tests reach
+    /// `notified_at` through it).
+    async fn start_test_http_server_with_state(
+        instance_id: &str,
+        emit_fn: EmitFn,
+    ) -> (std::net::SocketAddr, Arc<ServerState>) {
+        let state = Arc::new(ServerState {
+            emit_fn,
+            hook_emit_fn: None,
+            instance_id: instance_id.to_string(),
+            session_projects: Arc::new(RwLock::new(HashMap::new())),
+            pending_statuses: Arc::new(RwLock::new(HashMap::new())),
+            notified_at: Arc::new(RwLock::new(HashMap::new())),
+        });
+
+        let app = build_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (addr, state)
+    }
+
     /// Spin up a real HTTP server backed by our handler, returning its address.
     async fn start_test_http_server(
         instance_id: &str,
@@ -878,25 +1025,12 @@ mod tests {
         Arc<RwLock<HashMap<u32, String>>>,
         Arc<RwLock<HashMap<u32, StatusRequest>>>,
     ) {
-        let session_projects = Arc::new(RwLock::new(HashMap::new()));
-        let pending_statuses = Arc::new(RwLock::new(HashMap::new()));
-
-        let state = Arc::new(ServerState {
-            emit_fn,
-            hook_emit_fn: None,
-            instance_id: instance_id.to_string(),
-            session_projects: session_projects.clone(),
-            pending_statuses: pending_statuses.clone(),
-        });
-
-        let app = build_router(state);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        (addr, session_projects, pending_statuses)
+        let (addr, state) = start_test_http_server_with_state(instance_id, emit_fn).await;
+        (
+            addr,
+            state.session_projects.clone(),
+            state.pending_statuses.clone(),
+        )
     }
 
     /// Helper: POST a status request to the test server.
@@ -982,6 +1116,7 @@ mod tests {
         assert_eq!(post_hook(addr, "/hook/session-start", None, body.clone()).await, 403);
         assert_eq!(post_hook(addr, "/hook/session-end", None, body.clone()).await, 403);
         assert_eq!(post_hook(addr, "/hook/pre-tool", None, body.clone()).await, 403);
+        assert_eq!(post_hook(addr, "/hook/post-tool", None, body.clone()).await, 403);
         assert_eq!(post_hook(addr, "/hook/notification", None, body.clone()).await, 403);
         assert_eq!(post_hook(addr, "/hook/user-prompt", None, body.clone()).await, 403);
         assert_eq!(post_hook(addr, "/hook/stop", None, body).await, 403);
@@ -1188,6 +1323,190 @@ mod tests {
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].status, "Working");
         assert_eq!(emitted[0].message, "Processing your request");
+    }
+
+    // ── Issue #109: notification shield + PostToolUse ───────────────
+
+    #[test]
+    fn notification_shield_window_rule_table() {
+        let at = Instant::now();
+        // No notification on record: PreToolUse paints Working freely.
+        assert!(pre_tool_may_downgrade(None, at));
+        // Inside the window (strict boundary — exactly 2s still shields):
+        // the permission dialog is up, the repaint is suppressed.
+        assert!(!pre_tool_may_downgrade(Some(at), at));
+        assert!(!pre_tool_may_downgrade(Some(at), at + Duration::from_secs(1)));
+        assert!(!pre_tool_may_downgrade(Some(at), at + NOTIFICATION_SHIELD_WINDOW));
+        // Past the window: a fresh tool start after approval repaints.
+        assert!(pre_tool_may_downgrade(
+            Some(at),
+            at + NOTIFICATION_SHIELD_WINDOW + Duration::from_millis(1)
+        ));
+        assert!(pre_tool_may_downgrade(
+            Some(at),
+            at + Duration::from_millis(2500)
+        ));
+    }
+
+    /// A PreToolUse body for an ordinary (non-question) tool.
+    fn bash_pre_tool_body() -> serde_json::Value {
+        serde_json::json!({
+            "session_id": "claude-uuid",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_use_id": "tu-1",
+            "tool_input": {"command": "ls"},
+        })
+    }
+
+    #[tokio::test]
+    async fn late_pre_tool_within_window_keeps_needs_input() {
+        // Issue #109 item 4, sequence 1: notification → pretooluse
+        // immediately after → the NeedsInput stays (no Working emitted
+        // while the permission dialog is up).
+        let (emit_fn, events) = test_emit_fn();
+        let (addr, state) = start_test_http_server_with_state("inst-secret", emit_fn).await;
+        state
+            .session_projects
+            .write()
+            .await
+            .insert(1, "/path/project".to_string());
+
+        let notification = serde_json::json!({
+            "session_id": "claude-uuid",
+            "hook_event_name": "Notification",
+            "message": "Claude needs your permission to use Bash",
+        });
+        assert_eq!(
+            post_hook(addr, "/hook/notification", Some("inst-secret"), notification).await,
+            200
+        );
+        assert_eq!(
+            post_hook(addr, "/hook/pre-tool", Some("inst-secret"), bash_pre_tool_body()).await,
+            200
+        );
+
+        let emitted = events.lock().unwrap();
+        assert_eq!(emitted.len(), 1, "the late PreToolUse emitted no status");
+        assert_eq!(emitted[0].status, "NeedsInput");
+    }
+
+    #[tokio::test]
+    async fn pre_tool_after_the_window_repaints_working() {
+        // Issue #109 item 4, sequence 2: notification → (2.5s) → pretooluse
+        // → Working (a fresh tool start after the approval). The 2.5s is
+        // simulated by backdating the shield stamp, not by sleeping.
+        let (emit_fn, events) = test_emit_fn();
+        let (addr, state) = start_test_http_server_with_state("inst-secret", emit_fn).await;
+        state
+            .session_projects
+            .write()
+            .await
+            .insert(1, "/path/project".to_string());
+
+        let notification = serde_json::json!({
+            "session_id": "claude-uuid",
+            "hook_event_name": "Notification",
+            "message": "Claude needs your permission to use Bash",
+        });
+        assert_eq!(
+            post_hook(addr, "/hook/notification", Some("inst-secret"), notification).await,
+            200
+        );
+        // Age the stamp to 2.5s ago (machine uptime dwarfs 2.5s).
+        let aged = Instant::now()
+            .checked_sub(Duration::from_millis(2500))
+            .expect("uptime > 2.5s");
+        state.notified_at.write().await.insert(1, aged);
+
+        assert_eq!(
+            post_hook(addr, "/hook/pre-tool", Some("inst-secret"), bash_pre_tool_body()).await,
+            200
+        );
+
+        let emitted = events.lock().unwrap();
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(emitted[0].status, "NeedsInput");
+        assert_eq!(emitted[1].status, "Working");
+        assert_eq!(emitted[1].message, "Running Bash");
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_needs_input_is_never_shielded() {
+        // The shield only suppresses DOWNGRADES to Working — a mid-turn
+        // question right after a notification still paints NeedsInput.
+        let (emit_fn, events) = test_emit_fn();
+        let (addr, state) = start_test_http_server_with_state("inst-secret", emit_fn).await;
+        state
+            .session_projects
+            .write()
+            .await
+            .insert(1, "/path/project".to_string());
+        state.notified_at.write().await.insert(1, Instant::now());
+
+        let body = serde_json::json!({
+            "session_id": "claude-uuid",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "AskUserQuestion",
+            "tool_use_id": "tu-2",
+            "tool_input": {},
+        });
+        assert_eq!(post_hook(addr, "/hook/pre-tool", Some("inst-secret"), body).await, 200);
+
+        let emitted = events.lock().unwrap();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].status, "NeedsInput");
+    }
+
+    #[tokio::test]
+    async fn post_tool_hook_emits_working_and_clears_the_shield() {
+        // Issue #109 item 5: PostToolUse → Working, unconditionally — a
+        // completed tool proves the permission prompt was answered, so it
+        // must not consult the shield, and it clears the stamp so the next
+        // PreToolUse repaints freely too.
+        let (emit_fn, events) = test_emit_fn();
+        let (addr, state) = start_test_http_server_with_state("inst-secret", emit_fn).await;
+        state
+            .session_projects
+            .write()
+            .await
+            .insert(1, "/path/project".to_string());
+
+        let notification = serde_json::json!({
+            "session_id": "claude-uuid",
+            "hook_event_name": "Notification",
+            "message": "Claude needs your permission to use Bash",
+        });
+        assert_eq!(
+            post_hook(addr, "/hook/notification", Some("inst-secret"), notification).await,
+            200
+        );
+
+        // The digit-shortcut scenario: no signal between the notification
+        // and the approved tool FINISHING (well inside the shield window).
+        let post_tool = serde_json::json!({
+            "session_id": "claude-uuid",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_use_id": "tu-1",
+        });
+        assert_eq!(
+            post_hook(addr, "/hook/post-tool", Some("inst-secret"), post_tool).await,
+            200
+        );
+        // Shield cleared: an immediate next PreToolUse paints Working too.
+        assert_eq!(
+            post_hook(addr, "/hook/pre-tool", Some("inst-secret"), bash_pre_tool_body()).await,
+            200
+        );
+
+        let emitted = events.lock().unwrap();
+        assert_eq!(emitted.len(), 3);
+        assert_eq!(emitted[0].status, "NeedsInput");
+        assert_eq!(emitted[1].status, "Working");
+        assert_eq!(emitted[1].message, "Finished Bash");
+        assert_eq!(emitted[2].status, "Working");
+        assert_eq!(emitted[2].message, "Running Bash");
     }
 
     #[tokio::test]
@@ -1547,6 +1866,7 @@ mod tests {
             instance_id: "test-instance".to_string(),
             session_projects: Arc::new(RwLock::new(HashMap::new())),
             pending_statuses: Arc::new(RwLock::new(HashMap::new())),
+            notified_at: Arc::new(RwLock::new(HashMap::new())),
         });
 
         let app = build_router(state);

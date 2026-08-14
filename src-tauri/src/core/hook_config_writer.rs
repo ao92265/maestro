@@ -1,8 +1,14 @@
 //! Writes Claude Code hooks configuration into `.claude/settings.local.json`.
 //!
 //! This module handles generating and writing hook configuration that tells
-//! Claude Code to POST hook events (SessionStart, SessionEnd, PreToolUse, Stop)
-//! back to Maestro's HTTP status server via curl commands.
+//! Claude Code to POST hook events (SessionStart, SessionEnd, PreToolUse,
+//! PostToolUse, Stop, Notification, UserPromptSubmit) back to Maestro's HTTP
+//! status server via curl commands.
+//!
+//! Maestro MANAGES ONLY ITS OWN ENTRIES in the file (issue #109): its hooks
+//! are recognizable by the `X-Maestro-Instance` header their curl command
+//! sends, writes replace exactly those, and cleanup removes exactly those —
+//! user-authored hooks in the same file survive both.
 
 use std::path::Path;
 
@@ -57,17 +63,98 @@ fn build_hooks_config(session_id: u32, status_port: u16, instance_id: &str) -> V
 
     // Notification is the only reliable signal for mid-turn waits (permission
     // prompts, idle-prompt reminder) and UserPromptSubmit the only reliable
-    // "a turn started" signal (issue #105). Both are async fire-and-forget:
-    // they must never block or inject context into the prompt (UserPromptSubmit
-    // stdout would otherwise be appended to the user's prompt).
+    // "a turn started" signal (issue #105). PostToolUse (issue #109) closes
+    // the digit-shortcut gap: approving the turn's LAST long tool fires no
+    // later PreToolUse, so without it the status stays NeedsInput for that
+    // tool's whole runtime. All three are async fire-and-forget: they must
+    // never block or inject context into the prompt (UserPromptSubmit stdout
+    // would otherwise be appended to the user's prompt).
     json!({
         "SessionStart": make_hook("hook/session-start", false),
         "SessionEnd": make_hook("hook/session-end", false),
         "PreToolUse": make_hook("hook/pre-tool", true),
+        "PostToolUse": make_hook("hook/post-tool", true),
         "Stop": make_hook("hook/stop", false),
         "Notification": make_hook("hook/notification", true),
         "UserPromptSubmit": make_hook("hook/user-prompt", true),
     })
+}
+
+/// Whether one hook entry (the `{type, command, ...}` object) is Maestro's.
+///
+/// Maestro's entries are the only ones that POST with the
+/// `X-Maestro-Instance` header (see [`build_hooks_config`]) — a marker that
+/// survives port and instance-id changes across launches, so entries written
+/// by ANY past Maestro run are recognized. Everything else in the file is
+/// user-authored and must never be touched (issue #109: the writer used to
+/// wholesale-replace the `hooks` key, destroying user hooks on every launch).
+fn is_maestro_hook_entry(entry: &Value) -> bool {
+    entry["command"]
+        .as_str()
+        .is_some_and(|cmd| cmd.contains("X-Maestro-Instance"))
+}
+
+/// Strips Maestro's hook entries from one event's matcher-group array,
+/// dropping groups left empty. Non-array shapes are left untouched (they are
+/// user-authored, however invalid). Returns whether the array is now empty.
+fn strip_maestro_entries(groups: &mut Value) -> bool {
+    let Some(groups) = groups.as_array_mut() else {
+        return false;
+    };
+    for group in groups.iter_mut() {
+        if let Some(hooks) = group["hooks"].as_array_mut() {
+            hooks.retain(|h| !is_maestro_hook_entry(h));
+        }
+    }
+    groups.retain(|group| {
+        group["hooks"]
+            .as_array()
+            .is_none_or(|hooks| !hooks.is_empty())
+    });
+    groups.is_empty()
+}
+
+/// Merges Maestro's hook entries into `config["hooks"]`, preserving every
+/// user-authored entry (issue #109 — this used to wholesale-replace the
+/// key): for each event Maestro manages, its own stale entries (recognized
+/// via [`is_maestro_hook_entry`], whatever port/instance wrote them) are
+/// removed first — so repeated launches never accumulate duplicates — and
+/// the fresh group is appended after the user's groups.
+fn merge_maestro_hooks(config: &mut Value, fresh: Value) {
+    if !config["hooks"].is_object() {
+        // Absent — or not an object, which no hooks schema accepts anyway:
+        // Maestro's fresh map becomes the whole value.
+        config["hooks"] = fresh;
+        return;
+    }
+    let Some(hooks) = config["hooks"].as_object_mut() else {
+        unreachable!("just checked is_object");
+    };
+    let Value::Object(fresh) = fresh else {
+        return; // build_hooks_config always yields an object
+    };
+    for (event, groups) in fresh {
+        match hooks.get_mut(&event) {
+            Some(existing) if existing.is_array() => {
+                strip_maestro_entries(existing);
+                if let (Some(arr), Some(new_groups)) =
+                    (existing.as_array_mut(), groups.as_array())
+                {
+                    arr.extend(new_groups.iter().cloned());
+                }
+            }
+            Some(existing) => {
+                // A non-array under an event key is invalid hooks schema;
+                // replacing it is the same self-heal spirit as the corrupt-
+                // file recovery.
+                log::warn!("hooks.{event} in settings.local.json is not an array — rebuilding it");
+                *existing = groups;
+            }
+            None => {
+                hooks.insert(event, groups);
+            }
+        }
+    }
 }
 
 /// Writes session hooks configuration to `.claude/settings.local.json`.
@@ -76,7 +163,8 @@ fn build_hooks_config(session_id: u32, status_port: u16, instance_id: &str) -> V
 /// 1. Creates the `.claude/` directory if it doesn't exist
 /// 2. Reads existing `.claude/settings.local.json` or starts with `{}`
 /// 3. Builds hooks config with `build_hooks_config()`
-/// 4. Sets `config["hooks"]` to the generated hooks
+/// 4. MERGES it into `config["hooks"]` (issue #109): Maestro's own stale
+///    entries are replaced, user-authored hook entries are preserved
 /// 5. Writes back with `serde_json::to_string_pretty`
 ///
 /// Other keys in settings.local.json (e.g. `enabledPlugins`) are preserved.
@@ -121,9 +209,10 @@ pub async fn write_session_hooks_config(
         config = serde_json::json!({});
     }
 
-    // Build and set hooks config
+    // Build and MERGE the hooks config — never wholesale-replace the key
+    // (issue #109: that destroyed user-authored hooks on every launch).
     let hooks = build_hooks_config(session_id, status_port, instance_id);
-    config["hooks"] = hooks;
+    merge_maestro_hooks(&mut config, hooks);
 
     // Write back atomically (temp file + rename) so a concurrent reader never
     // sees a truncated file.
@@ -143,10 +232,13 @@ pub async fn write_session_hooks_config(
     Ok(())
 }
 
-/// Removes session hooks configuration from `.claude/settings.local.json`.
+/// Removes Maestro's session hooks from `.claude/settings.local.json`.
 ///
-/// Removes the `"hooks"` key while preserving other settings in the file.
-/// No-op if the file doesn't exist.
+/// Removes ONLY Maestro's own hook entries (issue #109) — user-authored
+/// hooks survive cleanup. Event keys left empty are dropped, and the
+/// `hooks` key itself is dropped once nothing remains, so legacy files
+/// where Maestro previously owned the whole key still clean up to no
+/// `hooks` key at all. No-op if the file doesn't exist.
 ///
 /// # Arguments
 ///
@@ -169,9 +261,21 @@ pub async fn remove_session_hooks_config(working_dir: &Path) -> Result<(), Strin
     let mut config: Value = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse settings.local.json: {}", e))?;
 
-    // Remove the hooks key
-    if let Some(obj) = config.as_object_mut() {
-        if obj.remove("hooks").is_some() {
+    // Strip Maestro's entries per event, then prune what emptied out.
+    if let Some(hooks) = config.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        let mut emptied: Vec<String> = Vec::new();
+        for (event, groups) in hooks.iter_mut() {
+            if strip_maestro_entries(groups) {
+                emptied.push(event.clone());
+            }
+        }
+        for event in emptied {
+            hooks.remove(&event);
+        }
+        if hooks.is_empty() {
+            if let Some(obj) = config.as_object_mut() {
+                obj.remove("hooks");
+            }
             log::debug!("Removed hooks config from {:?}", settings_path);
         }
     }
@@ -313,16 +417,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remove_hooks_config() {
+    async fn test_remove_hooks_config_legacy_maestro_owned_key() {
         let dir = tempdir().unwrap();
         let claude_dir = dir.path().join(".claude");
         std::fs::create_dir_all(&claude_dir).unwrap();
 
-        // Write a config with hooks + other keys
+        // A legacy file where Maestro previously owned the WHOLE hooks key
+        // (every entry carries the X-Maestro-Instance marker) — cleanup must
+        // still remove the key entirely (issue #109).
         let existing = json!({
             "someOtherSetting": "keep-me",
             "hooks": {
-                "SessionStart": [{"hooks": [{"type": "command", "command": "curl ..."}]}]
+                "SessionStart": [{"hooks": [{"type": "command", "command": "curl -s -X POST http://127.0.0.1:9905/hook/session-start -H 'X-Maestro-Instance: old-inst' -d @- || cd ."}]}],
+                "Stop": [{"hooks": [{"type": "command", "command": "curl -s -X POST http://127.0.0.1:9905/hook/stop -H 'X-Maestro-Instance: old-inst' -d @- || cd ."}]}]
             }
         });
         std::fs::write(
@@ -347,6 +454,119 @@ mod tests {
             config["someOtherSetting"], "keep-me",
             "other settings should be preserved"
         );
+    }
+
+    /// A user-authored hook entry — no X-Maestro-Instance marker anywhere.
+    fn user_hook_group(command: &str) -> Value {
+        json!({"matcher": "Bash", "hooks": [{"type": "command", "command": command}]})
+    }
+
+    /// Counts entries under one event that carry Maestro's marker.
+    fn maestro_entries(config: &Value, event: &str) -> usize {
+        config["hooks"][event]
+            .as_array()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .flat_map(|g| g["hooks"].as_array().cloned().unwrap_or_default())
+                    .filter(is_maestro_hook_entry)
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn test_user_hooks_survive_write_and_cleanup() {
+        // Issue #109: the writer used to wholesale-replace the hooks key,
+        // destroying user-authored hooks on every launch, and cleanup used
+        // to delete the whole key.
+        let dir = tempdir().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let existing = json!({
+            "hooks": {
+                // An event Maestro also manages…
+                "PreToolUse": [user_hook_group("my-linter --check")],
+                // …and one it does not touch at all.
+                "SubagentStop": [user_hook_group("notify-send done")],
+            }
+        });
+        std::fs::write(
+            claude_dir.join("settings.local.json"),
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        write_session_hooks_config(dir.path(), 4, 9902, "inst-merge")
+            .await
+            .unwrap();
+
+        let content = std::fs::read_to_string(claude_dir.join("settings.local.json")).unwrap();
+        let config: Value = serde_json::from_str(&content).unwrap();
+        // The user's PreToolUse group is still first; Maestro's follows it.
+        let pre_tool = config["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_tool.len(), 2, "user group + Maestro group");
+        assert_eq!(pre_tool[0]["hooks"][0]["command"], "my-linter --check");
+        assert!(is_maestro_hook_entry(&pre_tool[1]["hooks"][0]));
+        // The unmanaged event is untouched.
+        assert_eq!(
+            config["hooks"]["SubagentStop"][0]["hooks"][0]["command"],
+            "notify-send done"
+        );
+
+        remove_session_hooks_config(dir.path()).await.unwrap();
+
+        let content = std::fs::read_to_string(claude_dir.join("settings.local.json")).unwrap();
+        let config: Value = serde_json::from_str(&content).unwrap();
+        // Maestro's entries are gone everywhere…
+        assert_eq!(maestro_entries(&config, "PreToolUse"), 0);
+        assert!(config["hooks"].get("SessionStart").is_none());
+        // …and BOTH user hooks survived the full write + cleanup cycle.
+        assert_eq!(
+            config["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "my-linter --check"
+        );
+        assert_eq!(
+            config["hooks"]["SubagentStop"][0]["hooks"][0]["command"],
+            "notify-send done"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repeated_writes_are_idempotent_per_event() {
+        // Re-launching (new session id, port, instance) must REPLACE
+        // Maestro's stale entries, never accumulate duplicates (issue #109).
+        let dir = tempdir().unwrap();
+
+        write_session_hooks_config(dir.path(), 1, 9900, "inst-a")
+            .await
+            .unwrap();
+        write_session_hooks_config(dir.path(), 2, 9950, "inst-b")
+            .await
+            .unwrap();
+
+        let settings_path = dir.path().join(".claude/settings.local.json");
+        let content = std::fs::read_to_string(&settings_path).unwrap();
+        let config: Value = serde_json::from_str(&content).unwrap();
+        for event in [
+            "SessionStart",
+            "SessionEnd",
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+            "Notification",
+            "UserPromptSubmit",
+        ] {
+            assert_eq!(
+                maestro_entries(&config, event),
+                1,
+                "exactly one Maestro entry for {event} after two writes"
+            );
+        }
+        // The surviving entry is the LATEST write's.
+        let command = config["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(command.contains("127.0.0.1:9950"), "stale entry replaced: {command}");
+        assert!(command.contains("X-Maestro-Session: 2"));
     }
 
     #[tokio::test]
@@ -399,6 +619,14 @@ mod tests {
             json!(true),
             "UserPromptSubmit should have async: true"
         );
+
+        // PostToolUse (issue #109) is wired like PreToolUse: fire-and-forget.
+        let post_tool_hook = &hooks["PostToolUse"][0]["hooks"][0];
+        assert_eq!(
+            post_tool_hook["async"],
+            json!(true),
+            "PostToolUse should have async: true"
+        );
     }
 
     #[tokio::test]
@@ -421,6 +649,16 @@ mod tests {
             user_prompt_cmd.contains("hook/user-prompt"),
             "UserPromptSubmit should POST to /hook/user-prompt, got: {}",
             user_prompt_cmd
+        );
+
+        // Issue #109: PostToolUse closes the digit-shortcut gap.
+        let post_tool_cmd = hooks["PostToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            post_tool_cmd.contains("hook/post-tool"),
+            "PostToolUse should POST to /hook/post-tool, got: {}",
+            post_tool_cmd
         );
     }
 
