@@ -6,13 +6,7 @@
     "lineWidth": 100
   },
   "files": {
-    "includes": [
-      "**/*",
-      "!**/node_modules/**",
-      "!**/dist/**",
-      "!**/target/**",
-      "!**/src-tauri/gen/**"
-    ]
+    "includes": ["**/*", "!**/node_modules", "!**/dist", "!**/target", "!**/src-tauri/gen"]
   },
   "linter": {
     "enabled": true,
