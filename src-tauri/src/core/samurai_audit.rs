@@ -32,6 +32,11 @@ use super::status_server::StatusServer;
 /// `INJECT` (issue #101) records every instruction Maestro types into an
 /// orchestrator terminal — delivery and ACK — so an unattended run can be
 /// replayed from the Audit panel alone.
+/// `KILL` records the DEATH of a supervised agent — every path that ends one
+/// (handoff kill, watchdog death, the user closing the tile, a verified run
+/// completion) — with a `details.cause` naming which
+/// (`supervisor::KILL_CAUSE_*`). Without it the panel showed an agent as
+/// SPAWN forever, long after its process was gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AuditEventKind {
@@ -42,6 +47,7 @@ pub enum AuditEventKind {
     Complete,
     Alert,
     Inject,
+    Kill,
 }
 
 /// Cap on instruction excerpts recorded in `details` (issue #101): long
@@ -443,6 +449,20 @@ mod tests {
         assert_eq!(excerpt.chars().count(), EXCERPT_MAX_CHARS);
         assert_eq!(total, EXCERPT_MAX_CHARS + 50);
         assert!(accented.starts_with(&excerpt));
+    }
+
+    #[test]
+    fn test_kill_kind_wire_spelling() {
+        // The frontend's `SamuraiAuditEventKind` union and the audit panel's
+        // badge map key off this exact spelling.
+        assert_eq!(
+            serde_json::to_string(&AuditEventKind::Kill).unwrap(),
+            "\"KILL\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AuditEventKind>("\"KILL\"").unwrap(),
+            AuditEventKind::Kill
+        );
     }
 
     #[tokio::test]

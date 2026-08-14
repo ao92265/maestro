@@ -404,9 +404,18 @@ fn join_refs(refs: &[String]) -> String {
 /// worktrees are one-per-epic (PRD §5.9), so colliding refs would already be
 /// sharing a working directory, which is the real isolation boundary.
 pub fn epic_slug(epic: &str) -> String {
+    ref_slug(epic, "epic")
+}
+
+/// Shared collapsing sanitizer behind [`epic_slug`] and the project-name half
+/// of the Samurai launch branch (`commands::samurai::epic_branch`): ASCII
+/// alphanumerics are kept (lowercased); every other run of characters
+/// collapses to one `-`; an input with nothing usable falls back to
+/// `fallback` so callers never produce an empty slug segment.
+pub(crate) fn ref_slug(input: &str, fallback: &str) -> String {
     let mut slug = String::new();
     let mut pending_dash = false;
-    for c in epic.chars() {
+    for c in input.chars() {
         if c.is_ascii_alphanumeric() {
             if pending_dash && !slug.is_empty() {
                 slug.push('-');
@@ -418,7 +427,7 @@ pub fn epic_slug(epic: &str) -> String {
         }
     }
     if slug.is_empty() {
-        "epic".to_string()
+        fallback.to_string()
     } else {
         slug
     }

@@ -187,18 +187,29 @@ const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 /// Resolve a model string to its context window in tokens.
 ///
 /// Claude Code marks 1M-context variants with a literal `[1m]` suffix on the
-/// model id (e.g. `claude-opus-4-8[1m]`), and some model families run a 1M
-/// window by default with no suffix — transcripts on this machine show bare
-/// `claude-fable-5` / `claude-opus-5` sessions with ~400k context tokens, so
-/// a flat 200k default would report >100%. Unknown models fall back to 200k,
-/// which errs toward OVER-stating usage — the safe direction for anything
-/// that acts on high context % (e.g. the Samurai handoff trigger).
+/// model id (e.g. `claude-sonnet-4-6[1m]`), and several models run a 1M window
+/// natively with no suffix. The list below mirrors the `context.native_1m`
+/// flag in Claude Code's own model catalog (verified against the 2.1.232
+/// bundle) — it must stay in sync, because a model missing from it is divided
+/// by 200k and reports ~5x the real usage: bare `claude-sonnet-5` sessions on
+/// this machine carry ~478k context tokens, which a flat 200k default turned
+/// into "238.8%" and tripped the Samurai 45% handoff at ~9% real usage.
+///
+/// Unknown models fall back to 200k, which errs toward OVER-stating usage —
+/// the safe direction for anything that acts on high context %.
 fn context_window_for_model(model: &str) -> u64 {
     if model.contains("[1m]") {
         return 1_000_000;
     }
-    // Families whose context window is 1M by default (no [1m] marker).
-    const MILLION_TOKEN_MODELS: &[&str] = &["claude-fable-5", "claude-mythos-5", "claude-opus-5"];
+    // Models whose context window is 1M natively (no [1m] marker).
+    const MILLION_TOKEN_MODELS: &[&str] = &[
+        "claude-fable-5",
+        "claude-mythos-5",
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-sonnet-5",
+    ];
     if MILLION_TOKEN_MODELS.iter().any(|m| model.starts_with(m)) {
         return 1_000_000;
     }
@@ -662,6 +673,15 @@ fn parse_assistant_message(session_id: u32, entry: &Entry) -> Vec<ClaudeEvent> {
         // Derived context-window usage: this API call's prompt size is the
         // session's current context, so each assistant message recomputes the
         // percentage and the latest one wins downstream (issue #41).
+        //
+        // This mirrors what Claude Code's own `/context` reports: the latest
+        // assistant message's input + cache_read + cache_creation over the RAW
+        // model window. `output_tokens` is deliberately excluded and no
+        // auto-compact reserve is subtracted — both match `/context`. (Claude
+        // Code's status-line "% until auto-compact" is a *different* figure:
+        // it adds output_tokens and divides by window - max_output - 13k, so
+        // it always reads higher. The badge and the 45% handoff track
+        // `/context`, the number the user can actually see.)
         let context_tokens =
             tu.input_tokens + tu.cache_read_input_tokens + tu.cache_creation_input_tokens;
         // An API-error entry (model "<synthetic>", isApiErrorMessage — e.g. a
@@ -1207,20 +1227,56 @@ mod tests {
         );
     }
 
-    /// Window resolution: the `[1m]` marker and the 1M-default families map to
-    /// 1M; everything else (including unknown models) defaults to 200k.
+    /// Window resolution: the `[1m]` marker and every natively-1M model map to
+    /// 1M; everything else (including unknown models) defaults to 200k. The 1M
+    /// set mirrors `context.native_1m` in Claude Code's model catalog.
     #[test]
     fn test_context_window_resolution() {
-        assert_eq!(context_window_for_model("claude-opus-4-8[1m]"), 1_000_000);
+        assert_eq!(context_window_for_model("claude-sonnet-4-6[1m]"), 1_000_000);
         assert_eq!(context_window_for_model("claude-sonnet-4-5[1m]"), 1_000_000);
         assert_eq!(context_window_for_model("claude-fable-5"), 1_000_000);
         assert_eq!(context_window_for_model("claude-mythos-5"), 1_000_000);
         assert_eq!(context_window_for_model("claude-opus-5"), 1_000_000);
-        assert_eq!(context_window_for_model("claude-opus-4-8"), 200_000);
+        // Natively 1M without a [1m] marker — dividing these by 200k reported
+        // >100% on real sessions (bare claude-sonnet-5 read 238.8%).
+        assert_eq!(context_window_for_model("claude-sonnet-5"), 1_000_000);
+        assert_eq!(context_window_for_model("claude-opus-4-8"), 1_000_000);
+        assert_eq!(context_window_for_model("claude-opus-4-7"), 1_000_000);
+        // Still 200k: opus 4.6 and older, every Sonnet before 5, every Haiku.
+        assert_eq!(context_window_for_model("claude-opus-4-6"), 200_000);
+        assert_eq!(context_window_for_model("claude-opus-4-5"), 200_000);
+        assert_eq!(context_window_for_model("claude-sonnet-4-6"), 200_000);
         assert_eq!(context_window_for_model("claude-haiku-4-5"), 200_000);
+        assert_eq!(context_window_for_model("claude-haiku-4-5-20251001"), 200_000);
         assert_eq!(context_window_for_model("claude-sonnet-4-5"), 200_000);
         assert_eq!(context_window_for_model(""), 200_000);
         assert_eq!(context_window_for_model("<synthetic>"), 200_000);
+    }
+
+    /// Regression for the badge/handoff mismatch: a real `claude-sonnet-5`
+    /// line whose prompt exceeds 200k must report ~48%, not an impossible
+    /// 238.8%. Token counts are the ones observed in a live transcript on this
+    /// machine; Claude Code's `/context` shows 48% for the same message.
+    #[test]
+    fn test_context_usage_native_1m_sonnet_5() {
+        let line = r#"{"type":"assistant","message":{"model":"claude-sonnet-5","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":4,"cache_creation_input_tokens":1658,"cache_read_input_tokens":476000,"output_tokens":1452}},"uuid":"a-s5","timestamp":"2026-08-14T10:00:00Z"}"#;
+        let events = parse_transcript_line(7, line);
+
+        let ctx = events
+            .iter()
+            .find(|e| matches!(e, ClaudeEvent::ContextUsageUpdate { .. }))
+            .expect("ContextUsageUpdate");
+        if let ClaudeEvent::ContextUsageUpdate {
+            context_tokens,
+            context_window,
+            percent,
+            ..
+        } = ctx
+        {
+            assert_eq!(*context_tokens, 477_662, "output_tokens stays excluded");
+            assert_eq!(*context_window, 1_000_000, "sonnet-5 runs a 1M window");
+            assert_eq!(*percent, 47.8, "477662 / 1M; the old table said 238.8");
+        }
     }
 
     /// A 200k-window model uses the default divisor.
