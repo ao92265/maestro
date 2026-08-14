@@ -41,21 +41,52 @@ use core::{ClaudeEvent, EventBus, TranscriptWatcher};
 /// Registers plugins (store, dialog), injects shared state (ProcessManager,
 /// SessionManager, WorktreeManager), verifies git availability at startup
 /// (non-fatal -- logs an error but does not abort), and mounts all IPC
+/// The log level the file/stdout logger runs at. `RUST_LOG` still overrides
+/// it, as it did under `env_logger`, but only as a bare level name (`debug`,
+/// `trace`, …) — the per-module filter syntax is not carried over, since
+/// nothing in this app used it.
+fn log_level_from_env() -> log::LevelFilter {
+    std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<log::LevelFilter>().ok())
+        .unwrap_or(log::LevelFilter::Info)
+}
+
 /// command handlers for the terminal, git, and session subsystems.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Initialize logger for RUST_LOG environment variable support
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp_millis()
-        .init();
-
-    log::info!("Maestro starting up...");
-
     // `mut` is required on macOS (see the macos-permissions plugin block
     // below); on other platforms the cfg block is removed and `mut` becomes
     // unused, so we silence that warning explicitly.
     #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut builder = tauri::Builder::default()
+        // Logging goes to a FILE, not just the console. A packaged Windows
+        // build has no console attached, so the previous stderr-only logger
+        // discarded every line — which is why a Samurai run that silently
+        // failed to hand off left nothing to diagnose afterwards. The log
+        // dir is the OS one for the bundle identifier
+        // (`%LOCALAPPDATA%\com.maestro.app\logs\maestro.log` on Windows).
+        // Stdout is kept so `tauri dev` still prints as before.
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("maestro".to_string()),
+                    },
+                ))
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Stdout,
+                ))
+                .level(log_level_from_env())
+                .max_file_size(10 * 1024 * 1024)
+                // Three files of history: long enough to cover an overnight
+                // autonomous run, bounded enough to never need a sweep.
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(3))
+                // Timestamps must line up with what the user sees in the
+                // audit panel and in their own terminal.
+                .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
+                .build(),
+        )
         .plugin(tauri_plugin_cli::init())
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // A second instance was launched with these args — forward to the
@@ -204,6 +235,10 @@ pub fn run() {
             commands::samurai::LaunchInFlight::default(),
         ))
         .setup(|app| {
+            // First line of every run: the logger is attached by the plugin's
+            // own setup, so anything logged before this point is dropped.
+            log::info!("Maestro starting up...");
+
             // Generate a unique instance ID for this Maestro run
             // This prevents status pollution between different app instances
             let instance_id = uuid::Uuid::new_v4().to_string();
