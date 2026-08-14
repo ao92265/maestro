@@ -1,5 +1,5 @@
-import { workflowWalkOrder } from "@/components/sidebar/WorkflowGraphEditor";
 import type { SamuraiWorkflowGraph } from "@/lib/samurai";
+import { workflowWalkOrder } from "@/lib/workflowGraph";
 
 /**
  * The PR review workflow: the same graph shape as the Samurai run workflow,
@@ -9,11 +9,10 @@ import type { SamuraiWorkflowGraph } from "@/lib/samurai";
  * user adds in the workflow editor shows up as one more checkbox with no
  * code change here.
  *
- * `workflowWalkOrder` is imported from the editor because the walk rule (start
- * node, first outgoing edge, stop on revisit) must stay identical to what the
- * canvas draws. That import is circular (the editor imports
- * {@link DEFAULT_PR_WORKFLOW} back) but safe: neither module touches the
- * other's bindings at module-evaluation time.
+ * The walk rule (start node, first outgoing edge, stop on revisit) comes from
+ * `@/lib/workflowGraph` rather than being restated here, so it stays identical
+ * to what the canvas draws — and importing it costs the PR panel nothing,
+ * since that module carries no React Flow dependency.
  */
 
 /** One checkbox in the PR dropdown: the node, plus the text to show for it. */
