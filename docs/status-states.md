@@ -131,6 +131,13 @@ Run `npm run tauri dev`, open a project, start a Claude session.
   POSTs when a gated tool starts, and PreToolUse is async (fire-and-forget),
   so a `Working` can in principle land after the permission `NeedsInput`.
   Self-corrects on the next signal; the 60s idle reminder is the backstop.
+- **Digit-shortcut approval of the turn's last tool:** approving a permission
+  prompt with a digit shortcut just runs the tool — no hook fires on the
+  approval itself, and no PostToolUse hook exists to report the tool
+  finishing. A later tool's PreToolUse or the turn's Stop normally repaints,
+  but when the approved tool is the turn's LAST long-running one, the status
+  stays red (NeedsInput) for that tool's whole runtime and only corrects at
+  the turn's Stop.
 - **Empty-Enter flip:** pressing Enter on an empty prompt while red flips the
   indicator to blue even though no turn starts (the flip cannot distinguish a
   submit from a nudge). The next real signal corrects it.

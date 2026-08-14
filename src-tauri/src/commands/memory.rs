@@ -56,8 +56,11 @@ fn projects_root() -> Result<PathBuf, String> {
     Ok(base_dirs.home_dir().join(".claude").join("projects"))
 }
 
-/// Encoded project dir names only ever contain ASCII alphanumerics, `_` and
-/// `-` (see [`encode_project_path`]) — anything else is rejected outright.
+/// Encoded project dir names only ever contain ASCII alphanumerics and `-` —
+/// `_` in a path encodes to `-` like every other special character (issue
+/// #86, see [`encode_project_path`]). The validator still accepts `_` on
+/// purpose: it guards against traversal, not against encoding drift, and a
+/// literal-underscore directory name is harmless to read.
 fn validate_dir_name(dir_name: &str) -> Result<(), String> {
     if dir_name.is_empty() {
         return Err("Project directory name is empty".into());
