@@ -171,7 +171,12 @@ impl SamuraiSchedule {
     /// runs OUTSIDE the lock (it may call back into `arm`/`cancel`); removal
     /// matches on `fire_at` too, so a re-arm issued during the callback
     /// survives the cleanup.
-    fn fire_due(&self) {
+    ///
+    /// `pub(crate)` for the park→fire→resume seam test in `samurai_resumer`:
+    /// driving one tick directly is what lets that test span the whole chain
+    /// in seconds instead of waiting out a real [`TICK_INTERVAL`]. The loop
+    /// above is still the only production caller.
+    pub(crate) fn fire_due(&self) {
         let now = Utc::now();
         let due: Vec<ScheduleEntry> = {
             let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);

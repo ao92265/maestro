@@ -13,6 +13,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { formatResumeAt, useCountdownNow } from "@/lib/parkTime";
 import { samePath } from "@/lib/path";
 import {
   type SamuraiPreflight,
@@ -34,6 +35,7 @@ import {
 import { workflowGraphForLaunch } from "@/stores/useSamuraiWorkflowStore";
 import {
   SAMURAI_TILE_CLOSE_STATES,
+  type SamuraiScheduleEntry,
   type SamuraiSessionInfo,
   useSessionStore,
 } from "@/stores/useSessionStore";
@@ -292,6 +294,37 @@ function runKey(run: SamuraiRunListEntry): string {
   return `${run.project_path}-${run.epic}`;
 }
 
+/**
+ * Comparable form of a run identity: lower-cased, every run of non-alphanumeric
+ * characters collapsed to a single dash. A run config stores a readable label
+ * (`epic #5 · issues #7, #9`) while its resume timer was armed under whatever
+ * string the supervisor held, so the two only line up once punctuation, casing
+ * and padding are out of the way — the same normalisation the branch slug uses.
+ */
+function epicSlug(epic: string): string {
+  return epic
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+/**
+ * The pending resume timer for one run, or null when it is not parked.
+ * Project paths go through `samePath`, never `===`: the same directory has
+ * several spellings on Windows, and matching on the epic alone would badge a
+ * run in one project with another project's timer.
+ */
+function findScheduleEntry(
+  run: SamuraiRunListEntry,
+  schedule: SamuraiScheduleEntry[],
+): SamuraiScheduleEntry | null {
+  const slug = epicSlug(run.epic);
+  return (
+    schedule.find((e) => samePath(e.project_path, run.project_path) && epicSlug(e.epic) === slug) ??
+    null
+  );
+}
+
 /** Where a run's live agent sits, or why it cannot be opened (issue #84). */
 type OpenTarget =
   | { kind: "open"; tabId: string; sessionId: number }
@@ -363,6 +396,8 @@ function findOpenTarget(
 function RunRow({
   run,
   target,
+  parked,
+  now,
   onOpen,
   onCleanup,
   pending,
@@ -371,6 +406,10 @@ function RunRow({
 }: {
   run: SamuraiRunListEntry;
   target: OpenTarget;
+  /** This run's pending resume timer, or null when it is not parked. */
+  parked: SamuraiScheduleEntry | null;
+  /** Ticking clock behind the park countdown (see `useCountdownNow`). */
+  now: number;
   onOpen: (tabId: string, sessionId: number) => void;
   onCleanup: (run: SamuraiRunListEntry) => void;
   /** Issue #99: this exact row's cleanup is in flight — spinner + dimmed row
@@ -387,6 +426,11 @@ function RunRow({
   const isCompleted = run.status === "COMPLETED";
   const open = target.kind === "open" ? target : null;
   const openHint = target.kind === "open" ? OPEN_HINT : target.reason;
+  // A parked run has no live agent BY DESIGN (its tile closed; the resume is a
+  // fresh spawn), so the row said "ACTIVE / no live agent" and never mentioned
+  // the park. The badge below is that missing state — dated, because a park
+  // governed by the 7-day window can be days out.
+  const resume = parked ? formatResumeAt(parked.fire_at, now) : null;
   return (
     <div
       className={`rounded px-1 py-0.5 hover:bg-maestro-surface ${pending ? "opacity-60" : ""}`}
@@ -440,6 +484,22 @@ function RunRow({
           {pending ? <Loader2 size={12} className="animate-spin" /> : <Trash2 size={12} />}
         </button>
       </div>
+      {/* The park badge gets its own line: with the date and the countdown in
+          it, it would squeeze the epic label out of the row above. A fire time
+          that does not parse still badges the run PARKED, just without a
+          resume reading — a broken stamp must never hide the parked state. */}
+      {parked && (
+        <div className="flex pl-1 pt-0.5">
+          <span
+            className="min-w-0 rounded bg-maestro-purple/20 px-1 py-px text-[9px] font-bold leading-tight tracking-wide text-maestro-purple"
+            title={`Parked — this run has no live agent on purpose. It resumes automatically${
+              resume ? ` at ${resume}` : ` (fire time unreadable: ${parked.fire_at})`
+            }, as a fresh agent.`}
+          >
+            {resume ? `PARKED · resumes ${resume}` : "PARKED"}
+          </span>
+        </div>
+      )}
       {/* Issue #102: the orchestrator's live details — a COMPLETED run's
           context reading is no longer live, so the meter is omitted. */}
       <OrchestratorDetails orchestrator={run.orchestrator} showLiveContext={!isCompleted} />
@@ -516,6 +576,11 @@ export function LaunchSection({
   const activeTab = tabs.find((t) => t.active);
   const projectPath = activeTab?.projectPath ?? "";
   const samuraiBySessionId = useSessionStore((s) => s.samuraiBySessionId);
+  // Every pending resume timer, all projects (issue #61) — the backend sends
+  // the full list on every arm/cancel/fire, so a park or a resume repaints the
+  // run rows live. Ticks only while something is actually parked.
+  const samuraiSchedule = useSessionStore((s) => s.samuraiSchedule);
+  const now = useCountdownNow(samuraiSchedule.length > 0);
 
   const usage = useUsageStore((s) => s.usage);
   const startPolling = useUsageStore((s) => s.startPolling);
@@ -1012,6 +1077,8 @@ export function LaunchSection({
                       ? findOpenTarget(run, samuraiBySessionId, tabs)
                       : { kind: "blocked", reason: NO_SESSION_REASON }
                   }
+                  parked={findScheduleEntry(run, samuraiSchedule)}
+                  now={now}
                   onOpen={(tabId, sessionId) => onNavigate?.(tabId, sessionId)}
                   onCleanup={handleCleanup}
                   pending={deletingKey === key}

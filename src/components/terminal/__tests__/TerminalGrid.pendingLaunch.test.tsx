@@ -109,9 +109,18 @@ vi.mock("@/lib/samurai", async (importOriginal) => {
   };
 });
 
+vi.mock("@/lib/terminalPrompt", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/terminalPrompt")>();
+  return {
+    ...actual,
+    terminalArmInitialPrompt: vi.fn(async () => {}),
+  };
+});
+
 import { invoke } from "@tauri-apps/api/core";
 import { samuraiHarvestArm, samuraiRegisterSession } from "@/lib/samurai";
 import { spawnShell, writeStdin } from "@/lib/terminal";
+import { terminalArmInitialPrompt } from "@/lib/terminalPrompt";
 import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
 import { useSessionStore } from "@/stores/useSessionStore";
 import { TerminalGrid } from "../TerminalGrid";
@@ -121,6 +130,7 @@ const spawnShellMock = vi.mocked(spawnShell);
 const writeStdinMock = vi.mocked(writeStdin);
 const registerMock = vi.mocked(samuraiRegisterSession);
 const harvestArmMock = vi.mocked(samuraiHarvestArm);
+const initialPromptArmMock = vi.mocked(terminalArmInitialPrompt);
 
 const WORKTREE = "C:/wt/samurai-77-78";
 
@@ -152,6 +162,7 @@ describe("TerminalGrid pending samurai launch", () => {
     writeStdinMock.mockClear();
     registerMock.mockClear();
     harvestArmMock.mockClear();
+    initialPromptArmMock.mockClear();
     useSessionStore.setState({ sessions: [], samuraiBySessionId: {}, parkedSessionIds: [] });
     usePendingLaunchStore.setState({ pending: [] });
   });
@@ -230,5 +241,60 @@ describe("TerminalGrid pending samurai launch", () => {
     const cli = writeStdinMock.mock.calls.map((c) => String(c[1])).join("\n");
     expect(cli).not.toContain("--dangerously-skip-permissions");
     expect(spawnShellMock).toHaveBeenCalledTimes(1);
+  });
+
+  // The generic "launch a terminal with a prompt" capability: any caller can
+  // queue a launch carrying `initialPrompt`, and the grid must arm the
+  // backend's injection BEFORE the CLI command is typed — the same ordering
+  // the harvest arm above relies on.
+  it("arms the initial prompt before launching the CLI for a prompted claim", async () => {
+    usePendingLaunchStore.getState().request({
+      tabId: "tab-1",
+      mode: "Claude",
+      resumeSessionId: null,
+      workingDirOverride: "C:/proj",
+      branch: null,
+      customName: "prompted session",
+      // Multi-line on purpose: the backend flattens it, the grid passes it
+      // through verbatim.
+      initialPrompt: "review the diff\nand summarise it",
+    });
+
+    render(<TerminalGrid projectPath="C:/proj" tabId="tab-1" isActive />);
+
+    await waitFor(() => expect(spawnShellMock).toHaveBeenCalled());
+
+    // Armed exactly once, with the launched session's id and the raw prompt…
+    await waitFor(() => expect(initialPromptArmMock).toHaveBeenCalledTimes(1));
+    expect(initialPromptArmMock).toHaveBeenCalledWith(1, "review the diff\nand summarise it");
+    // …and strictly before the CLI command went to the PTY.
+    await waitFor(() => expect(writeStdinMock).toHaveBeenCalled());
+    expect(initialPromptArmMock.mock.invocationCallOrder[0]).toBeLessThan(
+      writeStdinMock.mock.invocationCallOrder[0],
+    );
+
+    // A plain interactive session — no harvest, no supervision registration.
+    expect(harvestArmMock).not.toHaveBeenCalled();
+    expect(registerMock).not.toHaveBeenCalled();
+    expect(spawnShellMock).toHaveBeenCalledTimes(1);
+  });
+
+  // The injection rides claude's SessionStart hook, which no other CLI posts:
+  // a non-Claude launch must NOT arm (it would strand a stale entry backend-
+  // side and inject nothing).
+  it("does not arm the initial prompt for a non-Claude launch", async () => {
+    usePendingLaunchStore.getState().request({
+      tabId: "tab-1",
+      mode: "OpenCode",
+      resumeSessionId: null,
+      workingDirOverride: "C:/proj",
+      branch: null,
+      initialPrompt: "review the diff",
+    });
+
+    render(<TerminalGrid projectPath="C:/proj" tabId="tab-1" isActive />);
+
+    await waitFor(() => expect(writeStdinMock).toHaveBeenCalled());
+    expect(initialPromptArmMock).not.toHaveBeenCalled();
   });
 });

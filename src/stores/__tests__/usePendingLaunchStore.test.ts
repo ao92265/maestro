@@ -88,6 +88,25 @@ describe("usePendingLaunchStore", () => {
     expect(usePendingLaunchStore.getState().pending).toHaveLength(2);
   });
 
+  // Generic initial-prompt launches: two identical requests are ONE launch
+  // (the store is the double-click guard), but two launches carrying
+  // DIFFERENT prompts must both queue — deduping them would silently drop a
+  // prompt the user asked for.
+  it("dedupes identical initialPrompt requests but queues different prompts", () => {
+    const plain: PendingLaunch = { ...launchFor("tab-1"), resumeSessionId: null };
+    const prompted: PendingLaunch = { ...plain, initialPrompt: "review the diff" };
+    usePendingLaunchStore.getState().request(prompted);
+    usePendingLaunchStore.getState().request({ ...prompted });
+    expect(usePendingLaunchStore.getState().pending).toHaveLength(1);
+
+    usePendingLaunchStore.getState().request({ ...plain, initialPrompt: "run the tests" });
+    expect(usePendingLaunchStore.getState().pending).toHaveLength(2);
+
+    // A prompted launch never dedupes against an otherwise identical plain one.
+    usePendingLaunchStore.getState().request(plain);
+    expect(usePendingLaunchStore.getState().pending).toHaveLength(3);
+  });
+
   it("still queues near-duplicates that differ in samurai generation", () => {
     const gen2: PendingLaunch = {
       ...launchFor("tab-1"),

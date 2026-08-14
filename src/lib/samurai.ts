@@ -180,6 +180,13 @@ export interface SamuraiWorkflowNode {
   id: string;
   /** The step's instruction text (editable in the workflow editor). */
   text: string;
+  /**
+   * Optional short display name, used where a step needs a one-line handle
+   * instead of its full text — the PR review workflow's checkboxes. Absent on
+   * Samurai run graphs; Rust's serde ignores the unknown field, so a graph
+   * carrying one still deserializes into `WorkflowNode`.
+   */
+  label?: string;
 }
 
 /** One directed edge between two node ids — mirrors the Rust `WorkflowEdge`. */

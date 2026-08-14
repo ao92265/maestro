@@ -74,6 +74,7 @@ import {
   writeSessionHooksConfig,
   writeStdin,
 } from "@/lib/terminal";
+import { terminalArmInitialPrompt } from "@/lib/terminalPrompt";
 import { useProjectColors } from "@/lib/useProjectColors";
 import { cleanupSessionWorktree, prepareSessionWorktree } from "@/lib/worktreeManager";
 import { useActivityStore } from "@/stores/useActivityStore";
@@ -1115,6 +1116,21 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
                 }
               }
 
+              // Generic initial prompt: same gate as harvest — arm the
+              // backend BEFORE the CLI launches so the injection is set
+              // strictly ahead of claude's SessionStart hook, which is what
+              // types the prompt in. Claude only: no other CLI posts that
+              // hook, so an armed non-Claude session would never inject.
+              // Failure is logged, not fatal — the terminal still opens, the
+              // user just types the prompt themselves.
+              if (slot.initialPrompt && slot.mode === "Claude") {
+                try {
+                  await terminalArmInitialPrompt(sessionId, slot.initialPrompt);
+                } catch (err) {
+                  console.error("[InitialPrompt] Failed to arm the initial prompt:", err);
+                }
+              }
+
               // Send CLI launch command
               await writeStdin(sessionId, `${cliCommand}\r`);
 
@@ -1843,6 +1859,9 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       // Harvest triage launches (issue #98) arm the backend's journal
       // prompt injection right before the CLI launches.
       harvest: launch.harvest ?? false,
+      // Generic initial prompt (any caller): armed right before the CLI
+      // launches, typed into the PTY on the session's first SessionStarted.
+      initialPrompt: launch.initialPrompt ?? null,
       // The History tab always names the exact directory to run in. Reusing the
       // pristine slot would otherwise inherit its worktreeMode, and any mode but
       // "project" sends launchSlotInner into prepareSessionWorktree — moving the
