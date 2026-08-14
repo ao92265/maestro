@@ -14,6 +14,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { MarkdownBody } from "@/components/git/shared/MarkdownBody";
 import { HealthReasonLines } from "@/components/shared/HealthReasonLines";
 import type { HealthFlag } from "@/lib/healthRules";
+import { formatResumeAt, useCountdownNow } from "@/lib/parkTime";
 import {
   isSamuraiInUseError,
   type SamuraiFileEntry,
@@ -104,18 +105,19 @@ function prettyJson(text: string): string {
   }
 }
 
-/** TIMER rows: "resumes at 14:32" (date prefixed when not today). */
-function formatFireAt(fireAt: string): string {
-  const d = new Date(fireAt);
-  if (Number.isNaN(d.getTime())) return `resumes at ${fireAt}`;
-  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  return d.toDateString() === new Date().toDateString()
-    ? `resumes at ${time}`
-    : `resumes at ${d.toLocaleDateString()} ${time}`;
+/**
+ * TIMER rows: "resumes at 06/08/2026, 14:32 · in 6d 3h 12m". Always dated —
+ * a 7-day-window park showed a bare `HH:MM` and read as "this afternoon".
+ * A stamp that does not parse still says the row is parked, without a time.
+ */
+function formatFireAt(fireAt: string, now: number): string {
+  const resume = formatResumeAt(fireAt, now);
+  return resume === null ? "parked" : `resumes at ${resume}`;
 }
 
 function FileRow({
   entry,
+  now,
   onOpen,
   onDelete,
   onCancelTimer,
@@ -124,6 +126,8 @@ function FileRow({
   healthFlags,
 }: {
   entry: SamuraiFileEntry;
+  /** Ticking clock behind a TIMER row's countdown (see `useCountdownNow`). */
+  now: number;
   /** Every row: open this file in the read-only viewer (issue #82). */
   onOpen: (entry: SamuraiFileEntry) => void;
   /** Absent on TIMER rows — a timer is cancelled, never file-deleted. */
@@ -139,7 +143,7 @@ function FileRow({
   const label = rowLabel(entry);
   const meta =
     entry.kind === "TIMER" && entry.fire_at
-      ? formatFireAt(entry.fire_at)
+      ? formatFireAt(entry.fire_at, now)
       : [formatSize(entry.size_bytes), formatAge(entry.modified_at)].filter(Boolean).join(" · ");
   return (
     <div>
@@ -158,7 +162,11 @@ function FileRow({
             <span className="text-maestro-muted"> · {baseName(entry.project_path)}</span>
           ) : null}
         </span>
-        <span className="shrink-0 text-[10px] text-maestro-muted/70">{meta}</span>
+        {/* Dated resume readings are long — the meta truncates (with the full
+            text on hover) instead of pushing the row's actions off the edge. */}
+        <span className="min-w-0 shrink truncate text-[10px] text-maestro-muted/70" title={meta}>
+          {meta}
+        </span>
         <button
           type="button"
           onClick={() => onOpen(entry)}
@@ -326,6 +334,11 @@ export function SecondBrainSection() {
   const [busy, setBusy] = useState(false);
   // The file shown in the read-only viewer overlay; null = closed (issue #82).
   const [openFile, setOpenFile] = useState<SamuraiFileEntry | null>(null);
+
+  // Ticking clock for the TIMER rows' countdowns — armed only while a pending
+  // timer is actually listed.
+  const hasTimer = (files ?? []).some((f) => f.kind === "TIMER" && f.fire_at);
+  const now = useCountdownNow(hasTimer);
 
   /* ── Health checker flags (rule-based, read-only) — issue #67 ── */
   const allHealthFlags = useHealthStore((s) => s.flags);
@@ -514,6 +527,7 @@ export function SecondBrainSection() {
                           <FileRow
                             key={`${entry.path}-${entry.epic ?? ""}-${i}`}
                             entry={entry}
+                            now={now}
                             healthFlags={
                               firstForPath
                                 ? healthRows.get(`${entry.path}|${baseName(entry.path)}`)

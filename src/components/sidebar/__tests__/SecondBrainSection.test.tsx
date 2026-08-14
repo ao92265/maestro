@@ -41,6 +41,7 @@ beforeAll(async () => {
   ]);
 });
 
+import { formatFireDateTime } from "@/lib/parkTime";
 import { SAMURAI_IN_USE_ERROR_PREFIX, type SamuraiFileEntry } from "@/lib/samurai";
 import { useHealthStore } from "@/stores/useHealthStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
@@ -336,6 +337,40 @@ describe("SecondBrainSection (issue #66)", () => {
     // schedule.json would neither stop the timer nor scope to one epic.
     expect(screen.getByRole("button", { name: "Cancel resume timer for #38" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /^Delete / })).toBeNull();
+  });
+
+  it("dates a timer row and counts down to it, so a week-out park cannot read as today", async () => {
+    // 7d 1h 30m out — the shape a 7-day-allowance park really has, which the
+    // old bare `HH:MM` rendered as if it were this afternoon.
+    const fireAt = new Date(Date.now() + 7 * 86_400_000 + 90 * 60_000).toISOString();
+    mockInvoke([
+      fileEntry({
+        kind: "TIMER",
+        path: "C:\\appdata\\samurai\\schedule.json",
+        fire_at: fireAt,
+        in_use: true,
+      }),
+    ]);
+    render(<SecondBrainSection />);
+
+    const meta = await screen.findByText(/^resumes at /);
+    expect(meta.textContent).toContain(formatFireDateTime(fireAt));
+    expect(meta.textContent).toMatch(/· in 7d 1h \d+m$/);
+  });
+
+  it("still says parked when a timer's fire time does not parse", async () => {
+    mockInvoke([
+      fileEntry({
+        kind: "TIMER",
+        path: "C:\\appdata\\samurai\\schedule.json",
+        fire_at: "garbage",
+        in_use: true,
+      }),
+    ]);
+    render(<SecondBrainSection />);
+
+    // No time to show, but the row must never stop saying the run is parked.
+    expect(await screen.findByText("parked")).toBeInTheDocument();
   });
 
   it("cancels a timer only after the no-self-resume consequence is confirmed", async () => {

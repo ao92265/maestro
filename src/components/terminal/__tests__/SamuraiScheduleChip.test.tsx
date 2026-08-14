@@ -1,12 +1,16 @@
 import { act, render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
+import { formatCountdown, formatFireDateTime } from "@/lib/parkTime";
 import { type SamuraiScheduleEntry, useSessionStore } from "@/stores/useSessionStore";
-import { earliestEntry, formatFireTime, SamuraiScheduleChip } from "../SamuraiScheduleChip";
+import { earliestEntry, SamuraiScheduleChip } from "../SamuraiScheduleChip";
+
+/** Fixed clock, so every countdown assertion below is exact. */
+const NOW = new Date("2026-08-06T10:00:00+00:00");
 
 function entry(overrides: Partial<SamuraiScheduleEntry> = {}): SamuraiScheduleEntry {
   return {
@@ -20,7 +24,13 @@ function entry(overrides: Partial<SamuraiScheduleEntry> = {}): SamuraiScheduleEn
 
 describe("SamuraiScheduleChip (issue #61)", () => {
   beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
     useSessionStore.setState({ samuraiSchedule: [] });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it("renders the park countdown for a project with a pending timer", () => {
@@ -28,9 +38,37 @@ describe("SamuraiScheduleChip (issue #61)", () => {
     useSessionStore.setState({ samuraiSchedule: [e] });
     render(<SamuraiScheduleChip projectPath="C:/proj" />);
 
-    // The exact HH:MM is locale/timezone-dependent — compare against the
-    // same formatter the chip uses.
-    expect(screen.getByText(`parked · resumes ${formatFireTime(e.fire_at)}`)).toBeInTheDocument();
+    // The exact date/time rendering is locale/timezone-dependent — compare
+    // against the same formatter the chip uses. The countdown is not: it is
+    // computed off the fixed clock above.
+    expect(screen.getByText(/^parked · resumes /).textContent).toBe(
+      `parked · resumes ${formatFireDateTime(e.fire_at)} · in 4h 32m`,
+    );
+  });
+
+  it("dates the reading, so a week-out park cannot read as this afternoon", () => {
+    // The 7-day allowance window is what parks most runs: a bare `HH:MM` said
+    // "09:05" for a resume a whole week away.
+    const e = entry({ fire_at: "2026-08-13T09:05:00+00:00" });
+    useSessionStore.setState({ samuraiSchedule: [e] });
+    render(<SamuraiScheduleChip projectPath="C:/proj" />);
+
+    const chip = screen.getByText(/^parked · resumes /);
+    expect(chip.textContent).toContain(formatFireDateTime(e.fire_at));
+    expect(chip.textContent).toContain("in 6d 23h 5m");
+  });
+
+  it("keeps the countdown live while it is mounted", () => {
+    useSessionStore.setState({ samuraiSchedule: [entry()] });
+    render(<SamuraiScheduleChip projectPath="C:/proj" />);
+    expect(screen.getByText(/in 4h 32m/)).toBeInTheDocument();
+
+    // A minute passes with nothing else happening — the chip must not sit
+    // frozen on the reading it mounted with.
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(screen.getByText(/in 4h 31m/)).toBeInTheDocument();
   });
 
   it("renders nothing without a pending timer for the project", () => {
@@ -46,7 +84,8 @@ describe("SamuraiScheduleChip (issue #61)", () => {
     useSessionStore.setState({ samuraiSchedule: [late, early] });
     render(<SamuraiScheduleChip projectPath="C:/proj" />);
 
-    const chip = screen.getByText(`parked · resumes ${formatFireTime(early.fire_at)}`);
+    const chip = screen.getByText(/^parked · resumes /);
+    expect(chip.textContent).toContain(formatFireDateTime(early.fire_at));
     // The title still lists every parked epic.
     expect(chip.getAttribute("title")).toContain("#37");
     expect(chip.getAttribute("title")).toContain("#38");
@@ -80,7 +119,7 @@ describe("SamuraiScheduleChip (issue #61)", () => {
   });
 });
 
-describe("earliestEntry / formatFireTime", () => {
+describe("earliestEntry / park time formatting", () => {
   it("picks the earliest parseable fire time", () => {
     const a = entry({ epic: "a", fire_at: "2026-08-06T13:00:00+00:00" });
     const b = entry({ epic: "b", fire_at: "2026-08-06T12:00:00+00:00" });
@@ -91,8 +130,26 @@ describe("earliestEntry / formatFireTime", () => {
     expect(earliestEntry([])).toBeNull();
   });
 
-  it("formats RFC 3339 to a local HH:MM and rejects garbage", () => {
-    expect(formatFireTime("2026-08-06T14:32:00+00:00")).toMatch(/\d{1,2}.\d{2}/);
-    expect(formatFireTime("garbage")).toBeNull();
+  it("formats RFC 3339 to a local date + time and rejects garbage", () => {
+    const formatted = formatFireDateTime("2026-08-06T14:32:00+00:00");
+    // Locale-dependent, but it always carries a date AND a time — the whole
+    // point is that the day is no longer implied.
+    expect(formatted).toMatch(/\d{1,2}.\d{1,2}.\d{2}/);
+    expect(formatted).toMatch(/\d{1,2}.\d{2}/);
+    expect(formatFireDateTime("garbage")).toBeNull();
+  });
+
+  it("counts down in d/h/m and never shows a negative one", () => {
+    const now = new Date("2026-08-06T10:00:00+00:00").getTime();
+    expect(formatCountdown("2026-08-13T13:07:00+00:00", now)).toBe("in 7d 3h 7m");
+    // Leading units are dropped when zero, not padded in…
+    expect(formatCountdown("2026-08-06T13:07:00+00:00", now)).toBe("in 3h 7m");
+    expect(formatCountdown("2026-08-06T10:07:00+00:00", now)).toBe("in 7m");
+    // …but a unit below a bigger one is kept, so the shape stays readable.
+    expect(formatCountdown("2026-08-13T10:00:00+00:00", now)).toBe("in 7d 0h 0m");
+    expect(formatCountdown("2026-08-06T10:00:30+00:00", now)).toBe("in <1m");
+    // The fire event and a render race by design — never a negative reading.
+    expect(formatCountdown("2026-08-06T09:00:00+00:00", now)).toBe("due now");
+    expect(formatCountdown("garbage", now)).toBeNull();
   });
 });
