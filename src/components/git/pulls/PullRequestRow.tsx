@@ -87,6 +87,7 @@ export function PullRequestRow({ pr, isSelected, onClick }: PullRequestRowProps)
           <span className="truncate">
             {pr.headRefName} → {pr.baseRefName}
           </span>
+          {pr.author?.login && <span className="shrink-0">by {pr.author.login}</span>}
         </div>
       </div>
 
