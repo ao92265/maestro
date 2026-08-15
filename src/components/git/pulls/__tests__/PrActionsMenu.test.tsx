@@ -167,6 +167,48 @@ describe("PrActionsMenu", () => {
     await waitFor(() => expect(screen.queryByLabelText("Check status")).not.toBeInTheDocument());
   });
 
+  it("launches the edited workflow verbatim: custom steps, edge order, no default text", async () => {
+    // A fully user-edited graph: custom texts, node-array order REVERSED
+    // relative to the edge order (so the prompt order can only come from the
+    // graph walk, never from array position), plus a disconnected box that
+    // must not leak into the prompt.
+    const edited: SamuraiWorkflowGraph = {
+      nodes: [
+        { id: "verdict", label: "Verdict", text: "Custom verdict ritual." },
+        { id: "triage", label: "Triage", text: "Custom triage ritual for <PR>." },
+        { id: "orphan", label: "Orphan", text: "Disconnected ritual." },
+      ],
+      edges: [{ from: "triage", to: "verdict" }],
+      start: "triage",
+    };
+    usePrWorkflowStore.setState({ graph: edited });
+    render(<PrActionsMenu pr={buildPr()} repoPath={REPO_PATH} />);
+    openMenu();
+
+    // The disconnected box never becomes a checkbox.
+    expect(screen.getAllByRole("checkbox")).toHaveLength(2);
+    fireEvent.click(checkboxFor("Verdict"));
+    fireEvent.click(screen.getByRole("button", { name: /Launch 2 steps/ }));
+
+    await waitFor(() => expect(usePendingLaunchStore.getState().pending).toHaveLength(1));
+    const launch = usePendingLaunchStore.getState().pending[0];
+    // The edited texts ride verbatim, renumbered in WALK order (triage first
+    // despite being listed second), with <PR> resolved to this PR's number.
+    const prompt = launch.initialPrompt ?? "";
+    expect(prompt).toContain("Step 1: Custom triage ritual for 123.");
+    expect(prompt).toContain("Step 2: Custom verdict ritual.");
+    expect(prompt.indexOf("Custom triage ritual")).toBeLessThan(
+      prompt.indexOf("Custom verdict ritual"),
+    );
+    // Nothing of the replaced default workflow leaks in…
+    expect(prompt).not.toContain("Gather the full picture");
+    expect(prompt).not.toContain("gh pr merge");
+    // …and neither does the disconnected box.
+    expect(prompt).not.toContain("Disconnected ritual");
+    // The launch is named after the edited step ids too.
+    expect(launch.customName).toBe("PR #123 triage+verdict");
+  });
+
   it("asks for a project tab instead of launching when none is active", async () => {
     useWorkspaceStore.setState({ tabs: [buildTab({ active: false })] });
     render(<PrActionsMenu pr={buildPr()} repoPath={REPO_PATH} />);
