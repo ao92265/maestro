@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { fireEvent, render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The persisted zustand stores hydrate through the Tauri store plugin at
 // import time; happy-dom has no Tauri backend, so stub it out.
@@ -132,6 +132,17 @@ function mockInvoke() {
 }
 
 describe("UtilityPanel", () => {
+  // NotepadPanel is lazy(() => import(...)) so React can only resolve it once
+  // the dynamic import settles. Under full-suite load, transforming that
+  // module (it drags in TipTap/ProseMirror) is slower than findByText's 1s
+  // default wait, so the "notes" tests flake. Resolving the import once up
+  // front here warms Vite's module cache: the in-component import() then
+  // hits the cache instead of doing a cold transform, so the Suspense
+  // boundary clears well within the default timeout.
+  beforeAll(async () => {
+    await import("@/components/notepad/NotepadPanel");
+  });
+
   beforeEach(() => {
     invokeMock.mockReset();
     mockInvoke();
@@ -242,7 +253,8 @@ describe("UtilityPanel", () => {
   it("renders the Launch panel with the run form and active runs", async () => {
     render(<UtilityPanel panel="launch" width={320} onResize={() => {}} onClose={() => {}} />);
     expect(screen.getByText("Launch Run")).toBeInTheDocument();
-    expect(screen.getByLabelText("Issues")).toBeInTheDocument();
+    // Issue #128: one free-text box replaced the epics + issues fields.
+    expect(screen.getByLabelText("What do you want to work on today")).toBeInTheDocument();
     // One button: it runs preflight itself, so there is no separate step.
     expect(screen.queryByRole("button", { name: "Run preflight" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Launch" })).toBeDisabled();

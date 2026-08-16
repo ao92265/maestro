@@ -29,6 +29,18 @@
 //! removing first would silently lose the resume on a crash. When the last
 //! entry is removed the file itself is deleted.
 //!
+//! **[`REASON_SCHEDULED_LAUNCH`] is the one exception** (issue #131 review,
+//! fix M3): its callback only dispatches the launch onto the async runtime
+//! and returns — the real work (network preflight + the full test-suite
+//! gate) runs for minutes afterward, so "remove after the callback
+//! returns" would erase the entry the instant it is dispatched, well
+//! before it resolves. [`fire_due`](SamuraiSchedule::fire_due) instead
+//! marks it `held` (persisted before the callback runs) and skips the
+//! removal below; the callback owns resolving it from there — cancel on a
+//! successful launch, re-arm un-held on a retry, re-arm held on a give-up.
+//! A crash mid-launch leaves it held, same as any other overdue scheduled
+//! launch: waiting for a human, never silently gone.
+//!
 //! **Fire granularity:** a 30s interval tick (same shape as
 //! `samurai_watchdog::spawn_watchdog` / `allowance_watcher`), not exact
 //! sleeps — timers are minute-granular by design (resets + 5 min).
@@ -49,6 +61,12 @@ const TICK_INTERVAL: Duration = Duration::from_secs(30);
 /// herd spread over 0..=5 minutes).
 pub const MAX_JITTER_SECS: u64 = 300;
 
+/// `reason` of a SCHEDULED LAUNCH entry (issue #129): the user picked a
+/// day+time for a run to launch itself. The resume path (`samurai_resumer`)
+/// only handles `"park"`; entries with this reason are routed to the launch
+/// handler instead (`lib.rs` fire callback).
+pub const REASON_SCHEDULED_LAUNCH: &str = "scheduled_launch";
+
 /// Fired for each due entry. Wired to the resume handler
 /// (`samurai_resumer`, issue #61) in `lib.rs`.
 pub type FireCallback = Arc<dyn Fn(ScheduleEntry) + Send + Sync>;
@@ -58,6 +76,27 @@ pub type FireCallback = Arc<dyn Fn(ScheduleEntry) + Send + Sync>;
 /// the park-countdown chip stays live without polling). `lib.rs` forwards it
 /// as the `samurai-schedule-event` Tauri event; tests collect it directly.
 pub type ScheduleChangedCallback = Arc<dyn Fn(&[ScheduleEntry]) + Send + Sync>;
+
+/// What a SCHEDULED LAUNCH entry (issue #129) launches when it fires: the
+/// free-text request (issue #128) plus the launch options the launcher UI
+/// exposes. A resume timer has no run yet to read them from a run config, so
+/// the entry carries them itself — the one exception to "kept lean".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScheduledLaunchSpec {
+    /// The verbatim free-text launch request ("what do you want to work on
+    /// today", issue #128).
+    pub text: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub handoff_context_pct: Option<f64>,
+    #[serde(default)]
+    pub skip_test_gate: bool,
+    /// How many times the fire→launch already failed preflight/refusal and
+    /// was re-armed (issue #129: unattended retry with backoff, bounded).
+    #[serde(default)]
+    pub attempts: u32,
+}
 
 /// One persisted timer. Kept lean (PRD §8): identity + when + why — the run
 /// config (`samurai_run_config`) holds everything a resume spawn needs.
@@ -72,9 +111,21 @@ pub struct ScheduleEntry {
     /// RFC 3339 UTC fire time, computed by the caller
     /// (`resets_at + 5 min +` [`jitter_secs`]).
     pub fire_at: String,
-    /// Why the timer exists (e.g. `"park"`) — for the audit trail and the
-    /// Second Brain Files panel ("resumes at 14:32").
+    /// Why the timer exists (`"park"`, or [`REASON_SCHEDULED_LAUNCH`]) — for
+    /// the audit trail and the Second Brain Files panel ("resumes at 14:32").
     pub reason: String,
+    /// The launch this entry performs when it fires — `Some` only on
+    /// [`REASON_SCHEDULED_LAUNCH`] entries (issue #129). `None` on every
+    /// resume timer, and on entries persisted before scheduled launches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<ScheduledLaunchSpec>,
+    /// A held entry NEVER fires — it waits for a human decision (issue
+    /// #129): a scheduled launch found OVERDUE at app start is held (never
+    /// auto-fired, matching the resume-timer startup rule), and one whose
+    /// unattended retries are exhausted is held rather than dropped, so the
+    /// UI can offer launch-or-discard either way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held: bool,
 }
 
 /// The persisted timer store + in-memory mirror. Constructed once at app
@@ -190,6 +241,56 @@ impl SamuraiSchedule {
                 entry.reason,
                 entry.fire_at,
             );
+
+            // Fix M3 (issue #131 review): a SCHEDULED LAUNCH entry's
+            // callback only dispatches the launch (spawns it onto the
+            // async runtime) and returns immediately — the real work
+            // (network preflight + the full test-suite gate) runs for
+            // minutes AFTER this call returns, unlike a park timer's
+            // resume, which stages synchronously inside the callback.
+            // Removing the entry right after the callback returns, like
+            // every other reason below, would erase it the instant the
+            // launch is dispatched — long before it resolves. A crash in
+            // that gap would lose the entry with nothing else to show for
+            // the scheduled run: no run config (written only after the
+            // gate), no held state, no alert.
+            //
+            // Hold it in place instead, persisted BEFORE the callback
+            // runs so it is on disk for the whole gap. `is_due` skips held
+            // entries, so this also stops the next tick from re-dispatching
+            // the same launch while it is still in flight. Ownership of
+            // resolving it transfers to the callback from here: a
+            // successful launch's own stale-timer sweep
+            // (`launch_run_inner`, review F5) cancels this same entry once
+            // the gate passes, a retry re-arms it un-held further out, and
+            // a give-up re-arms it held with the ALERT — so this loop must
+            // NOT also remove it below. A crash leaves it exactly like any
+            // other overdue-but-held scheduled launch: `hold_overdue_launches`
+            // already treats that as "wait for a human" (issue #129), the
+            // same nothing-auto-starts-on-reopen rule park timers get.
+            if entry.reason == REASON_SCHEDULED_LAUNCH {
+                let snapshot = {
+                    let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+                    for e in entries.iter_mut() {
+                        if e.project_path == entry.project_path
+                            && e.epic == entry.epic
+                            && e.fire_at == entry.fire_at
+                        {
+                            e.held = true;
+                        }
+                    }
+                    if let Err(e) = persist(&self.path, &entries) {
+                        log::error!(
+                            "samurai schedule: failed to persist in-flight launch marker: {e}"
+                        );
+                    }
+                    entries.clone()
+                };
+                self.notify_change(&snapshot);
+                (self.on_fire)(entry.clone());
+                continue;
+            }
+
             (self.on_fire)(entry.clone());
             // Remove AFTER the callback returned (module doc: a crash
             // mid-callback re-fires on next launch — the safe direction).
@@ -209,6 +310,37 @@ impl SamuraiSchedule {
             // time) as soon as the timer fired — one event per fire.
             self.notify_change(&snapshot);
         }
+    }
+
+    /// Marks every OVERDUE scheduled-launch entry held (issue #129) and
+    /// returns them. Called once at app start, BEFORE the fire loop spawns:
+    /// a launch whose day+time passed while the app was closed must never
+    /// auto-fire on reopen — the same nothing-auto-starts rule restored
+    /// resume timers follow (`samurai_resumer::mark_restored`) — so it is
+    /// held for an explicit launch-or-discard instead. Future-dated
+    /// scheduled launches stay armed and fire normally: firing at the picked
+    /// time is the feature. Resume timers are untouched.
+    pub fn hold_overdue_launches(&self) -> Vec<ScheduleEntry> {
+        let now = Utc::now();
+        let (held, snapshot) = {
+            let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut held = Vec::new();
+            for entry in entries.iter_mut() {
+                if entry.reason == REASON_SCHEDULED_LAUNCH && !entry.held && is_due(entry, now) {
+                    entry.held = true;
+                    held.push(entry.clone());
+                }
+            }
+            if held.is_empty() {
+                return held;
+            }
+            if let Err(e) = persist(&self.path, &entries) {
+                log::error!("samurai schedule: failed to persist held launches: {e}");
+            }
+            (held, entries.clone())
+        };
+        self.notify_change(&snapshot);
+        held
     }
 
     /// Invokes the change callback (if any) outside the entries lock, so a
@@ -237,10 +369,14 @@ pub fn jitter_secs(epic: &str) -> u64 {
     hash % (MAX_JITTER_SECS + 1)
 }
 
-/// A timer is due once `fire_at <= now`. An unparseable `fire_at` counts as
-/// due — firing a resume early is recoverable (spawning is idempotent),
-/// silently never firing it would strand the epic.
+/// A timer is due once `fire_at <= now` — unless it is HELD (issue #129: a
+/// held entry waits for a human decision and never fires). An unparseable
+/// `fire_at` counts as due — firing a resume early is recoverable (spawning
+/// is idempotent), silently never firing it would strand the epic.
 fn is_due(entry: &ScheduleEntry, now: DateTime<Utc>) -> bool {
+    if entry.held {
+        return false;
+    }
     match DateTime::parse_from_rfc3339(&entry.fire_at) {
         Ok(fire_at) => fire_at <= now,
         Err(e) => {
@@ -326,6 +462,23 @@ mod tests {
             epic: epic.to_string(),
             fire_at: fire_at.to_string(),
             reason: "park".to_string(),
+            launch: None,
+            held: false,
+        }
+    }
+
+    /// A scheduled-launch entry (issue #129) with a minimal spec.
+    fn launch_entry(project: &str, epic: &str, fire_at: &str) -> ScheduleEntry {
+        ScheduleEntry {
+            reason: REASON_SCHEDULED_LAUNCH.to_string(),
+            launch: Some(ScheduledLaunchSpec {
+                text: format!("work {epic}"),
+                model: None,
+                handoff_context_pct: None,
+                skip_test_gate: false,
+                attempts: 0,
+            }),
+            ..entry(project, epic, fire_at)
         }
     }
 
@@ -542,6 +695,155 @@ mod tests {
         let changes = changes.lock().unwrap();
         assert_eq!(changes.len(), 4);
         assert!(changes[3].is_empty());
+    }
+
+    // --- issue #129: scheduled-launch entries ---
+
+    #[test]
+    fn test_pre_129_schedule_json_still_loads() {
+        // Entries persisted before scheduled launches existed carry neither
+        // `launch` nor `held` — they must load as plain resume timers.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        std::fs::write(
+            &path,
+            r##"[{"project_path":"C:/git/alpha","epic":"#37","fire_at":"2030-01-01T00:00:00+00:00","reason":"park"}]"##,
+        )
+        .unwrap();
+        let loaded = load_entries(&path);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].launch, None);
+        assert!(!loaded[0].held);
+    }
+
+    #[test]
+    fn test_launch_spec_round_trips_through_persist_and_reload() {
+        let dir = tempdir().unwrap();
+        let (cb, _) = collector();
+        let armed = launch_entry("C:/git/alpha", "issue #7", &in_one_hour());
+        {
+            let (schedule, _task) =
+                SamuraiSchedule::new(dir.path().to_path_buf(), cb.clone(), None);
+            schedule.arm(armed.clone()).unwrap();
+        }
+        let (reloaded, _task) = SamuraiSchedule::new(dir.path().to_path_buf(), cb, None);
+        assert_eq!(reloaded.list(), vec![armed]);
+    }
+
+    #[test]
+    fn test_held_entry_never_fires() {
+        let dir = tempdir().unwrap();
+        let (cb, fired) = collector();
+        let (schedule, _task) = SamuraiSchedule::new(dir.path().to_path_buf(), cb, None);
+        let mut held = launch_entry("C:/git/alpha", "issue #7", "2020-01-01T00:00:00+00:00");
+        held.held = true;
+        schedule.arm(held).unwrap();
+
+        schedule.fire_due();
+
+        assert!(
+            fired.lock().unwrap().is_empty(),
+            "held entries wait for a human"
+        );
+        assert_eq!(
+            schedule.list().len(),
+            1,
+            "and stay armed for launch-or-discard"
+        );
+    }
+
+    #[test]
+    fn test_hold_overdue_launches_holds_only_overdue_scheduled_launches() {
+        let dir = tempdir().unwrap();
+        let (cb, fired) = collector();
+        let (schedule, _task) = SamuraiSchedule::new(dir.path().to_path_buf(), cb.clone(), None);
+        // Overdue scheduled launch → held. Future one and an overdue park
+        // timer → untouched.
+        schedule
+            .arm(launch_entry(
+                "C:/git/alpha",
+                "issue #7",
+                "2020-01-01T00:00:00+00:00",
+            ))
+            .unwrap();
+        schedule
+            .arm(launch_entry("C:/git/alpha", "issue #9", &in_one_hour()))
+            .unwrap();
+        schedule
+            .arm(entry("C:/git/alpha", "#38", "2020-01-01T00:00:00+00:00"))
+            .unwrap();
+
+        let held = schedule.hold_overdue_launches();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].epic, "issue #7");
+        assert!(held[0].held);
+
+        // The hold reached the file: a reload (another restart) keeps it.
+        let (reloaded, _task) = SamuraiSchedule::new(dir.path().to_path_buf(), cb, None);
+        assert_eq!(reloaded.list().iter().filter(|e| e.held).count(), 1);
+
+        // The fire loop's first tick now fires the park timer (the resumer's
+        // restored gate handles that one) but NOT the held launch; the
+        // future launch stays armed.
+        schedule.fire_due();
+        let fired = fired.lock().unwrap();
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].epic, "#38");
+        assert_eq!(schedule.list().len(), 2, "held + future launches remain");
+    }
+
+    #[test]
+    fn test_scheduled_launch_survives_fire_dispatch_until_resolved() {
+        // Fix M3 (issue #131 review): a scheduled launch's real work
+        // (network preflight + the full test-suite gate) runs for minutes
+        // on the async runtime — the synchronous fire callback only
+        // dispatches it and returns immediately, unlike a park timer's
+        // resume, which stages synchronously inside the callback. The
+        // module's crash-refire invariant ("remove AFTER the callback
+        // returned") only protects synchronous work: if `fire_due` removed
+        // this entry the instant the dispatching callback returned — same
+        // as every other reason — an app crash during those in-flight
+        // minutes would lose the entry with nothing else to show for it (no
+        // run config, written only after the gate; no held state; no
+        // alert). This callback only records that it fired (mirroring the
+        // real one, which spawns onto the runtime and returns without
+        // waiting) — proving the entry itself, not the launch outcome, must
+        // still be there afterward.
+        let dir = tempdir().unwrap();
+        let (cb, fired) = collector();
+        let (schedule, _task) = SamuraiSchedule::new(dir.path().to_path_buf(), cb, None);
+        schedule
+            .arm(launch_entry(
+                "C:/git/alpha",
+                "issue #7",
+                "2020-01-01T00:00:00+00:00",
+            ))
+            .unwrap();
+
+        schedule.fire_due();
+
+        assert_eq!(fired.lock().unwrap().len(), 1, "the launch was dispatched");
+        let remaining = schedule.list();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "the entry must survive dispatch — a crash right here, before the \
+             async launch resolves, must not silently drop the scheduled run"
+        );
+        assert_eq!(remaining[0].epic, "issue #7");
+        assert_eq!(
+            remaining[0].launch.as_ref().unwrap().text,
+            "work issue #7",
+            "the launch spec itself, not just a bare marker, survives"
+        );
+        assert!(
+            remaining[0].held,
+            "held — not due — so the next 30s tick doesn't re-dispatch the \
+             same launch while it's still in flight"
+        );
+        let on_disk = load_entries(&dir.path().join("schedule.json"));
+        assert_eq!(on_disk.len(), 1, "persisted, not just held in memory");
+        assert!(on_disk[0].held);
     }
 
     #[test]

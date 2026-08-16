@@ -84,7 +84,7 @@ import { useMcpStore } from "@/stores/useMcpStore";
 import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
 import { usePluginStore } from "@/stores/usePluginStore";
 import type { AiMode } from "@/stores/useSessionStore";
-import { SAMURAI_TILE_CLOSE_STATES, useSessionStore } from "@/stores/useSessionStore";
+import { SAMURAI_TERMINAL_STATES, useSessionStore } from "@/stores/useSessionStore";
 import {
   type RepositoryInfo,
   useWorkspaceStore,
@@ -1841,7 +1841,22 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       !launchingSlotIdsRef.current.has(current[0].id)
         ? current[0]
         : null;
-    if (!reusable && current.length >= MAX_SESSIONS) {
+    // Parked samurai terminal-state tiles (issue #122) are dead weight: the
+    // PTY is gone and only the transcript remains. A long autonomous run
+    // leaves one per generation, so counting them against the cap would
+    // drop a successor's launch AFTER `consume` claimed it — silently
+    // stalling the run (PR #131 review M4). Exempt them from the count.
+    const sessionState = useSessionStore.getState();
+    const occupiedCount = current.filter((s) => {
+      if (s.sessionId === null) return true;
+      const samuraiInfo = sessionState.samuraiBySessionId[s.sessionId];
+      return !(
+        samuraiInfo !== undefined &&
+        SAMURAI_TERMINAL_STATES.has(samuraiInfo.state) &&
+        sessionState.parkedSessionIds.includes(s.sessionId)
+      );
+    }).length;
+    if (!reusable && occupiedCount >= MAX_SESSIONS) {
       setError(`Cannot resume: maximum of ${MAX_SESSIONS} sessions per project`);
       return;
     }
@@ -1920,43 +1935,51 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     }
   }, [slots, launchSlot]);
 
-  // Samurai kills (issue #55) and parks (issue #60): after a validated
-  // handoff — or a validated allowance park — the session is announced by
-  // transitioning to KILLED/PARKED on the samurai-supervisor-event channel.
-  // No PTY-exit event exists and terminal teardown is otherwise always
-  // frontend-initiated, so without this the dead tile would linger as a
-  // zombie. Reuse the manual close path (kill IPC + handleKill), minus the
-  // working-dir artifacts the successor (or the resume's fresh spawn) is
-  // about to reuse.
+  // Samurai kills (issue #55), parks (issue #60) and deaths (issue #44):
+  // once a session reaches a terminal supervisor state (KILLED/PARKED/DEAD,
+  // `SAMURAI_TERMINAL_STATES`) the session is announced on the
+  // samurai-supervisor-event channel. No PTY-exit event exists and terminal
+  // teardown is otherwise always frontend-initiated, so without this the
+  // tile would linger, live, forever. Per issue #122's decided policy this
+  // reuses the EXISTING park mechanism (`handlePark`, the same one the P
+  // button drives) rather than closing the tile: the terminal moves into the
+  // footer parking tray, and its transcript stays reachable by unparking it
+  // — resuming is always a fresh spawn either way, so nothing is lost by
+  // keeping the old terminal around instead of destroying it.
   //
   // Deliberately placed AFTER the pending-launch consume/launch effects
-  // (fresh-eyes finding A): effects run in definition order, so when the
+  // (fresh-eyes finding A): effects run in definition order, so when a
   // KILLED update and the successor's queued launch land in the same commit,
-  // the consume effect claims and appends the successor slot FIRST, and this
-  // effect's handleKill then removes the predecessor leaf from the layout
-  // tree the consume effect just rebuilt — the reverse order would leave a
-  // stale leaf behind (and, before the handleKill guard, unmounted the grid
-  // under the claimed launch).
+  // the consume effect claims and appends the successor slot first.
   const samuraiBySessionId = useSessionStore((s) => s.samuraiBySessionId);
+  // One-shot guard (PR #131 review H2): the effect re-runs whenever
+  // `parkedSet` changes, and the samurai entry keeps its terminal state
+  // forever — so a user unpark from the tray would immediately re-trigger
+  // the park (and a redundant re-kill) without this. Session ids are never
+  // reused (resume is always a fresh spawn), so once handled is handled.
+  const samuraiAutoParkedSessionIdsRef = useRef<Set<number>>(new Set());
   useEffect(() => {
     for (const slot of slotsRef.current) {
-      if (slot.sessionId === null) continue;
+      if (slot.sessionId === null || parkedSet.has(slot.sessionId)) continue;
+      if (samuraiAutoParkedSessionIdsRef.current.has(slot.sessionId)) continue;
       const info = samuraiBySessionId[slot.sessionId];
-      if (info && SAMURAI_TILE_CLOSE_STATES.has(info.state)) {
-        // The replicator/parker paths already tore the PTY down, but the
-        // Phase-2 circuit breaker (samurai_progress.rs) only transitions to
-        // PARKED — kill here so no path can orphan a live agent running with
-        // --dangerously-skip-permissions. A second kill is a harmless
-        // SessionNotFound (process_manager.rs removes from the map before
-        // signalling).
-        //
-        // handleKill → removeSession drops the supervision entry, so this
-        // effect cannot re-fire for the same session.
-        killSession(slot.sessionId).catch(console.error);
-        handleKill(slot.sessionId, { keepDirArtifacts: true });
+      if (info && SAMURAI_TERMINAL_STATES.has(info.state)) {
+        samuraiAutoParkedSessionIdsRef.current.add(slot.sessionId);
+        // The replicator/parker paths already tore the PTY down, and a DEAD
+        // session's process is already gone by definition — but the Phase-2
+        // circuit breaker (samurai_progress.rs) only transitions to PARKED,
+        // leaving the PTY running. Kill it there so no path can orphan a
+        // live agent running with --dangerously-skip-permissions; skip the
+        // redundant IPC call for DEAD, whose process is confirmed gone.
+        if (info.state !== "DEAD") {
+          killSession(slot.sessionId).catch(console.error);
+        }
+        // parkSession is idempotent and the `parkedSet` guard above stops
+        // this from re-firing for an already-parked session.
+        handlePark(slot.id);
       }
     }
-  }, [samuraiBySessionId, handleKill]);
+  }, [samuraiBySessionId, parkedSet, handlePark]);
 
   // Handle zoom toggle for a slot
   const handleToggleZoom = useCallback(

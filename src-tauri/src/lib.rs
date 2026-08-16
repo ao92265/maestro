@@ -726,6 +726,30 @@ pub fn run() {
             // tracker above (finding H): pending instruction + idle flag.
             app.manage(injector.clone());
             let _ = samurai_injector.set(injector.clone());
+            // Issue #118: the blindness self-heal. A session whose transcript
+            // stream is dead (watch never attached — e.g. a lost SessionStart
+            // hook or a refused OS watcher — or silently died) is re-resolved
+            // to the newest transcript in its Claude project directory (the
+            // same fallback the recovery digest uses) and force-restarted,
+            // instead of staying blind for the rest of the run.
+            let rewatch_watcher = app.state::<Arc<TranscriptWatcher>>().inner().clone();
+            let rewatch_handle = app.handle().clone();
+            injector.set_rewatcher(Arc::new(move |session_id| {
+                let Some(dir) = rewatch_handle
+                    .state::<SessionManager>()
+                    .get_session(session_id)
+                    .map(|s| s.working_directory.unwrap_or(s.project_path))
+                else {
+                    return false;
+                };
+                match commands::claude_sessions::newest_transcript_for_project(&dir) {
+                    Some(path) => {
+                        rewatch_watcher.restart_watching(session_id, path);
+                        true
+                    }
+                    None => false,
+                }
+            }));
             core::samurai_injector::spawn_injector(injector.clone());
 
             // Samurai (issue #59): per-epic run-config store + persisted
@@ -870,11 +894,24 @@ pub fn run() {
             // the full timer list to the frontend — the park-countdown chip
             // stays live without polling.
             let schedule_event_handle = app.handle().clone();
+            // Issue #129: scheduled-launch timers route to the launch
+            // handler (async — spawned onto the runtime, which pulls its
+            // dependencies from managed state at fire time); every other
+            // reason keeps going to the resumer.
+            let launch_fire_handle = app.handle().clone();
             let (samurai_schedule, samurai_schedule_task) =
                 core::samurai_schedule::SamuraiSchedule::new(
                     commands::ai_runner::artifact_base_dir("samurai"),
                     Arc::new(move |entry: core::samurai_schedule::ScheduleEntry| {
-                        resumer_for_fire.on_fire(entry);
+                        if entry.reason == core::samurai_schedule::REASON_SCHEDULED_LAUNCH {
+                            let handle = launch_fire_handle.clone();
+                            tauri::async_runtime::spawn(async move {
+                                commands::samurai::handle_scheduled_launch_fire(handle, entry)
+                                    .await;
+                            });
+                        } else {
+                            resumer_for_fire.on_fire(entry);
+                        }
                     }),
                     Some(Arc::new(
                         move |entries: &[core::samurai_schedule::ScheduleEntry]| {
@@ -921,13 +958,26 @@ pub fn run() {
             // Issue #61: closes the circular construction order — the
             // resumer can now re-arm deferred timers and consult the
             // parking-engaged guard.
-            samurai_resumer.bind(samurai_schedule, samurai_parker.clone());
+            samurai_resumer.bind(samurai_schedule.clone(), samurai_parker.clone());
             // Nothing auto-starts on app reopen: the timers `schedule.json`
             // already held at startup ALERT instead of spawning when they
             // fire (the same rule the reconciler follows). Uses the same
             // pre-fire-loop snapshot, and must run BEFORE that loop is
             // spawned below or a past-due entry could spawn in the gap.
             samurai_resumer.mark_restored(&reconcile_timers);
+            // Issue #129, same rule for scheduled launches: one whose picked
+            // day+time passed while the app was closed is HELD — never
+            // auto-fired on reopen — and waits for the user's explicit
+            // launch-or-discard. Future-dated ones stay armed and fire at
+            // their time. Must run BEFORE the fire loop spawns below, or the
+            // first tick would fire the overdue entry unattended.
+            let overdue_launches = samurai_schedule.hold_overdue_launches();
+            if !overdue_launches.is_empty() {
+                log::warn!(
+                    "samurai schedule: {} overdue scheduled launch(es) held at startup for launch-or-discard",
+                    overdue_launches.len(),
+                );
+            }
             // Ordering invariant (review F2): the schedule's fire loop is
             // spawned only AFTER the bind above — its first tick fires every
             // past-due timer immediately, and a fire before the bind would
@@ -1216,6 +1266,8 @@ pub fn run() {
             commands::samurai::samurai_audit_read,
             commands::samurai::samurai_audit_clear,
             commands::samurai::samurai_schedule_list,
+            commands::samurai::samurai_schedule_launch,
+            commands::samurai::samurai_recover_run,
             commands::samurai::samurai_get_config,
             commands::samurai::samurai_set_config,
             // Samurai run launcher (issue #63) + workflow graph (issue #91)

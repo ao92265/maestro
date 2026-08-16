@@ -91,8 +91,26 @@ pub fn park_written_retry_value(generation: u32) -> String {
 /// The soft wind-down instruction's ACK value (issue #60). Generation-scoped
 /// like every other marker value; there is no written stage — the ACK alone
 /// completes the instruction.
-pub fn soft_winddown_ack_value(generation: u32) -> String {
-    format!("winddown gen-{generation}")
+///
+/// `episode` (issue #131 fix M7) additionally scopes the value to ONE
+/// wind-down episode within the generation: unlike Handoff/Park (once per
+/// generation), a soft wind-down can legitimately recur several times in one
+/// generation as the 5h allowance rises and falls, so generation+kind alone
+/// is not unique. Without the episode, a transcript replay of an EARLIER
+/// episode's ACK line (issue #118's `restart_watching` re-reads from byte 0)
+/// would textually match a LATER episode's still-pending entry and
+/// spuriously complete it.
+pub fn soft_winddown_ack_value(generation: u32, episode: u32) -> String {
+    format!("winddown gen-{generation}-{episode}")
+}
+
+/// The wind-down all-clear instruction's ACK value (issue #120).
+/// Kind-scoped (`allclear …`) so a transcript replay of the wind-down's own
+/// ACK can never acknowledge its all-clear; ack-only like the wind-down.
+/// `episode` — see [`soft_winddown_ack_value`] (fix M7); an all-clear
+/// carries the SAME episode number as the wind-down it closes.
+pub fn winddown_allclear_ack_value(generation: u32, episode: u32) -> String {
+    format!("allclear gen-{generation}-{episode}")
 }
 
 /// The run-completion declaration tag (issue #96). The orchestrator replies
@@ -138,6 +156,21 @@ fn completion_declaration_clause() -> String {
          reply — emit it exactly once, only as the actual signal at that moment.",
         tag = RUN_COMPLETE_TAG
     )
+}
+
+/// The local-only scheduling prohibition (issue #121) every orchestrator
+/// brief and every wait-inducing instruction (park, soft wind-down)
+/// carries: all waiting and rescheduling is Maestro's job, handled by its
+/// own LOCAL timers (`schedule.json`) — a cloud-scheduled agent or routine
+/// (e.g. Claude Code's `/schedule`) would escape Maestro's supervision,
+/// audit, and allowance accounting entirely. Single line by construction
+/// (see module doc).
+fn local_scheduling_clause() -> &'static str {
+    " SCHEDULING: all waiting and rescheduling is MAESTRO'S job, handled by its own LOCAL \
+     timers. NEVER create cloud-scheduled agents, routines, or jobs (e.g. Claude Code's \
+     /schedule) to resume, retry, or \"come back later\" — a cloud reschedule escapes \
+     Maestro's supervision, audit, and allowance accounting. When you must wait, stop and \
+     wait in this terminal; Maestro resumes the work itself."
 }
 
 /// The delimited WORKFLOW section rider (issue #91): wraps the numbered
@@ -441,21 +474,36 @@ pub fn handoff_file_relpath(epic: &str, generation: u32) -> String {
     format!(".maestro/handoffs/{}-gen{generation}.md", epic_slug(epic))
 }
 
+/// The DASH-spelled sibling of [`handoff_file_relpath`] —
+/// `.maestro/handoffs/<epic>-gen-<N>.md` — the deviating spelling issue #119
+/// tolerates for DISCOVERY ([`parse_handoff_generation`]). Fix L1 (issue
+/// #131 review): a read that only tries the canonical path treats a
+/// perfectly readable dash-variant handoff as missing, sending a run into
+/// full reconstruction it does not need — callers that read (not just list)
+/// handoff files must fall back to this spelling on a canonical-read miss.
+/// Nothing writes this spelling on purpose; it exists only so a deviating
+/// orchestrator's actual output is still found.
+pub fn handoff_file_dash_relpath(epic: &str, generation: u32) -> String {
+    format!(".maestro/handoffs/{}-gen-{generation}.md", epic_slug(epic))
+}
+
 /// Parses the generation number out of a handoff FILENAME shaped by
 /// [`handoff_file_relpath`] — `<slug>-gen<N>.md` → `Some(N)`. The resume path
 /// (issue #61) scans `.maestro/handoffs/` with this to find the latest
-/// generation on disk. Anything else returns `None` — including the
-/// `-recovery` digests ([`recovery_digest_relpath`]), whose tail after
-/// `-gen<N>` is not all digits. `rsplit_once` takes the LAST `-gen`, so an
-/// epic slug that itself contains `-gen` (e.g. `x-gen5-gen2.md`) still
-/// parses the real generation.
+/// generation on disk. Issue #119 (tolerant discovery): the dash spelling a
+/// deviating orchestrator actually produced, `<slug>-gen-<N>.md`, parses
+/// too. Anything else returns `None` — including the `-recovery` digests
+/// ([`recovery_digest_relpath`]), whose tail after `-gen<N>` is not all
+/// digits. `rsplit_once` takes the LAST `-gen`, so an epic slug that itself
+/// contains `-gen` (e.g. `x-gen5-gen2.md`) still parses the real generation.
 pub fn parse_handoff_generation(filename: &str) -> Option<u32> {
     let stem = filename.strip_suffix(".md")?;
     let (_, tail) = stem.rsplit_once("-gen")?;
-    if tail.is_empty() || !tail.bytes().all(|b| b.is_ascii_digit()) {
+    let digits = tail.strip_prefix('-').unwrap_or(tail);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    tail.parse().ok()
+    digits.parse().ok()
 }
 
 /// Full idle-injected handoff instruction (PRD §5.4 + §6): immediate ACK,
@@ -474,7 +522,9 @@ pub fn handoff_instruction(epic: &str, generation: u32) -> String {
          (3) Ensure `.maestro/` is listed in this repo's .gitignore; add it if missing. \
          (4) Commit WIP to this run's branch: stage named paths only (never `git add .` or \
          `git add -A`), one Conventional Commit message (`type(scope): summary`). \
-         (5) Write the handoff file to {relpath} following the PRD section 6 template EXACTLY, \
+         (5) Write the handoff file to {relpath} — EXACTLY this repo-relative path inside this \
+         worktree, creating directories as needed; NEVER invent another filename or location \
+         (never a HANDOFF-*.md at the repo root) — following the PRD section 6 template EXACTLY, \
          with these headings in this order: Goal / Done / In progress / Decisions + why / \
          Failed attempts / Repo state / Verify / Next steps. \"Failed attempts\" is REQUIRED — \
          record the dead ends you tried so your successor does not repeat them. Keep every \
@@ -511,7 +561,9 @@ pub fn handoff_corrective_instruction(epic: &str, generation: u32, failure: &str
          <samurai-ack>{ack}</samurai-ack> — note the value differs from the first \
          instruction's; use exactly this one. \
          (2) Fix the failure above: write the handoff file and/or commit WIP to this run's \
-         branch (stage named paths only, Conventional Commit message). \
+         branch (stage named paths only, Conventional Commit message). If you wrote the \
+         handoff under any other filename or directory (e.g. a HANDOFF-*.md at the repo \
+         root), MOVE it to exactly {relpath}. \
          (3) Then reply with a message that contains exactly \
          <samurai-handoff-written>{written}</samurai-handoff-written>. \
          Never quote, restate, or echo these marker strings anywhere else in any reply — \
@@ -528,7 +580,7 @@ pub fn handoff_corrective_instruction(epic: &str, generation: u32, failure: &str
 /// in-flight steps, prepare for a possible park instruction. ACK required;
 /// no state transition, no file, no written marker. Single line by
 /// construction (see module doc).
-pub fn soft_winddown_instruction(generation: u32) -> String {
+pub fn soft_winddown_instruction(generation: u32, episode: u32) -> String {
     format!(
         "[Maestro Samurai] Allowance wind-down: the token allowance for this account is \
          approaching its limit. Do the following: \
@@ -540,8 +592,30 @@ pub fn soft_winddown_instruction(generation: u32) -> String {
          may follow shortly, and anything uncommitted at that point is at risk. \
          No file needs to be written for this instruction. Never quote, restate, or echo the \
          marker string anywhere else in any reply — emit it exactly once, only as the actual \
+         signal.{scheduling}",
+        scheduling = local_scheduling_clause(),
+        ack = soft_winddown_ack_value(generation, episode),
+    )
+}
+
+/// The wind-down all-clear instruction (issue #120): the allowance
+/// recovered — the governing window reset or usage fell back below the soft
+/// threshold — so a session that received a soft wind-down and was never
+/// parked may resume full-throughput work. Ack-only, like the wind-down: no
+/// state transition, no file, no written marker. Single line by
+/// construction (see module doc).
+pub fn winddown_allclear_instruction(generation: u32, episode: u32) -> String {
+    format!(
+        "[Maestro Samurai] Allowance all-clear: the token allowance has recovered, so the \
+         earlier wind-down no longer applies. Do the following: \
+         (1) Acknowledge IMMEDIATELY, before anything else, by replying with a message that \
+         contains exactly <samurai-ack>{ack}</samurai-ack>. \
+         (2) Resume normal operation: you may spawn subagents again and work at your normal \
+         pace and parallelism. \
+         No file needs to be written for this instruction. Never quote, restate, or echo the \
+         marker string anywhere else in any reply — emit it exactly once, only as the actual \
          signal.",
-        ack = soft_winddown_ack_value(generation),
+        ack = winddown_allclear_ack_value(generation, episode),
     )
 }
 
@@ -564,7 +638,9 @@ pub fn park_instruction(epic: &str, generation: u32) -> String {
          (3) Ensure `.maestro/` is listed in this repo's .gitignore; add it if missing. \
          (4) Commit ALL WIP to this run's branch: stage named paths only (never `git add .` or \
          `git add -A`), one Conventional Commit message (`type(scope): summary`). \
-         (5) Write or update the handoff file at {relpath} following the PRD section 6 \
+         (5) Write or update the handoff file at {relpath} — EXACTLY this repo-relative path \
+         inside this worktree, creating directories as needed; NEVER invent another filename \
+         or location (never a HANDOFF-*.md at the repo root) — following the PRD section 6 \
          template EXACTLY, with these headings in this order: Goal / Done / In progress / \
          Decisions + why / Failed attempts / Repo state / Verify / Next steps. It doubles as \
          the park state your successor resumes from, so keep every section to pointers \
@@ -575,7 +651,8 @@ pub fn park_instruction(epic: &str, generation: u32) -> String {
          <samurai-handoff-written>{written}</samurai-handoff-written>. \
          Never quote, restate, or echo these marker strings anywhere else in any reply — \
          emit each one exactly once, only as the actual signal at its required moment; a \
-         quoted marker is read as the real signal.",
+         quoted marker is read as the real signal.{scheduling}",
+        scheduling = local_scheduling_clause(),
         ack = park_ack_value(generation),
         relpath = handoff_file_relpath(epic, generation),
         written = park_written_value(generation),
@@ -597,7 +674,9 @@ pub fn park_corrective_instruction(epic: &str, generation: u32, failure: &str) -
          <samurai-ack>{ack}</samurai-ack> — note the value differs from the first \
          instruction's; use exactly this one. \
          (2) Fix the failure above: write/update the handoff file and/or commit ALL WIP to \
-         this run's branch (stage named paths only, Conventional Commit message). \
+         this run's branch (stage named paths only, Conventional Commit message). If you \
+         wrote the handoff under any other filename or directory (e.g. a HANDOFF-*.md at \
+         the repo root), MOVE it to exactly {relpath}. \
          (3) Then reply with a message that contains exactly \
          <samurai-handoff-written>{written}</samurai-handoff-written>. \
          Never quote, restate, or echo these marker strings anywhere else in any reply — \
@@ -700,11 +779,19 @@ fn is_issue_list(epic_text: &str) -> bool {
 /// `epic` is the run's IDENTITY string — [`RunRefs::label`] from issue #83
 /// onward, so it already spells what the run is (`epic #5`, `issues #7, #9`)
 /// and is never prefixed with the word "epic" here.
+///
+/// `has_refs` (issue #128 fix L2) is `false` for a pure-prose run — one
+/// launched via [`LaunchInput`] with no `#N` refs, whose `epic` identity is
+/// a [`prose_label`], not a GitHub ref. Such a run has no issue/epic number
+/// to enumerate a PR title with, so [`pr_discipline_reminder`] is skipped
+/// entirely rather than emitting "issue/epic number" framing for a run that
+/// references no issue.
 pub fn successor_ritual_instruction(
     epic: &str,
     predecessor_generation: u32,
     head_matched: bool,
     compiled_workflow: &str,
+    has_refs: bool,
 ) -> String {
     let epic_text = epic.split_whitespace().collect::<Vec<_>>().join(" ");
     let generation = predecessor_generation + 1;
@@ -721,13 +808,18 @@ pub fn successor_ritual_instruction(
     let order = order_contract_reminder();
     let workflow = workflow_section(compiled_workflow);
     let clause = completion_declaration_clause();
-    let pr_reminder = pr_discipline_reminder(is_list);
+    let scheduling = local_scheduling_clause();
+    let pr_reminder = if has_refs {
+        format!(" {}", pr_discipline_reminder(is_list))
+    } else {
+        String::new()
+    };
     if head_matched {
         format!(
             "{opening} Maestro verified that this repository's current HEAD equals the SHA \
              recorded in the handoff's \"Repo state\" section, so the verify step is already \
              satisfied: SKIP the commands in the handoff's Verify section and continue directly \
-             with its Next steps.{order}{workflow}{clause} {pr_reminder}"
+             with its Next steps.{order}{workflow}{clause}{scheduling}{pr_reminder}"
         )
     } else {
         format!(
@@ -735,7 +827,8 @@ pub fn successor_ritual_instruction(
              SHA recorded in the handoff's \"Repo state\" section. You MUST run every command in \
              the handoff's Verify section FIRST, and trust NOTHING the handoff claims that those \
              commands do not confirm — investigate and fix any failure before moving on. Only \
-             then continue with the handoff's Next steps.{order}{workflow}{clause} {pr_reminder}"
+             then continue with the handoff's Next steps.{order}{workflow}{clause}{scheduling}\
+             {pr_reminder}"
         )
     }
 }
@@ -893,8 +986,191 @@ pub fn launch_instruction(refs: &RunRefs, repo_pin: Option<&str>, compiled_workf
          `git add -A`; Conventional Commit messages `type(scope): summary`). \
          (5) {gh_progress}. \
          (6) NEVER switch to, commit to, or push any other branch, and NEVER touch any \
-         repository other than this one.{caution}{order}{workflow}{clause}",
+         repository other than this one.{caution}{order}{workflow}{clause}{scheduling}",
         subject = refs.prose(),
+        scheduling = local_scheduling_clause(),
+    )
+}
+
+/// One free-text launch request (issue #128): the launcher's single "what do
+/// you want to work on today" input, replacing the structured epics + issues
+/// fields.
+///
+/// The text is whitespace-collapsed to one line at parse time (module doc:
+/// every instruction must stay one paste-able line), so two spellings of the
+/// same request — extra padding, a stray newline — are ONE request. Every
+/// `#N` token found in the text becomes a ref (held as standalone issues —
+/// the #87 no-epic-framing contract; whether a ref is an epic is gen-1's
+/// discovery, briefed epic-first either way). Bare numbers are NOT refs: in
+/// prose ("fix 3 bugs") they are just words, and a false ref would hijack
+/// the run's identity.
+///
+/// **Identity:** [`Self::label`] is the run's identity string, the exact
+/// role [`RunRefs::label`] plays for ref launches — branch, worktree,
+/// handoff filenames, resume timers and the refusal matrix all key off it
+/// via [`epic_slug`]. Refs present → the refs label (`issues #7, #9`).
+/// Pure prose → a short slug of the text plus an FNV-1a hash
+/// (`fix-the-flaky-test-1a2b3c4d`): stable for the same text, distinct for
+/// different text, and bounded (≤ [`PROSE_SLUG_MAX`] + 9 chars) so Windows
+/// `MAX_PATH` never bites the worktree dir built from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchInput {
+    text: String,
+    refs: RunRefs,
+}
+
+impl LaunchInput {
+    /// Parses the launcher's free-text box (see type doc).
+    pub fn parse(raw: &str) -> Self {
+        let text = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        let refs = RunRefs::new(std::iter::empty::<&str>(), extract_hash_refs(&text));
+        Self { text, refs }
+    }
+
+    /// Nothing usable was typed — the launch command refuses this before any
+    /// side effect.
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// The request, whitespace-collapsed to one line.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The `#N` refs found in the text, as standalone issues (type doc).
+    pub fn refs(&self) -> &RunRefs {
+        &self.refs
+    }
+
+    /// The run's identity/display string (type doc).
+    pub fn label(&self) -> String {
+        if self.refs.is_empty() {
+            prose_label(&self.text)
+        } else {
+            self.refs.label()
+        }
+    }
+}
+
+/// Every `#N` token in `text`, in first-appearance order, deduplicated —
+/// `#7` twice in one request is one ref, or the label (the run's identity)
+/// would differ from the same request typed once.
+fn extract_hash_refs(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut refs: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'#' {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > start {
+                let number = &text[start..end];
+                if !refs.iter().any(|r| r == number) {
+                    refs.push(number.to_string());
+                }
+            }
+            i = end.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    refs
+}
+
+/// Longest slug prefix a prose label keeps before its hash — chosen so the
+/// whole label stays ≤ 33 chars and the worktree dir built from it never
+/// pushes a Windows path over `MAX_PATH`.
+const PROSE_SLUG_MAX: usize = 24;
+
+/// `fix-the-flaky-test-1a2b3c4d`: a readable head from the text plus an
+/// 8-hex FNV-1a hash of the WHOLE (collapsed) text, so two prose requests
+/// sharing their first words still get distinct run identities. Slug chars
+/// are ASCII by construction ([`ref_slug`]), so the byte truncation is safe.
+fn prose_label(text: &str) -> String {
+    let slug = ref_slug(text, "run");
+    let head = slug[..slug.len().min(PROSE_SLUG_MAX)].trim_end_matches('-');
+    format!("{head}-{:08x}", fnv1a_64(text) as u32)
+}
+
+/// FNV-1a over the raw text (the `samurai_schedule::jitter_secs` constants).
+fn fnv1a_64(input: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// The gen-1 opening brief for a FREE-TEXT launch (issue #128) — what
+/// [`launch_instruction`] is to the structured refs, this is to the single
+/// text box. Two shapes:
+///
+/// - **Refs found in the text:** the full [`launch_instruction`] for those
+///   refs (issues shape — #87: no epic framing), followed by the user's
+///   request VERBATIM (the text is the work order, and any constraint it
+///   states must survive the trip) and an explicit EPIC-FIRST rider: a
+///   referenced issue that is an epic brings every child issue into the run
+///   — the same epic-first context gathering the old Epics field bought.
+/// - **Pure prose:** no GitHub context gathering at all — the request text
+///   IS the scope. The brief keeps the same working discipline (plan, small
+///   idempotent subagent commits, one run PR, never another branch), the
+///   `--repo` pin or its caution, the workflow section and the completion
+///   clause.
+///
+/// Single line by construction (see module doc); the text is
+/// whitespace-collapsed by [`LaunchInput::parse`].
+pub fn launch_text_instruction(
+    input: &LaunchInput,
+    repo_pin: Option<&str>,
+    compiled_workflow: &str,
+) -> String {
+    let text = input.text();
+    if !input.refs().is_empty() {
+        let base = launch_instruction(input.refs(), repo_pin, compiled_workflow);
+        return format!(
+            "{base} The user's launch request, VERBATIM: \"{text}\" — it is the work order \
+             behind the issue references above; honour any constraint it states. EPIC-FIRST: \
+             any referenced issue that is itself an epic brings EVERY child issue it references \
+             into this run — read each child and ALL of its comments before planning."
+        );
+    }
+    let (gh_note, caution) = match repo_pin {
+        Some(pin) => (
+            format!(" For any `gh` command you run, pass `--repo {pin}` explicitly."),
+            String::new(),
+        ),
+        None => (
+            String::new(),
+            " CAUTION: Maestro could not determine this repository's origin remote, so no \
+             `--repo` pin is available — before running any `gh` command, double-check it \
+             targets the correct repository."
+                .to_string(),
+        ),
+    };
+    let workflow = workflow_section(compiled_workflow);
+    let clause = completion_declaration_clause();
+    let scheduling = local_scheduling_clause();
+    format!(
+        "[Maestro Samurai] You are generation 1, the FIRST orchestrator, for this run. This \
+         directory is this run's dedicated worktree on its own branch. The user's request, \
+         VERBATIM: \"{text}\". The request references no GitHub issue, so the request text is \
+         your FULL scope — do not go hunting for issues to work. Do the following: \
+         (1) Plan the work the request describes before touching code. \
+         (2) Work it via SMALL idempotent subagent tasks, each committing its completed step \
+         to THIS branch (stage named paths only, never `git add .` or `git add -A`; \
+         Conventional Commit messages `type(scope): summary`). \
+         (3) Open the run's pull request for finished work and keep it updated — every PR \
+         body must contain `Closes #N` (or `Fixes #N`) for each issue it resolves, and the \
+         title must summarise this run's scope from the moment it is created.{gh_note} \
+         (4) NEVER switch to, commit to, or push any other branch, and NEVER touch any \
+         repository other than this one.{caution}{workflow}{clause}{scheduling}"
     )
 }
 
@@ -930,19 +1206,47 @@ pub fn recovery_digest_relpath(epic: &str, successor_generation: u32) -> String 
 ///
 /// `compiled_workflow` (issue #91) is the run's numbered workflow — see
 /// [`successor_ritual_instruction`].
+///
+/// `has_refs` (issue #128 fix L2) is `false` for a pure-prose run — one
+/// launched via [`LaunchInput`] with no `#N` refs, whose `epic` identity is
+/// a [`prose_label`], not a GitHub ref. Such a run has no GitHub issue to
+/// read or comment on and no issue/epic number for a PR title, so those
+/// steps are dropped entirely rather than sending the recovering successor
+/// hunting for an issue that does not exist — reconstruction falls back to
+/// git history and the pre-digested transcript summary alone.
 pub fn recovery_ritual_instruction(
     epic: &str,
     predecessor_generation: u32,
     repo_pin: Option<&str>,
     compiled_workflow: &str,
+    has_refs: bool,
 ) -> String {
     let epic_text = epic.split_whitespace().collect::<Vec<_>>().join(" ");
+    let generation = predecessor_generation + 1;
+    let digest_relpath = recovery_digest_relpath(epic, generation);
+    if !has_refs {
+        let order = order_contract_reminder();
+        let workflow = workflow_section(compiled_workflow);
+        let clause = completion_declaration_clause();
+        let scheduling = local_scheduling_clause();
+        return format!(
+            "[Maestro Samurai] RECOVERY MODE: you are generation {generation} for {epic_text}. \
+             Generation {predecessor_generation} died without a valid handoff file, so there is \
+             nothing to hand off to you. This run references no GitHub issue — do not go \
+             hunting for one. Reconstruct the state of the work from two sources: \
+             (1) run `git log --oneline -20` in this repository; \
+             (2) read the pre-digested transcript summary Maestro extracted to {digest_relpath} \
+             — treat it as hints, NOT as truth. \
+             Then run the project's standard verification (build + tests) BEFORE trusting or \
+             continuing anything — investigate and fix any failure first. Once verification \
+             passes, continue this run's remaining \
+             work.{order}{workflow}{clause}{scheduling}"
+        );
+    }
     // Issue #87: a comma-separated issue list must not get epic framing in
     // the PR-discipline reminder (the run wording itself is neutral —
     // "this run's GitHub issue(s)" — from issue #83 onward).
     let is_list = is_issue_list(&epic_text);
-    let generation = predecessor_generation + 1;
-    let digest_relpath = recovery_digest_relpath(epic, generation);
     let (gh_read, gh_comment, caution) = match repo_pin {
         Some(pin) => (
             format!(
@@ -966,6 +1270,7 @@ pub fn recovery_ritual_instruction(
     let order = order_contract_reminder();
     let workflow = workflow_section(compiled_workflow);
     let clause = completion_declaration_clause();
+    let scheduling = local_scheduling_clause();
     let pr_reminder = pr_discipline_reminder(is_list);
     format!(
         "[Maestro Samurai] RECOVERY MODE: you are generation {generation} for {epic_text}. \
@@ -978,7 +1283,8 @@ pub fn recovery_ritual_instruction(
          Then run the project's standard verification (build + tests) BEFORE trusting or \
          continuing anything — investigate and fix any failure first. Once verification passes, \
          {gh_comment} that generation {generation} has taken over in \
-         recovery mode, then continue this run's remaining work.{caution}{order}{workflow}{clause} \
+         recovery mode, then continue this run's remaining \
+         work.{caution}{order}{workflow}{clause}{scheduling} \
          {pr_reminder}"
     )
 }
@@ -1089,6 +1395,23 @@ mod tests {
     }
 
     #[test]
+    fn test_handoff_file_dash_relpath_shape_and_parses_back() {
+        // Fix L1: the dash spelling a deviating orchestrator actually
+        // writes — distinct from the canonical path, but still parses.
+        assert_eq!(
+            handoff_file_dash_relpath("#37", 2),
+            ".maestro/handoffs/37-gen-2.md"
+        );
+        assert_ne!(
+            handoff_file_dash_relpath("#37", 2),
+            handoff_file_relpath("#37", 2)
+        );
+        let filename = handoff_file_dash_relpath("#37", 2);
+        let filename = filename.rsplit('/').next().unwrap();
+        assert_eq!(parse_handoff_generation(filename), Some(2));
+    }
+
+    #[test]
     fn test_parse_handoff_generation_roundtrips_the_relpath() {
         // The parser must accept exactly what handoff_file_relpath produces.
         for (epic, generation) in [("#37", 1), ("#37", 42), ("Epic 12: Auth", 10), ("", 3)] {
@@ -1119,6 +1442,123 @@ mod tests {
             parse_handoff_generation("37-gen99999999999999999999.md"),
             None
         );
+    }
+
+    // --- issue #120: wind-down all-clear ---
+
+    #[test]
+    fn test_winddown_allclear_is_ack_only_with_kind_scoped_marker() {
+        // Kind-scoped: no other instruction's ACK (nor a replay of the
+        // wind-down's own) may satisfy the all-clear.
+        assert_eq!(winddown_allclear_ack_value(4, 1), "allclear gen-4-1");
+        assert_ne!(
+            winddown_allclear_ack_value(4, 1),
+            soft_winddown_ack_value(4, 1)
+        );
+        assert_ne!(winddown_allclear_ack_value(4, 1), handoff_ack_value(4));
+        assert_ne!(winddown_allclear_ack_value(4, 1), park_ack_value(4));
+        // Fix M7: episode-scoped too — the SAME generation's second episode
+        // gets a distinct value from the first.
+        assert_ne!(
+            winddown_allclear_ack_value(4, 1),
+            winddown_allclear_ack_value(4, 2)
+        );
+
+        let text = winddown_allclear_instruction(4, 1);
+        assert!(!text.contains('\n'), "all-clear must be single-line");
+        assert!(text.contains("<samurai-ack>allclear gen-4-1</samurai-ack>"));
+        // Ack-only: it lifts the wind-down (subagents allowed again) and
+        // demands no file and no written marker.
+        assert!(text.contains("spawn subagents again"));
+        assert!(text.contains("No file needs to be written"));
+        assert!(!text.contains("<samurai-handoff-written>"));
+        assert!(text.contains("Never quote, restate, or echo"));
+    }
+
+    // --- issue #121: local-only scheduling prohibition (drift guard) ---
+
+    #[test]
+    fn test_every_orchestrator_brief_forbids_cloud_scheduling() {
+        // All rescheduling is LOCAL — Maestro's own timers. A cloud-scheduled
+        // agent/routine (e.g. Claude Code's /schedule) escapes supervision,
+        // audit, and allowance accounting entirely, so every brief that could
+        // tempt an agent to "come back later" carries the prohibition.
+        let texts = [
+            launch_instruction(&RunRefs::epics_only("#37"), Some("o/r"), &wf()),
+            successor_ritual_instruction("#37", 2, true, &wf(), true),
+            successor_ritual_instruction("#37", 2, false, &wf(), true),
+            recovery_ritual_instruction("#37", 2, Some("o/r"), &wf(), true),
+            park_instruction("#37", 2),
+            soft_winddown_instruction(2, 1),
+            launch_text_instruction(&LaunchInput::parse("do things"), Some("o/r"), &wf()),
+        ];
+        for text in texts {
+            assert!(
+                text.contains("NEVER create cloud-scheduled agents"),
+                "missing cloud-scheduling prohibition: {text}"
+            );
+            assert!(
+                text.contains("/schedule"),
+                "prohibition must name the /schedule escape hatch: {text}"
+            );
+            assert!(
+                text.contains("waiting and rescheduling is MAESTRO'S job"),
+                "prohibition must say waiting is Maestro's job: {text}"
+            );
+            assert!(!text.contains('\n'), "brief must stay single-line");
+        }
+    }
+
+    // --- issue #119: exactly ONE canonical handoff path ---
+
+    #[test]
+    fn test_file_writing_instructions_forbid_inventing_another_handoff_path() {
+        // A live gen-1 wrote `HANDOFF-…-gen-1.md` at the worktree ROOT —
+        // invisible to the Second Brain files panel and unparseable on
+        // resume. Both file-writing instructions must pin the canonical
+        // path and forbid any other name or location outright.
+        for text in [handoff_instruction("#37", 2), park_instruction("#37", 2)] {
+            assert!(text.contains(".maestro/handoffs/37-gen2.md"));
+            assert!(
+                text.contains("EXACTLY this repo-relative path"),
+                "missing exact-path pin: {text}"
+            );
+            assert!(
+                text.contains("never a HANDOFF-*.md at the repo root"),
+                "missing root-convention prohibition: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_correctives_direct_a_move_to_the_exact_expected_path() {
+        // The validator is the enforcement point (#119): when the file is
+        // missing, the corrective must CORRECT a deviating agent — name the
+        // exact expected path and tell it to move a misplaced handoff there
+        // — not just restate the checks.
+        for text in [
+            handoff_corrective_instruction("#37", 4, "the handoff file is missing"),
+            park_corrective_instruction("#37", 4, "the handoff file is missing"),
+        ] {
+            assert!(text.contains(".maestro/handoffs/37-gen4.md"));
+            assert!(
+                text.contains("MOVE it to exactly .maestro/handoffs/37-gen4.md"),
+                "missing move-to-canonical-path correction: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_handoff_generation_tolerates_a_gen_dash_variant() {
+        // #119 tolerant discovery: the observed deviation spelled the
+        // generation `-gen-1`, not `-gen1`.
+        assert_eq!(parse_handoff_generation("37-gen-1.md"), Some(1));
+        assert_eq!(parse_handoff_generation("37-gen-42.md"), Some(42));
+        // Garbled variants still parse as nothing.
+        assert_eq!(parse_handoff_generation("37-gen-.md"), None);
+        assert_eq!(parse_handoff_generation("37-gen-2x.md"), None);
+        // Recovery digests stay excluded in the dash spelling too.
+        assert_eq!(parse_handoff_generation("37-gen-3-recovery.md"), None);
     }
 
     #[test]
@@ -1192,9 +1632,12 @@ mod tests {
         assert_ne!(park_written_retry_value(3), park_written_value(3));
         // And the park retry values never collide with the handoff ones.
         assert_ne!(park_written_retry_value(3), handoff_written_retry_value(3));
-        assert_eq!(soft_winddown_ack_value(4), "winddown gen-4");
-        assert_ne!(soft_winddown_ack_value(4), handoff_ack_value(4));
-        assert_ne!(soft_winddown_ack_value(4), park_ack_value(4));
+        assert_eq!(soft_winddown_ack_value(4, 1), "winddown gen-4-1");
+        assert_ne!(soft_winddown_ack_value(4, 1), handoff_ack_value(4));
+        assert_ne!(soft_winddown_ack_value(4, 1), park_ack_value(4));
+        // Fix M7: episode-scoped — the same generation's second episode
+        // gets a distinct value from the first.
+        assert_ne!(soft_winddown_ack_value(4, 1), soft_winddown_ack_value(4, 2));
     }
 
     #[test]
@@ -1247,10 +1690,10 @@ mod tests {
 
     #[test]
     fn test_soft_winddown_instruction_shape() {
-        let text = soft_winddown_instruction(3);
+        let text = soft_winddown_instruction(3, 1);
         assert!(!text.contains('\n'));
         assert!(!text.contains('\r'));
-        assert!(text.contains("<samurai-ack>winddown gen-3</samurai-ack>"));
+        assert!(text.contains("<samurai-ack>winddown gen-3-1</samurai-ack>"));
         // Wind down: no new subagents, wrap up, park may follow.
         assert!(text.contains("NO new subagents"));
         assert!(text.contains("CURRENT step only"));
@@ -1333,19 +1776,19 @@ mod tests {
     #[test]
     fn test_ritual_instruction_is_single_line_both_branches() {
         for head_matched in [true, false] {
-            let text = successor_ritual_instruction("#37", 2, head_matched, &wf());
+            let text = successor_ritual_instruction("#37", 2, head_matched, &wf(), true);
             assert!(!text.contains('\n'), "ritual must not contain \\n");
             assert!(!text.contains('\r'), "ritual must not contain \\r");
         }
         // A pathological epic ref cannot smuggle a newline into the paste.
-        let text = successor_ritual_instruction("epic\nwith newline", 2, true, &wf());
+        let text = successor_ritual_instruction("epic\nwith newline", 2, true, &wf(), true);
         assert!(!text.contains('\n'));
         assert!(text.contains("epic with newline"));
     }
 
     #[test]
     fn test_ritual_instruction_head_match_branch_skips_verify() {
-        let text = successor_ritual_instruction("#37", 2, true, &wf());
+        let text = successor_ritual_instruction("#37", 2, true, &wf(), true);
         // Identity: generation, the run's own ref, predecessor. Issue #83:
         // the ref is NOT prefixed with "epic" here — the identity string
         // (RunRefs::label) already says what the run is.
@@ -1366,7 +1809,7 @@ mod tests {
 
     #[test]
     fn test_ritual_instruction_mismatch_branch_requires_verify() {
-        let text = successor_ritual_instruction("#37", 2, false, &wf());
+        let text = successor_ritual_instruction("#37", 2, false, &wf(), true);
         assert!(text.contains("generation 3"));
         assert!(text.contains("successor to generation 2"));
         assert!(text.contains(".maestro/handoffs/37-gen2.md"));
@@ -1396,19 +1839,19 @@ mod tests {
     #[test]
     fn test_recovery_instruction_is_single_line() {
         for pin in [None, Some("owner/repo")] {
-            let text = recovery_ritual_instruction("#37", 2, pin, &wf());
+            let text = recovery_ritual_instruction("#37", 2, pin, &wf(), true);
             assert!(!text.contains('\n'), "recovery must not contain \\n");
             assert!(!text.contains('\r'), "recovery must not contain \\r");
         }
         // A pathological epic ref cannot smuggle a newline into the paste.
-        let text = recovery_ritual_instruction("epic\nwith newline", 2, None, &wf());
+        let text = recovery_ritual_instruction("epic\nwith newline", 2, None, &wf(), true);
         assert!(!text.contains('\n'));
         assert!(text.contains("epic with newline"));
     }
 
     #[test]
     fn test_recovery_instruction_content() {
-        let text = recovery_ritual_instruction("#37", 2, None, &wf());
+        let text = recovery_ritual_instruction("#37", 2, None, &wf(), true);
         // Identity: what happened and who the successor is.
         assert!(text.contains("RECOVERY MODE"));
         assert!(text.contains("generation 3"));
@@ -1434,7 +1877,7 @@ mod tests {
     fn test_recovery_instruction_pins_the_repo_when_known() {
         // Fresh-eyes finding D (PRD §10): with the origin remote parsed, BOTH
         // the issue read and the takeover comment carry --repo explicitly.
-        let text = recovery_ritual_instruction("#37", 2, Some("nachogl1/maestro"), &wf());
+        let text = recovery_ritual_instruction("#37", 2, Some("nachogl1/maestro"), &wf(), true);
         assert_eq!(
             text.matches("--repo nachogl1/maestro").count(),
             2,
@@ -1451,7 +1894,7 @@ mod tests {
 
     #[test]
     fn test_recovery_instruction_without_pin_carries_a_caution() {
-        let text = recovery_ritual_instruction("#37", 2, None, &wf());
+        let text = recovery_ritual_instruction("#37", 2, None, &wf(), true);
         // No pinned `gh` usage (the caution itself mentions the missing pin).
         assert!(!text.contains("passing `--repo"));
         assert!(!text.contains("again via `gh`"));
@@ -1722,14 +2165,15 @@ mod tests {
         // From step 1b onward these receive RunRefs::label() — an
         // issues-only run must never be described as an epic anywhere.
         let label = RunRefs::new(NO_REFS, ["7", "9"]).label();
-        let successor = successor_ritual_instruction(&label, 2, true, &wf());
+        let successor = successor_ritual_instruction(&label, 2, true, &wf(), true);
         assert!(successor.contains("generation 3 for issues #7, #9"));
-        let recovery = recovery_ritual_instruction(&label, 2, Some("nachogl1/maestro"), &wf());
+        let recovery =
+            recovery_ritual_instruction(&label, 2, Some("nachogl1/maestro"), &wf(), true);
         assert!(recovery.contains("generation 3 for issues #7, #9"));
         for text in [
             successor,
             recovery,
-            recovery_ritual_instruction(&label, 2, None, &wf()),
+            recovery_ritual_instruction(&label, 2, None, &wf(), true),
             handoff_instruction(&label, 2),
             handoff_corrective_instruction(&label, 2, "handoff file missing"),
             park_instruction(&label, 2),
@@ -1743,9 +2187,9 @@ mod tests {
         // And an epic-only run still reads exactly as it did: the label
         // itself supplies the word.
         let label = RunRefs::epics_only("#5").label();
-        assert!(successor_ritual_instruction(&label, 2, true, &wf())
+        assert!(successor_ritual_instruction(&label, 2, true, &wf(), true)
             .contains("generation 3 for epic #5"));
-        assert!(recovery_ritual_instruction(&label, 2, None, &wf())
+        assert!(recovery_ritual_instruction(&label, 2, None, &wf(), true)
             .contains("you are generation 3 for epic #5."));
     }
 
@@ -1799,7 +2243,7 @@ mod tests {
     fn test_successor_ritual_instruction_list_shape_has_no_epic_framing() {
         // Pre-#83 configs store the raw comma list as the run's identity;
         // the brief must carry it verbatim, with zero epic framing.
-        let text = successor_ritual_instruction("77, 78", 2, true, &wf());
+        let text = successor_ritual_instruction("77, 78", 2, true, &wf(), true);
         assert!(text.contains("generation 3 for 77, 78"));
         assert!(!text.to_lowercase().contains("epic"));
         assert!(text.contains("generation 3"));
@@ -1808,7 +2252,7 @@ mod tests {
 
     #[test]
     fn test_recovery_ritual_instruction_list_shape_has_no_epic_framing() {
-        let text = recovery_ritual_instruction("77, 78", 2, Some("nachogl1/maestro"), &wf());
+        let text = recovery_ritual_instruction("77, 78", 2, Some("nachogl1/maestro"), &wf(), true);
         assert!(text.contains("generation 3 for 77, 78"));
         assert!(text.contains("read this run's GitHub issue(s) and ALL of their comments"));
         assert!(text.contains("comment on this run's GitHub issue(s)"));
@@ -1877,7 +2321,7 @@ mod tests {
     #[test]
     fn test_successor_ritual_instruction_instructs_pr_issue_linking() {
         for head_matched in [true, false] {
-            let text = successor_ritual_instruction("#37", 2, head_matched, &wf());
+            let text = successor_ritual_instruction("#37", 2, head_matched, &wf(), true);
             assert!(text.contains("Closes #N"), "{text}");
             assert!(text.contains("Fixes #N"), "{text}");
             assert!(text.contains("GitHub auto-closes them on merge"), "{text}");
@@ -1887,7 +2331,7 @@ mod tests {
     #[test]
     fn test_recovery_ritual_instruction_instructs_pr_issue_linking() {
         // Audited per issue #95: recovery briefs can open PRs too.
-        let text = recovery_ritual_instruction("#37", 2, None, &wf());
+        let text = recovery_ritual_instruction("#37", 2, None, &wf(), true);
         assert!(text.contains("Closes #N"));
         assert!(text.contains("Fixes #N"));
         assert!(text.contains("GitHub auto-closes them on merge"));
@@ -1913,7 +2357,7 @@ mod tests {
 
     #[test]
     fn test_successor_ritual_instruction_instructs_pr_title_enumerates_refs() {
-        let text = successor_ritual_instruction("#37", 2, true, &wf());
+        let text = successor_ritual_instruction("#37", 2, true, &wf(), true);
         assert!(
             text.contains(
                 "its title must list every issue/epic number this run covers, from the moment \
@@ -1937,10 +2381,10 @@ mod tests {
         let briefs = [
             launch_instruction(&RunRefs::epics_only("#38"), Some("nachogl1/maestro"), &wf()),
             launch_instruction(&RunRefs::new(NO_REFS, ["77", "78"]), None, &wf()),
-            successor_ritual_instruction("#37", 2, true, &wf()),
-            successor_ritual_instruction("#37", 2, false, &wf()),
-            recovery_ritual_instruction("#37", 2, Some("nachogl1/maestro"), &wf()),
-            recovery_ritual_instruction("#37", 2, None, &wf()),
+            successor_ritual_instruction("#37", 2, true, &wf(), true),
+            successor_ritual_instruction("#37", 2, false, &wf(), true),
+            recovery_ritual_instruction("#37", 2, Some("nachogl1/maestro"), &wf(), true),
+            recovery_ritual_instruction("#37", 2, None, &wf(), true),
         ];
         for text in &briefs {
             // The exact tag the samurai_completion scanner watches for, in
@@ -2026,11 +2470,11 @@ mod tests {
         // order fixed at launch — they must not re-plan it, and a new
         // deviation goes through the same alert + confirmation.
         let briefs = [
-            successor_ritual_instruction("#37", 2, true, &wf()),
-            successor_ritual_instruction("#37", 2, false, &wf()),
-            successor_ritual_instruction("77, 78", 2, true, &wf()),
-            recovery_ritual_instruction("#37", 2, Some("nachogl1/maestro"), &wf()),
-            recovery_ritual_instruction("77, 78", 2, None, &wf()),
+            successor_ritual_instruction("#37", 2, true, &wf(), true),
+            successor_ritual_instruction("#37", 2, false, &wf(), true),
+            successor_ritual_instruction("77, 78", 2, true, &wf(), true),
+            recovery_ritual_instruction("#37", 2, Some("nachogl1/maestro"), &wf(), true),
+            recovery_ritual_instruction("77, 78", 2, None, &wf(), true),
         ];
         for text in &briefs {
             assert!(text.contains("fixed at launch"), "{text}");
@@ -2056,10 +2500,10 @@ mod tests {
         let briefs = [
             launch_instruction(&RunRefs::epics_only("#38"), Some("nachogl1/maestro"), &wf()),
             launch_instruction(&RunRefs::new(NO_REFS, ["76", "77", "78"]), None, &wf()),
-            successor_ritual_instruction("#37", 2, true, &wf()),
-            successor_ritual_instruction("#37", 2, false, &wf()),
-            recovery_ritual_instruction("#37", 2, Some("nachogl1/maestro"), &wf()),
-            recovery_ritual_instruction("#37", 2, None, &wf()),
+            successor_ritual_instruction("#37", 2, true, &wf(), true),
+            successor_ritual_instruction("#37", 2, false, &wf(), true),
+            recovery_ritual_instruction("#37", 2, Some("nachogl1/maestro"), &wf(), true),
+            recovery_ritual_instruction("#37", 2, None, &wf(), true),
         ];
         for text in &briefs {
             assert!(
@@ -2115,8 +2559,8 @@ mod tests {
         let custom = "Step 1: custom implement Step 2: custom ship";
         for text in [
             launch_instruction(&RunRefs::epics_only("#38"), None, custom),
-            successor_ritual_instruction("#37", 2, true, custom),
-            recovery_ritual_instruction("#37", 2, None, custom),
+            successor_ritual_instruction("#37", 2, true, custom, true),
+            recovery_ritual_instruction("#37", 2, None, custom, true),
         ] {
             assert!(text.contains("Step 1: custom implement"), "{text}");
             assert!(text.contains("Step 2: custom ship"), "{text}");
@@ -2130,8 +2574,8 @@ mod tests {
         // pathological compiled string cannot smuggle a newline in.
         for text in [
             launch_instruction(&RunRefs::epics_only("#38"), None, ""),
-            successor_ritual_instruction("#37", 2, false, "  "),
-            recovery_ritual_instruction("#37", 2, None, ""),
+            successor_ritual_instruction("#37", 2, false, "  ", true),
+            recovery_ritual_instruction("#37", 2, None, "", true),
         ] {
             assert!(!text.contains("WORKFLOW"), "{text}");
             assert!(!text.contains("END OF"), "{text}");
@@ -2147,9 +2591,9 @@ mod tests {
         // brief must stay free of epic framing even WITH the workflow.
         let text = launch_instruction(&RunRefs::new(NO_REFS, ["76", "77", "78"]), None, &wf());
         assert!(!text.to_lowercase().contains("epic"), "{text}");
-        let text = successor_ritual_instruction("77, 78", 2, true, &wf());
+        let text = successor_ritual_instruction("77, 78", 2, true, &wf(), true);
         assert!(!text.to_lowercase().contains("epic"), "{text}");
-        let text = recovery_ritual_instruction("77, 78", 2, None, &wf());
+        let text = recovery_ritual_instruction("77, 78", 2, None, &wf(), true);
         assert!(!text.to_lowercase().contains("epic"), "{text}");
     }
 
@@ -2198,5 +2642,174 @@ mod tests {
         assert!(text.contains("Malformed lines are skipped"));
         assert!(text.contains("NEVER rewrite or delete existing lines"));
         assert!(text.contains("append-only"));
+    }
+
+    // --- issue #128: free-text launch input ---
+
+    #[test]
+    fn test_launch_input_extracts_hash_refs_as_issues() {
+        let input = LaunchInput::parse("Please work on #77 and #78 (see #77 for context).");
+        assert_eq!(
+            input.refs().issues(),
+            ["77", "78"],
+            "deduplicated, in order"
+        );
+        assert!(input.refs().epics().is_empty());
+        assert_eq!(input.label(), "issues #77, #78");
+        // Bare numbers in prose are NOT refs — they are just words.
+        let input = LaunchInput::parse("fix 3 bugs in module 7");
+        assert!(input.refs().is_empty());
+        // A lone `#` with no digits carries nothing.
+        assert!(LaunchInput::parse("look at # and #x").refs().is_empty());
+    }
+
+    #[test]
+    fn test_launch_input_collapses_whitespace_into_one_identity() {
+        // Two spellings of one request must be ONE run identity — label()
+        // keys the branch, worktree, handoffs and refusal matrix.
+        let a = LaunchInput::parse("  fix the   flaky\ntest ");
+        let b = LaunchInput::parse("fix the flaky test");
+        assert_eq!(a.text(), "fix the flaky test");
+        assert_eq!(a.label(), b.label());
+        assert!(!a.text().contains('\n'), "text must stay one line");
+    }
+
+    #[test]
+    fn test_launch_input_prose_label_is_short_slug_plus_stable_hash() {
+        let input = LaunchInput::parse("Fix the flaky UtilityPanel empty-state test under load");
+        let label = input.label();
+        // slug head + 8-hex hash, bounded for Windows MAX_PATH.
+        assert!(label.len() <= PROSE_SLUG_MAX + 9, "label too long: {label}");
+        assert!(
+            label.starts_with("fix-the-flaky"),
+            "readable head expected: {label}"
+        );
+        let tail = label.rsplit('-').next().unwrap();
+        assert_eq!(tail.len(), 8, "8-hex hash tail: {label}");
+        assert!(tail.bytes().all(|b| b.is_ascii_hexdigit()));
+        // Stable for the same text; distinct for different text (even when
+        // the readable head matches).
+        assert_eq!(label, LaunchInput::parse(input.text()).label());
+        let other = LaunchInput::parse("Fix the flaky UtilityPanel empty-state test differently");
+        assert_ne!(label, other.label());
+        // The slug already passes epic_slug unchanged — no double mangling.
+        assert_eq!(epic_slug(&label), label);
+    }
+
+    #[test]
+    fn test_launch_input_empty_and_symbol_only() {
+        assert!(LaunchInput::parse("").is_empty());
+        assert!(LaunchInput::parse("   \n\t ").is_empty());
+        assert!(!LaunchInput::parse("#77").is_empty());
+        assert!(!LaunchInput::parse("do things").is_empty());
+    }
+
+    #[test]
+    fn test_launch_text_instruction_with_refs_rides_the_ref_brief_verbatim() {
+        let input = LaunchInput::parse("Ship #7 and #9, tests first please");
+        let text = launch_text_instruction(&input, Some("nachogl1/maestro"), &wf());
+        // The full issues-shape launch instruction rides first, unmodified.
+        let base = launch_instruction(input.refs(), Some("nachogl1/maestro"), &wf());
+        assert!(text.starts_with(&base), "ref brief must ride first");
+        // The user's request reaches the orchestrator VERBATIM…
+        assert!(
+            text.contains("VERBATIM: \"Ship #7 and #9, tests first please\""),
+            "{text}"
+        );
+        // …and the refs keep epic-first context gathering: a referenced epic
+        // brings its children into the run.
+        assert!(text.contains("EPIC-FIRST"), "{text}");
+        assert!(text.contains("EVERY child issue it references"), "{text}");
+        assert!(!text.contains('\n'), "single paste-able line");
+    }
+
+    #[test]
+    fn test_launch_text_instruction_prose_skips_context_gathering() {
+        let input = LaunchInput::parse("Refactor the audit panel styling");
+        let text = launch_text_instruction(&input, Some("nachogl1/maestro"), &wf());
+        assert!(
+            text.contains("VERBATIM: \"Refactor the audit panel styling\""),
+            "{text}"
+        );
+        // No GitHub context gathering for pure prose — the text IS the scope.
+        assert!(text.contains("references no GitHub issue"), "{text}");
+        assert!(text.contains("FULL scope"), "{text}");
+        assert!(!text.contains("ALL of their comments"), "{text}");
+        // The working discipline, pin, workflow and completion clause stay.
+        assert!(text.contains("--repo nachogl1/maestro"), "{text}");
+        assert!(text.contains("SMALL idempotent subagent tasks"), "{text}");
+        assert!(
+            text.contains("NEVER switch to, commit to, or push"),
+            "{text}"
+        );
+        assert!(
+            text.contains("WORKFLOW — the process for this run"),
+            "{text}"
+        );
+        assert!(text.contains(RUN_COMPLETE_TAG), "{text}");
+        // M1: pure-prose launches must forbid cloud scheduling too, same as
+        // every other orchestrator brief.
+        assert!(
+            text.contains("NEVER create cloud-scheduled agents"),
+            "{text}"
+        );
+        assert!(!text.contains('\n'), "single paste-able line");
+
+        // Unpinned: the explicit caution replaces the pin note.
+        let unpinned = launch_text_instruction(&input, None, &wf());
+        assert!(
+            unpinned.contains("CAUTION: Maestro could not determine"),
+            "{unpinned}"
+        );
+        assert!(!unpinned.contains("--repo "), "{unpinned}");
+    }
+
+    // --- issue #128 fix L2: prose runs must not hunt nonexistent issues ---
+
+    #[test]
+    fn test_recovery_ritual_instruction_prose_skips_github_entirely() {
+        // A pure-prose run's `epic` identity is a prose_label, not a GitHub
+        // ref — recovery must not send the agent hunting for an issue that
+        // was never referenced.
+        let text = recovery_ritual_instruction(
+            "refactor-audit-panel-1a2b3c4d",
+            2,
+            Some("o/r"),
+            &wf(),
+            false,
+        );
+        assert!(text.contains("RECOVERY MODE"), "{text}");
+        assert!(text.contains("references no GitHub issue"), "{text}");
+        assert!(!text.contains("GitHub issue(s)"), "{text}");
+        assert!(!text.contains("`gh` CLI"), "{text}");
+        assert!(!text.contains("--repo "), "{text}");
+        assert!(!text.contains("issue/epic number"), "{text}");
+        // The reconstruction sources shrink to git log + digest only.
+        assert!(text.contains("`git log --oneline -20`"), "{text}");
+        assert!(text.contains("pre-digested transcript summary"), "{text}");
+        assert!(
+            text.contains("continue this run's remaining work"),
+            "{text}"
+        );
+        assert!(!text.contains('\n'), "single paste-able line");
+    }
+
+    #[test]
+    fn test_successor_ritual_instruction_prose_skips_pr_ref_reminder() {
+        // A prose run has no issue/epic number for pr_discipline_reminder to
+        // enumerate, so the reminder is dropped entirely rather than telling
+        // the agent to list a ref number that does not exist.
+        for head_matched in [true, false] {
+            let text = successor_ritual_instruction(
+                "refactor-audit-panel-1a2b3c4d",
+                2,
+                head_matched,
+                &wf(),
+                false,
+            );
+            assert!(!text.contains("issue/epic number"), "{text}");
+            assert!(!text.contains("GitHub auto-closes them on merge"), "{text}");
+            assert!(!text.contains('\n'), "single paste-able line");
+        }
     }
 }
