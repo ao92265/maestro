@@ -35,6 +35,7 @@ use crate::core::samurai_schedule::{
 use crate::core::samurai_test_gate::{self, SamuraiTestGate, TestGateProgress};
 use crate::core::samurai_workflow::{self, WorkflowGraph};
 use crate::core::supervisor::{SessionSnapshot, Supervisor, SupervisorState};
+use crate::core::windows_process::StdCommandExt;
 use crate::core::worktree_manager::{project_name, WorktreeManager};
 use crate::git::{Git, GitError};
 use crate::github::{AuthStatus, GitHub};
@@ -736,6 +737,10 @@ fn verify_worktree_git(worktree: &Path) -> Result<(String, String), String> {
         let output = std::process::Command::new("git")
             .args(args)
             .current_dir(worktree)
+            // Fix R4 (issue #131 review 2): every other backend `git` call
+            // hides the console window; without it each recovery click
+            // flashes console windows over the app on Windows.
+            .hide_console_window()
             .output()
             .map_err(|e| format!("git did not run in {}: {e}", worktree.display()))?;
         if !output.status.success() {
@@ -1009,6 +1014,7 @@ pub(crate) fn schedule_launch_inner(
     model: Option<String>,
     handoff_context_pct: Option<f64>,
     skip_test_gate: bool,
+    workflow: Option<WorkflowGraph>,
 ) -> Result<ScheduleEntry, String> {
     let input = LaunchInput::parse(text);
     if input.is_empty() {
@@ -1034,6 +1040,10 @@ pub(crate) fn schedule_launch_inner(
             handoff_context_pct,
             skip_test_gate,
             attempts: 0,
+            // Fix C4: the graph the user edited rides the timer, so the
+            // fire snapshots it into the run config exactly as an
+            // immediate launch would.
+            workflow,
         }),
         held: false,
     };
@@ -1061,6 +1071,7 @@ pub fn samurai_schedule_launch(
     model: Option<String>,
     handoff_context_pct: Option<f64>,
     skip_test_gate: Option<bool>,
+    workflow: Option<WorkflowGraph>,
 ) -> Result<ScheduleEntry, String> {
     let project = canonical_project_path(&project_path);
     schedule_launch_inner(
@@ -1072,6 +1083,7 @@ pub fn samurai_schedule_launch(
         model,
         handoff_context_pct,
         skip_test_gate.unwrap_or(false),
+        workflow,
     )
 }
 
@@ -1138,7 +1150,9 @@ pub(crate) async fn scheduled_launch_fire_inner(
                     &input,
                     spec.model.clone(),
                     spec.handoff_context_pct,
-                    None,
+                    // Fix C4: the graph captured when the launch was
+                    // SCHEDULED, not a fresh default template.
+                    spec.workflow.clone(),
                     worktree_base,
                 )
                 .await
@@ -3285,6 +3299,92 @@ mod tests {
         assert_eq!(resume.details["branch"], launched.branch);
     }
 
+    /// Fix T2 (issue #131 review 2): "recovery re-verifies real state via
+    /// git, not disk" was asserted as `result.branch == launched.branch` —
+    /// exactly what a stored record would produce, so reverting
+    /// `verify_worktree_git` to read the run config would still have passed.
+    /// The worktree is MUTATED here, so only git can answer correctly.
+    #[tokio::test]
+    async fn test_recover_reports_the_worktrees_real_git_state_not_the_launch_record() {
+        let h = cleanup_harness();
+        let (gate, _calls) = recording_gate(vec![]);
+        let launched = run_launch(&h, &gate, true, "#38").await.unwrap();
+        let snapshot = h
+            .supervisor
+            .register_session(1, h.project.clone(), launched.epic.clone(), 1)
+            .unwrap();
+        h.replicator.on_registered(&snapshot);
+        h.supervisor.transition(1, SupervisorState::Dead).unwrap();
+        write_handoff(&launched.worktree_path, "issue #38", 1);
+
+        // The crashed agent had moved on: a new commit, on a branch that is
+        // NOT the one the launch recorded.
+        let worktree = PathBuf::from(&launched.worktree_path);
+        let git = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&worktree)
+                .hide_console_window()
+                .output()
+                .expect("git must be runnable in tests");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["checkout", "-q", "-b", "drifted-since-launch"]);
+        std::fs::write(worktree.join("drift.txt"), "moved on\n").unwrap();
+        git(&["add", "drift.txt"]);
+        git(&["commit", "-q", "-m", "chore: drift"]);
+        let real_head = git(&["rev-parse", "--short", "HEAD"]);
+
+        let result = recover(&h, "issue #38").await.unwrap();
+
+        assert_eq!(result.branch, "drifted-since-launch");
+        assert_ne!(
+            result.branch, launched.branch,
+            "the launch record must not be the source of truth"
+        );
+        assert_eq!(result.head, real_head);
+        // The audit row carries the same git-verified branch.
+        let read = h.audit.read(&h.project, None, None).await.unwrap();
+        let resume = read
+            .events
+            .iter()
+            .find(|e| e.event == AuditEventKind::Resume)
+            .expect("a RESUME row lands before the spawn");
+        assert_eq!(resume.details["branch"], "drifted-since-launch");
+    }
+
+    /// Fix T2: a worktree git cannot answer for is a REFUSAL, not a spawn.
+    #[tokio::test]
+    async fn test_recover_refuses_a_worktree_git_cannot_answer_for() {
+        let h = cleanup_harness();
+        let (gate, _calls) = recording_gate(vec![]);
+        let launched = run_launch(&h, &gate, true, "#38").await.unwrap();
+        h.supervisor
+            .register_session(1, h.project.clone(), launched.epic.clone(), 1)
+            .unwrap();
+        h.supervisor.transition(1, SupervisorState::Dead).unwrap();
+
+        // The config points at a directory that exists but is no repository
+        // (the worktree was replaced by a plain folder, or its .git is gone).
+        let not_a_repo = tempdir().unwrap();
+        let mut config = h.run_configs.get(&h.project, "issue #38").unwrap();
+        config.worktree_path = not_a_repo.path().to_string_lossy().into_owned();
+        h.run_configs.save(&config).unwrap();
+
+        let err = recover(&h, "issue #38").await.unwrap_err();
+        assert!(err.contains("git"), "{err}");
+        assert_eq!(
+            h.spawns.lock().unwrap().len(),
+            1,
+            "only the original launch spawn — recovery refused"
+        );
+    }
+
     #[tokio::test]
     async fn test_recover_reports_from_handoff_for_a_dash_variant_handoff() {
         // Fix L1: a run whose true resume point's handoff exists only as the
@@ -3356,6 +3456,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap()
     }
@@ -3398,6 +3499,7 @@ mod tests {
             Some("opus".to_string()),
             Some(30.0),
             false,
+            None,
         )
         .unwrap();
 
@@ -3425,6 +3527,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap();
         let entries = h.schedule.list();
@@ -3441,6 +3544,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("scheduled request is empty"), "{err}");
@@ -3453,6 +3557,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("in the past"), "{err}");
@@ -3465,6 +3570,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("unusable schedule time"), "{err}");
@@ -3493,6 +3599,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("ACTIVE run already exists"), "{err}");
@@ -3528,6 +3635,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("pending park-resume timer"), "{err}");
@@ -3580,12 +3688,58 @@ mod tests {
         assert!(h.schedule.list().is_empty());
     }
 
+    /// Fix C4 (issue #131 review 2): the workflow graph the user EDITED must
+    /// ride the timer and reach the run config, exactly as it does on the
+    /// immediate-launch path. Without it the fire snapshotted
+    /// `WorkflowGraph::default()` and the edit was silently discarded — from
+    /// gen-1's brief through every successor brief.
+    #[tokio::test]
+    async fn test_scheduled_fire_launches_with_the_workflow_captured_at_arm_time() {
+        let h = cleanup_harness();
+        let (gate, _calls) = recording_gate(vec![]);
+        let mut custom = WorkflowGraph::default();
+        custom
+            .nodes
+            .iter_mut()
+            .find(|n| n.id == "review")
+            .unwrap()
+            .text = "Scheduled custom review ritual".to_string();
+        let fire_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let entry = schedule_launch_inner(
+            &h.schedule,
+            &h.run_configs,
+            &h.project,
+            "work #38",
+            &fire_at,
+            None,
+            None,
+            true,
+            Some(custom.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            entry.launch.as_ref().unwrap().workflow,
+            Some(custom.clone())
+        );
+
+        let outcome = fire_scheduled(&h, &gate, &preflight(true, true), entry).await;
+
+        assert_eq!(outcome, ScheduledLaunchOutcome::Launched);
+        let config = h.run_configs.get(&h.project, "issue #38").unwrap();
+        assert_eq!(config.workflow, Some(custom), "the edited graph, verbatim");
+    }
+
     #[tokio::test]
     async fn test_scheduled_fire_retries_with_backoff_on_unattended_refusal() {
         let h = cleanup_harness();
         let (gate, _calls) = recording_gate(vec![]);
         let entry = arm_scheduled_launch(&h, "work #38");
 
+        // Fix T7 (issue #131 review 2): the backoff is measured against a
+        // clock read taken HERE, immediately before the fire — not against a
+        // live `Utc::now()` at assertion time with ~100s of slack, which
+        // flakes on a loaded runner.
+        let armed_at = chrono::Utc::now();
         // gh auth failed at fire time and nobody is at the keyboard.
         let outcome = fire_scheduled(&h, &gate, &preflight(false, true), entry).await;
 
@@ -3600,11 +3754,17 @@ mod tests {
         assert!(!re.held);
         assert_eq!(re.launch.as_ref().unwrap().attempts, 1);
         assert_eq!(re.launch.as_ref().unwrap().text, "work #38");
-        let fire_at = chrono::DateTime::parse_from_rfc3339(&re.fire_at).unwrap();
-        let secs_out = (fire_at.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds();
+        let fire_at = chrono::DateTime::parse_from_rfc3339(&re.fire_at)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // The re-arm is `now + SCHEDULED_LAUNCH_RETRY_SECS` taken during the
+        // fire, so it lands in [armed_at + RETRY, done_at + RETRY]: an exact
+        // bound that no runner load can widen.
+        let done_at = chrono::Utc::now();
+        let retry = chrono::Duration::seconds(SCHEDULED_LAUNCH_RETRY_SECS);
         assert!(
-            (800..=SCHEDULED_LAUNCH_RETRY_SECS).contains(&secs_out),
-            "retry ~15 min out, got {secs_out}s"
+            fire_at >= armed_at + retry && fire_at <= done_at + retry,
+            "retry must be exactly {SCHEDULED_LAUNCH_RETRY_SECS}s past the fire, got {fire_at}"
         );
     }
 

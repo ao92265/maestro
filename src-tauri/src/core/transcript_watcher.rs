@@ -360,6 +360,35 @@ impl TranscriptWatcher {
         self.start_watching(session_id, transcript_path);
     }
 
+    /// The samurai blindness self-heal's entry point (issue #118), hardened
+    /// by fix C3 (issue #131 review 2): force-reattach `session_id` to the
+    /// transcript it is REGISTERED against, and refuse — `false`, which the
+    /// injector turns into the `context_blind` ALERT — when it is registered
+    /// against none.
+    ///
+    /// It used to re-bind to "the newest `*.jsonl` in the session's Claude
+    /// project directory", which matches no session identity at all. Every
+    /// generation of a run shares one worktree, so that directory holds
+    /// gen-1…gen-N transcripts: a session blind because its watch never
+    /// attached got the PREDECESSOR generation's file restarted from byte 0,
+    /// replaying gen-N-1's context readings into gen-N's handoff trigger and
+    /// its markers into the injector's ack scanner. A human ALERT is the
+    /// correct outcome for a session whose transcript was never registered.
+    pub fn rewatch_registered(&self, session_id: u32) -> bool {
+        match self.transcript_path(session_id) {
+            Some(path) => {
+                self.restart_watching(session_id, path);
+                true
+            }
+            None => {
+                log::warn!(
+                    "TranscriptWatcher: session {session_id} has no registered transcript — refusing to guess one (its session-start hook never landed)"
+                );
+                false
+            }
+        }
+    }
+
     /// Stop watching a session's transcript file and clean up resources.
     pub fn stop_watching(&self, session_id: u32) {
         if let Some((_, state)) = self.watchers.remove(&session_id) {
@@ -1375,23 +1404,31 @@ mod tests {
         // The per-worktree project directory Claude has not created yet.
         let project_dir = root.path().join("C--worktree-project");
         let main_path = project_dir.join("t.jsonl");
+        assert!(!project_dir.exists(), "the directory must be missing first");
         watcher.start_watching(1, main_path.clone());
         assert_eq!(
             watcher.watched_sessions(),
             vec![1],
             "the session must be registered even though its directory does not exist yet"
         );
+        // Fix T12 (issue #131 review 2): this is the #125 fix itself, and it
+        // is deterministic — the watch CREATES the missing directory rather
+        // than failing permanently. Asserting it removes the fixed 300ms
+        // sleep the test used to race against (the #116 flake class); only
+        // OS notify delivery below is genuinely asynchronous, and that is
+        // polled to a deadline, never slept on.
+        assert!(
+            project_dir.is_dir(),
+            "starting the watch must create the missing project directory"
+        );
 
-        // Claude creates the directory and writes the orchestrator's
-        // transcript moments later.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        std::fs::create_dir_all(&project_dir).unwrap();
+        // Claude writes the orchestrator's transcript moments later.
         let spawn = r#"{"type":"assistant","message":{"model":"claude-fable-5","content":[{"type":"tool_use","id":"toolu_S","name":"Agent","input":{"description":"samurai subagent","subagent_type":"general-purpose","prompt":"do the thing"}}]},"uuid":"m1","timestamp":"2026-08-15T20:27:30Z"}"#;
         std::fs::write(&main_path, format!("{spawn}\n")).unwrap();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
             {
                 let events = captured.lock().unwrap();
                 if events.iter().any(|e| matches!(
@@ -1410,6 +1447,37 @@ mod tests {
         }
 
         watcher.stop_watching(1);
+    }
+
+    /// Fix C3 (issue #131 review 2): the blindness self-heal reattaches ONLY
+    /// the session's own registered transcript. A run's generations share one
+    /// worktree — and therefore one Claude project directory holding
+    /// gen-1…gen-N — so "newest file in the directory" would hand a blind
+    /// gen-N its PREDECESSOR's transcript and replay it from byte 0.
+    #[tokio::test]
+    async fn test_rewatch_only_reattaches_the_sessions_own_transcript() {
+        let (event_bus, _captured) = test_event_bus();
+        let watcher = TranscriptWatcher::new(event_bus);
+        let dir = tempfile::tempdir().unwrap();
+
+        // The shared project dir: the predecessor's transcript is the NEWEST
+        // file in it, written after this session's own.
+        let mine = dir.path().join("gen-2.jsonl");
+        std::fs::write(&mine, "").unwrap();
+        let predecessor = dir.path().join("gen-1-newer.jsonl");
+        std::fs::write(&predecessor, "").unwrap();
+
+        // A session with no registered transcript (its session-start hook
+        // never landed) refuses to heal — the injector ALERTs instead.
+        assert!(!watcher.rewatch_registered(7), "nothing registered");
+        assert!(watcher.watched_sessions().is_empty());
+
+        // A registered session reattaches to ITS OWN file, never the newer
+        // sibling.
+        watcher.start_watching(7, mine.clone());
+        assert!(watcher.rewatch_registered(7));
+        assert_eq!(watcher.transcript_path(7), Some(mine));
+        watcher.stop_watching(7);
     }
 
     #[test]

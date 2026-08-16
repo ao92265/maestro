@@ -727,28 +727,15 @@ pub fn run() {
             app.manage(injector.clone());
             let _ = samurai_injector.set(injector.clone());
             // Issue #118: the blindness self-heal. A session whose transcript
-            // stream is dead (watch never attached — e.g. a lost SessionStart
-            // hook or a refused OS watcher — or silently died) is re-resolved
-            // to the newest transcript in its Claude project directory (the
-            // same fallback the recovery digest uses) and force-restarted,
-            // instead of staying blind for the rest of the run.
+            // stream silently died is force-restarted on the transcript it is
+            // REGISTERED against, instead of staying blind for the rest of
+            // the run. Fix C3 (issue #131 review 2): only that registered
+            // path — a session with none gets the `context_blind` ALERT, not
+            // a guess at "the newest file in the project directory", which
+            // for a multi-generation run is the PREDECESSOR's transcript.
             let rewatch_watcher = app.state::<Arc<TranscriptWatcher>>().inner().clone();
-            let rewatch_handle = app.handle().clone();
             injector.set_rewatcher(Arc::new(move |session_id| {
-                let Some(dir) = rewatch_handle
-                    .state::<SessionManager>()
-                    .get_session(session_id)
-                    .map(|s| s.working_directory.unwrap_or(s.project_path))
-                else {
-                    return false;
-                };
-                match commands::claude_sessions::newest_transcript_for_project(&dir) {
-                    Some(path) => {
-                        rewatch_watcher.restart_watching(session_id, path);
-                        true
-                    }
-                    None => false,
-                }
+                rewatch_watcher.rewatch_registered(session_id)
             }));
             core::samurai_injector::spawn_injector(injector.clone());
 
@@ -931,6 +918,25 @@ pub fn run() {
             // schedule.json, stranding the epic (the reconciler snapshot
             // lists it as timer-owned, so nothing respawns it either).
             let reconcile_timers = samurai_schedule.list();
+            // Fix S3 (issue #131 review 2): a corrupt/truncated
+            // schedule.json used to discard every pending timer behind a
+            // log line. Surviving entries are now salvaged per-entry and
+            // whatever was lost gets a durable, account-wide ALERT — a
+            // dropped scheduled launch has no cold-start reconciliation
+            // backstop, so nothing else would ever surface it.
+            if let Some(details) = samurai_schedule.load_alert() {
+                log::error!("samurai schedule: entries were dropped at load — {details}");
+                audit_log.append(
+                    core::allowance_watcher::ACCOUNT_PROJECT,
+                    core::samurai_audit::AuditEvent::now(
+                        "",
+                        core::samurai_audit::AuditEventKind::Alert,
+                        0,
+                        0,
+                        details,
+                    ),
+                );
+            }
             app.manage(samurai_schedule.clone());
 
             // Samurai (issue #60): the allowance parker — the backend
