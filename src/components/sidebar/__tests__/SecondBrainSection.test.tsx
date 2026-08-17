@@ -47,6 +47,7 @@ import {
   type SamuraiAuditEvent,
   type SamuraiFileEntry,
   type SamuraiFileGroup,
+  type SamuraiFileKind,
 } from "@/lib/samurai";
 import { useHealthStore } from "@/stores/useHealthStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
@@ -272,10 +273,13 @@ describe("SecondBrainSection (issue #66)", () => {
     expect(screen.getAllByText("IN USE")).toHaveLength(2);
   });
 
-  it("renders the backend's card order — live pinned first, then newest first", async () => {
-    // `samurai_files.rs` already sorts (!is_live, created_at desc); the panel
-    // must render that order as given rather than re-sorting it. The live
-    // group is deliberately the OLDEST, so a timestamp-only order would fail.
+  it("renders group order as given, never re-sorting", async () => {
+    // Review finding C12: this pins the PANEL only — it renders the array the
+    // backend hands it, untouched. The mock's order is the mock's, so the
+    // "live pinned first, then newest first" ordering itself (#140 AC3) is
+    // pinned by the `samurai_files.rs` sort test, not here. What would fail
+    // here is a panel that re-sorted: the live group is deliberately both the
+    // OLDEST and the first, so any timestamp or liveness sort reorders it.
     const live = fileGroup({
       id: "run:a:1",
       label: "Epic #1 — live",
@@ -391,6 +395,9 @@ describe("SecondBrainSection (issue #66)", () => {
       kind: "PR_REVIEW",
       label: "PR #142 — fix journal splitting",
       created_at: new Date(Date.now() - 3 * 3600_000).toISOString(),
+      // Review finding C5: a PR review's group id IS the key its audit rows
+      // are stamped with, and the filter must use exactly that spelling.
+      audit_key: "pr:nachogl1/maestro#142",
       audit_rows: 6,
     });
     const auditPath = "C:\\appdata\\samurai\\audit\\maestro.jsonl";
@@ -445,6 +452,209 @@ describe("SecondBrainSection (issue #66)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Clear audit filter" }));
     expect(screen.getByText(/Session spawned/)).toBeInTheDocument();
     expect(screen.getByText("Run completed")).toBeInTheDocument();
+  });
+
+  it("offers the audit action only for groups whose project is the active tab's", async () => {
+    // Review finding C1: AuditSection reads the ACTIVE tab's audit log and
+    // nothing else, while the Files panel lists groups from every project — so
+    // a foreign card's audit action always landed on "No audit rows for X"
+    // under a header claiming N of them.
+    const auditPath = "C:\\appdata\\samurai\\audit\\maestro.jsonl";
+    const mine = fileGroup({ audit_rows: 12 });
+    const other = fileGroup({
+      id: "run:other:40",
+      label: "Epic #40 — another project",
+      project_path: "C:\\git\\other",
+      audit_key: "40",
+      audit_rows: 5,
+    });
+    // Both shapes batch B added: the account-wide scope lives on a pseudo-path
+    // with its own audit file, and a cleaned project's reconstructed run has
+    // no project path at all.
+    const account = fileGroup({
+      id: "run:account:account",
+      label: "Account-wide",
+      project_path: "samurai-account",
+      audit_key: "account",
+      audit_rows: 3,
+    });
+    const cleaned = fileGroup({
+      id: "run:gone:41",
+      label: "Epic #41 — cleaned project",
+      project_path: null,
+      audit_key: "41",
+      audit_rows: 2,
+    });
+    const groups = [mine, other, account, cleaned];
+    mockInvoke(
+      groups.map((g) =>
+        fileEntry({ group_id: g.id, kind: "AUDIT_LOG", path: auditPath, epic: null }),
+      ),
+      {},
+      undefined,
+      {},
+      groups,
+    );
+    render(<SecondBrainSection />);
+
+    expect(
+      await screen.findByRole("button", { name: `Show audit rows for ${mine.label}` }),
+    ).toBeInTheDocument();
+    for (const group of [other, account, cleaned]) {
+      expect(
+        screen.queryByRole("button", { name: `Show audit rows for ${group.label}` }),
+      ).toBeNull();
+    }
+    // Every card still renders — only the action that would lie is gone.
+    expect(screen.getAllByTestId("file-group")).toHaveLength(4);
+  });
+
+  it("never offers plain delete on the shared audit and journal slices", async () => {
+    // Review finding C2: those rows are per-group SLICES of ONE physical file
+    // every card shares, so an ordinary "delete this file" would silently wipe
+    // every other group's rows. Clearing the audit log stays its own action on
+    // the audit card, which says what it destroys.
+    mockInvoke([
+      fileEntry(),
+      fileEntry({
+        kind: "AUDIT_LOG",
+        path: "C:\\appdata\\samurai\\audit\\maestro.jsonl",
+        epic: null,
+      }),
+      fileEntry({ kind: "JOURNAL", path: "C:\\appdata\\samurai\\journal.jsonl", epic: null }),
+    ]);
+    render(<SecondBrainSection />);
+    expect(await screen.findByText("38-gen2.md")).toBeInTheDocument();
+
+    expect(screen.getByRole("button", { name: "Delete 38-gen2.md" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Delete maestro.jsonl" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Delete journal.jsonl" })).toBeNull();
+  });
+
+  it("sizes a card on its own files, not on the shared logs it only slices", async () => {
+    // Review finding C3: AUDIT_LOG/JOURNAL/TIMER rows carry the WHOLE shared
+    // file's size — megabytes belonging to no single run, re-counted on every
+    // card. Finding C6: a card with no sized file of its own reads 0 KB.
+    const own = fileGroup();
+    const sliceOnly = fileGroup({
+      id: "run:b:40",
+      label: "Epic #40 — slices only",
+      audit_key: "40",
+    });
+    mockInvoke(
+      [
+        fileEntry(), // HANDOFF, 4 KB — the only file this run really owns
+        fileEntry({
+          kind: "AUDIT_LOG",
+          path: "C:\\appdata\\samurai\\audit\\maestro.jsonl",
+          size_bytes: 3 * 1024 * 1024,
+          epic: null,
+        }),
+        fileEntry({
+          group_id: sliceOnly.id,
+          kind: "JOURNAL",
+          path: "C:\\appdata\\samurai\\journal.jsonl",
+          size_bytes: 8 * 1024 * 1024,
+          epic: null,
+        }),
+      ],
+      {},
+      undefined,
+      {},
+      [own, sliceOnly],
+    );
+    render(<SecondBrainSection />);
+
+    const cards = await screen.findAllByTestId("file-group");
+    expect(within(cards[0]).getByText("2 files · 4 KB")).toBeInTheDocument();
+    expect(within(cards[1]).getByText("1 file · 0 KB")).toBeInTheDocument();
+  });
+
+  it("badges the distinct files, not one row per group slice", async () => {
+    // Review finding C7: the badge counted `entries`, which since #139 holds
+    // one AUDIT_LOG row PER GROUP for the very same file.
+    const auditPath = "C:\\appdata\\samurai\\audit\\maestro.jsonl";
+    const first = fileGroup();
+    const second = fileGroup({ id: "run:b:40", label: "Epic #40", audit_key: "40" });
+    mockInvoke(
+      [
+        fileEntry(),
+        fileEntry({ kind: "AUDIT_LOG", path: auditPath, epic: null }),
+        fileEntry({ group_id: second.id, kind: "AUDIT_LOG", path: auditPath, epic: null }),
+      ],
+      {},
+      undefined,
+      {},
+      [first, second],
+    );
+    render(<SecondBrainSection />);
+    expect(await screen.findByText("38-gen2.md")).toBeInTheDocument();
+
+    // Three rows, two files on disk.
+    const filesHeader = screen.getByText("Files").parentElement as HTMLElement;
+    expect(within(filesHeader).getByText("2")).toBeInTheDocument();
+  });
+
+  it("tags a kind it does not know readably instead of leaving the row blank", async () => {
+    // Review finding C8: the tag is now the only "what is this" signal a row
+    // carries, and a kind added backend-side rendered it as empty space.
+    mockInvoke([
+      fileEntry({ kind: "AGENT_LOG" as SamuraiFileKind, path: "C:\\appdata\\samurai\\agent.log" }),
+      fileEntry({ kind: "PR_REVIEW_RUN", path: "C:\\appdata\\samurai\\pr-runs\\review.json" }),
+    ]);
+    render(<SecondBrainSection />);
+
+    expect(await screen.findByText("agent log")).toBeInTheDocument();
+    expect(screen.getByText("record")).toBeInTheDocument();
+  });
+
+  it("keeps a label-matched card collapsed while a search is active", async () => {
+    // Review finding C4: a search force-expanded EVERY surviving card, so
+    // clicking a header flipped `collapsed` and `aria-expanded` while the rows
+    // never moved. Only a FILE-NAME hit may override the user's collapse.
+    const review = fileGroup({
+      id: "pr:nachogl1/maestro#142",
+      kind: "PR_REVIEW",
+      label: "PR #142 — fix journal splitting",
+      audit_key: "pr:nachogl1/maestro#142",
+      created_at: new Date(Date.now() - 3 * 3600_000).toISOString(),
+    });
+    mockInvoke(
+      [
+        fileEntry(),
+        fileEntry({
+          group_id: review.id,
+          kind: "BRIEF",
+          path: "C:\\git\\maestro\\.maestro\\briefs\\pr-142-check-review.md",
+        }),
+      ],
+      {},
+      undefined,
+      {},
+      [fileGroup(), review],
+    );
+    render(<SecondBrainSection />);
+    expect(await screen.findByText("38-gen2.md")).toBeInTheDocument();
+
+    const header = () => screen.getByRole("button", { name: /Epic #38/ });
+    fireEvent.click(header());
+    expect(screen.queryByText("38-gen2.md")).toBeNull();
+
+    // A LABEL hit leaves the collapse alone — and the toggle still works.
+    const search = screen.getByLabelText("Search runs and files");
+    fireEvent.change(search, { target: { value: "Samurai supervision" } });
+    expect(screen.getAllByTestId("file-group")).toHaveLength(1);
+    expect(header()).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("38-gen2.md")).toBeNull();
+
+    fireEvent.click(header());
+    expect(header()).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("38-gen2.md")).toBeInTheDocument();
+
+    // A FILE-NAME hit still opens the card, so the match is never hidden.
+    fireEvent.click(header());
+    fireEvent.change(search, { target: { value: "38-gen2" } });
+    expect(screen.getByText("38-gen2.md")).toBeInTheDocument();
   });
 
   it("renders the empty state when nothing has run yet", async () => {
@@ -793,6 +1003,16 @@ describe("SecondBrainSection (issue #66)", () => {
     expect(screen.getByText("Files")).toBeInTheDocument();
   });
 
+  /*
+   * Review finding C13 — the two tests below and the HARVEST_REPORT row in
+   * "offers the open action on every row" are NOT live coverage: since issue
+   * #98 harvest opens an interactive session and writes its report to
+   * Downloads, so `samurai_files_list` emits no HARVEST_REPORT row at all
+   * (#142 tracks restoring the affordance for legacy files still on disk).
+   * They pin the RESTORE path: the day a HARVEST_REPORT row is listed again,
+   * it must still read through the dedicated harvest command and must still
+   * refuse to turn the report's raw HTML into live elements.
+   */
   it("opens a harvest report in the markdown overlay and closes it again", async () => {
     const reportPath = "C:\\appdata\\samurai\\harvest\\2026-08-06.md";
     mockInvoke([fileEntry({ kind: "HARVEST_REPORT", path: reportPath, epic: null })]);

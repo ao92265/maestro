@@ -425,6 +425,55 @@ function AuditRow({ event }: { event: SamuraiAuditEvent }) {
  */
 export const SAMURAI_ACCOUNT_RUN = "account";
 
+/* ── The backend's audit grouping key, mirrored (issue #136 review C5) ── */
+
+/** Longest readable head `bound_slug` keeps — `PROSE_SLUG_MAX` in Rust. */
+const SLUG_HEAD_MAX = 24;
+/** Longest slug left unhashed — `SLUG_MAX` (head + `-` + 8 hex) in Rust. */
+const SLUG_MAX = SLUG_HEAD_MAX + 9;
+
+/**
+ * FNV-1a (64-bit), truncated to its low 32 bits as 8 hex digits — byte-for-byte
+ * what `samurai_prompts::bound_slug` appends (`fnv1a_64(slug) as u32`, `{:08x}`).
+ * Slugs are ASCII by construction, so char codes are the bytes Rust hashes.
+ */
+function fnv1a32Hex(input: string): string {
+  const prime = 0x100000001b3n;
+  const mask = 0xffffffffffffffffn;
+  let hash = 0xcbf29ce484222325n;
+  for (let i = 0; i < input.length; i++) {
+    hash = ((hash ^ BigInt(input.charCodeAt(i))) * prime) & mask;
+  }
+  return (hash & 0xffffffffn).toString(16).padStart(8, "0");
+}
+
+/**
+ * The group key an audit row's `epic` resolves to — the TS mirror of
+ * `samurai_files::audit_key` (`core/samurai_files.rs`), which is what
+ * `SamuraiFileGroup.audit_key` and therefore `audit_rows` are counted on.
+ *
+ * Filtering had compared the RAW `epic` string instead, so the two spellings
+ * of one run (`#38` and `38`) never met: a card claimed "37 rows" and then
+ * showed none. A PR review's id is already the key; everything else is a run
+ * identity string put through the same slug every samurai surface uses —
+ * ASCII alphanumerics kept and lowercased, every other run of characters
+ * collapsed to one dash, and the result length-bounded with a hash tail so
+ * long identities stay inside Windows path limits.
+ */
+export function samuraiAuditKey(epic: string): string {
+  if (epic.startsWith("pr:")) return epic;
+  // ASCII-only classes on purpose: Rust keeps `is_ascii_alphanumeric` and
+  // treats every other character — accented letters included — as a separator,
+  // so case-folding must come AFTER the filter, never before it.
+  const slug =
+    epic
+      .replace(/[^A-Za-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .toLowerCase() || "epic";
+  if (slug.length <= SLUG_MAX) return slug;
+  return `${slug.slice(0, SLUG_HEAD_MAX).replace(/-+$/, "")}-${fnv1a32Hex(slug)}`;
+}
+
 /** One run's cluster of audit rows, newest-first (see {@link groupByRun}). */
 interface AuditRunGroup {
   /** The raw epic string; empty for pre-#139 account-wide rows. */
@@ -500,10 +549,13 @@ function mergeAuditRows(
 /**
  * A group's slice of the audit stream (issue #140): the Second Brain's per-run
  * / per-PR-review audit row focuses this view instead of opening a second one.
- * `runId` is what the rows' `epic` must equal — a run's epic identity string,
- * or the `pr:<owner/repo>#<number>` id a PR review's rows are stamped with.
+ * `runId` is the group's `audit_key` — the exact key the backend counted its
+ * `audit_rows` on: a run's epic SLUG (`38`, never `#38`), or the
+ * `pr:<owner/repo>#<number>` id a PR review's rows are stamped with. Rows are
+ * matched by putting their own `epic` through {@link samuraiAuditKey}.
  */
 export interface AuditRunFilter {
+  /** The group's `SamuraiFileGroup.audit_key`, never a raw epic string. */
   runId: string;
   /** The group's label, for the "showing … only" line. */
   label: string;
@@ -598,9 +650,12 @@ export function AuditSection({
 
   // Issue #140: the Second Brain's per-group audit row focuses this stream on
   // one run / PR review rather than opening a second audit surface. The rows
-  // carry that identity in their `epic`.
+  // carry that identity in their `epic`, in whatever spelling their writer
+  // used — so both sides go through the backend's own key (finding C5).
   const visible =
-    events === null || filter === null ? events : events.filter((e) => e.epic === filter.runId);
+    events === null || filter === null
+      ? events
+      : events.filter((e) => e.epic !== "" && samuraiAuditKey(e.epic) === filter.runId);
 
   return (
     <div className={cardClass}>

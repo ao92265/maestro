@@ -180,7 +180,9 @@ describe("PrActionsMenu", () => {
     await waitFor(() => expect(usePendingLaunchStore.getState().pending).toHaveLength(1));
     const launch = usePendingLaunchStore.getState().pending[0];
     expect(launch.briefDir).toBe(REPO_PATH);
-    expect(launch.briefStem).toBe("pr-123-check-review");
+    // Review finding C9: the stem carries a hash of the exact step selection,
+    // so a second review never overwrites a running one's brief.
+    expect(launch.briefStem).toMatch(/^pr-123-check-review-[0-9a-f]{8}$/);
   });
 
   it("records the review as a run so its artifacts have work to belong to", async () => {
@@ -202,6 +204,24 @@ describe("PrActionsMenu", () => {
       project_path: REPO_PATH,
       steps: ["check", "review"],
     });
+  });
+
+  it("records the review under the PR's own checkout, not the active tab's project", async () => {
+    // Review finding C10: in a multi-repo workspace the PR belongs to a
+    // repository inside the tab, so recording the tab's project filed the
+    // review under the wrong project. The brief still goes to the terminal's
+    // cwd — that is the directory the launch actually opens in.
+    const PR_CHECKOUT = "C:\\git\\maestro\\packages\\api";
+    render(<PrActionsMenu pr={buildPr()} repoPath={PR_CHECKOUT} />);
+    openMenu();
+
+    fireEvent.click(screen.getByRole("button", { name: /Launch 1 step/ }));
+
+    await waitFor(() => expect(usePendingLaunchStore.getState().pending).toHaveLength(1));
+    const launch = usePendingLaunchStore.getState().pending[0];
+    expect(launch.prRun?.project_path).toBe(PR_CHECKOUT);
+    expect(launch.briefDir).toBe(REPO_PATH);
+    expect(launch.workingDirOverride).toBe(REPO_PATH);
   });
 
   it("records an unparseable PR url as an empty repo slug rather than blocking", async () => {
@@ -236,8 +256,8 @@ describe("PrActionsMenu", () => {
     fireEvent.click(screen.getByRole("button", { name: /Launch 2 steps/ }));
 
     await waitFor(() => expect(usePendingLaunchStore.getState().pending).toHaveLength(1));
-    expect(usePendingLaunchStore.getState().pending[0].briefStem).toBe(
-      "pr-123-triage-verdict-post-notes",
+    expect(usePendingLaunchStore.getState().pending[0].briefStem).toMatch(
+      /^pr-123-triage-verdict-post-notes-[0-9a-f]{8}$/,
     );
   });
 

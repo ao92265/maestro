@@ -133,7 +133,12 @@ export function PrActionsMenu({ pr, repoPath }: PrActionsMenuProps) {
         pr: pr.number,
         title: pr.title,
         repo: githubRepoSlug(pr.url) ?? "",
-        project_path: projectPath,
+        // The PR's OWN checkout, not the tab's project (review finding C10):
+        // in a multi-repo workspace they differ, and the record must group
+        // under the repository the review is actually about. `briefDir` above
+        // stays on the tab's project — that is the terminal's working
+        // directory, where the pointer's relative path resolves.
+        project_path: repoPath,
         steps: selectedIds,
       },
     });

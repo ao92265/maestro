@@ -17,6 +17,7 @@ import { MarkdownBody } from "@/components/git/shared/MarkdownBody";
 import { HealthReasonLines } from "@/components/shared/HealthReasonLines";
 import type { HealthFlag } from "@/lib/healthRules";
 import { formatResumeAt, useCountdownNow } from "@/lib/parkTime";
+import { samePath } from "@/lib/path";
 import {
   isSamuraiInUseError,
   type SamuraiFileEntry,
@@ -31,6 +32,7 @@ import {
   samuraiTimerCancel,
 } from "@/lib/samurai";
 import { flagsByRow, useHealthStore } from "@/stores/useHealthStore";
+import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 import { type AuditRunFilter, AuditSection } from "./AuditSection";
 import { JournalSection } from "./JournalSection";
 import { cardClass, SectionHeader } from "./sectionChrome";
@@ -51,6 +53,29 @@ const KIND_TAGS: Record<SamuraiFileKind, string> = {
   HARVEST_REPORT: "harvest",
 };
 
+/**
+ * The row's kind tag. Falls back to the kind itself, readably spaced, for any
+ * kind added backend-side after this map (issue #136 review C8): the tag is
+ * the only "what is this" signal a row carries, so it must never be blank.
+ */
+function kindTag(kind: SamuraiFileKind): string {
+  const tag: string | undefined = KIND_TAGS[kind];
+  return tag ?? kind.toLowerCase().replace(/_/g, " ");
+}
+
+/**
+ * Kinds whose row is a per-group SLICE of one file every card shares — the
+ * project audit log, the ops journal, and the single pending-timer schedule.
+ * Their `size_bytes` is the WHOLE file's, and deleting one would destroy
+ * every other group's rows, so they are excluded from both the header's size
+ * and the row delete action (issue #136 review C2, C3).
+ */
+const SHARED_FILE_KINDS: ReadonlySet<SamuraiFileKind> = new Set<SamuraiFileKind>([
+  "AUDIT_LOG",
+  "JOURNAL",
+  "TIMER",
+]);
+
 /** Last path segment, for compact file/project display. */
 function baseName(path: string): string {
   const parts = path.split(/[\\/]/).filter(Boolean);
@@ -67,15 +92,29 @@ function rowLabel(entry: SamuraiFileEntry): string {
   return baseName(entry.path);
 }
 
-/** "3 KB" / "1.2 MB" — same rounding bar as the audit size line (min 1 KB). */
+/**
+ * "3 KB" / "1.2 MB" — same rounding bar as the audit size line (min 1 KB for
+ * anything non-empty). Nothing is exactly "0 KB", so that reading is reserved
+ * for genuinely zero bytes rather than rounded up to a byte that is not there
+ * (issue #136 review C6).
+ */
 function formatSize(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes <= 0) return "0 KB";
   return `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
 
-/** "1 file · 4 KB" / "6 files · 84 KB" — a card header's own reading. */
+/**
+ * "1 file · 4 KB" / "6 files · 84 KB" — a card header's own reading. The size
+ * counts only the files this group OWNS: a slice row reports the whole shared
+ * file's size, so summing those put the same megabytes on every card and told
+ * the user this run had produced them (issue #136 review C3).
+ */
 function groupSummary(entries: SamuraiFileEntry[]): string {
-  const bytes = entries.reduce((total, entry) => total + entry.size_bytes, 0);
+  const bytes = entries.reduce(
+    (total, entry) => (SHARED_FILE_KINDS.has(entry.kind) ? total : total + entry.size_bytes),
+    0,
+  );
   return `${entries.length} file${entries.length === 1 ? "" : "s"} · ${formatSize(bytes)}`;
 }
 
@@ -179,7 +218,7 @@ function FileRow({
         title={`${entry.path}${entry.project_path ? `\nproject: ${entry.project_path}` : ""}${entry.epic ? `\nepic: ${entry.epic}` : ""}`}
       >
         <span className="w-12 shrink-0 truncate text-[10px] font-medium text-maestro-muted/70">
-          {KIND_TAGS[entry.kind]}
+          {kindTag(entry.kind)}
         </span>
         {entry.in_use && (
           <span className="shrink-0 whitespace-nowrap rounded bg-amber-500/15 px-1 py-px text-[9px] font-bold tracking-wide text-amber-500">
@@ -384,7 +423,20 @@ export function SecondBrainSection() {
   // The group the audit stream above is focused on; null = every row.
   const [auditFilter, setAuditFilter] = useState<AuditRunFilter | null>(null);
 
+  // Which project's audit log the AuditSection above is reading — the gate on
+  // the per-group audit action (review finding C1).
+  const tabs = useWorkspaceStore((s) => s.tabs);
+  const activeProjectPath = tabs.find((t) => t.active)?.projectPath ?? "";
+
   const files = listing?.entries ?? null;
+
+  /**
+   * How many FILES the panel manages. Not `entries.length`: since issue #139
+   * the shared audit log and journal contribute one row PER GROUP, so a badge
+   * counting rows grew with the number of runs while the disk did not (review
+   * finding C7).
+   */
+  const distinctFileCount = new Set((files ?? []).map((entry) => entry.path)).size;
 
   // Ticking clock for the TIMER rows' countdowns — armed only while a pending
   // timer is actually listed.
@@ -522,10 +574,10 @@ export function SecondBrainSection() {
     return (listing?.groups ?? []).flatMap((group) => {
       const own = (listing?.entries ?? []).filter((entry) => entry.group_id === group.id);
       if (needle === "" || group.label.toLowerCase().includes(needle)) {
-        return [{ group, own, shown: own }];
+        return [{ group, own, shown: own, fileMatch: false }];
       }
       const shown = own.filter((entry) => rowLabel(entry).toLowerCase().includes(needle));
-      return shown.length > 0 ? [{ group, own, shown }] : [];
+      return shown.length > 0 ? [{ group, own, shown, fileMatch: true }] : [];
     });
   }, [listing, query]);
 
@@ -537,13 +589,28 @@ export function SecondBrainSection() {
     });
 
   /**
-   * Focus the audit stream on one group (requirement 4). A run's rows carry
-   * its epic identity; a PR review's carry the `pr:` group id, which is also
-   * the group's own id — so the entry's epic, else the id, is the run id in
-   * both cases.
+   * Focus the audit stream on one group (requirement 4), keyed on the exact
+   * value the backend counted the group's `audit_rows` on — the epic slug for
+   * a run, the `pr:` id for a PR review. Filtering on the raw epic string
+   * instead let a card claim N rows and then show none (review finding C5).
    */
-  const showGroupAudit = (group: SamuraiFileGroup, entry: SamuraiFileEntry) =>
-    setAuditFilter({ runId: entry.epic ?? group.id, label: group.label });
+  const showGroupAudit = (group: SamuraiFileGroup) =>
+    setAuditFilter({ runId: group.audit_key, label: group.label });
+
+  /**
+   * Whether this group's rows are the ones `AuditSection` is reading. That
+   * view loads the ACTIVE tab's project audit log and nothing else, while the
+   * Files panel lists groups from every project — including the account-wide
+   * scope, which lives on its own pseudo-path with its own file, and a cleaned
+   * project's run, which has no project path left at all. Offering the audit
+   * action on any of those focused a stream that could never hold their rows
+   * ("No audit rows for X" under a header claiming N of them), so it is
+   * offered only where it can tell the truth (review finding C1).
+   */
+  const groupAuditIsReadable = (group: SamuraiFileGroup) =>
+    group.project_path !== null &&
+    activeProjectPath !== "" &&
+    samePath(group.project_path, activeProjectPath);
 
   // TIMER rows all share schedule.json as their path — a file's health
   // reasons render only under the FIRST row bearing that path (the badge
@@ -564,9 +631,9 @@ export function SecondBrainSection() {
           label="Files"
           iconColor="text-maestro-accent"
           badge={
-            files && files.length > 0 ? (
+            distinctFileCount > 0 ? (
               <span className="rounded-full bg-maestro-accent/20 px-1.5 text-[10px] font-bold text-maestro-accent">
-                {files.length}
+                {distinctFileCount}
               </span>
             ) : undefined
           }
@@ -614,10 +681,13 @@ export function SecondBrainSection() {
           </p>
         ) : (
           <div className="max-h-[45vh] overflow-y-auto space-y-2">
-            {visibleGroups.map(({ group, own, shown }) => {
-              // A card matched by a file name opens itself, so the hit is
-              // never hidden behind a collapsed header (requirement 5).
-              const expanded = query.trim() !== "" || !collapsed.has(group.id);
+            {visibleGroups.map(({ group, own, shown, fileMatch }) => {
+              // A card matched by a FILE NAME opens itself, so the hit is
+              // never hidden behind a collapsed header (requirement 5). A
+              // card matched by its LABEL keeps the user's collapse: forcing
+              // every searched card open left the header's toggle flipping
+              // `aria-expanded` while nothing moved (review finding C4).
+              const expanded = fileMatch || !collapsed.has(group.id);
               return (
                 <div key={group.id} data-testid="file-group">
                   <button
@@ -665,10 +735,16 @@ export function SecondBrainSection() {
                             // Every kind is readable in place (issue #82) —
                             // the viewer picks its renderer per extension.
                             onOpen={setOpenFile}
-                            // TIMER rows are cancelled, never file-deleted —
-                            // schedule.json self-cleans and the backend
-                            // refuses deleting it (review F1).
-                            onDelete={entry.kind === "TIMER" ? null : handleDelete}
+                            // No plain delete on a shared file: a TIMER row is
+                            // cancelled instead (schedule.json self-cleans and
+                            // the backend refuses deleting it — review F1),
+                            // and an AUDIT_LOG / JOURNAL row is this group's
+                            // SLICE of a file every other card shares, so
+                            // "delete this file" would wipe their rows too
+                            // (review finding C2). Clearing the audit log
+                            // stays its own action, on the audit card that
+                            // says what it destroys.
+                            onDelete={SHARED_FILE_KINDS.has(entry.kind) ? null : handleDelete}
                             onCancelTimer={
                               entry.kind === "TIMER" && entry.epic && entry.project_path
                                 ? handleCancelTimer
@@ -690,8 +766,8 @@ export function SecondBrainSection() {
                                 : null
                             }
                             onShowAudit={
-                              entry.kind === "AUDIT_LOG"
-                                ? (row) => showGroupAudit(group, row)
+                              entry.kind === "AUDIT_LOG" && groupAuditIsReadable(group)
+                                ? () => showGroupAudit(group)
                                 : null
                             }
                             busy={busy}

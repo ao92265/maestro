@@ -109,7 +109,16 @@ function sameLaunch(a: PendingLaunch, b: PendingLaunch): boolean {
     (a.samurai?.epic ?? null) === (b.samurai?.epic ?? null) &&
     (a.samurai?.generation ?? null) === (b.samurai?.generation ?? null) &&
     (a.harvest ?? false) === (b.harvest ?? false) &&
-    (a.initialPrompt ?? null) === (b.initialPrompt ?? null)
+    (a.initialPrompt ?? null) === (b.initialPrompt ?? null) &&
+    // Issue #136 review (C11): two launches carrying the SAME prompt can
+    // still differ in where that prompt is staged as a brief, or in which PR
+    // review they record — collapsing them silently dropped one of the two.
+    (a.briefDir ?? null) === (b.briefDir ?? null) &&
+    (a.briefStem ?? null) === (b.briefStem ?? null) &&
+    (a.prRun?.pr ?? null) === (b.prRun?.pr ?? null) &&
+    (a.prRun?.repo ?? null) === (b.prRun?.repo ?? null) &&
+    (a.prRun?.project_path ?? null) === (b.prRun?.project_path ?? null) &&
+    JSON.stringify(a.prRun?.steps ?? []) === JSON.stringify(b.prRun?.steps ?? [])
   );
 }
 

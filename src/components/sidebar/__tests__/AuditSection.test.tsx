@@ -26,7 +26,12 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 
 import type { SamuraiAuditEvent, SamuraiAuditEventPayload } from "@/lib/samurai";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
-import { ALERT_SENTENCES, AuditSection, SAMURAI_ACCOUNT_RUN } from "../AuditSection";
+import {
+  ALERT_SENTENCES,
+  AuditSection,
+  SAMURAI_ACCOUNT_RUN,
+  samuraiAuditKey,
+} from "../AuditSection";
 
 const invokeMock = vi.mocked(invoke);
 const listenMock = vi.mocked(listen);
@@ -335,6 +340,34 @@ describe("AuditSection (issue #46)", () => {
     expect(screen.getByText(/gen-0 · session 1/)).toBeInTheDocument();
   });
 
+  // Review finding C5: the Second Brain's per-group audit action passes the
+  // key the backend COUNTED the group's rows on (`SamuraiFileGroup.audit_key`
+  // — the epic SLUG, `38`, never `#38`). Comparing it to the raw `epic` string
+  // made a card claim "37 rows" and then show none.
+  it("filters on the backend's slugged audit key, not the raw epic spelling", async () => {
+    mockInvoke([
+      auditEvent({ epic: "#38", event: "SPAWN", generation: 1 }),
+      auditEvent({ epic: "38", event: "PARK", generation: 1, details: { phase: "parked" } }),
+      auditEvent({ epic: "#7", event: "COMPLETE", generation: 1, details: {} }),
+    ]);
+    render(<AuditSection filter={{ runId: "38", label: "Epic #38" }} />);
+
+    expect(await screen.findByText(/Session spawned/)).toBeInTheDocument();
+    expect(screen.getByText("Session parked")).toBeInTheDocument();
+    expect(screen.queryByText("Run completed")).toBeNull();
+  });
+
+  it("filters a PR review on its group id, which is already the audit key", async () => {
+    mockInvoke([
+      auditEvent({ epic: "pr:nachogl1/maestro#142", event: "COMPLETE", details: {} }),
+      auditEvent({ epic: "#38", event: "SPAWN", generation: 1 }),
+    ]);
+    render(<AuditSection filter={{ runId: "pr:nachogl1/maestro#142", label: "PR #142" }} />);
+
+    expect(await screen.findByText("Run completed")).toBeInTheDocument();
+    expect(screen.queryByText(/Session spawned/)).toBeNull();
+  });
+
   it("clears the log only after the user confirms", async () => {
     mockInvoke([auditEvent()], 2048);
     askMock.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
@@ -405,6 +438,41 @@ const BACKEND_ALERT_KINDS = [
   "soft_winddown_invalid",
   "winddown_allclear_invalid",
 ];
+
+/*
+ * `samuraiAuditKey` mirrors `samurai_files::audit_key` + `epic_slug` +
+ * `bound_slug` (`src-tauri/src/core/samurai_files.rs`,
+ * `core/samurai_prompts.rs`). The expectations below are the values that Rust
+ * chain produces, so a change on either side breaks this test rather than
+ * silently emptying a filtered audit view (issue #136 review C5).
+ */
+describe("samuraiAuditKey", () => {
+  it("resolves both spellings of one run to the key the backend counted on", () => {
+    expect(samuraiAuditKey("#38")).toBe("38");
+    expect(samuraiAuditKey("38")).toBe("38");
+    expect(samuraiAuditKey("Epic #5 issues #7 #9")).toBe("epic-5-issues-7-9");
+    expect(samuraiAuditKey("#101 #102 #103 #104 #105 #106 #107")).toBe(
+      "101-102-103-104-105-106-107",
+    );
+    expect(samuraiAuditKey(SAMURAI_ACCOUNT_RUN)).toBe("account");
+  });
+
+  it("passes a PR review's id through untouched — it is already the key", () => {
+    expect(samuraiAuditKey("pr:nachogl1/maestro#142")).toBe("pr:nachogl1/maestro#142");
+  });
+
+  it("bounds a long identity with the same hash tail Rust appends", () => {
+    // A free-text launch (issue #128): over `SLUG_MAX`, so Rust keeps 24
+    // readable characters plus the low 32 bits of FNV-1a over the full slug.
+    expect(samuraiAuditKey("work on the authentication refactor end to end")).toBe(
+      "work-on-the-authenticati-b68a38ea",
+    );
+  });
+
+  it("falls back to `epic` for an identity with nothing sluggable in it", () => {
+    expect(samuraiAuditKey("***")).toBe("epic");
+  });
+});
 
 describe("ALERT_SENTENCES coverage (issue #123)", () => {
   it("has a plain-language sentence for every kind the backend emits", () => {
