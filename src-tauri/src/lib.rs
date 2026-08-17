@@ -863,13 +863,31 @@ pub fn run() {
             let harvest_notify: commands::harvest::HarvestNotifyFn = Arc::new(move |outcome| {
                 let _ = harvest_app.emit(commands::harvest::HARVEST_EVENT, outcome);
             });
+            // Issue #103, harvest edition: the triage paste is one of the
+            // largest Maestro types, and its entries are CONSUMED the moment
+            // the body lands — so a swallowed Enter would lose them behind a
+            // prompt sitting unsent in the input box. Same watch the samurai
+            // briefs get: released by hook-side turn activity, re-sends only
+            // the Enter. Account-wide pseudo-project (allowance convention):
+            // a harvest session belongs to no run.
+            let harvest_replicator = replicator.clone();
+            let harvest_watch: commands::harvest::HarvestDeliveredFn =
+                Arc::new(move |session_id| {
+                    harvest_replicator.watch_delivery(
+                        core::allowance_watcher::ACCOUNT_PROJECT,
+                        "harvest",
+                        0,
+                        session_id,
+                    );
+                });
             let harvest_triage = Arc::new(
                 commands::harvest::HarvestTriage::new(
                     journal_store.clone(),
                     commands::harvest::downloads_dir_string(),
                     harvest_deliver,
                 )
-                .with_notify(harvest_notify),
+                .with_notify(harvest_notify)
+                .with_delivery_watch(harvest_watch),
             );
             app.manage(harvest_triage.clone());
             let _ = harvest_triage_slot.set(harvest_triage);

@@ -218,6 +218,16 @@ pub type HarvestNotifyFn = Arc<dyn Fn(HarvestInjectionOutcome) + Send + Sync>;
 /// Tauri event name carrying a [`HarvestInjectionOutcome`].
 pub const HARVEST_EVENT: &str = "samurai-harvest-event";
 
+/// Called with the session id right after a triage prompt's BODY reached the
+/// PTY. Production arms the replicator's issue-#103 delivery watch: the
+/// triage paste is one of the largest Maestro ever types (a 1.3 KB template
+/// plus up to 12,000 chars of entries), which is exactly the case where the
+/// CLI swallows the submitting Enter as part of the paste burst — and this
+/// prompt's entries are marked CONSUMED the moment the body lands, so an
+/// unsubmitted prompt loses them. The watch releases on any hook-side turn
+/// activity and re-sends ONLY the Enter, never the body.
+pub type HarvestDeliveredFn = Arc<dyn Fn(u32) + Send + Sync>;
+
 /// The interactive-harvest state machine: `arm` stages a just-launched
 /// session, the session's first `SessionStarted` hook signal injects the
 /// triage prompt and commits journal consumption. Managed as
@@ -234,6 +244,8 @@ pub struct HarvestTriage {
     /// Reports every injection outcome to the UI. `None` in tests that do
     /// not assert on it.
     notify: Option<HarvestNotifyFn>,
+    /// Arms the post-delivery Enter-resend watch. `None` in tests.
+    on_delivered: Option<HarvestDeliveredFn>,
 }
 
 impl HarvestTriage {
@@ -244,12 +256,20 @@ impl HarvestTriage {
             deliver,
             armed: Mutex::new(HashSet::new()),
             notify: None,
+            on_delivered: None,
         }
     }
 
     /// [`Self::new`] plus the outcome reporter the Journal card renders.
     pub fn with_notify(mut self, notify: HarvestNotifyFn) -> Self {
         self.notify = Some(notify);
+        self
+    }
+
+    /// [`Self::new`] plus the post-delivery Enter-resend watch
+    /// ([`HarvestDeliveredFn`]).
+    pub fn with_delivery_watch(mut self, on_delivered: HarvestDeliveredFn) -> Self {
+        self.on_delivered = Some(on_delivered);
         self
     }
 
@@ -343,6 +363,12 @@ impl HarvestTriage {
                 )),
             });
             return;
+        }
+        // The body landed. Arm the Enter-resend watch BEFORE consumption
+        // flips: this paste is big enough for the CLI to swallow the
+        // submitting Enter, and the entries are consumed either way.
+        if let Some(on_delivered) = &self.on_delivered {
+            on_delivered(session_id);
         }
         // Consumption flips NOW — exactly the snapshot rendered above,
         // anchored on the snapshotted raw lines so an interleaved per-entry
@@ -838,6 +864,49 @@ mod tests {
         triage.arm(7).unwrap();
         triage.on_session_started(7);
         assert_eq!(*attempts.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_successful_delivery_arms_the_enter_resend_watch() {
+        // Issue #103: the triage paste is big enough for the CLI to swallow
+        // the submitting Enter, and the entries are consumed the moment the
+        // BODY lands — so an unsubmitted prompt loses them. The watch is
+        // armed on success only; a failed write has nothing to re-submit.
+        let dir = tempdir().unwrap();
+        let journal = Arc::new(JournalStore::new(dir.path().to_path_buf()));
+        journal
+            .append_entry(&JournalEntry::now(
+                JournalCategory::Error,
+                "boom",
+                None,
+                None,
+            ))
+            .unwrap();
+        let watched: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = watched.clone();
+        let watch: HarvestDeliveredFn = Arc::new(move |id| sink.lock().unwrap().push(id));
+        let fail = Arc::new(Mutex::new(true));
+        let deliver: DeliverFn = Arc::new(move |_, _| {
+            let mut fail = fail.lock().unwrap();
+            if *fail {
+                *fail = false;
+                return Err("session not found".to_string());
+            }
+            Ok(())
+        });
+        let triage = HarvestTriage::new(journal.clone(), "/downloads".to_string(), deliver)
+            .with_delivery_watch(watch);
+
+        triage.arm(7).unwrap();
+        triage.on_session_started(7);
+        assert!(
+            watched.lock().unwrap().is_empty(),
+            "a failed write has nothing to re-submit"
+        );
+
+        triage.arm(7).unwrap();
+        triage.on_session_started(7);
+        assert_eq!(*watched.lock().unwrap(), vec![7]);
     }
 
     #[test]

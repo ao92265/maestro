@@ -1,3 +1,4 @@
+import { listen } from "@tauri-apps/api/event";
 /**
  * Zustand store for marketplace plugin browsing and installation.
  *
@@ -147,6 +148,31 @@ const defaultFilters: MarketplaceFilters = {
   showNotInstalled: false,
 };
 
+/**
+ * Backend channels announcing that the plugin inventory changed
+ * (`src-tauri/src/commands/marketplace.rs`).
+ */
+const MARKETPLACE_EVENTS = [
+  "marketplace:refresh-complete",
+  "marketplace:plugin-installed",
+  "marketplace:plugin-uninstalled",
+] as const;
+
+/** True once the listeners are attached — `initialize` may run more than once. */
+let marketplaceEventsBound = false;
+
+async function subscribeToMarketplaceEvents(onChange: () => void): Promise<void> {
+  if (marketplaceEventsBound) return;
+  marketplaceEventsBound = true;
+  try {
+    await Promise.all(MARKETPLACE_EVENTS.map((name) => listen(name, onChange)));
+  } catch (err) {
+    // Event system unavailable (tests): the store still works on reads.
+    marketplaceEventsBound = false;
+    console.error("Failed to subscribe to marketplace events:", err);
+  }
+}
+
 export const useMarketplaceStore = create<MarketplaceState>()((set, get) => ({
   sources: [],
   availablePlugins: [],
@@ -182,6 +208,12 @@ export const useMarketplaceStore = create<MarketplaceState>()((set, get) => ({
     try {
       await loadMarketplaceData();
       await get().fetchAll();
+      // The backend emits on every refresh/install/uninstall, and nothing
+      // listened: a change made through one code path left every other view
+      // rendering stale plugin state until a manual refresh.
+      await subscribeToMarketplaceEvents(() => {
+        void get().fetchAll();
+      });
     } catch (err) {
       console.error("Failed to initialize marketplace:", err);
       set({ error: String(err) });

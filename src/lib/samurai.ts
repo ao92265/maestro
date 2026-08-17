@@ -606,6 +606,9 @@ export interface SamuraiConfig {
   park_hard_5h_pct: number;
   park_hard_7d_pct: number;
   ack_timeout_secs: number;
+  /** The stuck-turn cap: how long an instruction may wait for an idle signal
+   *  before the injector raises its one-shot ack_timeout ALERT. */
+  max_turn_wait_secs: number;
   staleness_window_secs: number;
   handoff_retention_days: number;
   breaker_events: number;
@@ -669,6 +672,8 @@ export interface SamuraiJournalListEntry {
 export interface SamuraiJournalListResult {
   entries: SamuraiJournalListEntry[];
   file_size_bytes: number;
+  /** Lines the parser could not understand — recorded, never listed. */
+  opaque_line_count: number;
 }
 
 /**

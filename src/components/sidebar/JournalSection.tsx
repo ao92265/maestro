@@ -148,6 +148,10 @@ export function JournalSection() {
   // JOURNAL_TAIL, and the header badge must not lie about the journal's size.
   const [totalEntries, setTotalEntries] = useState(0);
   const [fileSizeBytes, setFileSizeBytes] = useState(0);
+  // Lines the backend could not parse. They are kept on disk but never
+  // listed or harvested, so without a count the friction an agent recorded
+  // with a mis-spelled category simply vanished from every surface.
+  const [opaqueLines, setOpaqueLines] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [category, setCategory] = useState<SamuraiJournalCategory>("BOTTLENECK");
@@ -164,6 +168,7 @@ export function JournalSection() {
       setRows(result.entries.slice().reverse().slice(0, JOURNAL_TAIL));
       setTotalEntries(result.entries.length);
       setFileSizeBytes(result.file_size_bytes);
+      setOpaqueLines(result.opaque_line_count ?? 0);
       setError(null);
     } catch (err) {
       if (isCancelled()) return;
@@ -349,6 +354,13 @@ export function JournalSection() {
       <p className="mb-2 text-[11px] text-maestro-muted">
         Ops observations awaiting the harvest, newest first.
         {fileSizeBytes > 0 ? ` ${Math.max(1, Math.round(fileSizeBytes / 1024))} KB on disk.` : ""}
+        {opaqueLines > 0 ? (
+          <span className="text-maestro-orange">
+            {" "}
+            {opaqueLines} unreadable {opaqueLines === 1 ? "line" : "lines"} skipped — never listed
+            or harvested.
+          </span>
+        ) : null}
       </p>
       <form onSubmit={handleAdd} className="mb-2 flex items-center gap-1">
         <select

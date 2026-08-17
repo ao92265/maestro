@@ -20,6 +20,7 @@ const SAMURAI_FIELDS: { key: keyof SamuraiConfig; label: string }[] = [
   { key: "park_hard_5h_pct", label: "Park hard, 5h window (%)" },
   { key: "park_hard_7d_pct", label: "Park hard, 7d window (%)" },
   { key: "ack_timeout_secs", label: "ACK timeout (seconds)" },
+  { key: "max_turn_wait_secs", label: "Max turn wait (seconds)" },
   { key: "staleness_window_secs", label: "Staleness window (seconds)" },
   { key: "handoff_retention_days", label: "Handoff retention (days)" },
   { key: "breaker_events", label: "Circuit breaker events (zero-progress trip)" },

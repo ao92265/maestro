@@ -899,10 +899,12 @@ export function LaunchSection({
     setNotice(null);
     setPhase("spawning");
     try {
-      // Launch what was SCHEDULED: the spec carries the graph snapshotted at
-      // arm time (issue #91). Entries armed before that field existed fall
-      // back to the current editor, which is what this path always used.
-      const workflow = spec.workflow ?? (await workflowGraphForLaunch());
+      // Launch what was SCHEDULED, and ONLY that: the spec carries the graph
+      // snapshotted at arm time (issue #91). Falling back to the CURRENT
+      // editor graph made "Launch now" and the timer firing produce two
+      // different processes for one scheduled run — the fire path passes the
+      // spec's graph as-is, so a `null` there means the backend default.
+      const workflow = spec.workflow ?? null;
       const result = await samuraiLaunchRun(
         entry.project_path,
         spec.text,

@@ -371,12 +371,21 @@ function WorkflowsCanvas({ onClose }: WorkflowsViewProps) {
   const [fallback, setFallback] = useState<SamuraiWorkflowGraph | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // Bumped to re-run the fetch below. Without it a single failed fetch was
+  // terminal: `stored` is already null, so the effect never re-ran, and the
+  // canvas showed "Loading workflow…" forever with no way to edit the
+  // Samurai workflow until the overlay was remounted.
+  const [reloadKey, setReloadKey] = useState(0);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reloadKey is not read in the body but is the intended trigger — bumping it is the only way to retry a failed fetch, since `stored` is already null when the fetch fails.
   useEffect(() => {
     if (stored !== null) return;
     let disposed = false;
     samuraiDefaultWorkflow()
       .then((graph) => {
-        if (!disposed) setFallback(graph);
+        if (disposed) return;
+        setFallback(graph);
+        setError(null);
       })
       .catch((err) => {
         if (!disposed) setError(String(err));
@@ -384,7 +393,7 @@ function WorkflowsCanvas({ onClose }: WorkflowsViewProps) {
     return () => {
       disposed = true;
     };
-  }, [stored]);
+  }, [stored, reloadKey]);
 
   const pr = mode === "pr";
   // Same fallback rule in both modes ("null means the default governs"); the
@@ -397,7 +406,12 @@ function WorkflowsCanvas({ onClose }: WorkflowsViewProps) {
     () => ({
       setText: (id, text) => graph && setGraph(setWorkflowNodeText(graph, id, text)),
       setLabel: (id, label) => graph && setGraph(setWorkflowNodeLabel(graph, id, label)),
-      removeNode: (id) => graph && setGraph(removeWorkflowNode(graph, id)),
+      // The LAST box never goes: an empty graph persists as
+      // `{nodes: [], edges: [], start: ""}`, which compiles to nothing — the
+      // run would then launch with no WORKFLOW section at all, and the only
+      // hint would be an empty canvas.
+      removeNode: (id) =>
+        graph && graph.nodes.length > 1 && setGraph(removeWorkflowNode(graph, id)),
       removeEdge: (from, to) => graph && setGraph(removeWorkflowEdge(graph, from, to)),
     }),
     [graph, setGraph],
@@ -428,6 +442,9 @@ function WorkflowsCanvas({ onClose }: WorkflowsViewProps) {
     setError(null);
     if (pr) resetPrGraph();
     else resetSamuraiGraph();
+    // Refetch, not just clear the message: when `stored` is already null the
+    // effect above has no dependency change to react to.
+    setReloadKey((key) => key + 1);
   };
 
   // Walk order first (the run's actual sequence), then the disconnected
@@ -532,11 +549,17 @@ function WorkflowsCanvas({ onClose }: WorkflowsViewProps) {
         {/* Only the Samurai default is fetched from the backend, so its error
             belongs to that mode alone. */}
         {!pr && error && (
-          <span
-            className="max-w-[220px] shrink-0 truncate text-[10px] text-maestro-red"
-            title={error}
-          >
-            {error}
+          <span className="flex shrink-0 items-center gap-1">
+            <span className="max-w-[220px] truncate text-[10px] text-maestro-red" title={error}>
+              {error}
+            </span>
+            <button
+              type="button"
+              onClick={() => setReloadKey((key) => key + 1)}
+              className="rounded border border-maestro-border px-1.5 py-0.5 text-[10px] text-maestro-muted hover:text-maestro-text"
+            >
+              Retry
+            </button>
           </span>
         )}
 

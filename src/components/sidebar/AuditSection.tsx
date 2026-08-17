@@ -468,6 +468,26 @@ function groupByRun(events: SamuraiAuditEvent[]): AuditRunGroup[] {
  * bounded box instead of pushing the rest of the panel down. Deliberately
  * zero polish otherwise — no filters, no virtualization.
  */
+/** Identity of an audit row for de-duplication across the read/stream race. */
+function auditRowKey(row: SamuraiAuditEvent): string {
+  return `${row.ts} ${row.event} ${row.session_id} ${row.generation} ${row.epic}`;
+}
+
+/**
+ * The read's rows plus any streamed row the read did not yet contain,
+ * newest-first and capped like the read itself.
+ */
+function mergeAuditRows(
+  read: SamuraiAuditEvent[],
+  streamed: SamuraiAuditEvent[] | null,
+): SamuraiAuditEvent[] {
+  if (!streamed || streamed.length === 0) return read;
+  const seen = new Set(read.map(auditRowKey));
+  const extra = streamed.filter((row) => !seen.has(auditRowKey(row)));
+  if (extra.length === 0) return read;
+  return [...extra, ...read].slice(0, AUDIT_TAIL);
+}
+
 export function AuditSection() {
   const tabs = useWorkspaceStore((s) => s.tabs);
   const activeTab = tabs.find((t) => t.active);
@@ -486,7 +506,12 @@ export function AuditSection() {
     }
     try {
       const result = await samuraiAuditRead(projectPath, AUDIT_TAIL);
-      setEvents(result.events.slice().reverse());
+      const read = result.events.slice().reverse();
+      // MERGE, not replace: the live listener attaches before this read
+      // resolves, so a row that streamed in meanwhile was overwritten and
+      // stayed invisible until a manual refresh — the "live stream, no
+      // polling" surface silently dropping a SPAWN or an ALERT.
+      setEvents((prev) => mergeAuditRows(read, prev));
       setFileSizeBytes(result.file_size_bytes);
       setError(null);
     } catch (err) {

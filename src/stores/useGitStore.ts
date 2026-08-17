@@ -45,14 +45,6 @@ export interface RemoteInfo {
 /** Remote connection status. */
 export type RemoteStatus = "unknown" | "checking" | "connected" | "disconnected";
 
-/** Worktree info returned from the backend. */
-export interface WorktreeInfo {
-  path: string;
-  head: string;
-  branch: string | null;
-  is_bare: boolean;
-}
-
 /**
  * Zustand store for centralized git state management.
  *

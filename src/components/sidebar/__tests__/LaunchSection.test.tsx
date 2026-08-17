@@ -549,6 +549,11 @@ describe("LaunchSection (issue #63)", () => {
       model: "claude-opus-5",
       handoffContextPct: 30,
       skipTestGate: true,
+      // The SCHEDULED graph and nothing else: substituting the current
+      // editor graph made "Launch now" and the timer firing launch two
+      // different processes for one entry (the fire path sends the spec's
+      // graph as-is, so `null` there means the backend default).
+      workflow: null,
     });
 
     // Discard: cancel the timer, launch nothing further.

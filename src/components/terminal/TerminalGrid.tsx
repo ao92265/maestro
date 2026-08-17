@@ -331,6 +331,20 @@ interface TerminalGridProps {
  * - When all sessions are killed by the user, an auto-respawn effect creates
  *   a fresh slot so the user is never left with an empty grid.
  */
+/**
+ * Message of a backend `PtyError` (`{code, message}` — `src-tauri/src/core/error.rs`),
+ * falling back to whatever shape actually arrived. The structured payload is
+ * the only thing that names the real cause of a failed spawn.
+ */
+function describePtyError(err: unknown): string {
+  if (err && typeof err === "object" && "message" in err) {
+    const { code, message } = err as { code?: unknown; message?: unknown };
+    const text = typeof message === "string" ? message : String(message);
+    return typeof code === "string" ? `${text} (${code})` : text;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
 export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(function TerminalGrid(
   {
     projectPath,
@@ -1208,7 +1222,10 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
         }
       } catch (err) {
         console.error("Failed to spawn shell:", err);
-        setError("Failed to start terminal session");
+        // `spawn_shell` returns a structured `PtyError {code, message}`; the
+        // fixed string threw away the only thing that says WHY (a missing
+        // shell, a permission denial, a vanished working directory).
+        setError(`Failed to start terminal session: ${describePtyError(err)}`);
       }
     },
     [projectPath, effectiveRepoPath, worktreeBasePath, tabId, addSessionToProject, refreshBranches],

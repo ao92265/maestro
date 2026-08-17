@@ -315,11 +315,23 @@ pub fn list_files(
 
     // 5. Journal + harvest reports (PRD §5.12 — Phase 5 writes them; the
     //    inventory lists whatever exists, so these stay empty until then).
-    push_dir_files(&mut entries, &roots.journal_dir, SamuraiFileKind::Journal);
+    // The journal is APPEND TARGET for every live agent (the rider tells them
+    // to `>>` their friction into it), so while any orchestrator is
+    // supervised, deleting it destroys unconsumed entries — it must route
+    // through the harder IN_USE confirm, not an ordinary one. Harvest
+    // reports are finished artifacts; nothing writes them mid-run.
+    let journal_in_use = !live.session_pairs.is_empty();
+    push_dir_files(
+        &mut entries,
+        &roots.journal_dir,
+        SamuraiFileKind::Journal,
+        journal_in_use,
+    );
     push_dir_files(
         &mut entries,
         &roots.harvest_dir,
         SamuraiFileKind::HarvestReport,
+        false,
     );
 
     entries.sort_by(|a, b| {
@@ -499,7 +511,12 @@ fn known_projects(
 
 /// Lists every regular file directly under `dir` as `kind` rows (journal +
 /// harvest — flat dirs, no association until Phase 5 defines their naming).
-fn push_dir_files(entries: &mut Vec<SamuraiFileEntry>, dir: &Path, kind: SamuraiFileKind) {
+fn push_dir_files(
+    entries: &mut Vec<SamuraiFileEntry>,
+    dir: &Path,
+    kind: SamuraiFileKind,
+    in_use: bool,
+) {
     let Ok(files) = std::fs::read_dir(dir) else {
         return;
     };
@@ -518,7 +535,7 @@ fn push_dir_files(entries: &mut Vec<SamuraiFileEntry>, dir: &Path, kind: Samurai
             modified_at,
             project_path: None,
             epic: None,
-            in_use: false,
+            in_use,
             has_live_session: false,
             fire_at: None,
         });
@@ -786,6 +803,39 @@ mod tests {
             assert!(raw.get(key).is_some(), "missing key {key} in {raw}");
         }
         assert_eq!(raw["kind"], "HANDOFF");
+    }
+
+    #[test]
+    fn test_journal_is_in_use_only_while_an_orchestrator_is_live() {
+        // The rider tells every live agent to append its friction to the
+        // journal, so deleting it mid-run destroys unconsumed entries — that
+        // has to hit the harder IN_USE confirm, not an ordinary one.
+        let f = fixture();
+        std::fs::create_dir_all(&f.roots.journal_dir).unwrap();
+        std::fs::write(
+            f.roots.journal_dir.join("journal.jsonl"),
+            "{}
+",
+        )
+        .unwrap();
+
+        let idle = list(&f, &[]);
+        assert!(
+            of_kind(&idle, SamuraiFileKind::Journal)
+                .iter()
+                .all(|e| !e.in_use),
+            "nothing supervised: an ordinary delete confirm is right"
+        );
+
+        let live = list(&f, &[session(&f.project, "#9", SupervisorState::Working)]);
+        let journal = of_kind(&live, SamuraiFileKind::Journal);
+        assert!(!journal.is_empty());
+        assert!(journal.iter().all(|e| e.in_use));
+        // Harvest reports are finished artifacts — nothing writes them
+        // mid-run, so they stay ordinary.
+        assert!(of_kind(&live, SamuraiFileKind::HarvestReport)
+            .iter()
+            .all(|e| !e.in_use));
     }
 
     #[test]

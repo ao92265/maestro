@@ -159,6 +159,12 @@ pub struct JournalEntryWithStatus {
 pub struct JournalListResult {
     pub entries: Vec<JournalEntryWithStatus>,
     pub file_size_bytes: u64,
+    /// Lines the parser could not understand (a mis-spelled category, a
+    /// shape that fails deserialization). They are never listed, harvested
+    /// or dropped — carried through every rewrite verbatim — so without this
+    /// count an agent's mis-written friction was recorded and then invisible
+    /// to everyone, with no signal that anything had been skipped.
+    pub opaque_line_count: usize,
 }
 
 /// One parsed line of the active file, in file order. `Opaque` lines
@@ -250,9 +256,14 @@ impl JournalStore {
                 _ => None,
             })
             .collect();
+        let opaque_line_count = lines
+            .iter()
+            .filter(|l| matches!(l, RawLine::Opaque(_)))
+            .count();
         Ok(JournalListResult {
             entries,
             file_size_bytes,
+            opaque_line_count,
         })
     }
 

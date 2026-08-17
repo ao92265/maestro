@@ -113,6 +113,29 @@ describe("WorkflowsView (issue #91 full-screen follow-up)", () => {
     usePrWorkflowStore.setState({ graph: null });
   });
 
+  it("a failed default fetch is retryable instead of loading forever", async () => {
+    // `stored` is already null when the fetch fails, so the effect had no
+    // dependency change to react to: the canvas sat on "Loading workflow…"
+    // with no way to edit the Samurai workflow until a remount.
+    let attempts = 0;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd !== "samurai_default_workflow") return undefined;
+      attempts += 1;
+      if (attempts === 1) throw new Error("backend hiccup");
+      return defaultGraph();
+    });
+
+    render(<WorkflowsView onClose={() => {}} />);
+
+    const retry = await screen.findByRole("button", { name: "Retry" });
+    expect(screen.queryByDisplayValue("Do the implement work.")).not.toBeInTheDocument();
+
+    fireEvent.click(retry);
+
+    expect(await screen.findByDisplayValue("Do the implement work.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+  });
+
   it("renders the backend default template's boxes with compiled step numbers", async () => {
     render(<WorkflowsView onClose={() => {}} />);
 
@@ -447,6 +470,22 @@ describe("workflow graph edits (pure rules)", () => {
     expect(once.nodes[once.nodes.length - 1]?.id).toBe("step-1");
     expect(twice.nodes[twice.nodes.length - 1]?.id).toBe("step-2");
     expect(workflowWalkOrder(twice)).toEqual(["a", "b", "c", "step-1", "step-2"]);
+  });
+
+  it("the last remaining box cannot be removed", async () => {
+    // An empty graph persists as {nodes: [], edges: [], start: ""}, which
+    // compiles to nothing: the run would launch with no WORKFLOW section at
+    // all and only an empty canvas to show for it.
+    render(<WorkflowsView onClose={() => {}} />);
+    await screen.findByDisplayValue("Do the implement work.");
+    for (const id of ["review", "qa-report", "push", "batch-review", "batch-qa", "batch-pr"]) {
+      fireEvent.click(screen.getByRole("button", { name: `Remove step ${id}` }));
+    }
+    await waitFor(() => expect(useSamuraiWorkflowStore.getState().graph?.nodes).toHaveLength(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove step implement" }));
+
+    expect(useSamuraiWorkflowStore.getState().graph?.nodes).toHaveLength(1);
   });
 
   it("removing a missing edge is a no-op", () => {

@@ -212,12 +212,18 @@ pub async fn kill_session(
     samurai_injector.remove_session(session_id);
     samurai_progress.remove_session(session_id);
 
-    // Log for debugging
-    let _project_path = session_mgr
-        .all_sessions()
-        .into_iter()
-        .find(|s| s.id == session_id)
-        .map(|s| s.project_path);
+    // The registry entry goes too. Closing one terminal never crossed the
+    // IPC seam (`useSessionStore.removeSession` is local state only), so
+    // every opened-and-closed session stayed in the manager for the app's
+    // lifetime and `get_sessions` kept reporting it — masked only by the
+    // mount-time `kill_all_sessions` wipe.
+    let removed = session_mgr.remove_session(session_id);
+    if let Some(session) = removed {
+        log::debug!(
+            "killed session {session_id} in {} — registry entry removed",
+            session.project_path
+        );
+    }
 
     result
 }
