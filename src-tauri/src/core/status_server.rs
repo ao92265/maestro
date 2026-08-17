@@ -285,12 +285,6 @@ impl StatusServer {
         let mut pending = self.pending_statuses.write().await;
         pending.remove(&session_id);
     }
-
-    /// Get list of registered session IDs (for debugging).
-    pub async fn registered_sessions(&self) -> Vec<u32> {
-        let projects = self.session_projects.read().await;
-        projects.keys().copied().collect()
-    }
 }
 
 /// Map MCP state string to session status string and call the emit function.
@@ -1900,7 +1894,14 @@ mod tests {
         server.register_session(1, "/path/project").await;
 
         assert!(events.lock().unwrap().is_empty());
-        assert_eq!(server.registered_sessions().await, vec![1]);
+        let registered: Vec<u32> = server
+            .session_projects
+            .read()
+            .await
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(registered, vec![1]);
     }
 
     #[tokio::test]
@@ -1942,10 +1943,12 @@ mod tests {
         server.unregister_session(1).await;
 
         // Session 3 (also project alpha) should still be registered
-        let registered = server.registered_sessions().await;
-        assert!(registered.contains(&2));
-        assert!(registered.contains(&3));
-        assert!(!registered.contains(&1));
+        {
+            let registered = server.session_projects.read().await;
+            assert!(registered.contains_key(&2));
+            assert!(registered.contains_key(&3));
+            assert!(!registered.contains_key(&1));
+        }
 
         // Register session 4 — should flush its buffer
         server.register_session(4, "/project/gamma").await;

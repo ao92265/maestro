@@ -40,15 +40,6 @@ pub struct McpCustomServer {
     pub created_at: String,
 }
 
-/// Status server info returned to the frontend.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StatusServerInfo {
-    pub port: u16,
-    pub status_url: String,
-    pub instance_id: String,
-}
-
 /// Creates a stable hash of a project path for use in store filenames.
 fn hash_project_path(path: &str) -> String {
     let mut hasher = Sha256::new();
@@ -206,60 +197,6 @@ pub async fn add_mcp_project(project_path: String) -> Result<(), String> {
         canonical
     );
     Ok(())
-}
-
-/// Removes a project from monitoring.
-///
-/// This is a no-op in the new HTTP-based architecture since we don't need
-/// file-based monitoring anymore. Kept for backwards compatibility.
-#[tauri::command]
-pub async fn remove_mcp_project(project_path: String) -> Result<(), String> {
-    let canonical = std::fs::canonicalize(&project_path)
-        .map_err(|e| format!("Invalid project path '{}': {}", project_path, e))?
-        .to_string_lossy()
-        .into_owned();
-
-    log::debug!(
-        "remove_mcp_project called for '{}' (no-op in HTTP architecture)",
-        canonical
-    );
-    Ok(())
-}
-
-/// Removes a session's status from tracking.
-///
-/// In the new HTTP-based architecture, this unregisters the session from
-/// the status server so it stops accepting updates for this session.
-#[tauri::command]
-pub async fn remove_session_status(
-    status_server: State<'_, Arc<StatusServer>>,
-    _project_path: String,
-    session_id: u32,
-) -> Result<(), String> {
-    status_server.unregister_session(session_id).await;
-    log::debug!("Unregistered session {} from status server", session_id);
-    Ok(())
-}
-
-/// Gets the status server info (URL, port, instance ID).
-///
-/// This is needed by the frontend when writing MCP configs so the
-/// MCP server knows where to POST status updates.
-#[tauri::command]
-pub async fn get_status_server_info(
-    status_server: State<'_, Arc<StatusServer>>,
-) -> Result<StatusServerInfo, String> {
-    let registered = status_server.registered_sessions().await;
-    log::info!(
-        "get_status_server_info: instance_id={}, registered_sessions={:?}",
-        status_server.instance_id(),
-        registered
-    );
-    Ok(StatusServerInfo {
-        port: status_server.port(),
-        status_url: status_server.status_url(),
-        instance_id: status_server.instance_id().to_string(),
-    })
 }
 
 /// Writes a session-specific `.mcp.json` file to the working directory.

@@ -1122,11 +1122,9 @@ pub fn run() {
             // Git commands
             commands::git::git_branches,
             commands::git::git_current_branch,
-            commands::git::git_uncommitted_count,
             commands::git::git_worktree_list,
             commands::git::git_worktree_add,
             commands::git::git_worktree_remove,
-            commands::git::git_worktree_status,
             commands::git::git_worktrees_status,
             commands::git::git_discard_file,
             commands::git::git_remove_file,
@@ -1159,10 +1157,8 @@ pub fn run() {
             // Session commands (new)
             commands::session::get_sessions,
             commands::session::create_session,
-            commands::session::update_session_status,
             commands::session::assign_session_branch,
             commands::session::rename_session,
-            commands::session::remove_session,
             commands::session::get_sessions_for_project,
             commands::session::remove_sessions_for_project,
             // Worktree commands
@@ -1179,8 +1175,6 @@ pub fn run() {
             commands::mcp::save_project_mcp_defaults,
             commands::mcp::load_project_mcp_defaults,
             commands::mcp::add_mcp_project,
-            commands::mcp::remove_mcp_project,
-            commands::mcp::remove_session_status,
             commands::mcp::write_session_mcp_config,
             commands::mcp::remove_session_mcp_config,
             commands::mcp::write_opencode_mcp_config,
@@ -1189,7 +1183,6 @@ pub fn run() {
             commands::mcp::get_custom_mcp_servers,
             commands::mcp::save_custom_mcp_server,
             commands::mcp::delete_custom_mcp_server,
-            commands::mcp::get_status_server_info,
             commands::mcp::get_mcp_status,
             commands::mcp::upsert_mcp_server,
             commands::mcp::remove_mcp_server,
@@ -1296,7 +1289,6 @@ pub fn run() {
             commands::catalog::load_project_catalog,
             // Samurai supervisor + audit log (Phase 1)
             commands::samurai::samurai_register_session,
-            commands::samurai::samurai_transition,
             commands::samurai::samurai_list_sessions,
             commands::samurai::samurai_audit_read,
             commands::samurai::samurai_audit_clear,

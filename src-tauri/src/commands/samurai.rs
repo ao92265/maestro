@@ -34,7 +34,7 @@ use crate::core::samurai_schedule::{
 };
 use crate::core::samurai_test_gate::{self, SamuraiTestGate, TestGateProgress};
 use crate::core::samurai_workflow::{self, WorkflowGraph};
-use crate::core::supervisor::{SessionSnapshot, Supervisor, SupervisorState};
+use crate::core::supervisor::{SessionSnapshot, Supervisor};
 use crate::core::windows_process::StdCommandExt;
 use crate::core::worktree_manager::{project_name, WorktreeManager};
 use crate::git::{Git, GitError};
@@ -129,23 +129,6 @@ pub fn samurai_register_session(
     };
     replicator.on_registered(&snapshot);
     Ok(snapshot)
-}
-
-/// Drives one state transition, e.g. `to_state = "HANDOFF_REQUESTED"`.
-/// Illegal transitions return an error (and land on the audit log as ALERT
-/// rows); they never panic.
-///
-/// Testing affordance: this drives supervisor STATE only, never processes —
-/// manually transitioning a live session to `KILLED` does not kill its PTY,
-/// so the terminal keeps running, orphaned from the state machine.
-#[tauri::command]
-pub fn samurai_transition(
-    supervisor: State<'_, Arc<Supervisor>>,
-    session_id: u32,
-    to_state: String,
-) -> Result<SessionSnapshot, String> {
-    let to: SupervisorState = to_state.parse()?;
-    supervisor.transition(session_id, to)
 }
 
 /// Snapshots of every supervised session, ordered by session id.
@@ -1869,6 +1852,7 @@ mod tests {
     use super::*;
     use crate::core::samurai_audit::AuditLog;
     use crate::core::samurai_files::{strip_extended_length, SamuraiFileKind};
+    use crate::core::supervisor::SupervisorState;
     use crate::core::windows_process::StdCommandExt;
     use tempfile::tempdir;
 

@@ -1008,10 +1008,12 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
           // Add project to MCP status monitor for polling status updates
           await invoke("add_mcp_project", { projectPath });
           // Add session to store directly (don't refetch all sessions to avoid status reset)
+          // Status is frontend-owned (issue #134): a freshly registered
+          // session starts Idle and moves on the MCP status stream.
           useSessionStore.getState().addSession({
             ...sessionConfig,
             name: finalName,
-            status: sessionConfig.status as import("@/stores/useSessionStore").BackendSessionStatus,
+            status: "Idle",
           });
         }
 

@@ -10,7 +10,7 @@ use crate::core::process_manager::ProcessManager;
 use crate::core::samurai_context::SamuraiContextStore;
 use crate::core::samurai_injector::SamuraiInjector;
 use crate::core::samurai_progress::SamuraiProgress;
-use crate::core::session_manager::{AiMode, SessionConfig, SessionManager, SessionStatus};
+use crate::core::session_manager::{AiMode, SessionConfig, SessionManager};
 use crate::core::status_server::StatusServer;
 use crate::core::supervisor::Supervisor;
 use crate::core::transcript_watcher::TranscriptWatcher;
@@ -23,8 +23,7 @@ pub async fn get_sessions(state: State<'_, SessionManager>) -> Result<Vec<Sessio
 }
 
 /// Exposes `SessionManager::create_session` to the frontend.
-/// Registers a new session with `Idle` status. Returns an error if the
-/// session ID already exists.
+/// Registers a new session. Returns an error if the session ID already exists.
 #[tauri::command]
 pub async fn create_session(
     state: State<'_, SessionManager>,
@@ -57,17 +56,6 @@ pub async fn create_session(
         .map_err(|existing| format!("Session {} already exists", existing.id))
 }
 
-/// Exposes `SessionManager::update_status` to the frontend.
-/// Returns `false` if the session does not exist (no error raised).
-#[tauri::command]
-pub async fn update_session_status(
-    state: State<'_, SessionManager>,
-    session_id: u32,
-    status: SessionStatus,
-) -> Result<bool, String> {
-    Ok(state.update_status(session_id, status))
-}
-
 /// Exposes `SessionManager::assign_branch` to the frontend.
 /// Links a session to a branch and optional worktree path. Returns an error
 /// string if the session does not exist.
@@ -95,16 +83,6 @@ pub async fn rename_session(
     state
         .rename_session(session_id, normalized)
         .ok_or_else(|| format!("Session {} not found", session_id))
-}
-
-/// Exposes `SessionManager::remove_session` to the frontend.
-/// Returns the removed session config, or `None` if it was not found.
-#[tauri::command]
-pub async fn remove_session(
-    state: State<'_, SessionManager>,
-    session_id: u32,
-) -> Result<Option<SessionConfig>, String> {
-    Ok(state.remove_session(session_id))
 }
 
 /// Gets all sessions for a specific project.

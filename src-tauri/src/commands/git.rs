@@ -51,15 +51,6 @@ pub async fn git_current_branch(repo_path: String) -> Result<String, GitError> {
     git.current_branch().await
 }
 
-/// Exposes `Git::uncommitted_count` to the frontend.
-/// Returns the number of dirty files (staged + unstaged + untracked).
-#[tauri::command]
-pub async fn git_uncommitted_count(repo_path: String) -> Result<usize, GitError> {
-    validate_repo_path(&repo_path)?;
-    let git = Git::new(&repo_path);
-    git.uncommitted_count().await
-}
-
 /// Exposes `Git::worktree_list` to the frontend.
 /// Returns all worktrees (including the main one) with path, HEAD, and branch info.
 #[tauri::command]
@@ -97,24 +88,6 @@ pub async fn git_worktree_remove(
     let git = Git::new(&repo_path);
     let wt_path = PathBuf::from(&path);
     git.worktree_remove(&wt_path, force).await
-}
-
-/// Exposes `Git::worktree_status` to the frontend.
-///
-/// `worktree_path` should be the absolute path to the worktree (or main repo)
-/// to inspect; `is_main_worktree` indicates whether it's the primary working
-/// tree. Returns a snapshot of every change that would be lost if the
-/// worktree or branch were deleted: staged/unstaged/untracked files,
-/// unpushed commits, and stashes that originated on the branch.
-#[tauri::command]
-pub async fn git_worktree_status(
-    worktree_path: String,
-    is_main_worktree: bool,
-) -> Result<WorktreeStatus, GitError> {
-    validate_repo_path(&worktree_path)?;
-    let git = Git::new(&worktree_path);
-    git.worktree_status(worktree_path.clone(), is_main_worktree)
-        .await
 }
 
 /// Exposes `Git::all_worktrees_status` to the frontend.

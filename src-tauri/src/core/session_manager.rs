@@ -15,32 +15,21 @@ pub enum AiMode {
     Plain,
 }
 
-/// Lifecycle state of a session, tracked for UI status indicators.
-///
-/// Transitions are driven by the frontend; the backend does not enforce
-/// a state machine. Invalid transitions (e.g., `Done` -> `Working`) are
-/// allowed and the caller is responsible for correctness.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SessionStatus {
-    Starting,
-    Idle,
-    Working,
-    NeedsInput,
-    Done,
-    Error,
-}
-
 /// Frontend-visible configuration and state for a single session.
 ///
 /// `branch` and `worktree_path` are `None` until `assign_branch` is called,
 /// allowing sessions to be created before their worktree is ready.
+///
+/// Deliberately carries no lifecycle status (issue #134): this registry lives
+/// only in memory, so it cannot outlive a reload and has nothing authoritative
+/// to say about what a session is doing. Status is owned by the frontend
+/// store, fed by the MCP `session-status-changed` stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
     pub id: u32,
     pub mode: AiMode,
     pub name: Option<String>,
     pub branch: Option<String>,
-    pub status: SessionStatus,
     pub worktree_path: Option<String>,
     /// The project directory this session belongs to.
     /// Canonicalized absolute path for reliable comparison.
@@ -75,7 +64,7 @@ impl SessionManager {
         }
     }
 
-    /// Inserts a new session with `Idle` status and no branch assigned.
+    /// Inserts a new session with no branch assigned.
     /// Returns `Err` with the existing config if a session with this ID already exists.
     // `Err` is the session that already occupies this id, so both variants are
     // a `SessionConfig` — boxing the error would not shrink the `Result`.
@@ -92,7 +81,6 @@ impl SessionManager {
             mode,
             name: None,
             branch: None,
-            status: SessionStatus::Idle,
             worktree_path: None,
             project_path,
             working_directory,
@@ -109,17 +97,6 @@ impl SessionManager {
     /// Returns a snapshot of the session config, or `None` if not found.
     pub fn get_session(&self, id: u32) -> Option<SessionConfig> {
         self.sessions.get(&id).map(|s| s.clone())
-    }
-
-    /// Updates the session's status in place. Returns `false` if the session
-    /// does not exist (no error is raised).
-    pub fn update_status(&self, id: u32, status: SessionStatus) -> bool {
-        if let Some(mut session) = self.sessions.get_mut(&id) {
-            session.status = status;
-            true
-        } else {
-            false
-        }
     }
 
     /// Updates the session's display name. Pass `None` to reset to the default.

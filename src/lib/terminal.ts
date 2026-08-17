@@ -271,13 +271,17 @@ export async function deleteClaudeSession(projectPath: string, sessionId: string
   return invoke("delete_claude_session", { projectPath, sessionId });
 }
 
-/** Session config returned by createSession. */
+/**
+ * Session config returned by createSession.
+ *
+ * No status field: session status is frontend-owned (issue #134) — the Rust
+ * `SessionManager` is an in-memory registry that never tracked one.
+ */
 export interface SessionConfig {
   id: number;
   mode: AiMode;
   name?: string | null;
   branch: string | null;
-  status: string;
   worktree_path: string | null;
   project_path: string;
   /** Shell spawn directory — may differ from project_path in multi-repo workspaces. */

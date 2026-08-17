@@ -61,23 +61,37 @@ const READY_FOR_USER_STATUSES: BackendSessionStatus[] = ["NeedsInput", "Done", "
 /**
  * Mirrors the Rust `SessionConfig` struct returned by `get_sessions`.
  *
+ * Status is deliberately absent (issue #134): the Rust `SessionManager` is an
+ * in-memory `DashMap` with no persistence, so it has nothing authoritative to
+ * say about a session's lifecycle state. Status is owned here, fed by the MCP
+ * `session-status-changed` stream.
+ *
  * @property id - Unique numeric session ID assigned by the backend.
  * @property branch - Git branch the session operates on, or null for the default branch.
  * @property worktree_path - Filesystem path to the git worktree, if one was created.
  * @property project_path - Canonicalized project directory this session belongs to.
- * @property statusMessage - Brief description of what the agent is doing (from MCP status).
- * @property needsInputPrompt - When status is NeedsInput, the specific question for the user.
  */
-export interface SessionConfig {
+export interface BackendSessionRow {
   id: number;
   mode: AiMode;
   name?: string | null;
   branch: string | null;
-  status: BackendSessionStatus;
   worktree_path: string | null;
   project_path: string;
   /** The actual directory the shell was spawned in (may differ from project_path in multi-repo workspaces). */
   working_directory?: string | null;
+}
+
+/**
+ * A session as the store holds it: the backend row plus the frontend-owned
+ * lifecycle state.
+ *
+ * @property status - Frontend-owned lifecycle state (see {@link BackendSessionRow}).
+ * @property statusMessage - Brief description of what the agent is doing (from MCP status).
+ * @property needsInputPrompt - When status is NeedsInput, the specific question for the user.
+ */
+export interface SessionConfig extends BackendSessionRow {
+  status: BackendSessionStatus;
   statusMessage?: string;
   needsInputPrompt?: string;
   /** Timestamp of the last MCP-driven status update (used by activity heuristic). */
@@ -282,7 +296,7 @@ interface SessionState {
   fetchSessionsForProject: (projectPath: string) => Promise<void>;
   addSession: (session: SessionConfig) => void;
   removeSession: (sessionId: number) => void;
-  removeSessionsForProject: (projectPath: string) => Promise<SessionConfig[]>;
+  removeSessionsForProject: (projectPath: string) => Promise<BackendSessionRow[]>;
   updateSession: (sessionId: number, updates: Partial<SessionConfig>) => void;
   renameSession: (sessionId: number, name: string | null) => Promise<void>;
   getSessionsByProject: (projectPath: string) => SessionConfig[];
@@ -326,6 +340,22 @@ interface ContextUsage {
  * ephemeral (reassigned each app launch).
  */
 const lastContextUsage: Map<number, ContextUsage> = new Map();
+
+/**
+ * Fold one freshly fetched backend row into the store's view of that session.
+ *
+ * Status is frontend-owned (issue #134), so a row for a session already in the
+ * store keeps its live `status`, `statusMessage` and `needsInputPrompt` — a
+ * refetch used to clobber them back to the backend's phantom `Idle`. A row new
+ * to the store has no live state to preserve and starts at `Idle`.
+ */
+function mergeFetchedSession(row: BackendSessionRow, current: SessionConfig[]): SessionConfig {
+  const existing = current.find((s) => s.id === row.id);
+  // Backend-owned fields (branch, worktree, name, paths) always win; the
+  // frontend-owned status fields survive because `row` does not carry them.
+  const merged: SessionConfig = existing ? { ...existing, ...row } : { ...row, status: "Idle" };
+  return withContextUsage(merged);
+}
 
 /** Merge the remembered context usage into a (freshly fetched) session. */
 function withContextUsage(session: SessionConfig): SessionConfig {
@@ -520,21 +550,26 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
   fetchSessions: async () => {
     set({ isLoading: true, error: null });
     try {
-      const fetched = await invoke<SessionConfig[]>("get_sessions");
-      // Re-apply last-known context usage — the backend doesn't carry it.
-      const sessions = fetched.map(withContextUsage);
-      set((state) => ({
-        sessions,
-        isLoading: false,
-        // Prune parked/flagged/attention IDs that no longer exist in the fetched list
-        parkedSessionIds: state.parkedSessionIds.filter((id) => sessions.some((s) => s.id === id)),
-        flaggedSessionIds: state.flaggedSessionIds.filter((id) =>
-          sessions.some((s) => s.id === id),
-        ),
-        attentionSessionIds: state.attentionSessionIds.filter((id) =>
-          sessions.some((s) => s.id === id),
-        ),
-      }));
+      const fetched = await invoke<BackendSessionRow[]>("get_sessions");
+      set((state) => {
+        // Keep live status (and last-known context usage) — the backend
+        // carries neither.
+        const sessions = fetched.map((row) => mergeFetchedSession(row, state.sessions));
+        return {
+          sessions,
+          isLoading: false,
+          // Prune parked/flagged/attention IDs that no longer exist in the fetched list
+          parkedSessionIds: state.parkedSessionIds.filter((id) =>
+            sessions.some((s) => s.id === id),
+          ),
+          flaggedSessionIds: state.flaggedSessionIds.filter((id) =>
+            sessions.some((s) => s.id === id),
+          ),
+          attentionSessionIds: state.attentionSessionIds.filter((id) =>
+            sessions.some((s) => s.id === id),
+          ),
+        };
+      });
     } catch (err) {
       console.error("Failed to fetch sessions:", err);
       set({ error: String(err), isLoading: false });
@@ -544,23 +579,28 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
   fetchSessionsForProject: async (projectPath: string) => {
     set({ isLoading: true, error: null });
     try {
-      const fetched = await invoke<SessionConfig[]>("get_sessions_for_project", {
+      const fetched = await invoke<BackendSessionRow[]>("get_sessions_for_project", {
         projectPath,
       });
-      // Re-apply last-known context usage — the backend doesn't carry it.
-      const sessions = fetched.map(withContextUsage);
-      set((state) => ({
-        sessions,
-        isLoading: false,
-        // Prune parked/flagged/attention IDs that no longer exist in the fetched list
-        parkedSessionIds: state.parkedSessionIds.filter((id) => sessions.some((s) => s.id === id)),
-        flaggedSessionIds: state.flaggedSessionIds.filter((id) =>
-          sessions.some((s) => s.id === id),
-        ),
-        attentionSessionIds: state.attentionSessionIds.filter((id) =>
-          sessions.some((s) => s.id === id),
-        ),
-      }));
+      set((state) => {
+        // Keep live status (and last-known context usage) — the backend
+        // carries neither.
+        const sessions = fetched.map((row) => mergeFetchedSession(row, state.sessions));
+        return {
+          sessions,
+          isLoading: false,
+          // Prune parked/flagged/attention IDs that no longer exist in the fetched list
+          parkedSessionIds: state.parkedSessionIds.filter((id) =>
+            sessions.some((s) => s.id === id),
+          ),
+          flaggedSessionIds: state.flaggedSessionIds.filter((id) =>
+            sessions.some((s) => s.id === id),
+          ),
+          attentionSessionIds: state.attentionSessionIds.filter((id) =>
+            sessions.some((s) => s.id === id),
+          ),
+        };
+      });
     } catch (err) {
       console.error("Failed to fetch sessions for project:", err);
       set({ error: String(err), isLoading: false });
@@ -657,7 +697,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
 
   renameSession: async (sessionId: number, name: string | null) => {
     try {
-      const updated = await invoke<SessionConfig>("rename_session", {
+      const updated = await invoke<BackendSessionRow>("rename_session", {
         sessionId,
         name,
       });
@@ -708,7 +748,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
 
   removeSessionsForProject: async (projectPath: string) => {
     try {
-      const removed = await invoke<SessionConfig[]>("remove_sessions_for_project", {
+      const removed = await invoke<BackendSessionRow[]>("remove_sessions_for_project", {
         projectPath,
       });
       // Same stale-id hygiene as removeSession.
