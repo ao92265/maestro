@@ -88,6 +88,13 @@ pub struct AuditEvent {
 
 impl AuditEvent {
     /// Builds an event stamped with the current UTC time.
+    ///
+    /// Issue #139's invariant — every row names the run it belongs to — is
+    /// swept for at the SOURCE (`test_no_audit_writer_stamps_an_empty_run_id`),
+    /// but that sweep only recognises the literal `""` / `String::new()`
+    /// spellings: a writer forwarding a variable that happens to be empty
+    /// walks straight past it. The debug assertion is the runtime half, so a
+    /// dev build trips where the sweep cannot look.
     pub fn now(
         epic: impl Into<String>,
         event: AuditEventKind,
@@ -95,9 +102,15 @@ impl AuditEvent {
         session_id: u32,
         details: Value,
     ) -> Self {
+        let epic = epic.into();
+        debug_assert!(
+            !epic.is_empty(),
+            "an audit row must name the run it belongs to (issue #139) — stamp the run id, or \
+             `allowance_watcher::ACCOUNT_RUN` for a genuinely account-wide row"
+        );
         Self {
             ts: chrono::Utc::now().to_rfc3339(),
-            epic: epic.into(),
+            epic,
             event,
             generation,
             session_id,
@@ -519,6 +532,18 @@ mod tests {
              `allowance_watcher::ACCOUNT_RUN` for a genuinely account-wide row):\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// Issue #139 c10, runtime half (review B9): the source sweep above only
+    /// recognises the literal empty spellings, so a writer forwarding a
+    /// variable that happens to be empty passes it untouched. A dev build
+    /// trips instead of writing a row no group can ever claim.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "must name the run it belongs to")]
+    fn test_an_empty_run_id_trips_the_debug_assertion() {
+        let forwarded = String::new();
+        AuditEvent::now(forwarded, AuditEventKind::Alert, 1, 1, json!({}));
     }
 
     #[test]

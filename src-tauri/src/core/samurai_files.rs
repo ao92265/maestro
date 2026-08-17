@@ -40,6 +40,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use super::allowance_watcher::{ACCOUNT_PROJECT, ACCOUNT_RUN};
 use super::samurai_audit::audit_file_name;
 use super::samurai_brief::BRIEF_DIR;
 use super::samurai_journal::JOURNAL_FILE;
@@ -113,6 +114,13 @@ impl SamuraiFileKind {
 /// `System`, `Other` or `Unattributed` kind. An artifact that cannot be
 /// attributed to a run or a PR review is a writer bug to fix, not a bucket to
 /// add.
+///
+/// The account-wide scope is not an exception to that. It is a
+/// [`Self::Run`] like any other — the `ACCOUNT_PROJECT`/`ACCOUNT_RUN`
+/// pseudo-run `allowance_watcher` and `samurai_parker` have always written
+/// their runless ALERTs under, labelled [`ACCOUNT_LABEL`] exactly as the audit
+/// panel already labels them. Nothing lands there for want of a better home:
+/// its rows name it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SamuraiGroupKind {
@@ -142,6 +150,14 @@ pub struct SamuraiFileGroup {
     pub created_at: Option<String>,
     /// A live supervised session (run) or an open review terminal (PR review).
     pub is_live: bool,
+    /// The value an audit row's `epic` must resolve to ([`audit_key`]) for the
+    /// row to belong here — the epic SLUG for a run (`38`, never `#38`), the
+    /// `pr:` id for a PR review.
+    ///
+    /// On the wire because [`Self::audit_rows`] is counted on it and the audit
+    /// view filters on it: the two spellings of one run made a card claim
+    /// "37 rows" and then show none when the user clicked through.
+    pub audit_key: String,
     /// This group's slice of the project audit JSONL — the rows whose `epic`
     /// is this group's run id.
     pub audit_rows: u32,
@@ -218,16 +234,23 @@ pub fn brief_dir(dir: &str) -> PathBuf {
     PathBuf::from(strip_prefix_str(dir)).join(BRIEF_DIR)
 }
 
-/// PRD §8 row 1: handoff files auto-clean `retention_days` after the epic
-/// completes — "completes" meaning its run config reached
+/// PRD §8 row 1: a completed epic's `.maestro/` artifacts auto-clean
+/// `retention_days` afterwards — "completes" meaning its run config reached
 /// [`RunConfigStatus::Archived`] (an ACTIVE epic's history is kept while it
 /// is live). Returns the removed paths for the caller's log.
 ///
-/// The age signal is the file's mtime: a handoff file is written once per
-/// generation and never touched again, so its mtime IS that generation's
-/// end. Missing evidence never deletes — an unreadable mtime, a non-`.md`
-/// entry or an unreadable directory is skipped, matching the inventory's
-/// "no handoff dir is the normal case" reading above.
+/// Both write-once artifact dirs are swept: `.maestro/handoffs/` and
+/// `.maestro/briefs/`. Briefs were left out when issue #137 introduced them,
+/// so every staged ritual and every relaunch accumulated one more file in the
+/// worktree with nothing to ever remove it. (A PR review's brief lands in the
+/// user's own checkout, which belongs to no archivable run and so is not
+/// swept here — that half needs its own policy, tracked in #145.)
+///
+/// The age signal is the file's mtime: a handoff or brief is written once and
+/// never touched again, so its mtime IS that generation's end. Missing
+/// evidence never deletes — an unreadable mtime, a non-`.md` entry or an
+/// unreadable directory is skipped, matching the inventory's "no handoff dir
+/// is the normal case" reading above.
 pub fn sweep_handoff_retention(
     configs: &[(PathBuf, SamuraiRunConfig)],
     retention_days: u32,
@@ -239,32 +262,36 @@ pub fn sweep_handoff_retention(
         if config.status != RunConfigStatus::Archived {
             continue;
         }
-        let dir = handoff_dir(&config.worktree_path);
-        if !seen_dirs.insert(dir.clone()) {
-            continue;
-        }
-        let Ok(files) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for file in files.flatten() {
-            let path = file.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+        for dir in [
+            handoff_dir(&config.worktree_path),
+            brief_dir(&config.worktree_path),
+        ] {
+            if !seen_dirs.insert(dir.clone()) {
                 continue;
             }
-            let expired = std::fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|m| m.elapsed().ok())
-                .is_some_and(|age| age >= max_age);
-            if !expired {
+            let Ok(files) = std::fs::read_dir(&dir) else {
                 continue;
-            }
-            match std::fs::remove_file(&path) {
-                Ok(()) => removed.push(path),
-                Err(e) => log::warn!(
-                    "samurai retention: failed to delete expired handoff {}: {e}",
-                    path.display()
-                ),
+            };
+            for file in files.flatten() {
+                let path = file.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let expired = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|m| m.elapsed().ok())
+                    .is_some_and(|age| age >= max_age);
+                if !expired {
+                    continue;
+                }
+                match std::fs::remove_file(&path) {
+                    Ok(()) => removed.push(path),
+                    Err(e) => log::warn!(
+                        "samurai retention: failed to delete expired artifact {}: {e}",
+                        path.display()
+                    ),
+                }
             }
         }
     }
@@ -290,6 +317,15 @@ pub fn sweep_handoff_retention(
 /// * A **harvest report** belongs to no run and no PR review, so it is no
 ///   longer listed at all (#142). `samurai_harvest_read` still serves the
 ///   legacy files by path.
+///
+/// Slicing must never make a file DISAPPEAR, though — before the grouping,
+/// every audit JSONL and the journal were listed unconditionally, and a user
+/// could open and delete them. So step 6 counts every audit file in the root
+/// (not only the ones the run/PR pass named) and adopts any slice no group
+/// claims onto the scope its own rows name: the account-wide pseudo-run for
+/// `samurai-account.jsonl`, and the run itself for a project whose configs
+/// were cleaned. See [`Groups::adopt_audit_slice`] — still no bucket, and no
+/// silent drop-out either.
 pub fn list_files(
     roots: &SamuraiFilesRoots,
     configs: &[(PathBuf, SamuraiRunConfig)],
@@ -325,7 +361,7 @@ pub fn list_files(
     }
     let open: HashSet<u32> = open_session_ids.iter().copied().collect();
     for (_, run) in pr_runs {
-        groups.upsert_pr(run, open.contains(&run.session_id));
+        groups.upsert_pr(run, samurai_pr_runs::is_live(run, &open));
     }
 
     let mut entries: Vec<SamuraiFileEntry> = Vec::new();
@@ -334,9 +370,16 @@ pub fn list_files(
     //    (issue #138) when one was written. Claimed FIRST so a review whose
     //    checkout doubles as a run worktree cannot have its brief swept up by
     //    the run's brief scan below.
-    let mut pr_briefs: HashSet<PathBuf> = HashSet::new();
+    //
+    //    One file, one row: relaunching the same PR with the same steps writes
+    //    a second RECORD that reuses the same brief stem, so the two records
+    //    name one file — which must still list once, or the card's
+    //    "N files · X KB" counts it twice.
+    let mut claimed_briefs: HashSet<String> = HashSet::new();
+    let mut brief_rows: HashMap<String, usize> = HashMap::new();
     for (path, run) in pr_runs {
         let group_id = run.group_id();
+        let live = samurai_pr_runs::is_live(run, &open);
         if let Some((size_bytes, modified_at)) = stat(path) {
             entries.push(SamuraiFileEntry {
                 group_id: group_id.clone(),
@@ -348,7 +391,7 @@ pub fn list_files(
                 epic: None,
                 // A record of a review whose terminal is still open is in use:
                 // deleting it orphans the group the terminal is writing under.
-                in_use: open.contains(&run.session_id),
+                in_use: live,
                 // No supervised session — "clean this epic" does not apply.
                 has_live_session: false,
                 fire_at: None,
@@ -357,8 +400,16 @@ pub fn list_files(
         let Some(brief) = samurai_pr_runs::brief_path(run) else {
             continue;
         };
-        pr_briefs.insert(brief.clone());
+        let key = path_key(&brief);
+        claimed_briefs.insert(key.clone());
+        if let Some(&index) = brief_rows.get(&key) {
+            // Another record of the same review already listed this file. It
+            // is in use if ANY of the terminals holding it still is.
+            entries[index].in_use |= live;
+            continue;
+        }
         if let Some((size_bytes, modified_at)) = stat(&brief) {
+            brief_rows.insert(key, entries.len());
             entries.push(SamuraiFileEntry {
                 group_id,
                 kind: SamuraiFileKind::Brief,
@@ -367,7 +418,7 @@ pub fn list_files(
                 modified_at,
                 project_path: Some(run.project_path.clone()),
                 epic: None,
-                in_use: open.contains(&run.session_id),
+                in_use: live,
                 has_live_session: false,
                 fire_at: None,
             });
@@ -398,7 +449,7 @@ pub fn list_files(
                 if path.extension().and_then(|e| e.to_str()) != Some("md") {
                     continue;
                 }
-                if pr_briefs.contains(&path) {
+                if claimed_briefs.contains(&path_key(&path)) {
                     continue;
                 }
                 let Some((size_bytes, modified_at)) = stat(&path) else {
@@ -476,18 +527,87 @@ pub fn list_files(
     // supervised, deleting it destroys unconsumed entries — it must route
     // through the harder IN_USE confirm, not an ordinary one.
     let journal_in_use = !live.session_pairs.is_empty();
-    let mut audit_counts: HashMap<String, HashMap<String, u32>> = HashMap::new();
-    for index in 0..groups.groups.len() {
-        let Some(project) = groups.groups[index].project_path.clone() else {
-            continue;
-        };
-        let key = groups.keys[index].clone();
 
-        let audit_path = roots.audit_dir.join(audit_file_name(&project));
-        let counts = audit_counts
-            .entry(project.clone())
-            .or_insert_with(|| count_audit_rows(&audit_path));
-        let rows = counts.get(&key).copied().unwrap_or(0);
+    // 6a. Count every audit JSONL in the root, not only the files the groups
+    //     above happen to point at. A file no group names is exactly the case
+    //     review B3 is about: the account-wide log, or a project whose run
+    //     configs were cleaned. Both are still on disk, still growing, and
+    //     were listed unconditionally before the panel was grouped.
+    let mut audit_counts: HashMap<String, HashMap<String, u32>> = HashMap::new();
+    let mut audit_projects: HashMap<String, String> = HashMap::new();
+    for index in 0..groups.groups.len() {
+        let file = groups.audit_files[index].clone();
+        if let Some(project) = groups.groups[index].project_path.clone() {
+            audit_projects.insert(file.clone(), project);
+        }
+        audit_counts
+            .entry(file.clone())
+            .or_insert_with(|| count_audit_rows(&roots.audit_dir.join(&file)));
+    }
+    if let Ok(files) = std::fs::read_dir(&roots.audit_dir) {
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            audit_counts
+                .entry(name.to_string())
+                .or_insert_with(|| count_audit_rows(&path));
+        }
+    }
+
+    // 6b. Adopt every counted slice no group claims, and every journal entry
+    //     no group claims, onto the real scope it names (see
+    //     `Groups::adopt_audit_slice`). Sorted so the adoption order — and so
+    //     the returned group order — does not ride on hash iteration.
+    let mut unclaimed: Vec<(&String, &String)> = audit_counts
+        .iter()
+        .flat_map(|(file, counts)| counts.keys().map(move |key| (file, key)))
+        .filter(|(file, key)| {
+            !(0..groups.groups.len())
+                .any(|i| &&groups.audit_files[i] == file && &&groups.groups[i].audit_key == key)
+        })
+        .collect();
+    unclaimed.sort();
+    for (file, key) in unclaimed {
+        let (file, key) = (file.clone(), key.clone());
+        groups.adopt_audit_slice(&file, &key, audit_projects.get(&file).map(String::as_str));
+    }
+    for owner in &journal_owners {
+        match (owner.project.as_deref(), owner.agent.as_deref()) {
+            (Some(project), Some(agent)) => {
+                if !groups.claims_journal(project, agent) {
+                    // The run the entry names, keyed on the LEADING segment of
+                    // its agent id — the segment `agent_matches` reads as the
+                    // run (the rest is the generation counter).
+                    let slug = epic_slug(agent);
+                    let key = slug.split('-').next().unwrap_or(&slug);
+                    groups.upsert_run(project, key, None, false);
+                }
+            }
+            // An entry naming no agent names no run: a user note, a harvest
+            // marker. That is an account-level record, and the account-wide
+            // scope is where the audit log already puts its own.
+            _ => groups.upsert_run(ACCOUNT_PROJECT, ACCOUNT_RUN, None, false),
+        }
+    }
+
+    // 6c. The slices themselves. A group with an empty slice gets no row at
+    //     all: an "audit (0 rows)" line says nothing a missing line does not.
+    for index in 0..groups.groups.len() {
+        let file = groups.audit_files[index].clone();
+        let key = groups.groups[index].audit_key.clone();
+        let project = groups.groups[index].project_path.clone();
+
+        let audit_path = roots.audit_dir.join(&file);
+        let rows = audit_counts
+            .get(&file)
+            .and_then(|counts| counts.get(&key))
+            .copied()
+            .unwrap_or(0);
         groups.groups[index].audit_rows = rows;
         if rows > 0 {
             if let Some((size_bytes, modified_at)) = stat(&audit_path) {
@@ -497,12 +617,14 @@ pub fn list_files(
                     path: stripped(&audit_path),
                     size_bytes,
                     modified_at,
-                    project_path: Some(project.clone()),
+                    project_path: project.clone(),
                     epic: groups.epics[index].clone(),
-                    in_use: live.project(&project),
-                    has_live_session: groups.epics[index]
-                        .as_deref()
-                        .is_some_and(|epic| live.session_pair(&project, epic)),
+                    in_use: project.as_deref().is_some_and(|p| live.project(p)),
+                    has_live_session: project.as_deref().is_some_and(|p| {
+                        groups.epics[index]
+                            .as_deref()
+                            .is_some_and(|epic| live.session_pair(p, epic))
+                    }),
                     fire_at: None,
                 });
             }
@@ -510,9 +632,7 @@ pub fn list_files(
 
         let journal_entries = journal_owners
             .iter()
-            .filter(|(entry_project, agent)| {
-                *entry_project == project && agent_matches(agent, &key)
-            })
+            .filter(|owner| owner.belongs_to(project.as_deref(), &key))
             .count() as u32;
         groups.groups[index].journal_entries = journal_entries;
         if journal_entries > 0 {
@@ -523,7 +643,7 @@ pub fn list_files(
                     path: stripped(&journal_path),
                     size_bytes,
                     modified_at,
-                    project_path: Some(project),
+                    project_path: project,
                     epic: groups.epics[index].clone(),
                     in_use: journal_in_use,
                     has_live_session: false,
@@ -566,16 +686,22 @@ pub fn run_group_id(project: &str, epic: &str) -> String {
     )
 }
 
+/// Header of the account-wide scope's card. The same words `AuditSection`
+/// already puts on the cluster of rows this group slices — allowance
+/// crossings and dropped scheduled launches, written under the
+/// [`ACCOUNT_PROJECT`]/[`ACCOUNT_RUN`] pseudo-entities while nothing is
+/// supervised. A real, named scope with real writers, NOT the generic bucket
+/// issue #139 refuses: nothing lands here for want of a better home.
+const ACCOUNT_LABEL: &str = "Account-wide";
+
 /// The groups under construction, plus the two per-group facts the
-/// [`SamuraiFileGroup`] wire shape does not carry: the key its audit/journal
-/// slice matches on, and the epic identity string its entries quote.
+/// [`SamuraiFileGroup`] wire shape does not carry: the audit FILE its slice is
+/// counted in, and the epic identity string its entries quote.
 #[derive(Default)]
 struct Groups {
     groups: Vec<SamuraiFileGroup>,
-    /// Per group: the value an audit row's `epic` (or a journal entry's
-    /// `agent`) must resolve to for the row to belong here — the epic slug for
-    /// a run, the `pr:` id for a PR review.
-    keys: Vec<String>,
+    /// Per group: the name of the audit JSONL its slice lives in.
+    audit_files: Vec<String>,
     /// Per group: the run's epic identity string, `None` for a PR review.
     epics: Vec<Option<String>>,
     index: HashMap<String, usize>,
@@ -598,7 +724,9 @@ impl Groups {
             self.groups[index].is_live |= is_live;
             return;
         }
-        let refs = match config {
+        let account = project == ACCOUNT_PROJECT && epic == ACCOUNT_RUN;
+        let refs: Vec<String> = match config {
+            _ if account => Vec::new(),
             Some(config) if !config.epics.is_empty() || !config.issues.is_empty() => config
                 .epics
                 .iter()
@@ -611,20 +739,27 @@ impl Groups {
         };
         let single_epic = config.is_none_or(|c| c.issues.is_empty());
         let titles: &[RefTitle] = config.map_or(&[], |c| c.ref_titles.as_slice());
-        self.index.insert(id.clone(), self.groups.len());
-        self.keys.push(epic_slug(epic));
-        self.epics.push(Some(epic.to_string()));
-        self.groups.push(SamuraiFileGroup {
-            id,
-            kind: SamuraiGroupKind::Run,
-            label: run_label(&refs, titles, single_epic),
-            refs,
-            project_path: Some(project.to_string()),
-            created_at: config.map(|c| c.created_at.clone()),
-            is_live,
-            audit_rows: 0,
-            journal_entries: 0,
-        });
+        let label = if account {
+            ACCOUNT_LABEL.to_string()
+        } else {
+            run_label(&refs, titles, single_epic)
+        };
+        self.push(
+            SamuraiFileGroup {
+                id,
+                kind: SamuraiGroupKind::Run,
+                label,
+                refs,
+                project_path: Some(project.to_string()),
+                created_at: config.map(|c| c.created_at.clone()),
+                is_live,
+                audit_key: epic_slug(epic),
+                audit_rows: 0,
+                journal_entries: 0,
+            },
+            audit_file_name(project),
+            Some(epic.to_string()),
+        );
     }
 
     /// Adds (or updates) the group for a PR review. Several launches of the
@@ -636,6 +771,13 @@ impl Groups {
         if let Some(&index) = self.index.get(&id) {
             let group = &mut self.groups[index];
             group.is_live |= is_live;
+            // A title fills an empty label whatever this record's recency:
+            // `read_dir` hands records over in arbitrary order, so gating the
+            // refresh on "newer" alone let an untitled record suppress a
+            // titled one and the card degraded to `PR #142` for no reason.
+            if !run.title.is_empty() && group.label == pr_label(run.pr, "") {
+                group.label = pr_label(run.pr, &run.title);
+            }
             if group
                 .created_at
                 .as_deref()
@@ -648,21 +790,122 @@ impl Groups {
             }
             return;
         }
-        self.index.insert(id.clone(), self.groups.len());
-        self.keys.push(id.clone());
-        self.epics.push(None);
-        self.groups.push(SamuraiFileGroup {
-            id,
-            kind: SamuraiGroupKind::PrReview,
-            label: pr_label(run.pr, &run.title),
-            refs: vec![format!("#{}", run.pr)],
-            project_path: Some(run.project_path.clone()),
-            created_at: Some(run.created_at.clone()),
-            is_live,
-            audit_rows: 0,
-            journal_entries: 0,
-        });
+        self.push(
+            SamuraiFileGroup {
+                id: id.clone(),
+                kind: SamuraiGroupKind::PrReview,
+                label: pr_label(run.pr, &run.title),
+                refs: vec![format!("#{}", run.pr)],
+                project_path: Some(run.project_path.clone()),
+                created_at: Some(run.created_at.clone()),
+                is_live,
+                audit_key: id,
+                audit_rows: 0,
+                journal_entries: 0,
+            },
+            audit_file_name(&run.project_path),
+            None,
+        );
     }
+
+    /// Gives an audit slice no group claims the REAL scope it belongs to
+    /// (issue #136 review B3). A slice reaching here means the group pass saw
+    /// no config, timer, session or record for it — not that it belongs
+    /// nowhere: the rows themselves name their scope, and this reconstructs it
+    /// from them, so nothing a user could previously see and delete goes
+    /// invisible. `project` is the checkout when some other group already
+    /// knows this audit file's, `None` when the file is all that is left.
+    ///
+    /// Deliberately no fallback branch: a key that names nothing recognisable
+    /// is left uncounted rather than parked in a generic bucket (#139).
+    fn adopt_audit_slice(&mut self, file: &str, key: &str, project: Option<&str>) {
+        // A PR review whose record was deleted: its rows carry the group id.
+        if let Some(number) = key
+            .strip_prefix("pr:")
+            .and_then(|rest| rest.rsplit_once('#'))
+            .and_then(|(_, n)| n.parse::<u32>().ok())
+        {
+            if self.index.contains_key(key) {
+                return;
+            }
+            self.push(
+                SamuraiFileGroup {
+                    id: key.to_string(),
+                    kind: SamuraiGroupKind::PrReview,
+                    label: pr_label(number, ""),
+                    refs: vec![format!("#{number}")],
+                    project_path: project.map(str::to_string),
+                    created_at: None,
+                    is_live: false,
+                    audit_key: key.to_string(),
+                    audit_rows: 0,
+                    journal_entries: 0,
+                },
+                file.to_string(),
+                None,
+            );
+            return;
+        }
+        // The account-wide pseudo-run: allowance crossings and dropped
+        // scheduled launches, written while nothing is supervised.
+        if key == ACCOUNT_RUN && file == audit_file_name(ACCOUNT_PROJECT) {
+            self.upsert_run(ACCOUNT_PROJECT, ACCOUNT_RUN, None, false);
+            return;
+        }
+        // A run whose config was cleaned away. Its rows are what is left of
+        // it, and they name it — with the same id the run had while its
+        // config existed, because the audit file name embeds the same project
+        // hash [`run_group_id`] keys on.
+        let Some(hash) = audit_file_project_hash(file) else {
+            return;
+        };
+        let id = format!("run:{hash}:{key}");
+        if self.index.contains_key(&id) {
+            return;
+        }
+        let refs = vec![ref_label(key)];
+        self.push(
+            SamuraiFileGroup {
+                id,
+                kind: SamuraiGroupKind::Run,
+                label: run_label(&refs, &[], true),
+                refs,
+                project_path: project.map(str::to_string),
+                created_at: None,
+                is_live: false,
+                audit_key: key.to_string(),
+                audit_rows: 0,
+                journal_entries: 0,
+            },
+            file.to_string(),
+            None,
+        );
+    }
+
+    /// Does any group already claim this journal entry? (See
+    /// [`agent_matches`] — the entry belongs to the run its `agent` names,
+    /// inside the project it names.)
+    fn claims_journal(&self, project: &str, agent: &str) -> bool {
+        self.groups.iter().any(|g| {
+            g.project_path.as_deref() == Some(project) && agent_matches(agent, &g.audit_key)
+        })
+    }
+
+    fn push(&mut self, group: SamuraiFileGroup, audit_file: String, epic: Option<String>) {
+        self.index.insert(group.id.clone(), self.groups.len());
+        self.audit_files.push(audit_file);
+        self.epics.push(epic);
+        self.groups.push(group);
+    }
+}
+
+/// The project hash an audit file name embeds
+/// (`<sanitized-basename>-<hash12>.jsonl`, `samurai_audit::audit_file_name`).
+/// It is the SAME hash [`run_group_id`] keys on, which is what lets a run
+/// whose config was cleaned rebuild its own group id out of its rows alone.
+fn audit_file_project_hash(file: &str) -> Option<&str> {
+    let (stem, hash) = file.strip_suffix(".jsonl")?.rsplit_once('-')?;
+    (!stem.is_empty() && !hash.is_empty()).then_some(hash)
 }
 
 /// A bare ref spelled the way a label quotes it: `38` and `#38` both render
@@ -763,11 +1006,29 @@ struct JournalOwner {
     agent: Option<String>,
 }
 
-/// The `(project, agent)` pair of every journal entry that names both — the
-/// only entries a group can claim. Harvest marker lines and user entries (no
-/// agent) name no run, so they belong to no group and are not counted.
-fn journal_owners(path: &Path) -> Vec<(String, String)> {
-    let mut owners: Vec<(String, String)> = Vec::new();
+impl JournalOwner {
+    /// Does this entry belong to the group scoped to (`project`, `key`)?
+    ///
+    /// An entry naming both a project and an agent belongs to the run its
+    /// agent names, in that project. An entry naming no agent — a user note, a
+    /// harvest marker — names no run at all, and is an account-level record:
+    /// it belongs to the account-wide scope, the same place the audit log's
+    /// own runless rows go. Keeping those countable is what stops the journal
+    /// from vanishing out of the panel entirely (review B3).
+    fn belongs_to(&self, project: Option<&str>, key: &str) -> bool {
+        match (self.project.as_deref(), self.agent.as_deref()) {
+            (Some(entry_project), Some(agent)) => {
+                project == Some(entry_project) && agent_matches(agent, key)
+            }
+            _ => project == Some(ACCOUNT_PROJECT) && key == ACCOUNT_RUN,
+        }
+    }
+}
+
+/// The `(project, agent)` naming of every journal entry, both halves optional
+/// — see [`JournalOwner::belongs_to`] for what each shape means.
+fn journal_owners(path: &Path) -> Vec<JournalOwner> {
+    let mut owners: Vec<JournalOwner> = Vec::new();
     let Ok(file) = std::fs::File::open(path) else {
         return owners;
     };
@@ -775,11 +1036,8 @@ fn journal_owners(path: &Path) -> Vec<(String, String)> {
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(owner) = serde_json::from_str::<JournalOwner>(&line) else {
-            continue;
-        };
-        if let (Some(project), Some(agent)) = (owner.project, owner.agent) {
-            owners.push((project, agent));
+        if let Ok(owner) = serde_json::from_str::<JournalOwner>(&line) {
+            owners.push(owner);
         }
     }
     owners
@@ -787,18 +1045,21 @@ fn journal_owners(path: &Path) -> Vec<(String, String)> {
 
 /// Does a journal entry's `agent` name this group's work? The rider asks
 /// agents for "your epic/generation id" (`samurai_prompts`), so the value is
-/// free text like `#38 gen-2` — slugged, that is `38-gen-2`, and the group's
-/// key (`38`) must appear as a whole segment of it. Substring matching alone
-/// would let epic `3` claim epic `38`'s entries.
+/// free text like `#38 gen-2` — slugged, that is `38-gen-2`, whose LEADING
+/// segment is the run id.
+///
+/// Leading only, deliberately. Matching any segment made the generation
+/// counter readable as a run id: `#9 gen-1` slugs to `9-gen-1`, whose last
+/// segment is `1`, so epic #1 counted every `gen-1` entry of every other run
+/// — and #2, #3… the same. Whole-segment matching is still what stops epic
+/// `3` from claiming epic `38`'s entries; anchoring it to the front is what
+/// stops a counter from impersonating a run.
 fn agent_matches(agent: &str, key: &str) -> bool {
     if key.starts_with("pr:") {
         return agent == key;
     }
     let slug = epic_slug(agent);
-    slug == key
-        || slug.starts_with(&format!("{key}-"))
-        || slug.ends_with(&format!("-{key}"))
-        || slug.contains(&format!("-{key}-"))
+    slug == key || slug.starts_with(&format!("{key}-"))
 }
 
 /// Deletes one managed file, guarded twice (issue #65):
@@ -1008,9 +1269,28 @@ fn strip_prefix_str(path: &str) -> &str {
     path.strip_prefix(r"\\?\").unwrap_or(path)
 }
 
+/// De-duplication identity of a path that must never be stat'ed to be
+/// compared — the PR-brief claim, which decides whether the run brief scan
+/// listed the same file a second time under a second group.
+///
+/// `PathBuf` equality is exact, so `C:\Git\Maestro\…` and `C:\git\maestro\…`
+/// — one spelling from the PR record, the other from the run config — read as
+/// two files on Windows, and the same brief listed twice in two groups. The
+/// key strips the verbatim prefix, unifies the separators and lowercases, the
+/// same shape `audit_file_name` already keys projects on. Two genuinely
+/// case-distinct briefs in one directory would collide on a case-sensitive
+/// filesystem; briefs are Maestro-written from a slugged, already-lowercased
+/// stem (`samurai_brief::write_brief`), so that pair cannot occur.
+fn path_key(path: &Path) -> String {
+    strip_prefix_str(&path.to_string_lossy())
+        .replace('\\', "/")
+        .to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::allowance_watcher::{ACCOUNT_PROJECT, ACCOUNT_RUN};
     use crate::core::samurai_pr_runs::PrReviewLaunch;
     use crate::core::samurai_run_config::RunConfigStore;
     use crate::core::supervisor::SupervisorState;
@@ -1116,6 +1396,8 @@ mod tests {
     }
 
     const PR_GROUP: &str = "pr:nachogl1/maestro#142";
+    /// A checkout whose run configs are gone but whose audit rows remain.
+    const CLEANED_PROJECT: &str = "C:/git/cleaned";
 
     fn fixture() -> Fixture {
         let base = tempdir().unwrap();
@@ -1152,6 +1434,15 @@ mod tests {
             ))
             .unwrap();
         store.archive(&project, "#7").unwrap();
+
+        // A single-digit epic that shares no rows with #9 — the fixture that
+        // catches a `gen-N` suffix being read as a run id (`9-gen-1` ends in
+        // `-1`), which every epic #1…#9 was silently claiming.
+        let wt1 = worktree_with(base.path(), "wt-1", &[], &[]);
+        let mut config1 =
+            SamuraiRunConfig::new(project.clone(), "#1", wt1.to_string_lossy().into_owned());
+        config1.epics = vec!["1".to_string()];
+        store.save(&config1).unwrap();
 
         let wt77 = worktree_with(base.path(), "wt-77", &[], &[]);
         let mut config77 = SamuraiRunConfig::new(
@@ -1201,8 +1492,23 @@ mod tests {
         audit.push_str(&audit_line(PR_GROUP));
         audit.push_str(&audit_line(""));
         std::fs::write(roots.audit_dir.join(audit_file_name(&project)), audit).unwrap();
-        // Another project's audit file must never be counted or listed here.
+        // Another project's audit file, holding nothing attributable.
         std::fs::write(roots.audit_dir.join("orphan-000000000000.jsonl"), "{}\n").unwrap();
+        // The account-wide log: allowance crossings and dropped scheduled
+        // launches, written under the `samurai-account` pseudo-project while
+        // nothing is supervised. No run config will ever point at it.
+        std::fs::write(
+            roots.audit_dir.join(audit_file_name(ACCOUNT_PROJECT)),
+            format!("{}{}", audit_line(ACCOUNT_RUN), audit_line(ACCOUNT_RUN)),
+        )
+        .unwrap();
+        // A project whose run configs were cleaned away: its rows still name
+        // the run they came from, and the file is still on disk.
+        std::fs::write(
+            roots.audit_dir.join(audit_file_name(CLEANED_PROJECT)),
+            format!("{}{}", audit_line("#5"), audit_line("5")),
+        )
+        .unwrap();
 
         // The journal: two entries by epic #9's agents, one by the user (no
         // agent → belongs to no run), one by an agent of another project.
@@ -1292,8 +1598,14 @@ mod tests {
             sorted(vec![
                 run_group_id(&f.project, "#9"),
                 run_group_id(&f.project, "#7"),
+                run_group_id(&f.project, "#1"),
                 run_group_id(&f.project, "issues #77, #78"),
                 PR_GROUP.to_string(),
+                // The scopes the shared logs are sliced under when no config
+                // or record names them (review B3).
+                run_group_id(ACCOUNT_PROJECT, ACCOUNT_RUN),
+                run_group_id(CLEANED_PROJECT, "#5"),
+                run_group_id("C:/git/elsewhere", "#9"),
             ])
         );
         for g in &groups {
@@ -1416,6 +1728,11 @@ mod tests {
         assert_eq!(epic9.audit_rows, 3);
         assert_eq!(epic9.journal_entries, 2, "only this run's agents' entries");
 
+        // Epic #1 wrote nothing: `#9 gen-1`'s trailing generation counter is
+        // not a run id, so #1 claims none of #9's entries.
+        let epic1 = group(&groups, &run_group_id(&f.project, "#1"));
+        assert_eq!((epic1.audit_rows, epic1.journal_entries), (0, 0));
+
         // Slug identity: the `7` rows belong to the `#7` run.
         assert_eq!(
             group(&groups, &run_group_id(&f.project, "#7")).audit_rows,
@@ -1430,13 +1747,22 @@ mod tests {
             .filter(|e| e.group_id == quiet.id)
             .all(|e| e.kind != SamuraiFileKind::AuditLog && e.kind != SamuraiFileKind::Journal));
 
-        // The unattributed audit row is counted nowhere: no bucket to hide in.
-        assert_eq!(groups.iter().map(|g| g.audit_rows).sum::<u32>(), 6);
-        assert_eq!(groups.iter().map(|g| g.journal_entries).sum::<u32>(), 2);
+        // The row written with an EMPTY run id is counted nowhere: it names
+        // no scope at all, and #139 admits no bucket to hide it in. (The
+        // sweep in `samurai_audit` is what keeps writers from making more.)
+        let this_project: u32 = groups
+            .iter()
+            .filter(|g| g.project_path.as_deref() == Some(f.project.as_str()))
+            .map(|g| g.audit_rows)
+            .sum();
+        assert_eq!(this_project, 6);
 
         // The physical files are unchanged and shared: one audit row entry
-        // per counting group, all pointing at the same JSONL.
-        let audits = of_kind(&entries, SamuraiFileKind::AuditLog);
+        // per counting group, all pointing at their project's one JSONL.
+        let audits: Vec<&SamuraiFileEntry> = of_kind(&entries, SamuraiFileKind::AuditLog)
+            .into_iter()
+            .filter(|e| e.project_path.as_deref() == Some(f.project.as_str()))
+            .collect();
         assert_eq!(audits.len(), 3);
         assert!(audits.iter().all(|e| e.path.ends_with(".jsonl")));
         assert_eq!(
@@ -1444,8 +1770,121 @@ mod tests {
             1
         );
         let journals = of_kind(&entries, SamuraiFileKind::Journal);
-        assert_eq!(journals.len(), 1);
-        assert!(journals[0].path.ends_with(JOURNAL_FILE));
+        assert!(journals.iter().all(|e| e.path.ends_with(JOURNAL_FILE)));
+        assert_eq!(
+            journals
+                .iter()
+                .filter(|e| e.project_path.as_deref() == Some(f.project.as_str()))
+                .count(),
+            1
+        );
+    }
+
+    /// Review B3: a managed file the user could see and delete before the
+    /// panel was grouped must not silently become invisible now that the
+    /// shared logs surface only as per-group SLICES.
+    ///
+    /// Every slice gets a REAL scope, never a generic bucket (#139 forbids
+    /// one): the account-wide log lands on the `ACCOUNT_PROJECT`/`ACCOUNT_RUN`
+    /// pseudo-run that already writes it, and a cleaned project's rows land on
+    /// the run those rows themselves name.
+    #[test]
+    fn test_unclaimed_audit_slices_land_on_a_real_scope_not_a_bucket() {
+        let f = fixture();
+        let (groups, entries) = list(&f, &[], &[]);
+
+        // The account-wide log — allowance ALERTs and dropped launches, still
+        // actively written, and previously listed unconditionally.
+        let account = group(&groups, &run_group_id(ACCOUNT_PROJECT, ACCOUNT_RUN));
+        assert_eq!(account.label, "Account-wide");
+        assert_eq!(account.audit_rows, 2);
+        assert!(!account.is_live);
+        let account_file = audit_file_name(ACCOUNT_PROJECT);
+        assert!(
+            entries.iter().any(|e| e.group_id == account.id
+                && e.kind == SamuraiFileKind::AuditLog
+                && e.path.ends_with(&account_file)),
+            "the account-wide audit file must still be listed and deletable"
+        );
+
+        // A project whose run configs were cleaned: the rows name the run, so
+        // the run is the group — reconstructed with the SAME id it would have
+        // had while its config existed.
+        let cleaned = group(&groups, &run_group_id(CLEANED_PROJECT, "#5"));
+        assert_eq!(cleaned.label, "Epic #5");
+        assert_eq!(cleaned.audit_rows, 2, "`#5` and `5` are one run");
+        assert!(entries.iter().any(|e| e.group_id == cleaned.id
+            && e.kind == SamuraiFileKind::AuditLog
+            && e.path.ends_with(&audit_file_name(CLEANED_PROJECT))));
+
+        // Still no generic group anywhere.
+        for g in &groups {
+            assert!(matches!(
+                g.kind,
+                SamuraiGroupKind::Run | SamuraiGroupKind::PrReview
+            ));
+            for banned in ["System", "Other", "Unattributed", "Unknown"] {
+                assert!(!g.label.contains(banned), "generic label: {}", g.label);
+            }
+        }
+    }
+
+    /// Review B3, the journal half: an entry naming a run Maestro no longer
+    /// has a config for lands on that run; an entry naming NO run at all is
+    /// account-level, and lands on the account-wide scope. Either way the
+    /// journal file stays listed.
+    #[test]
+    fn test_unclaimed_journal_entries_keep_the_journal_listed() {
+        let f = fixture();
+        let (groups, entries) = list(&f, &[], &[]);
+
+        // The user entry (no agent → names no run) is account-level.
+        let account = group(&groups, &run_group_id(ACCOUNT_PROJECT, ACCOUNT_RUN));
+        assert_eq!(account.journal_entries, 1);
+
+        // The other project's agent entry lands on ITS run, not on #9's.
+        let elsewhere = group(&groups, &run_group_id("C:/git/elsewhere", "#9"));
+        assert_eq!(elsewhere.journal_entries, 1);
+        assert_eq!(elsewhere.project_path.as_deref(), Some("C:/git/elsewhere"));
+
+        // Every journal entry is now accounted for, and the file is listed.
+        assert_eq!(groups.iter().map(|g| g.journal_entries).sum::<u32>(), 4);
+        let journals = of_kind(&entries, SamuraiFileKind::Journal);
+        assert_eq!(journals.len(), 3, "one row per counting group");
+        assert!(journals.iter().all(|e| e.path.ends_with(JOURNAL_FILE)));
+    }
+
+    /// Review B4: the group publishes the exact key its `audit_rows` were
+    /// counted on, so the audit view can filter on the same spelling. Filtering
+    /// on the raw `epic` showed zero rows for a card claiming N.
+    #[test]
+    fn test_groups_publish_the_key_their_audit_slice_was_counted_on() {
+        let f = fixture();
+        let (groups, _) = list(&f, &[], &[]);
+
+        // A run's key is the epic SLUG — the audit log carries `#9` and `7`
+        // for the same runs the configs spell `#9` and `#7`.
+        assert_eq!(
+            group(&groups, &run_group_id(&f.project, "#9")).audit_key,
+            "9"
+        );
+        assert_eq!(
+            group(&groups, &run_group_id(&f.project, "#7")).audit_key,
+            "7"
+        );
+        // A PR review's key is its group id, which is what its rows carry.
+        assert_eq!(group(&groups, PR_GROUP).audit_key, PR_GROUP);
+        assert_eq!(
+            group(&groups, &run_group_id(ACCOUNT_PROJECT, ACCOUNT_RUN)).audit_key,
+            ACCOUNT_RUN
+        );
+
+        // The contract: a group claiming rows publishes a key those rows
+        // actually resolve to.
+        for g in groups.iter().filter(|g| g.audit_rows > 0) {
+            assert!(!g.audit_key.is_empty(), "{g:?}");
+            assert_eq!(g.audit_key, audit_key(&g.audit_key), "{g:?}");
+        }
     }
 
     /// Criterion 6: a PR review launch leaves a record, and the record and
@@ -1495,6 +1934,136 @@ mod tests {
         assert!(entries
             .iter()
             .any(|e| e.group_id == PR_GROUP && e.kind == SamuraiFileKind::PrReviewRun));
+    }
+
+    /// A record from an EARLIER app launch must never report itself live.
+    /// Maestro's PTY session ids restart at 1 every launch while records
+    /// persist forever, so an old record with `session_id: 3` matched an
+    /// unrelated terminal 3 — and the dead review's record and brief came
+    /// back `in_use`, deletable only with `force`.
+    #[test]
+    fn test_a_pr_record_from_an_earlier_app_launch_is_never_live() {
+        let mut f = fixture();
+        let session = f.pr_runs[0].1.session_id;
+
+        // This launch's record, its terminal open: live, as before.
+        let (groups, entries) = list(&f, &[], &[session]);
+        assert!(group(&groups, PR_GROUP).is_live);
+        assert!(entries
+            .iter()
+            .any(|e| e.group_id == PR_GROUP && e.kind == SamuraiFileKind::PrReviewRun && e.in_use));
+
+        // The same record, written by a previous launch: terminal 7 belongs
+        // to somebody else now.
+        f.pr_runs[0].1.launch_id = "20200101000000-1".to_string();
+        let (groups, entries) = list(&f, &[], &[session]);
+        assert!(!group(&groups, PR_GROUP).is_live);
+        assert!(entries
+            .iter()
+            .filter(|e| e.group_id == PR_GROUP && e.kind != SamuraiFileKind::AuditLog)
+            .all(|e| !e.in_use));
+    }
+
+    /// One brief file, one row — even when two records name it. Relaunching
+    /// the same PR with the same steps writes a second record that reuses the
+    /// brief stem, and two rows for one file double-count the card's header.
+    #[test]
+    fn test_one_brief_lists_once_across_relaunches_of_the_same_pr() {
+        let mut f = fixture();
+        let relaunch = PrReviewRun {
+            session_id: 11,
+            created_at: "2030-01-01T00:00:00+00:00".to_string(),
+            ..f.pr_runs[0].1.clone()
+        };
+        f.pr_runs
+            .push((f.roots.runs_dir.join("pr").join("relaunch.json"), relaunch));
+
+        let (_, entries) = list(&f, &[], &[]);
+        let briefs: Vec<&SamuraiFileEntry> = entries
+            .iter()
+            .filter(|e| e.kind == SamuraiFileKind::Brief && e.group_id == PR_GROUP)
+            .collect();
+        assert_eq!(briefs.len(), 1, "one file, one row: {briefs:?}");
+
+        // …and the surviving row is in use while EITHER terminal is open.
+        let (_, entries) = list(&f, &[], &[11]);
+        assert!(entries
+            .iter()
+            .filter(|e| e.kind == SamuraiFileKind::Brief && e.group_id == PR_GROUP)
+            .all(|e| e.in_use));
+    }
+
+    /// Review B5: `read_dir` hands the records of one PR over in arbitrary
+    /// order, so a titled record can arrive AFTER a newer untitled one. The
+    /// card must still say what the PR is — a title fills an empty label
+    /// whatever the order, and only recency decides between two titles.
+    #[test]
+    fn test_a_pr_title_fills_an_empty_label_whatever_the_record_order() {
+        let base = tempdir().unwrap();
+        let roots = roots_in(base.path());
+        let project = base.path().to_string_lossy().into_owned();
+        let record = |title: &str, session, created_at: &str| {
+            let mut run = PrReviewRun::now(
+                PrReviewLaunch {
+                    pr: 142,
+                    title: title.to_string(),
+                    repo: "nachogl1/maestro".to_string(),
+                    project_path: project.clone(),
+                    steps: vec![],
+                },
+                session,
+                None,
+            );
+            run.created_at = created_at.to_string();
+            (roots.runs_dir.join(format!("{session}.json")), run)
+        };
+
+        // The untitled relaunch is the NEWER of the two, and is seen first.
+        let runs = vec![
+            record("", 9, "2026-08-17T13:00:00+00:00"),
+            record("fix journal splitting", 7, "2026-08-17T12:00:00+00:00"),
+        ];
+        let (groups, _) = list_files(&roots, &[], &[], &[], &runs, &[]);
+        assert_eq!(
+            group(&groups, PR_GROUP).label,
+            "PR #142 — fix journal splitting"
+        );
+
+        // The newest title still wins when there are two.
+        let runs = vec![
+            record("stale title", 9, "2026-08-17T12:00:00+00:00"),
+            record("fix journal splitting", 7, "2026-08-17T13:00:00+00:00"),
+        ];
+        let (groups, _) = list_files(&roots, &[], &[], &[], &runs, &[]);
+        assert_eq!(
+            group(&groups, PR_GROUP).label,
+            "PR #142 — fix journal splitting"
+        );
+    }
+
+    #[test]
+    fn test_brief_claim_key_ignores_case_and_separator_spelling() {
+        // Windows resolves `C:\Git\Maestro` and `C:\git\maestro` to one
+        // checkout; `PathBuf` equality does not. The PR record and the run
+        // config can carry either spelling, and an exact compare listed the
+        // same brief twice, in two groups.
+        let key = path_key(Path::new(r"C:\git\maestro\.maestro\briefs\pr-1.md"));
+        assert_eq!(
+            key,
+            path_key(Path::new(r"C:\Git\Maestro\.maestro\briefs\PR-1.md"))
+        );
+        assert_eq!(
+            key,
+            path_key(Path::new(r"\\?\C:\git\maestro\.maestro\briefs\pr-1.md"))
+        );
+        assert_eq!(
+            key,
+            path_key(Path::new("C:/git/maestro/.maestro/briefs/pr-1.md"))
+        );
+        assert_ne!(
+            key,
+            path_key(Path::new(r"C:\git\other\.maestro\briefs\pr-1.md"))
+        );
     }
 
     /// A PR review whose checkout doubles as a run worktree must not have its
@@ -1593,6 +2162,7 @@ mod tests {
             "project_path",
             "created_at",
             "is_live",
+            "audit_key",
             "audit_rows",
             "journal_entries",
         ] {
@@ -1953,9 +2523,21 @@ mod tests {
         // is free text. Epic `3` must never claim epic `38`'s entries.
         assert!(agent_matches("#38 gen-2", "38"));
         assert!(agent_matches("38", "38"));
-        assert!(agent_matches("gen-1 of 38", "38"));
         assert!(!agent_matches("#380 gen-2", "38"));
         assert!(!agent_matches("#3 gen-2", "38"));
+
+        // Only the LEADING segment identifies the run. A trailing or interior
+        // one is the generation counter, and matching it made every
+        // single-digit epic claim every `gen-N` entry of every other run:
+        // `#9 gen-1` slugs to `9-gen-1`, whose last segment is `1`.
+        assert!(!agent_matches("#9 gen-1", "1"));
+        assert!(!agent_matches("#9 gen-2", "2"));
+        assert!(!agent_matches("#38 gen-7 of 12", "12"));
+        // The cost of that rule: a run id buried mid-string no longer
+        // matches. The rider asks for the id FIRST, so this is the shape
+        // production writes, and a missed slice beats a stolen one.
+        assert!(!agent_matches("gen-1 of 38", "38"));
+
         // A PR review's key is its group id, matched exactly.
         assert!(agent_matches(PR_GROUP, PR_GROUP));
         assert!(!agent_matches("pr:nachogl1/maestro#143", PR_GROUP));
@@ -1963,12 +2545,19 @@ mod tests {
 
     #[test]
     fn test_retention_sweep_only_touches_archived_epics() {
-        // PRD §8 row 1. The fixture has an ACTIVE epic (#9, two handoffs)
-        // and an ARCHIVED one (#7, one handoff).
+        // PRD §8 row 1. The fixture has an ACTIVE epic (#9, two handoffs, one
+        // brief) and an ARCHIVED one (#7, one handoff).
         let f = fixture();
         let wt7 = f.base.path().join("wt-7").join(".maestro").join("handoffs");
         let wt9 = f.base.path().join("wt-9").join(".maestro").join("handoffs");
         std::fs::write(wt7.join("notes.txt"), "not a handoff").unwrap();
+        // Review B11: briefs accumulate in the same worktree and were never
+        // swept — one per generation, per staged ritual, forever.
+        let brief7 = f.base.path().join("wt-7").join(BRIEF_DIR);
+        std::fs::create_dir_all(&brief7).unwrap();
+        std::fs::write(brief7.join("gen-1-ritual.md"), "# brief").unwrap();
+        std::fs::write(brief7.join("notes.txt"), "not a brief").unwrap();
+        let brief9 = f.base.path().join("wt-9").join(BRIEF_DIR);
         let configs = f.store.list_with_paths();
 
         // Fresh files under the shipped 14-day window: nothing is swept.
@@ -1979,15 +2568,20 @@ mod tests {
         // fake clock; `validate()` forbids 0 in a real config, so the sweep
         // only ever sees >= 1 in production.
         let removed = sweep_handoff_retention(&configs, 0);
-        assert_eq!(removed.len(), 1, "removed: {removed:?}");
+        assert_eq!(removed.len(), 2, "handoff AND brief; removed: {removed:?}");
         assert!(!wt7.join("7-gen1.md").exists());
+        assert!(!brief7.join("gen-1-ritual.md").exists());
         assert!(
-            wt7.join("notes.txt").exists(),
-            "only .md handoffs are swept"
+            wt7.join("notes.txt").exists() && brief7.join("notes.txt").exists(),
+            "only .md artifacts are swept"
         );
         assert!(
             wt9.join("9-gen1.md").exists() && wt9.join("9-gen2.md").exists(),
             "an ACTIVE epic keeps its history while it is live"
+        );
+        assert!(
+            brief9.join("gen-1-launch.md").exists(),
+            "an ACTIVE epic keeps its briefs too"
         );
 
         // Idempotent; an already-empty (or missing) handoff dir is not an

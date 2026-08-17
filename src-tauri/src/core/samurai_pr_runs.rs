@@ -26,12 +26,43 @@
 //! and carries on. The review still runs; it simply groups under nothing until
 //! the next launch — the same policy the brief write itself follows.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
 /// Directory name, inside the `runs` root, holding PR-review records.
 pub const PR_RUNS_DIR: &str = "pr";
+
+/// This app launch's id, computed once per process.
+///
+/// Records outlive the app; Maestro's PTY session ids do not — they restart at
+/// 1 on every launch (`process_manager`'s `AtomicU32::new(1)`). Comparing a
+/// stored `session_id` against the open terminals therefore matched an
+/// unrelated shell after a restart, and the dead review reported itself LIVE:
+/// its record and brief came back `in_use`, deletable only with `force`.
+/// Pairing the session with the launch that issued it makes the comparison
+/// mean what it reads as. Filesystem-safe by construction, because
+/// [`record_file_name`] carries it too.
+pub fn launch_id() -> &'static str {
+    static LAUNCH_ID: OnceLock<String> = OnceLock::new();
+    LAUNCH_ID.get_or_init(|| {
+        format!(
+            "{}-{}",
+            chrono::Utc::now().format("%Y%m%d%H%M%S"),
+            std::process::id()
+        )
+    })
+}
+
+/// Is this review's terminal one of the CURRENTLY open ones? True only when
+/// the record was written by this app launch AND its session is still open —
+/// a record from an earlier launch (or a pre-#136 record carrying no launch at
+/// all) can never prove liveness, so it is treated as closed.
+pub fn is_live(run: &PrReviewRun, open_session_ids: &HashSet<u32>) -> bool {
+    run.launch_id == launch_id() && open_session_ids.contains(&run.session_id)
+}
 
 /// The record's `kind` discriminator. A one-variant enum so the SCREAMING wire
 /// spelling is pinned by serde rather than by a string literal (the
@@ -82,25 +113,32 @@ pub struct PrReviewRun {
     #[serde(default)]
     pub brief: Option<String>,
     /// The Maestro terminal session the review opened in. Its liveness is what
-    /// makes the group live.
+    /// makes the group live — but only together with [`Self::launch_id`], see
+    /// [`is_live`].
     pub session_id: u32,
+    /// The app launch that opened that session ([`launch_id`]). Empty on
+    /// records written before this field existed, which simply never match the
+    /// running launch — the safe reading.
+    #[serde(default)]
+    pub launch_id: String,
     /// RFC 3339 UTC creation timestamp.
     pub created_at: String,
 }
 
 impl PrReviewRun {
     /// Builds a record from a launch plus the two delivery facts, stamped with
-    /// the current UTC time.
+    /// the current UTC time and this app launch's id.
     pub fn now(launch: PrReviewLaunch, session_id: u32, brief: Option<String>) -> Self {
         Self {
             kind: PrRunKind::PrReview,
             pr: launch.pr,
             title: launch.title,
             repo: launch.repo,
-            project_path: launch.project_path,
+            project_path: normalize_project(&launch.project_path),
             steps: launch.steps,
             brief,
             session_id,
+            launch_id: launch_id().to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
         }
     }
@@ -180,9 +218,9 @@ impl PrRunStore {
     }
 }
 
-/// `<owner>-<repo>-<number>-<session>.json`, the repo segment sanitized to
-/// `[a-z0-9-]` because `owner/repo` carries a slash, which is not a legal
-/// Windows file name character.
+/// `<owner>-<repo>-<number>-<launch>-<session>.json`, the repo segment
+/// sanitized to `[a-z0-9-]` because `owner/repo` carries a slash, which is not
+/// a legal Windows file name character.
 ///
 /// Keyed on the SESSION, not the creation timestamp. A timestamp made the name
 /// unstable in both directions: two launches in the same tick produced the
@@ -191,9 +229,26 @@ impl PrRunStore {
 /// (`InitialPromptInjector::arm`) — produced a second name and left one review
 /// with several records. One review terminal now owns exactly one record file,
 /// rewritten in place if it is re-armed.
+///
+/// And keyed on the LAUNCH as well as the session, for the reason
+/// [`launch_id`] exists: session ids restart at 1 each launch, so the session
+/// alone would let today's terminal 3 overwrite last week's review of the same
+/// PR — silently destroying the only record it left.
 fn record_file_name(run: &PrReviewRun) -> String {
     let repo = sanitize(&run.repo);
-    format!("{repo}-{}-{}.json", run.pr, run.session_id)
+    format!(
+        "{repo}-{}-{}-{}.json",
+        run.pr, run.launch_id, run.session_id
+    )
+}
+
+/// Strips the Windows `\\?\` extended-length prefix, per fork convention (see
+/// `commands/ai_runner.rs::canonical_project_path`,
+/// `samurai_audit::normalize_project` and `samurai_run_config`). Applied on
+/// construction so a record's checkout hashes to the same audit file, and
+/// keys the same Second Brain project, as every other samurai surface.
+fn normalize_project(project: &str) -> String {
+    project.strip_prefix(r"\\?\").unwrap_or(project).to_string()
 }
 
 /// Lowercased, with every run of non-`[a-z0-9]` characters collapsed to one
@@ -232,6 +287,16 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// A record whose PROJECT PATH arrives in the Windows verbatim spelling —
+    /// the shape the frontend can hand over when a path went through
+    /// `fs::canonicalize` somewhere upstream.
+    fn verbatim_launch() -> PrReviewLaunch {
+        PrReviewLaunch {
+            project_path: r"\\?\C:\git\maestro".to_string(),
+            ..launch()
+        }
+    }
+
     fn launch() -> PrReviewLaunch {
         PrReviewLaunch {
             pr: 142,
@@ -268,6 +333,7 @@ mod tests {
             "steps",
             "brief",
             "session_id",
+            "launch_id",
             "created_at",
         ] {
             assert!(raw.get(key).is_some(), "missing key {key} in {raw}");
@@ -341,6 +407,68 @@ mod tests {
     }
 
     #[test]
+    fn test_a_record_is_stamped_and_named_with_the_app_launch() {
+        let dir = tempdir().unwrap();
+        let store = PrRunStore::new(dir.path().to_path_buf());
+
+        let run = PrReviewRun::now(launch(), 3, None);
+        assert_eq!(run.launch_id, launch_id());
+        assert!(!run.launch_id.is_empty());
+
+        // The launch is in the FILE NAME too: without it a session id reused
+        // across app launches would overwrite the older launch's record of
+        // the same PR — the record is the only proof that review happened.
+        let path = store.record(&run).unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.contains(launch_id()), "{name}");
+        assert!(name.starts_with("nachogl1-maestro-142-"), "{name}");
+
+        let mut older = PrReviewRun::now(launch(), 3, None);
+        older.launch_id = "20200101000000-1".to_string();
+        assert_ne!(store.record(&older).unwrap(), path);
+        assert_eq!(store.list_with_paths().len(), 2);
+    }
+
+    #[test]
+    fn test_a_record_from_an_earlier_launch_is_never_live() {
+        // PTY session ids restart at 1 every app launch (`process_manager`)
+        // while records persist forever, so `session_id` alone cannot mean
+        // "this terminal": after a restart, terminal 3 is an unrelated shell.
+        let open: HashSet<u32> = HashSet::from([3]);
+        let current = PrReviewRun::now(launch(), 3, None);
+        assert!(is_live(&current, &open));
+        assert!(!is_live(&current, &HashSet::from([4])));
+
+        let mut older = current.clone();
+        older.launch_id = "20200101000000-1".to_string();
+        assert!(!is_live(&older, &open));
+
+        // A record written before this field existed carries no launch at
+        // all — unprovable, therefore not live.
+        let mut legacy = current.clone();
+        legacy.launch_id = String::new();
+        assert!(!is_live(&legacy, &open));
+    }
+
+    #[test]
+    fn test_legacy_records_without_a_launch_id_still_load() {
+        let dir = tempdir().unwrap();
+        let store = PrRunStore::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(dir.path().join(PR_RUNS_DIR)).unwrap();
+        std::fs::write(
+            dir.path().join(PR_RUNS_DIR).join("legacy.json"),
+            r#"{"kind":"PR_REVIEW","pr":142,"title":"t","repo":"o/r",
+                "project_path":"C:/git/maestro","steps":[],"session_id":3,
+                "created_at":"2026-08-17T12:00:00+00:00"}"#,
+        )
+        .unwrap();
+
+        let loaded = store.list_with_paths();
+        assert_eq!(loaded.len(), 1, "a pre-launch-id record must still read");
+        assert_eq!(loaded[0].1.launch_id, "");
+    }
+
+    #[test]
     fn test_group_id_is_stable_and_per_pr() {
         let run = PrReviewRun::now(launch(), 7, None);
         assert_eq!(run.group_id(), "pr:nachogl1/maestro#142");
@@ -358,6 +486,26 @@ mod tests {
         std::fs::write(dir.path().join(PR_RUNS_DIR).join("notes.txt"), "ignored").unwrap();
 
         assert_eq!(store.list_with_paths().len(), 1);
+    }
+
+    #[test]
+    fn test_the_checkout_is_normalized_on_construction() {
+        // Run configs normalize on save (`samurai_run_config`), and the audit
+        // file name hashes the project string — so a `\\?\`-prefixed spelling
+        // stored raw here hashed to a DIFFERENT audit file and the PR group
+        // counted zero audit rows against a log full of its own.
+        let run = PrReviewRun::now(verbatim_launch(), 7, None);
+        assert_eq!(run.project_path, r"C:\git\maestro");
+        assert_eq!(
+            run.project_path,
+            PrReviewRun::now(launch(), 7, None).project_path
+        );
+        // And the brief resolves against the normalized checkout.
+        let run = PrReviewRun::now(verbatim_launch(), 7, Some("a.md".to_string()));
+        assert_eq!(
+            brief_path(&run).unwrap(),
+            Path::new(r"C:\git\maestro").join("a.md")
+        );
     }
 
     #[test]

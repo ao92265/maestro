@@ -1266,13 +1266,22 @@ impl SamuraiReplicator {
                 ),
                 samurai_prompts::journal_instruction(&default_journal_file()),
             );
-            let instruction = brief_or_inline(
-                &working_dir,
-                ritual_brief_name(generation, true),
-                instruction,
-            )
-            .await;
-            {
+            // The entry has to still be waiting BEFORE the brief is written:
+            // a delivered or dropped entry has nothing to receive the
+            // re-stage, and writing first left an orphan `gen-N-recovery.md`
+            // in the worktree pointing at nothing, with nothing to clean it.
+            let still_pending = this.lock_pending().iter().any(|p| {
+                p.generation == generation
+                    && p.epic == snapshot.epic
+                    && p.project == snapshot.project
+            });
+            if still_pending {
+                let instruction = brief_or_inline(
+                    &working_dir,
+                    ritual_brief_name(generation, true),
+                    instruction,
+                )
+                .await;
                 let mut pending = this.lock_pending();
                 if let Some(p) = pending.iter_mut().find(|p| {
                     p.generation == generation
@@ -5303,6 +5312,36 @@ mod tests {
         let brief = brief_text(repo.path(), &staged);
         assert!(brief.contains("RECOVERY MODE"), "{brief}");
         assert!(brief.contains("journal.jsonl"), "{brief}");
+    }
+
+    /// Review A9: the DEAD path re-stages on an async task, and it used to
+    /// write the brief BEFORE looking its pending entry up. A run cancelled in
+    /// that window left a `gen-N-recovery.md` in the worktree that no entry
+    /// points at, that no group owns, and that nothing ever cleans.
+    #[tokio::test]
+    async fn test_a_cancelled_recovery_leaves_no_orphan_brief() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-orphan-brief";
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        h.dirs
+            .lock()
+            .unwrap()
+            .insert(1, repo.path().to_string_lossy().into_owned());
+        let snapshot = to_dead(&h.supervisor, project, "epic-9", 2);
+
+        h.replicator.on_dead(&snapshot);
+        assert!(h.replicator.cancel_pending_for_epic(project, "epic-9"));
+        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
+
+        assert!(
+            !repo
+                .path()
+                .join(".maestro/briefs/gen-3-recovery.md")
+                .exists(),
+            "the brief of a cancelled recovery must never reach the worktree"
+        );
     }
 
     #[tokio::test]

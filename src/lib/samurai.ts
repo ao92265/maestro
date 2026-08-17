@@ -551,6 +551,14 @@ export interface SamuraiFileGroup {
   created_at: string | null;
   /** A live supervised session (run) or an open review terminal (PR review). */
   is_live: boolean;
+  /**
+   * The value an audit row's `epic` must resolve to for the row to belong to
+   * this group — the epic SLUG for a run (`38`, never `#38`), the `pr:` id for
+   * a PR review. `audit_rows` is counted on exactly this spelling, so the
+   * audit view must filter on it rather than on a raw epic string: the two
+   * spellings of one run made a card claim N rows and then show none.
+   */
+  audit_key: string;
   /** This group's slice of the shared project audit JSONL. */
   audit_rows: number;
   /** This group's slice of the shared ops journal. */

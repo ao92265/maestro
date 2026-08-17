@@ -83,6 +83,9 @@ function fileGroup(overrides: Partial<SamuraiFileGroup> = {}): SamuraiFileGroup 
     project_path: "C:\\git\\maestro",
     created_at: new Date(Date.now() - 2 * 3600_000).toISOString(),
     is_live: false,
+    // The slugged key the backend counted `audit_rows` on (issue #139): the
+    // audit view filters on this, not on the raw `#38` spelling.
+    audit_key: "38",
     audit_rows: 0,
     journal_entries: 0,
     ...overrides,
