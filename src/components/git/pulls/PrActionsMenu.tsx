@@ -1,6 +1,11 @@
 import { MoreVertical, Play } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { buildPrActionPrompt, prActionLaunchName } from "@/lib/prActionPrompt";
+import {
+  buildPrActionPrompt,
+  githubRepoSlug,
+  prActionBriefStem,
+  prActionLaunchName,
+} from "@/lib/prActionPrompt";
 import {
   compilePrWorkflow,
   DEFAULT_PR_WORKFLOW,
@@ -114,6 +119,28 @@ export function PrActionsMenu({ pr, repoPath }: PrActionsMenuProps) {
         compiledSteps,
         needsWorktree: prWorkflowNeedsWorktree(selectedIds, launchGraph),
       }),
+      // This prompt is several KB with every step ticked — too big to type
+      // into the PTY reliably (issue #138). Naming a brief target lets the
+      // backend stage it as a file in the project checkout and type a
+      // one-line pointer at it instead.
+      briefDir: projectPath || null,
+      briefStem: prActionBriefStem(pr.number, selectedIds),
+      // Issue #139: a PR review used to leave NOTHING on disk, so its brief
+      // and audit rows had no work to belong to. The same arm hop writes a
+      // persistent record — PR, title, repo, steps — which is the review's
+      // identity in the Second Brain.
+      prRun: {
+        pr: pr.number,
+        title: pr.title,
+        repo: githubRepoSlug(pr.url) ?? "",
+        // The PR's OWN checkout, not the tab's project (review finding C10):
+        // in a multi-repo workspace they differ, and the record must group
+        // under the repository the review is actually about. `briefDir` above
+        // stays on the tab's project — that is the terminal's working
+        // directory, where the pointer's relative path resolves.
+        project_path: repoPath,
+        steps: selectedIds,
+      },
     });
     // Make sure the grid is mounted to consume the request — the project may
     // still be sitting on the idle landing view.

@@ -46,7 +46,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde_json::json;
 
-use super::allowance_watcher::{AllowanceEvent, ThresholdKind, ACCOUNT_PROJECT};
+use super::allowance_watcher::{AllowanceEvent, ThresholdKind, ACCOUNT_PROJECT, ACCOUNT_RUN};
 use super::samurai_audit::{AuditEvent, AuditEventKind, AuditLog};
 use super::samurai_context::SamuraiContextStore;
 use super::samurai_injector::SamuraiInjector;
@@ -287,23 +287,24 @@ impl SamuraiParker {
                 state.suppress_timers = true;
             }
         }
-        let mut projects: Vec<String> = self
+        // One row per SUPERVISED RUN, stamped with that run (issue #139) —
+        // the same shape as the allowance ALERTs, which this mirrors.
+        let mut targets: Vec<(String, String)> = self
             .supervisor
             .list_sessions()
             .into_iter()
-            .map(|s| s.project)
+            .map(|s| (s.project, s.epic))
             .collect();
-        projects.sort();
-        projects.dedup();
-        if projects.is_empty() {
-            projects.push(ACCOUNT_PROJECT.to_string());
+        targets.sort();
+        targets.dedup();
+        if targets.is_empty() {
+            targets.push((ACCOUNT_PROJECT.to_string(), ACCOUNT_RUN.to_string()));
         }
-        for project in &projects {
-            // Epic-less account-wide row (generation/session 0), same shape
-            // as the allowance ALERTs.
+        for (project, epic) in &targets {
+            // Account-wide row (generation/session 0) but never run-less.
             self.audit.append(
                 project,
-                AuditEvent::now("", AuditEventKind::Alert, 0, 0, json!({ "kind": reason })),
+                AuditEvent::now(epic, AuditEventKind::Alert, 0, 0, json!({ "kind": reason })),
             );
         }
         self.advance();

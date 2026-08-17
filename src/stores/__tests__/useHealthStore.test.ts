@@ -69,7 +69,7 @@ function mockBackend({
       case "list_dev_processes":
         return processes;
       case "samurai_files_list":
-        return samuraiFiles;
+        return { groups: [], entries: samuraiFiles };
       case "samurai_get_config":
         return { size_warn_bytes: sizeWarnBytes };
       default:
@@ -94,6 +94,7 @@ function memFile(relPath: string, overrides: Record<string, unknown> = {}) {
 /** One Samurai-managed inventory row, shaped like `SamuraiFileEntry`. */
 function samuraiFile(path: string, sizeBytes: number) {
   return {
+    group_id: "run:000000000000:38",
     kind: "AUDIT_LOG",
     path,
     size_bytes: sizeBytes,

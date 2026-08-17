@@ -107,6 +107,50 @@ describe("usePendingLaunchStore", () => {
     expect(usePendingLaunchStore.getState().pending).toHaveLength(3);
   });
 
+  // Review finding C11: the de-dup compared neither the brief target nor the
+  // PR record, so two PR reviews differing only in where their brief lands —
+  // or in which review they record — silently collapsed into one launch.
+  it("queues launches that differ only in brief target or PR record", () => {
+    const base: PendingLaunch = {
+      ...launchFor("tab-1"),
+      resumeSessionId: null,
+      initialPrompt: "review the PR",
+      briefDir: "C:/git/maestro",
+      briefStem: "pr-1-check-aaaaaaaa",
+    };
+    const record = {
+      pr: 1,
+      title: "one",
+      repo: "nachogl1/maestro",
+      project_path: "C:/git/maestro",
+      steps: ["check"],
+    };
+    const store = usePendingLaunchStore.getState();
+
+    store.request(base);
+    store.request({ ...base });
+    expect(usePendingLaunchStore.getState().pending).toHaveLength(1);
+
+    store.request({ ...base, briefStem: "pr-1-check-review-bbbbbbbb" });
+    expect(usePendingLaunchStore.getState().pending).toHaveLength(2);
+
+    store.request({ ...base, briefDir: "C:/git/other" });
+    expect(usePendingLaunchStore.getState().pending).toHaveLength(3);
+
+    store.request({ ...base, prRun: record });
+    store.request({ ...base, prRun: { ...record } });
+    expect(usePendingLaunchStore.getState().pending).toHaveLength(4);
+
+    store.request({ ...base, prRun: { ...record, pr: 2 } });
+    expect(usePendingLaunchStore.getState().pending).toHaveLength(5);
+
+    store.request({ ...base, prRun: { ...record, project_path: "C:/git/other" } });
+    expect(usePendingLaunchStore.getState().pending).toHaveLength(6);
+
+    store.request({ ...base, prRun: { ...record, steps: ["check", "review"] } });
+    expect(usePendingLaunchStore.getState().pending).toHaveLength(7);
+  });
+
   it("still queues near-duplicates that differ in samurai generation", () => {
     const gen2: PendingLaunch = {
       ...launchFor("tab-1"),

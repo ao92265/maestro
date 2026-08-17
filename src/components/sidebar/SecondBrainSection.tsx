@@ -1,11 +1,13 @@
 import { ask } from "@tauri-apps/plugin-dialog";
 import {
+  ChevronRight,
   Eraser,
   Eye,
   Files,
   FileText,
   Loader2,
   RefreshCw,
+  ScrollText,
   TimerOff,
   Trash2,
   X,
@@ -15,10 +17,13 @@ import { MarkdownBody } from "@/components/git/shared/MarkdownBody";
 import { HealthReasonLines } from "@/components/shared/HealthReasonLines";
 import type { HealthFlag } from "@/lib/healthRules";
 import { formatResumeAt, useCountdownNow } from "@/lib/parkTime";
+import { samePath } from "@/lib/path";
 import {
   isSamuraiInUseError,
   type SamuraiFileEntry,
+  type SamuraiFileGroup,
   type SamuraiFileKind,
+  type SamuraiFilesListing,
   samuraiCleanupEpic,
   samuraiFileDelete,
   samuraiFileRead,
@@ -27,23 +32,49 @@ import {
   samuraiTimerCancel,
 } from "@/lib/samurai";
 import { flagsByRow, useHealthStore } from "@/stores/useHealthStore";
-import { AuditSection } from "./AuditSection";
+import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
+import { type AuditRunFilter, AuditSection } from "./AuditSection";
 import { JournalSection } from "./JournalSection";
 import { cardClass, SectionHeader } from "./sectionChrome";
 
 /**
- * Display order + labels for the file groups (PRD §8 rows 1–5). Journal and
- * harvest reports only exist from Phase 5, so their groups stay hidden until
- * files actually appear; the other groups show an empty hint instead.
+ * What a row IS, as a small per-row tag (issue #140). Deliberately never a
+ * section header: rows group by the run or PR review they belong to, and a
+ * kind header would put the plumbing back above the work.
  */
-const GROUPS: { kind: SamuraiFileKind; label: string; hideWhenEmpty: boolean }[] = [
-  { kind: "HANDOFF", label: "Handoffs", hideWhenEmpty: false },
-  { kind: "RUN_CONFIG", label: "Run configs", hideWhenEmpty: false },
-  { kind: "TIMER", label: "Timers", hideWhenEmpty: false },
-  { kind: "AUDIT_LOG", label: "Audit logs", hideWhenEmpty: false },
-  { kind: "JOURNAL", label: "Journal", hideWhenEmpty: true },
-  { kind: "HARVEST_REPORT", label: "Harvest reports", hideWhenEmpty: true },
-];
+const KIND_TAGS: Record<SamuraiFileKind, string> = {
+  BRIEF: "brief",
+  HANDOFF: "handoff",
+  RUN_CONFIG: "config",
+  PR_REVIEW_RUN: "record",
+  TIMER: "timer",
+  AUDIT_LOG: "audit",
+  JOURNAL: "journal",
+  HARVEST_REPORT: "harvest",
+};
+
+/**
+ * The row's kind tag. Falls back to the kind itself, readably spaced, for any
+ * kind added backend-side after this map (issue #136 review C8): the tag is
+ * the only "what is this" signal a row carries, so it must never be blank.
+ */
+function kindTag(kind: SamuraiFileKind): string {
+  const tag: string | undefined = KIND_TAGS[kind];
+  return tag ?? kind.toLowerCase().replace(/_/g, " ");
+}
+
+/**
+ * Kinds whose row is a per-group SLICE of one file every card shares — the
+ * project audit log, the ops journal, and the single pending-timer schedule.
+ * Their `size_bytes` is the WHOLE file's, and deleting one would destroy
+ * every other group's rows, so they are excluded from both the header's size
+ * and the row delete action (issue #136 review C2, C3).
+ */
+const SHARED_FILE_KINDS: ReadonlySet<SamuraiFileKind> = new Set<SamuraiFileKind>([
+  "AUDIT_LOG",
+  "JOURNAL",
+  "TIMER",
+]);
 
 /** Last path segment, for compact file/project display. */
 function baseName(path: string): string {
@@ -61,10 +92,30 @@ function rowLabel(entry: SamuraiFileEntry): string {
   return baseName(entry.path);
 }
 
-/** "3 KB" / "1.2 MB" — same rounding bar as the audit size line (min 1 KB). */
+/**
+ * "3 KB" / "1.2 MB" — same rounding bar as the audit size line (min 1 KB for
+ * anything non-empty). Nothing is exactly "0 KB", so that reading is reserved
+ * for genuinely zero bytes rather than rounded up to a byte that is not there
+ * (issue #136 review C6).
+ */
 function formatSize(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes <= 0) return "0 KB";
   return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+/**
+ * "1 file · 4 KB" / "6 files · 84 KB" — a card header's own reading. The size
+ * counts only the files this group OWNS: a slice row reports the whole shared
+ * file's size, so summing those put the same megabytes on every card and told
+ * the user this run had produced them (issue #136 review C3).
+ */
+function groupSummary(entries: SamuraiFileEntry[]): string {
+  const bytes = entries.reduce(
+    (total, entry) => (SHARED_FILE_KINDS.has(entry.kind) ? total : total + entry.size_bytes),
+    0,
+  );
+  return `${entries.length} file${entries.length === 1 ? "" : "s"} · ${formatSize(bytes)}`;
 }
 
 /** Rough age from an RFC 3339 modified time; empty when unknown. */
@@ -115,17 +166,33 @@ function formatFireAt(fireAt: string, now: number): string {
   return resume === null ? "parked" : `resumes at ${resume}`;
 }
 
+/**
+ * The row's right-hand reading. TIMER rows count down; the two SLICE rows
+ * (audit, journal) report their group's own count rather than the shared
+ * file's size, which says nothing about this run (issue #140 requirement 4).
+ */
+function rowMeta(entry: SamuraiFileEntry, group: SamuraiFileGroup, now: number): string {
+  if (entry.kind === "TIMER" && entry.fire_at) return formatFireAt(entry.fire_at, now);
+  if (entry.kind === "AUDIT_LOG") return `${group.audit_rows} rows`;
+  if (entry.kind === "JOURNAL") return `${group.journal_entries} entries`;
+  return [formatSize(entry.size_bytes), formatAge(entry.modified_at)].filter(Boolean).join(" · ");
+}
+
 function FileRow({
   entry,
+  group,
   now,
   onOpen,
   onDelete,
   onCancelTimer,
   onCleanEpic,
+  onShowAudit,
   busy,
   healthFlags,
 }: {
   entry: SamuraiFileEntry;
+  /** The run / PR review this row belongs to — its counts and label. */
+  group: SamuraiFileGroup;
   /** Ticking clock behind a TIMER row's countdown (see `useCountdownNow`). */
   now: number;
   /** Every row: open this file in the read-only viewer (issue #82). */
@@ -136,21 +203,23 @@ function FileRow({
   onCancelTimer: ((entry: SamuraiFileEntry) => void) | null;
   /** Present only on rows offering the one-click epic cleanup. */
   onCleanEpic: ((entry: SamuraiFileEntry) => void) | null;
+  /** AUDIT_LOG rows only: focus the audit view on this group (issue #140). */
+  onShowAudit: ((entry: SamuraiFileEntry) => void) | null;
   busy: boolean;
   /** Size warnings the health checker raised against this file (issue #67). */
   healthFlags?: HealthFlag[];
 }) {
   const label = rowLabel(entry);
-  const meta =
-    entry.kind === "TIMER" && entry.fire_at
-      ? formatFireAt(entry.fire_at, now)
-      : [formatSize(entry.size_bytes), formatAge(entry.modified_at)].filter(Boolean).join(" · ");
+  const meta = rowMeta(entry, group, now);
   return (
     <div>
       <div
         className="flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] hover:bg-maestro-surface"
         title={`${entry.path}${entry.project_path ? `\nproject: ${entry.project_path}` : ""}${entry.epic ? `\nepic: ${entry.epic}` : ""}`}
       >
+        <span className="w-12 shrink-0 truncate text-[10px] font-medium text-maestro-muted/70">
+          {kindTag(entry.kind)}
+        </span>
         {entry.in_use && (
           <span className="shrink-0 whitespace-nowrap rounded bg-amber-500/15 px-1 py-px text-[9px] font-bold tracking-wide text-amber-500">
             IN USE
@@ -177,6 +246,18 @@ function FileRow({
         >
           <Eye size={12} />
         </button>
+        {onShowAudit && (
+          <button
+            type="button"
+            onClick={() => onShowAudit(entry)}
+            disabled={busy}
+            className="rounded p-1 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-text disabled:opacity-40"
+            aria-label={`Show audit rows for ${group.label}`}
+            title="Show only this group's rows in the audit stream above"
+          >
+            <ScrollText size={12} />
+          </button>
+        )}
         {onCleanEpic && (
           <button
             type="button"
@@ -317,9 +398,10 @@ function FileViewerModal({ entry, onClose }: { entry: SamuraiFileEntry; onClose:
  * Second Brain panel body (issue #66, PRD §5.11): the Samurai audit stream on
  * top (the Phase 1 AuditSection absorbed as-is), the ops journal card
  * (issue #71, PRD §5.12) and below them the Files
- * section — every managed resource from `samurai_files_list` grouped by kind
- * with size + age, a read-only view per row (issue #82),
- * delete-with-confirm per row (in-use files get a second,
+ * section — every managed resource from `samurai_files_list`, one collapsible
+ * card per RUN or PR REVIEW (issue #140) in the backend's order (live pinned
+ * first, then newest first), with the kind as a per-row tag, a read-only view
+ * per row (issue #82), delete-with-confirm per row (in-use files get a second,
  * harder confirm before force-deleting; TIMER rows get a cancel-timer action
  * instead of delete), and one-click "clean this epic" on run configs without
  * a live supervised session. Deliberately minimal per the PRD: list, read,
@@ -328,12 +410,33 @@ function FileViewerModal({ entry, onClose }: { entry: SamuraiFileEntry; onClose:
  */
 export function SecondBrainSection() {
   // null = loading.
-  const [files, setFiles] = useState<SamuraiFileEntry[] | null>(null);
+  const [listing, setListing] = useState<SamuraiFilesListing | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   // The file shown in the read-only viewer overlay; null = closed (issue #82).
   const [openFile, setOpenFile] = useState<SamuraiFileEntry | null>(null);
+  // Group ids the user collapsed — remembered per group for the session
+  // (issue #140 requirement 2); cards default to expanded.
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
+  const [query, setQuery] = useState("");
+  // The group the audit stream above is focused on; null = every row.
+  const [auditFilter, setAuditFilter] = useState<AuditRunFilter | null>(null);
+
+  // Which project's audit log the AuditSection above is reading — the gate on
+  // the per-group audit action (review finding C1).
+  const tabs = useWorkspaceStore((s) => s.tabs);
+  const activeProjectPath = tabs.find((t) => t.active)?.projectPath ?? "";
+
+  const files = listing?.entries ?? null;
+
+  /**
+   * How many FILES the panel manages. Not `entries.length`: since issue #139
+   * the shared audit log and journal contribute one row PER GROUP, so a badge
+   * counting rows grew with the number of runs while the disk did not (review
+   * finding C7).
+   */
+  const distinctFileCount = new Set((files ?? []).map((entry) => entry.path)).size;
 
   // Ticking clock for the TIMER rows' countdowns — armed only while a pending
   // timer is actually listed.
@@ -346,10 +449,10 @@ export function SecondBrainSection() {
 
   const refresh = useCallback(async () => {
     try {
-      setFiles(await samuraiFilesList());
+      setListing(await samuraiFilesList());
       setError(null);
     } catch (err) {
-      setFiles([]);
+      setListing({ groups: [], entries: [] });
       setError(String(err));
     }
   }, []);
@@ -459,6 +562,56 @@ export function SecondBrainSection() {
     }
   };
 
+  /**
+   * The cards to render, in the backend's order — live pinned first, then
+   * newest `created_at` first (`samurai_files.rs` sorts; this never re-sorts).
+   * Search (requirement 5) matches the group LABEL or a file NAME: a label
+   * hit keeps the whole card, a file hit keeps the card with the matching
+   * rows alone.
+   */
+  const visibleGroups = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return (listing?.groups ?? []).flatMap((group) => {
+      const own = (listing?.entries ?? []).filter((entry) => entry.group_id === group.id);
+      if (needle === "" || group.label.toLowerCase().includes(needle)) {
+        return [{ group, own, shown: own, fileMatch: false }];
+      }
+      const shown = own.filter((entry) => rowLabel(entry).toLowerCase().includes(needle));
+      return shown.length > 0 ? [{ group, own, shown, fileMatch: true }] : [];
+    });
+  }, [listing, query]);
+
+  const toggleGroup = (id: string) =>
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(id)) next.add(id);
+      return next;
+    });
+
+  /**
+   * Focus the audit stream on one group (requirement 4), keyed on the exact
+   * value the backend counted the group's `audit_rows` on — the epic slug for
+   * a run, the `pr:` id for a PR review. Filtering on the raw epic string
+   * instead let a card claim N rows and then show none (review finding C5).
+   */
+  const showGroupAudit = (group: SamuraiFileGroup) =>
+    setAuditFilter({ runId: group.audit_key, label: group.label });
+
+  /**
+   * Whether this group's rows are the ones `AuditSection` is reading. That
+   * view loads the ACTIVE tab's project audit log and nothing else, while the
+   * Files panel lists groups from every project — including the account-wide
+   * scope, which lives on its own pseudo-path with its own file, and a cleaned
+   * project's run, which has no project path left at all. Offering the audit
+   * action on any of those focused a stream that could never hold their rows
+   * ("No audit rows for X" under a header claiming N of them), so it is
+   * offered only where it can tell the truth (review finding C1).
+   */
+  const groupAuditIsReadable = (group: SamuraiFileGroup) =>
+    group.project_path !== null &&
+    activeProjectPath !== "" &&
+    samePath(group.project_path, activeProjectPath);
+
   // TIMER rows all share schedule.json as their path — a file's health
   // reasons render only under the FIRST row bearing that path (the badge
   // already counts each flag exactly once). Rebuilt every render.
@@ -466,7 +619,7 @@ export function SecondBrainSection() {
 
   return (
     <div className="space-y-3">
-      <AuditSection />
+      <AuditSection filter={auditFilter} onClearFilter={() => setAuditFilter(null)} />
 
       {/* Issue #98: harvest opens an interactive session — no report row
           lands in this inventory anymore, so no refresh callback. */}
@@ -478,9 +631,9 @@ export function SecondBrainSection() {
           label="Files"
           iconColor="text-maestro-accent"
           badge={
-            files && files.length > 0 ? (
+            distinctFileCount > 0 ? (
               <span className="rounded-full bg-maestro-accent/20 px-1.5 text-[10px] font-bold text-maestro-accent">
-                {files.length}
+                {distinctFileCount}
               </span>
             ) : undefined
           }
@@ -497,36 +650,82 @@ export function SecondBrainSection() {
           }
         />
         <p className="mb-2 text-[11px] text-maestro-muted">
-          Every Samurai-managed file, all projects. Viewing is read-only; deleting always asks and
-          in-use files ask twice.
+          Every Samurai-managed file, under the run or PR review it came from. Viewing is read-only;
+          deleting always asks and in-use files ask twice.
         </p>
         {error && <p className="mb-2 text-[11px] text-maestro-red">{error}</p>}
         {notice && <p className="mb-2 text-[11px] text-maestro-green">{notice}</p>}
-        {files === null ? (
+        {listing !== null && listing.groups.length > 0 && (
+          <input
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            aria-label="Search runs and files"
+            placeholder="Search runs, PR reviews and files…"
+            className="mb-2 w-full rounded border border-maestro-border/60 bg-maestro-bg px-1.5 py-1 text-[11px] text-maestro-text placeholder:text-maestro-muted/60"
+          />
+        )}
+        {listing === null ? (
           <div className="flex items-center gap-2 px-1 py-2 text-[11px] text-maestro-muted">
             <Loader2 size={12} className="animate-spin" /> Loading…
           </div>
+        ) : listing.groups.length === 0 ? (
+          // No kind list to show as empty, and deliberately no System/Other
+          // card: a group is a run or a PR review, or it does not exist.
+          <p className="px-1 py-2 text-[11px] italic text-maestro-muted">
+            No runs or PR reviews yet.
+          </p>
+        ) : visibleGroups.length === 0 ? (
+          <p className="px-1 py-2 text-[11px] italic text-maestro-muted">
+            No run or PR review matches this search.
+          </p>
         ) : (
           <div className="max-h-[45vh] overflow-y-auto space-y-2">
-            {GROUPS.map(({ kind, label, hideWhenEmpty }) => {
-              const entries = files.filter((f) => f.kind === kind);
-              if (entries.length === 0 && hideWhenEmpty) return null;
+            {visibleGroups.map(({ group, own, shown, fileMatch }) => {
+              // A card matched by a FILE NAME opens itself, so the hit is
+              // never hidden behind a collapsed header (requirement 5). A
+              // card matched by its LABEL keeps the user's collapse: forcing
+              // every searched card open left the header's toggle flipping
+              // `aria-expanded` while nothing moved (review finding C4).
+              const expanded = fileMatch || !collapsed.has(group.id);
               return (
-                <div key={kind}>
-                  <div className="mb-0.5 px-1 text-[10px] font-semibold uppercase tracking-wide text-maestro-muted">
-                    {label}
-                  </div>
-                  {entries.length === 0 ? (
-                    <p className="px-1 text-[11px] italic text-maestro-muted">None.</p>
-                  ) : (
-                    <div className="space-y-0.5">
-                      {entries.map((entry, i) => {
+                <div key={group.id} data-testid="file-group">
+                  <button
+                    type="button"
+                    onClick={() => toggleGroup(group.id)}
+                    aria-expanded={expanded}
+                    className="flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left text-[11px] hover:bg-maestro-surface"
+                    title={group.project_path ?? undefined}
+                  >
+                    <ChevronRight
+                      size={10}
+                      className={`shrink-0 text-maestro-muted transition-transform ${expanded ? "rotate-90" : ""}`}
+                    />
+                    <span
+                      data-testid="file-group-label"
+                      className="min-w-0 flex-1 truncate font-medium text-maestro-text"
+                    >
+                      {group.label}
+                    </span>
+                    {group.is_live && (
+                      <span className="shrink-0 whitespace-nowrap rounded bg-maestro-green/20 px-1 py-px text-[9px] font-bold tracking-wide text-maestro-green">
+                        LIVE
+                      </span>
+                    )}
+                    <span className="shrink-0 whitespace-nowrap text-[10px] text-maestro-muted/70">
+                      {groupSummary(own)}
+                    </span>
+                  </button>
+                  {expanded && (
+                    <div className="space-y-0.5 pl-3">
+                      {shown.map((entry, i) => {
                         const firstForPath = !seenFlagPaths.has(entry.path);
                         seenFlagPaths.add(entry.path);
                         return (
                           <FileRow
                             key={`${entry.path}-${entry.epic ?? ""}-${i}`}
                             entry={entry}
+                            group={group}
                             now={now}
                             healthFlags={
                               firstForPath
@@ -536,12 +735,18 @@ export function SecondBrainSection() {
                             // Every kind is readable in place (issue #82) —
                             // the viewer picks its renderer per extension.
                             onOpen={setOpenFile}
-                            // TIMER rows are cancelled, never file-deleted —
-                            // schedule.json self-cleans and the backend
-                            // refuses deleting it (review F1).
-                            onDelete={kind === "TIMER" ? null : handleDelete}
+                            // No plain delete on a shared file: a TIMER row is
+                            // cancelled instead (schedule.json self-cleans and
+                            // the backend refuses deleting it — review F1),
+                            // and an AUDIT_LOG / JOURNAL row is this group's
+                            // SLICE of a file every other card shares, so
+                            // "delete this file" would wipe their rows too
+                            // (review finding C2). Clearing the audit log
+                            // stays its own action, on the audit card that
+                            // says what it destroys.
+                            onDelete={SHARED_FILE_KINDS.has(entry.kind) ? null : handleDelete}
                             onCancelTimer={
-                              kind === "TIMER" && entry.epic && entry.project_path
+                              entry.kind === "TIMER" && entry.epic && entry.project_path
                                 ? handleCancelTimer
                                 : null
                             }
@@ -553,11 +758,16 @@ export function SecondBrainSection() {
                               // until archive-at-completion lands with the
                               // COMPLETE event emission, and must still be
                               // cleanable (review F2).
-                              kind === "RUN_CONFIG" &&
+                              entry.kind === "RUN_CONFIG" &&
                               entry.epic &&
                               entry.project_path &&
                               !entry.has_live_session
                                 ? handleCleanEpic
+                                : null
+                            }
+                            onShowAudit={
+                              entry.kind === "AUDIT_LOG" && groupAuditIsReadable(group)
+                                ? () => showGroupAudit(group)
                                 : null
                             }
                             busy={busy}

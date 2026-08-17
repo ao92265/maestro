@@ -319,8 +319,10 @@ export function evaluateProcesses(
 
 /** Lower-case kind labels for size-warning reasons, e.g. "audit log". */
 const SAMURAI_KIND_LABELS: Record<SamuraiFileKind, string> = {
+  BRIEF: "brief",
   HANDOFF: "handoff",
   RUN_CONFIG: "run config",
+  PR_REVIEW_RUN: "PR review run",
   TIMER: "schedule",
   AUDIT_LOG: "audit log",
   JOURNAL: "journal",

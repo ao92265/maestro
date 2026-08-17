@@ -57,6 +57,58 @@ export function prActionLaunchName(prNumber: number, stepIds: string[]): string 
   return `PR #${prNumber} ${suffix}`;
 }
 
+/** Longest sanitised step chain kept in a brief stem before it is counted instead. */
+const MAX_BRIEF_STEM_STEPS_CHARS = 40;
+
+/**
+ * FNV-1a (32-bit) as 8 lowercase hex digits — a short, stable fingerprint of
+ * one step selection. Deliberately `[0-9a-f]` only: the backend slugs the
+ * stem it is handed down to `[a-z0-9._-]`, so anything richer would be
+ * rewritten and the typed pointer would name a file that was never written.
+ */
+function stepsFingerprint(stepIds: string[]): string {
+  // JSON, not a join: two selections must fingerprint differently even when
+  // the separator is part of the ids themselves (`["check","review"]` vs
+  // `["check-review"]`).
+  const input = JSON.stringify(stepIds);
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    hash = Math.imul(hash ^ input.charCodeAt(i), 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+/**
+ * The file stem of the brief this launch is staged as (issue #138):
+ * `pr-123-check-review-1a2b3c4d`. The backend writes it to
+ * `<project>/.maestro/briefs/<stem>.md` and types a pointer at it instead of
+ * the multi-KB prompt itself.
+ *
+ * Step ids are free text from the workflow editor, so everything outside
+ * `a-z0-9` collapses to a single dash — a `+`, a space or a `../` can never
+ * reach the filesystem — and a long chain becomes a count so the file name
+ * stays short (Windows path limits).
+ *
+ * The trailing fingerprint is the collision guard (review finding C9): the
+ * readable half is lossy — `["check","review"]` and `["check-review"]` slug
+ * to the same text, and any two long chains of equal length both become
+ * `K-steps` — so without it a second review would overwrite a running
+ * review's brief before its agent had read it. It is a function of the step
+ * ids alone, so relaunching the same selection still reuses one file.
+ */
+export function prActionBriefStem(prNumber: number, stepIds: string[]): string {
+  // No steps means no selection to tell apart — and nothing to fingerprint.
+  if (stepIds.length === 0) return `pr-${prNumber}`;
+  const slug = stepIds
+    .join("-")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  const readable =
+    slug !== "" && slug.length <= MAX_BRIEF_STEM_STEPS_CHARS ? slug : `${stepIds.length}-steps`;
+  return `pr-${prNumber}-${readable}-${stepsFingerprint(stepIds)}`;
+}
+
 /** How the agent is told to get a repo slug when the URL did not yield one. */
 function repoPinRule(slug: string | null, repoPath: string): string {
   if (slug) {

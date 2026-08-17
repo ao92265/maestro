@@ -510,22 +510,71 @@ export function samuraiCleanupEpic(
 // Issue #65: Second Brain file inventory + guarded delete
 // ---------------------------------------------------------------------------
 
-/** What a listed file is (PRD §8 rows 1–5) — mirrors `SamuraiFileKind`. */
+/**
+ * What a listed file is (PRD §8 rows 1–5, plus the two kinds issue #139
+ * adds) — mirrors `SamuraiFileKind`. A kind is a per-row TAG, never a
+ * section header: rows are grouped by their {@link SamuraiFileGroup}.
+ */
 export type SamuraiFileKind =
+  | "BRIEF"
   | "HANDOFF"
   | "RUN_CONFIG"
+  | "PR_REVIEW_RUN"
   | "TIMER"
   | "AUDIT_LOG"
   | "JOURNAL"
   | "HARVEST_REPORT";
 
+/** What a group represents (issue #139) — mirrors `SamuraiGroupKind`. */
+export type SamuraiGroupKind = "RUN" | "PR_REVIEW";
+
+/**
+ * One unit of WORK every artifact belongs to — a samurai run or a PR review
+ * (issue #139; mirrors the Rust `SamuraiFileGroup`).
+ *
+ * There is deliberately no generic/system group: if an artifact would land
+ * in one, that is a backend writer bug, never a UI fallback.
+ */
+export interface SamuraiFileGroup {
+  /** `run:<project-hash>:<epic-slug>` or `pr:<owner/repo>#<number>`. */
+  id: string;
+  kind: SamuraiGroupKind;
+  /**
+   * `Epic #38 — Samurai supervision`, `Run #77, #78 — (2 issues)`,
+   * `PR #142 — fix journal splitting`; refs alone when no title was captured.
+   */
+  label: string;
+  /** The refs behind the group: `["#38"]`, `["#77", "#78"]`. */
+  refs: string[];
+  project_path: string | null;
+  /** RFC 3339 creation time; null for a run known only from a timer/session. */
+  created_at: string | null;
+  /** A live supervised session (run) or an open review terminal (PR review). */
+  is_live: boolean;
+  /**
+   * The value an audit row's `epic` must resolve to for the row to belong to
+   * this group — the epic SLUG for a run (`38`, never `#38`), the `pr:` id for
+   * a PR review. `audit_rows` is counted on exactly this spelling, so the
+   * audit view must filter on it rather than on a raw epic string: the two
+   * spellings of one run made a card claim N rows and then show none.
+   */
+  audit_key: string;
+  /** This group's slice of the shared project audit JSONL. */
+  audit_rows: number;
+  /** This group's slice of the shared ops journal. */
+  journal_entries: number;
+}
+
 /**
  * One inventory row — mirrors the Rust `SamuraiFileEntry`
  * (`core/samurai_files.rs`). `TIMER` rows share `schedule.json` as their
  * `path` (one row per pending timer) and carry `fire_at` so the UI can
- * render "resumes at 14:32".
+ * render "resumes at 14:32"; `AUDIT_LOG` and `JOURNAL` rows likewise share
+ * one file and represent their group's slice of it.
  */
 export interface SamuraiFileEntry {
+  /** The {@link SamuraiFileGroup.id} this artifact belongs to — never empty. */
+  group_id: string;
   kind: SamuraiFileKind;
   /** Absolute path, Windows `\\?\` prefix already stripped. */
   path: string;
@@ -563,12 +612,21 @@ export function isSamuraiInUseError(error: unknown): boolean {
   return typeof error === "string" && error.startsWith(SAMURAI_IN_USE_ERROR_PREFIX);
 }
 
+/** The grouped inventory `samurai_files_list` returns (issue #139). */
+export interface SamuraiFilesListing {
+  /** One per samurai run or PR review, live first then newest first. */
+  groups: SamuraiFileGroup[];
+  /** Every artifact, each carrying the `group_id` it belongs to. */
+  entries: SamuraiFileEntry[];
+}
+
 /**
- * Every Samurai-managed file (PRD §8) as one flat list: handoffs, run
- * configs (active + archived), pending timers, per-project audit logs, and
- * Phase 5 journal/harvest reports once they exist.
+ * Every Samurai-managed artifact (PRD §8), grouped by the run or PR review it
+ * came from (issue #139): briefs, handoffs, run configs (active + archived),
+ * PR-review records, pending timers, and each group's slice of the shared
+ * audit log and ops journal.
  */
-export function samuraiFilesList(): Promise<SamuraiFileEntry[]> {
+export function samuraiFilesList(): Promise<SamuraiFilesListing> {
   return invoke("samurai_files_list");
 }
 

@@ -416,9 +416,67 @@ function AuditRow({ event }: { event: SamuraiAuditEvent }) {
   );
 }
 
+/**
+ * The run id account-wide rows carry (allowance crossings, dropped scheduled
+ * launches) when nothing is supervised — mirrors `ACCOUNT_RUN` in
+ * `src-tauri/src/core/allowance_watcher.rs`. Since issue #139 no audit row is
+ * ever written with an empty `epic`; rows predating that still are, and both
+ * spellings cluster under the same header.
+ */
+export const SAMURAI_ACCOUNT_RUN = "account";
+
+/* ── The backend's audit grouping key, mirrored (issue #136 review C5) ── */
+
+/** Longest readable head `bound_slug` keeps — `PROSE_SLUG_MAX` in Rust. */
+const SLUG_HEAD_MAX = 24;
+/** Longest slug left unhashed — `SLUG_MAX` (head + `-` + 8 hex) in Rust. */
+const SLUG_MAX = SLUG_HEAD_MAX + 9;
+
+/**
+ * FNV-1a (64-bit), truncated to its low 32 bits as 8 hex digits — byte-for-byte
+ * what `samurai_prompts::bound_slug` appends (`fnv1a_64(slug) as u32`, `{:08x}`).
+ * Slugs are ASCII by construction, so char codes are the bytes Rust hashes.
+ */
+function fnv1a32Hex(input: string): string {
+  const prime = 0x100000001b3n;
+  const mask = 0xffffffffffffffffn;
+  let hash = 0xcbf29ce484222325n;
+  for (let i = 0; i < input.length; i++) {
+    hash = ((hash ^ BigInt(input.charCodeAt(i))) * prime) & mask;
+  }
+  return (hash & 0xffffffffn).toString(16).padStart(8, "0");
+}
+
+/**
+ * The group key an audit row's `epic` resolves to — the TS mirror of
+ * `samurai_files::audit_key` (`core/samurai_files.rs`), which is what
+ * `SamuraiFileGroup.audit_key` and therefore `audit_rows` are counted on.
+ *
+ * Filtering had compared the RAW `epic` string instead, so the two spellings
+ * of one run (`#38` and `38`) never met: a card claimed "37 rows" and then
+ * showed none. A PR review's id is already the key; everything else is a run
+ * identity string put through the same slug every samurai surface uses —
+ * ASCII alphanumerics kept and lowercased, every other run of characters
+ * collapsed to one dash, and the result length-bounded with a hash tail so
+ * long identities stay inside Windows path limits.
+ */
+export function samuraiAuditKey(epic: string): string {
+  if (epic.startsWith("pr:")) return epic;
+  // ASCII-only classes on purpose: Rust keeps `is_ascii_alphanumeric` and
+  // treats every other character — accented letters included — as a separator,
+  // so case-folding must come AFTER the filter, never before it.
+  const slug =
+    epic
+      .replace(/[^A-Za-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .toLowerCase() || "epic";
+  if (slug.length <= SLUG_MAX) return slug;
+  return `${slug.slice(0, SLUG_HEAD_MAX).replace(/-+$/, "")}-${fnv1a32Hex(slug)}`;
+}
+
 /** One run's cluster of audit rows, newest-first (see {@link groupByRun}). */
 interface AuditRunGroup {
-  /** The raw epic string; empty for account-wide rows (e.g. allowance ALERTs). */
+  /** The raw epic string; empty for pre-#139 account-wide rows. */
   key: string;
   /** Cluster header text. */
   label: string;
@@ -448,7 +506,7 @@ function groupByRun(events: SamuraiAuditEvent[]): AuditRunGroup[] {
   }
   return order.map((key) => ({
     key,
-    label: key || "Account-wide",
+    label: key && key !== SAMURAI_ACCOUNT_RUN ? key : "Account-wide",
     events: buckets.get(key) ?? [],
   }));
 }
@@ -488,7 +546,29 @@ function mergeAuditRows(
   return [...extra, ...read].slice(0, AUDIT_TAIL);
 }
 
-export function AuditSection() {
+/**
+ * A group's slice of the audit stream (issue #140): the Second Brain's per-run
+ * / per-PR-review audit row focuses this view instead of opening a second one.
+ * `runId` is the group's `audit_key` — the exact key the backend counted its
+ * `audit_rows` on: a run's epic SLUG (`38`, never `#38`), or the
+ * `pr:<owner/repo>#<number>` id a PR review's rows are stamped with. Rows are
+ * matched by putting their own `epic` through {@link samuraiAuditKey}.
+ */
+export interface AuditRunFilter {
+  /** The group's `SamuraiFileGroup.audit_key`, never a raw epic string. */
+  runId: string;
+  /** The group's label, for the "showing … only" line. */
+  label: string;
+}
+
+export function AuditSection({
+  filter = null,
+  onClearFilter,
+}: {
+  /** Show only this group's rows; null (the default) shows every row. */
+  filter?: AuditRunFilter | null;
+  onClearFilter?: () => void;
+} = {}) {
   const tabs = useWorkspaceStore((s) => s.tabs);
   const activeTab = tabs.find((t) => t.active);
   const projectPath = activeTab?.projectPath ?? "";
@@ -568,6 +648,15 @@ export function AuditSection() {
     }
   };
 
+  // Issue #140: the Second Brain's per-group audit row focuses this stream on
+  // one run / PR review rather than opening a second audit surface. The rows
+  // carry that identity in their `epic`, in whatever spelling their writer
+  // used — so both sides go through the backend's own key (finding C5).
+  const visible =
+    events === null || filter === null
+      ? events
+      : events.filter((e) => e.epic !== "" && samuraiAuditKey(e.epic) === filter.runId);
+
   return (
     <div className={cardClass}>
       <SectionHeader
@@ -575,9 +664,9 @@ export function AuditSection() {
         label="Samurai Audit"
         iconColor="text-maestro-accent"
         badge={
-          events && events.length > 0 ? (
+          visible && visible.length > 0 ? (
             <span className="rounded-full bg-maestro-accent/20 px-1.5 text-[10px] font-bold text-maestro-accent">
-              {events.length}
+              {visible.length}
             </span>
           ) : undefined
         }
@@ -610,20 +699,35 @@ export function AuditSection() {
         {fileSizeBytes > 0 ? ` ${Math.max(1, Math.round(fileSizeBytes / 1024))} KB on disk.` : ""}
       </p>
       {error && <p className="mb-2 text-[11px] text-maestro-red">{error}</p>}
-      {events === null ? (
+      {filter && (
+        <div className="mb-2 flex items-center gap-1.5 text-[11px]">
+          <span className="min-w-0 flex-1 truncate text-maestro-accent">
+            Showing {filter.label} only
+          </span>
+          <button
+            type="button"
+            onClick={onClearFilter}
+            aria-label="Clear audit filter"
+            className="shrink-0 rounded px-1 py-px text-maestro-muted hover:bg-maestro-surface hover:text-maestro-text"
+          >
+            Clear
+          </button>
+        </div>
+      )}
+      {visible === null ? (
         <div className="flex items-center gap-2 px-1 py-2 text-[11px] text-maestro-muted">
           <Loader2 size={12} className="animate-spin" /> Loading…
         </div>
-      ) : events.length === 0 ? (
+      ) : visible.length === 0 ? (
         <p className="px-1 py-2 text-[11px] italic text-maestro-muted">
-          No audit events for this project.
+          {filter ? `No audit rows for ${filter.label}.` : "No audit events for this project."}
         </p>
       ) : (
         // Bounded + scrollable (issue #123): without this, a long-running
         // project's audit rows push the Files card ever further down the
         // Second Brain panel instead of scrolling in place.
         <div data-testid="audit-events" className="max-h-[40vh] space-y-2 overflow-y-auto">
-          {groupByRun(events).map((run) => (
+          {groupByRun(visible).map((run) => (
             <div key={run.key}>
               <div className="mb-0.5 px-1 text-[10px] font-semibold uppercase tracking-wide text-maestro-muted">
                 {run.label}

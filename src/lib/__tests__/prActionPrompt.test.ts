@@ -3,6 +3,7 @@ import {
   buildPrActionPrompt,
   githubRepoSlug,
   type PrActionPromptInput,
+  prActionBriefStem,
   prActionLaunchName,
 } from "../prActionPrompt";
 
@@ -65,6 +66,60 @@ describe("prActionLaunchName", () => {
     expect(prActionLaunchName(123, ["investigate-everything", "review-and-post-the-notes"])).toBe(
       "PR #123 2 steps",
     );
+  });
+});
+
+describe("prActionBriefStem", () => {
+  it("names the brief after the PR and the ticked steps", () => {
+    expect(prActionBriefStem(123, ["check"])).toMatch(/^pr-123-check-[0-9a-f]{8}$/);
+    expect(prActionBriefStem(123, ["check", "review"])).toMatch(
+      /^pr-123-check-review-[0-9a-f]{8}$/,
+    );
+  });
+
+  it("keeps only characters a file name can carry", () => {
+    expect(prActionBriefStem(123, ["triage + verdict", "post NOTES"])).toMatch(
+      /^pr-123-triage-verdict-post-notes-[0-9a-f]{8}$/,
+    );
+    expect(prActionBriefStem(123, ["../escape"])).toMatch(/^pr-123-escape-[0-9a-f]{8}$/);
+    // Step ids with nothing usable in them still leave a legal stem.
+    expect(prActionBriefStem(123, ["***"])).toMatch(/^pr-123-1-steps-[0-9a-f]{8}$/);
+    expect(prActionBriefStem(123, [])).toBe("pr-123");
+  });
+
+  it("counts the steps instead when the chain would make a long name", () => {
+    expect(prActionBriefStem(123, ["investigate-everything", "review-and-post-the-notes"])).toMatch(
+      /^pr-123-2-steps-[0-9a-f]{8}$/,
+    );
+  });
+
+  // Review finding C9: two DIFFERENT step selections must never name the same
+  // brief file — the second launch would overwrite a running review's brief
+  // before its agent had read it.
+  it("never names two different step selections the same file", () => {
+    // Same slug, different selection: the separator is lost to the slug.
+    expect(prActionBriefStem(123, ["check", "review"])).not.toBe(
+      prActionBriefStem(123, ["check-review"]),
+    );
+    // Both collapse to "2 steps": only a hash still tells them apart.
+    expect(
+      prActionBriefStem(123, ["investigate-everything", "review-and-post-the-notes"]),
+    ).not.toBe(prActionBriefStem(123, ["investigate-everything", "review-and-post-the-nodes"]));
+    // Deterministic: relaunching the same selection reuses one file.
+    expect(prActionBriefStem(123, ["check", "review"])).toBe(
+      prActionBriefStem(123, ["check", "review"]),
+    );
+    // A different PR is a different brief even with identical steps.
+    expect(prActionBriefStem(123, ["check"])).not.toBe(prActionBriefStem(124, ["check"]));
+  });
+
+  // The backend slugs the stem it is handed (`[a-z0-9._-]`, issue #136 batch
+  // A): a stem carrying anything else would be written under a different name
+  // than the one the pointer quotes.
+  it("survives the backend's own slugging unchanged", () => {
+    for (const ids of [["check"], ["triage + verdict", "post NOTES"], ["***"], ["x".repeat(80)]]) {
+      expect(prActionBriefStem(123, ids)).toMatch(/^[a-z0-9._-]+$/);
+    }
   });
 });
 

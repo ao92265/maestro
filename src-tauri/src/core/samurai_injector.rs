@@ -2576,6 +2576,37 @@ mod tests {
     }
 
     #[test]
+    fn test_a_brief_file_never_blocks_handoff_validation() {
+        // Issue #137 pins the `.maestro/` exemption: long instructions are
+        // now written INTO the worktree as brief files, so a run always has
+        // one on disk when it hands off. Untracked or tracked, it must never
+        // read as uncommitted WIP.
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        let rel = samurai_prompts::handoff_file_relpath("#9", 1);
+        write_handoff_file(repo, "#9", 1);
+        let brief =
+            crate::core::samurai_brief::write_brief(repo, "gen-1-launch", "[Maestro Samurai] …")
+                .unwrap();
+        assert!(repo.join(&brief).is_file());
+
+        // Untracked (the normal case: `.maestro/` is gitignored).
+        let sha = validate_handoff(repo, &rel).unwrap().expect("HEAD sha");
+
+        // And STAGED, for a run whose gitignore step was skipped: still not
+        // WIP that should have been committed.
+        let out = std::process::Command::new("git")
+            .args(["add", "--force", ".maestro"])
+            .current_dir(repo)
+            .hide_console_window()
+            .output()
+            .expect("git must be runnable in tests");
+        assert!(out.status.success());
+        assert_eq!(validate_handoff(repo, &rel), Ok(Some(sha)));
+    }
+
+    #[test]
     fn test_validate_handoff_outside_a_git_repo_fails() {
         let dir = tempdir().unwrap();
         write_handoff_file(dir.path(), "#9", 1);

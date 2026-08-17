@@ -112,19 +112,37 @@ function mockInvoke() {
       case "samurai_list_runs":
         return [];
       case "samurai_files_list":
-        return [
-          {
-            kind: "HANDOFF",
-            path: "C:\\data\\worktrees\\maestro\\samurai-38\\.maestro\\handoffs\\38-gen2.md",
-            size_bytes: 4096,
-            modified_at: "2026-08-06T12:00:00Z",
-            project_path: "C:\\git\\maestro",
-            epic: "#38",
-            in_use: false,
-            has_live_session: false,
-            fire_at: null,
-          },
-        ];
+        return {
+          // Issue #140: the panel renders one card per run / PR review, so
+          // the entry's group must be in the listing for its row to appear.
+          groups: [
+            {
+              id: "run:000000000000:38",
+              kind: "RUN",
+              label: "Epic #38 — Samurai supervision",
+              refs: ["#38"],
+              project_path: "C:\\git\\maestro",
+              created_at: "2026-08-06T11:00:00Z",
+              is_live: false,
+              audit_rows: 0,
+              journal_entries: 0,
+            },
+          ],
+          entries: [
+            {
+              group_id: "run:000000000000:38",
+              kind: "HANDOFF",
+              path: "C:\\data\\worktrees\\maestro\\samurai-38\\.maestro\\handoffs\\38-gen2.md",
+              size_bytes: 4096,
+              modified_at: "2026-08-06T12:00:00Z",
+              project_path: "C:\\git\\maestro",
+              epic: "#38",
+              in_use: false,
+              has_live_session: false,
+              fire_at: null,
+            },
+          ],
+        };
       default:
         return undefined;
     }
@@ -244,10 +262,10 @@ describe("UtilityPanel", () => {
     expect(await screen.findByText("SPAWN")).toBeInTheDocument();
     expect(screen.getByText("gen-2")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Clear audit log" })).toBeInTheDocument();
-    // Files below: the grouped inventory from samurai_files_list.
+    // Files below: the inventory grouped by run / PR review (issue #140).
     expect(screen.getByText("Files")).toBeInTheDocument();
     expect(await screen.findByText("38-gen2.md")).toBeInTheDocument();
-    expect(screen.getByText("Handoffs")).toBeInTheDocument();
+    expect(screen.getByText("Epic #38 — Samurai supervision")).toBeInTheDocument();
   });
 
   it("renders the Launch panel with the run form and active runs", async () => {

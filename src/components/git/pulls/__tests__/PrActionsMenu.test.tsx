@@ -167,6 +167,100 @@ describe("PrActionsMenu", () => {
     await waitFor(() => expect(screen.queryByLabelText("Check status")).not.toBeInTheDocument());
   });
 
+  it("stages the prompt as a brief file in the project checkout", async () => {
+    // Issue #138: the launch names where the prompt is written and under what
+    // stem, so the backend types a one-line pointer instead of a multi-KB
+    // payload the PTY delivers in spliced fragments.
+    render(<PrActionsMenu pr={buildPr()} repoPath={REPO_PATH} />);
+    openMenu();
+
+    fireEvent.click(checkboxFor("Review & post"));
+    fireEvent.click(screen.getByRole("button", { name: /Launch 2 steps/ }));
+
+    await waitFor(() => expect(usePendingLaunchStore.getState().pending).toHaveLength(1));
+    const launch = usePendingLaunchStore.getState().pending[0];
+    expect(launch.briefDir).toBe(REPO_PATH);
+    // Review finding C9: the stem carries a hash of the exact step selection,
+    // so a second review never overwrites a running one's brief.
+    expect(launch.briefStem).toMatch(/^pr-123-check-review-[0-9a-f]{8}$/);
+  });
+
+  it("records the review as a run so its artifacts have work to belong to", async () => {
+    // Issue #139: a PR review used to leave NOTHING on disk, so its brief and
+    // audit rows had no group. The launch now carries the record's metadata —
+    // PR, title, repo slug, checkout, ticked steps — and the backend adds the
+    // session id and the brief path at the arm hop.
+    render(<PrActionsMenu pr={buildPr()} repoPath={REPO_PATH} />);
+    openMenu();
+
+    fireEvent.click(checkboxFor("Review & post"));
+    fireEvent.click(screen.getByRole("button", { name: /Launch 2 steps/ }));
+
+    await waitFor(() => expect(usePendingLaunchStore.getState().pending).toHaveLength(1));
+    expect(usePendingLaunchStore.getState().pending[0].prRun).toEqual({
+      pr: 123,
+      title: "feat(pr): monitoring tower",
+      repo: "nachogl1/maestro",
+      project_path: REPO_PATH,
+      steps: ["check", "review"],
+    });
+  });
+
+  it("records the review under the PR's own checkout, not the active tab's project", async () => {
+    // Review finding C10: in a multi-repo workspace the PR belongs to a
+    // repository inside the tab, so recording the tab's project filed the
+    // review under the wrong project. The brief still goes to the terminal's
+    // cwd — that is the directory the launch actually opens in.
+    const PR_CHECKOUT = "C:\\git\\maestro\\packages\\api";
+    render(<PrActionsMenu pr={buildPr()} repoPath={PR_CHECKOUT} />);
+    openMenu();
+
+    fireEvent.click(screen.getByRole("button", { name: /Launch 1 step/ }));
+
+    await waitFor(() => expect(usePendingLaunchStore.getState().pending).toHaveLength(1));
+    const launch = usePendingLaunchStore.getState().pending[0];
+    expect(launch.prRun?.project_path).toBe(PR_CHECKOUT);
+    expect(launch.briefDir).toBe(REPO_PATH);
+    expect(launch.workingDirOverride).toBe(REPO_PATH);
+  });
+
+  it("records an unparseable PR url as an empty repo slug rather than blocking", async () => {
+    // A slug that will not parse must never stop a review launching: the
+    // group still keys off the PR number within the checkout.
+    render(<PrActionsMenu pr={buildPr({ url: "not-a-github-url" })} repoPath={REPO_PATH} />);
+    openMenu();
+
+    fireEvent.click(screen.getByRole("button", { name: /Launch 1 step/ }));
+
+    await waitFor(() => expect(usePendingLaunchStore.getState().pending).toHaveLength(1));
+    expect(usePendingLaunchStore.getState().pending[0].prRun?.repo).toBe("");
+  });
+
+  it("keeps the brief stem filesystem-safe for step ids with symbols or spaces", async () => {
+    // Step ids come from the workflow editor, so they are free text: a stem
+    // built from them must still be one legal file name.
+    usePrWorkflowStore.setState({
+      graph: {
+        nodes: [
+          { id: "triage + verdict", label: "Triage", text: "Custom triage ritual." },
+          { id: "post NOTES", label: "Post", text: "Custom posting ritual." },
+        ],
+        edges: [{ from: "triage + verdict", to: "post NOTES" }],
+        start: "triage + verdict",
+      },
+    });
+    render(<PrActionsMenu pr={buildPr()} repoPath={REPO_PATH} />);
+    openMenu();
+
+    fireEvent.click(checkboxFor("Post"));
+    fireEvent.click(screen.getByRole("button", { name: /Launch 2 steps/ }));
+
+    await waitFor(() => expect(usePendingLaunchStore.getState().pending).toHaveLength(1));
+    expect(usePendingLaunchStore.getState().pending[0].briefStem).toMatch(
+      /^pr-123-triage-verdict-post-notes-[0-9a-f]{8}$/,
+    );
+  });
+
   it("launches the edited workflow verbatim: custom steps, edge order, no default text", async () => {
     // A fully user-edited graph: custom texts, node-array order REVERSED
     // relative to the edge order (so the prompt order can only come from the

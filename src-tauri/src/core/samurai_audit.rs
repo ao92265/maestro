@@ -88,6 +88,13 @@ pub struct AuditEvent {
 
 impl AuditEvent {
     /// Builds an event stamped with the current UTC time.
+    ///
+    /// Issue #139's invariant — every row names the run it belongs to — is
+    /// swept for at the SOURCE (`test_no_audit_writer_stamps_an_empty_run_id`),
+    /// but that sweep only recognises the literal `""` / `String::new()`
+    /// spellings: a writer forwarding a variable that happens to be empty
+    /// walks straight past it. The debug assertion is the runtime half, so a
+    /// dev build trips where the sweep cannot look.
     pub fn now(
         epic: impl Into<String>,
         event: AuditEventKind,
@@ -95,9 +102,15 @@ impl AuditEvent {
         session_id: u32,
         details: Value,
     ) -> Self {
+        let epic = epic.into();
+        debug_assert!(
+            !epic.is_empty(),
+            "an audit row must name the run it belongs to (issue #139) — stamp the run id, or \
+             `allowance_watcher::ACCOUNT_RUN` for a genuinely account-wide row"
+        );
         Self {
             ts: chrono::Utc::now().to_rfc3339(),
-            epic: epic.into(),
+            epic,
             event,
             generation,
             session_id,
@@ -449,6 +462,88 @@ mod tests {
         assert_eq!(excerpt.chars().count(), EXCERPT_MAX_CHARS);
         assert_eq!(total, EXCERPT_MAX_CHARS + 50);
         assert!(accented.starts_with(&excerpt));
+    }
+
+    /// Every `.rs` file under `src/`, recursively.
+    fn rust_sources(dir: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir)
+            .expect("readable source dir")
+            .flatten()
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(rust_sources(&path));
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                files.push(path);
+            }
+        }
+        files
+    }
+
+    /// Issue #139, the invariant behind the Second Brain's grouping: EVERY
+    /// audit row names the run it belongs to. Rows written with an empty
+    /// `epic` are the only reason a generic "Unattributed" bucket would ever
+    /// be needed — so the writers are fixed and this sweep keeps them fixed.
+    ///
+    /// A source sweep rather than a runtime assertion on purpose: an empty
+    /// run id is a bug at the CALL SITE, and the call sites are spread across
+    /// a dozen modules whose writers no single test can drive. Test fixtures
+    /// are exempt (they build rows of every shape deliberately), so each
+    /// file's `#[cfg(test)] mod tests` is cut before the scan.
+    #[test]
+    fn test_no_audit_writer_stamps_an_empty_run_id() {
+        const CTOR: &str = "AuditEvent::now(";
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sites = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+
+        for file in rust_sources(&src) {
+            let content = std::fs::read_to_string(&file).expect("readable source");
+            let production = content
+                .split("\n#[cfg(test)]\nmod tests {")
+                .next()
+                .unwrap_or(&content)
+                .to_string();
+            for (offset, _) in production.match_indices(CTOR) {
+                sites += 1;
+                let epic = production[offset + CTOR.len()..].trim_start();
+                if epic.starts_with("\"\"") || epic.starts_with("String::new()") {
+                    let line = production[..offset].lines().count();
+                    offenders.push(format!("{}:{}", file.display(), line + 1));
+                }
+            }
+            // The struct-literal spelling of the same bug.
+            for empty in ["epic: String::new()", "epic: \"\".to_string()"] {
+                if production.contains(empty) {
+                    offenders.push(format!("{} ({empty})", file.display()));
+                }
+            }
+        }
+
+        assert!(
+            sites >= 10,
+            "the sweep found only {sites} `{CTOR}` sites — it has stopped scanning what it thinks \
+             it scans (renamed constructor?), so it can no longer catch an unattributed row"
+        );
+        assert!(
+            offenders.is_empty(),
+            "audit rows written with an empty run id — stamp the run (or \
+             `allowance_watcher::ACCOUNT_RUN` for a genuinely account-wide row):\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Issue #139 c10, runtime half (review B9): the source sweep above only
+    /// recognises the literal empty spellings, so a writer forwarding a
+    /// variable that happens to be empty passes it untouched. A dev build
+    /// trips instead of writing a row no group can ever claim.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "must name the run it belongs to")]
+    fn test_an_empty_run_id_trips_the_debug_assertion() {
+        let forwarded = String::new();
+        AuditEvent::now(forwarded, AuditEventKind::Alert, 1, 1, json!({}));
     }
 
     #[test]
