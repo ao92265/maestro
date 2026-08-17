@@ -24,6 +24,18 @@
 //! the input box unsubmitted. The gap therefore scales with the payload
 //! ([`submit_delay`]), and the replicator arms a post-delivery check that
 //! re-sends the lone Enter ([`resend_submit`]) when no turn ever starts.
+//!
+//! **The body itself is typed in chunks, not in one burst.** Observed live
+//! (2026-08-17): a gen-1 launch brief of several KB arrived at the agent as
+//! its LAST ~700 characters — the transcript recorded a user message that
+//! began mid-word, in the middle of the journaling rider, on two separate
+//! launches (700 and 749 chars). One `write_all` of the whole payload reaches
+//! the CLI's stdin as a rapid burst of reads, and only the final one survives
+//! into its input box; everything typed before it is lost, so the agent gets
+//! a headless fragment with no task in it. The body is therefore written as
+//! [`CHUNK_BYTES`]-sized frames spaced [`CHUNK_DELAY`] apart
+//! ([`chunk_frames`]), which keeps every read small and leaves the CLI time
+//! to fold each one into its input state before the next arrives.
 
 use std::time::Duration;
 
@@ -60,11 +72,37 @@ pub fn submit_delay(payload_bytes: usize) -> Duration {
 /// sites and the tests that assert on it.
 pub const SUBMIT_KEY: &str = "\r";
 
-/// The two frames one instruction is delivered as: the text, then the
-/// submit. Pure, so the shape is unit-testable without a PTY — the timing
-/// between them is not (no test can prove the CLI's paste heuristic).
-pub fn submit_frames(text: &str) -> [String; 2] {
-    [text.to_string(), SUBMIT_KEY.to_string()]
+/// Largest body frame written to the PTY in one `write_stdin` call. Sized
+/// well under the ~700 characters that survived the one-burst delivery
+/// (module doc), so a frame is never big enough for the CLI to drop what came
+/// before it.
+pub const CHUNK_BYTES: usize = 256;
+
+/// Gap between consecutive body frames — long enough for the CLI to consume a
+/// frame and re-render its input box before the next arrives. Like
+/// [`SUBMIT_DELAY`] this is a property of the CLI's input handling, not a user
+/// preference: a value of 0 re-merges the frames into the burst that lost the
+/// launch brief.
+pub const CHUNK_DELAY: Duration = Duration::from_millis(50);
+
+/// The body frames one instruction is typed as: `text` split into pieces of
+/// at most [`CHUNK_BYTES`], never mid-codepoint. Empty text yields no frames
+/// (nothing to type). Pure, so the shape is unit-testable without a PTY — the
+/// timing between the frames is not (no test can prove the CLI's input
+/// handling).
+pub fn chunk_frames(text: &str) -> Vec<String> {
+    let mut frames = Vec::new();
+    let mut frame = String::new();
+    for c in text.chars() {
+        if frame.len() + c.len_utf8() > CHUNK_BYTES {
+            frames.push(std::mem::take(&mut frame));
+        }
+        frame.push(c);
+    }
+    if !frame.is_empty() {
+        frames.push(frame);
+    }
+    frames
 }
 
 /// Verdict callback for one submitted instruction (issue #109): invoked with
@@ -98,18 +136,32 @@ pub fn submit_instruction(
 ) {
     tauri::async_runtime::spawn(async move {
         let delay = submit_delay(text.len());
-        let [body, submit] = submit_frames(&text);
-        if let Err(e) = write_frame(&processes, session_id, body, ctx, "instruction").await {
-            // The text never landed — sending a bare Enter now would submit
-            // whatever the user happened to have typed in that box.
-            outcome(Err(e));
-            return;
+        let frames = chunk_frames(&text);
+        let last = frames.len().saturating_sub(1);
+        for (i, frame) in frames.into_iter().enumerate() {
+            if let Err(e) = write_frame(&processes, session_id, frame, ctx, "instruction").await {
+                // The text never landed in full — sending a bare Enter now
+                // would submit a half-typed instruction (or whatever the user
+                // happened to have typed in that box).
+                outcome(Err(e));
+                return;
+            }
+            if i < last {
+                tokio::time::sleep(CHUNK_DELAY).await;
+            }
         }
         outcome(Ok(()));
         tokio::time::sleep(delay).await;
         // Enter-frame failures are logged only: the delivery watches (and,
         // for harvest, the user) recover a submit that never landed.
-        let _ = write_frame(&processes, session_id, submit, ctx, "submit").await;
+        let _ = write_frame(
+            &processes,
+            session_id,
+            SUBMIT_KEY.to_string(),
+            ctx,
+            "submit",
+        )
+        .await;
     });
 }
 
@@ -136,16 +188,32 @@ pub fn submit_instruction_confirmed(
     ctx: &'static str,
 ) -> Result<(), String> {
     let delay = submit_delay(text.len());
-    let [body, submit] = submit_frames(&text);
-    processes
-        .write_stdin(session_id, &body)
-        .map_err(|e| format!("writing instruction to session {session_id} failed: {e}"))?;
+    let frames = chunk_frames(&text);
+    let last = frames.len().saturating_sub(1);
+    for (i, frame) in frames.iter().enumerate() {
+        processes
+            .write_stdin(session_id, frame)
+            .map_err(|e| format!("writing instruction to session {session_id} failed: {e}"))?;
+        // Callers are already on the blocking pool (see below), so the
+        // inter-frame gap is a plain sleep — the same gap `submit_instruction`
+        // awaits.
+        if i < last {
+            std::thread::sleep(CHUNK_DELAY);
+        }
+    }
     // The body landed — the delayed Enter follows the fire-and-forget policy
     // of `submit_instruction` (over-waiting is free, and a swallowed Enter is
     // user-recoverable).
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(delay).await;
-        let _ = write_frame(&processes, session_id, submit, ctx, "submit").await;
+        let _ = write_frame(
+            &processes,
+            session_id,
+            SUBMIT_KEY.to_string(),
+            ctx,
+            "submit",
+        )
+        .await;
     });
     Ok(())
 }
@@ -198,11 +266,58 @@ mod tests {
         // The whole point: the instruction carries NO submit key, and the
         // submit is a frame of its own. A single `format!("{text}\r")` write
         // is what the CLI mistook for a paste.
-        let [body, submit] = submit_frames("[Maestro Samurai] do the thing");
-        assert_eq!(body, "[Maestro Samurai] do the thing");
-        assert!(!body.contains('\r'), "no submit key inside the payload");
-        assert!(!body.contains('\n'), "still a single pasteable line");
-        assert_eq!(submit, "\r");
+        let body = chunk_frames("[Maestro Samurai] do the thing");
+        assert_eq!(body, ["[Maestro Samurai] do the thing"]);
+        assert!(!body[0].contains('\r'), "no submit key inside the payload");
+        assert!(!body[0].contains('\n'), "still a single pasteable line");
+        assert_eq!(SUBMIT_KEY, "\r");
+    }
+
+    #[test]
+    fn test_short_instructions_stay_one_chunk() {
+        // Nothing under the chunk size changes shape: the pre-existing
+        // single-write delivery is still what a short instruction gets.
+        let text = "x".repeat(CHUNK_BYTES);
+        assert_eq!(chunk_frames(&text), [text.as_str()]);
+        // Empty text has nothing to type — the lone Enter still follows.
+        assert!(chunk_frames("").is_empty());
+    }
+
+    #[test]
+    fn test_a_multi_kb_brief_is_typed_in_bounded_chunks() {
+        // The bug: a several-KB brief written as ONE burst reached the agent
+        // as its last ~700 chars. Every frame must be small enough that the
+        // CLI folds it into the input box before the next one lands.
+        let brief = "[Maestro Samurai] You are generation 1. ".repeat(200);
+        let chunks = chunk_frames(&brief);
+        assert!(chunks.len() > 1, "a multi-KB brief must not be one write");
+        for chunk in &chunks {
+            assert!(!chunk.is_empty(), "no empty frame");
+            assert!(chunk.len() <= CHUNK_BYTES, "frame over the chunk size");
+        }
+        // Chunking is a transport detail: what the agent reads is the brief.
+        assert_eq!(chunks.concat(), brief);
+        // And no frame smuggles a submit key, so no chunk boundary can send
+        // the half-typed brief on its own.
+        assert!(chunks.iter().all(|c| !c.contains(SUBMIT_KEY)));
+    }
+
+    #[test]
+    fn test_chunking_never_splits_a_character() {
+        // Instruction text carries em dashes and arrows (the briefs are full
+        // of them); slicing mid-codepoint would panic in `write_stdin` — or
+        // type a replacement char into the agent's prompt.
+        let text = "— ✅ 🗡️ ".repeat(200);
+        let chunks = chunk_frames(&text);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|c| c.len() <= CHUNK_BYTES));
+        assert_eq!(chunks.concat(), text, "every codepoint survives intact");
+    }
+
+    #[test]
+    fn test_chunk_delay_is_non_zero() {
+        // A zero gap re-merges the frames into the burst that lost the brief.
+        assert!(CHUNK_DELAY > Duration::ZERO);
     }
 
     #[test]
