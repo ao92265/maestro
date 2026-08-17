@@ -331,22 +331,36 @@ fn launch_refusal(preflight: &SamuraiPreflight, live_session: bool) -> Option<St
 /// created from HEAD when missing; a branch already checked out in another
 /// worktree means the epic worktree already exists — its path is returned,
 /// not an error.
+/// What [`ensure_epic_worktree`] resolved, plus what it had to CREATE to get
+/// there. The creation flags are what makes a blocked launch cleanable: git
+/// state this call brought into existence can be undone, state that was
+/// already there (a previous run's worktree, with its work in it) must not be.
+struct EpicWorktree {
+    path: PathBuf,
+    /// This call created the worktree (as opposed to reusing an existing one).
+    worktree_created: bool,
+    /// This call created the branch.
+    branch_created: bool,
+}
+
 async fn ensure_epic_worktree(
     worktrees: &WorktreeManager,
     project: &str,
     branch: &str,
     base_override: Option<&Path>,
-) -> Result<PathBuf, String> {
+) -> Result<EpicWorktree, String> {
     let repo = PathBuf::from(project);
     let git = Git::new(&repo);
     let branches = git
         .list_branches()
         .await
         .map_err(|e| format!("could not list branches in {project}: {e}"))?;
+    let mut branch_created = false;
     if !branches.iter().any(|b| !b.is_remote && b.name == branch) {
         git.create_branch(branch, None)
             .await
             .map_err(|e| format!("could not create branch {branch}: {e}"))?;
+        branch_created = true;
     }
     // Checked out in the MAIN worktree (someone explored the branch by
     // hand): `worktree add` then needs --force — the
@@ -356,11 +370,53 @@ async fn ensure_epic_worktree(
         .create_with_base(branch, &repo, base_override, branch_in_main)
         .await
     {
-        Ok(path) => Ok(path),
+        Ok(path) => Ok(EpicWorktree {
+            path,
+            worktree_created: true,
+            branch_created,
+        }),
         // REUSE, not an error: the guard's payload carries where the epic
         // worktree already lives.
-        Err(GitError::BranchAlreadyCheckedOut { path, .. }) => Ok(PathBuf::from(path)),
+        Err(GitError::BranchAlreadyCheckedOut { path, .. }) => Ok(EpicWorktree {
+            path: PathBuf::from(path),
+            worktree_created: false,
+            branch_created,
+        }),
         Err(e) => Err(format!("could not create the epic worktree: {e}")),
+    }
+}
+
+/// Undoes exactly what [`ensure_epic_worktree`] created, for a launch that
+/// never made it past the test gate. Without this the blocked launch left a
+/// multi-GB bootstrapped worktree (and possibly a branch) behind that NO UI
+/// surface offers to remove: the run has no ACTIVE config, so it appears in
+/// neither the runs list nor the Second Brain file inventory. Reused git
+/// state is never touched — it may hold a previous run's work.
+async fn undo_epic_worktree(
+    worktrees: &WorktreeManager,
+    project: &str,
+    branch: &str,
+    created: &EpicWorktree,
+) {
+    let repo = PathBuf::from(project);
+    if created.worktree_created {
+        match worktrees.remove(&repo, &created.path).await {
+            Ok(()) => log::info!(
+                "samurai launch: removed the worktree the blocked launch created at {:?}",
+                created.path
+            ),
+            Err(e) => log::warn!(
+                "samurai launch: could not remove the worktree the blocked launch created at {:?}: {e}",
+                created.path
+            ),
+        }
+    }
+    if created.branch_created {
+        if let Err(e) = Git::new(&repo).delete_branch(branch, false).await {
+            log::warn!(
+                "samurai launch: could not delete the branch the blocked launch created ({branch}): {e}"
+            );
+        }
     }
 }
 
@@ -518,8 +574,8 @@ pub(crate) async fn launch_run_inner(
     }
 
     let branch = epic_branch(project, &epic);
-    let worktree = ensure_epic_worktree(worktrees, project, &branch, worktree_base).await?;
-    let worktree_path = strip_extended_prefix(&worktree.to_string_lossy()).to_string();
+    let created = ensure_epic_worktree(worktrees, project, &branch, worktree_base).await?;
+    let worktree_path = strip_extended_prefix(&created.path.to_string_lossy()).to_string();
 
     // Issue #90b: the test-suite gate — bootstrap the epic worktree, then
     // `cargo test --workspace` inside it; red = launch blocked (the skip
@@ -553,6 +609,11 @@ pub(crate) async fn launch_run_inner(
                 }),
             ),
         );
+        // The gate bootstrapped this worktree (npm install + a release
+        // build), and a blocked launch writes no ACTIVE run config — so the
+        // run appears in no list and no UI surface offers to clean it up.
+        // Undo exactly what this call created; reused state is left alone.
+        undo_epic_worktree(worktrees, project, &branch, &created).await;
         return Err(failure.message);
     }
 
@@ -2262,15 +2323,21 @@ mod tests {
         let first = ensure_epic_worktree(&worktrees, &project, "samurai-38", Some(base.path()))
             .await
             .unwrap();
-        assert!(first.exists());
-        assert!(first.starts_with(base.path()));
+        assert!(first.path.exists());
+        assert!(first.path.starts_with(base.path()));
+        assert!(first.worktree_created, "the first launch creates both");
+        assert!(first.branch_created);
 
         // Relaunch: REUSE — same path, no error (reconciliation depends on
         // path stability, PRD §5.9).
         let second = ensure_epic_worktree(&worktrees, &project, "samurai-38", Some(base.path()))
             .await
             .unwrap();
-        assert_eq!(first, second);
+        assert_eq!(first.path, second.path);
+        assert!(
+            !second.worktree_created && !second.branch_created,
+            "a reused worktree is never reported as created — a blocked launch must not delete it"
+        );
     }
 
     /// Everything cleanup (and the gated launch) needs, rooted in tempdirs.
@@ -2452,7 +2519,8 @@ mod tests {
         let worktree =
             ensure_epic_worktree(&h.worktrees, &h.project, "samurai-38", Some(h.base.path()))
                 .await
-                .unwrap();
+                .unwrap()
+                .path;
         h.run_configs
             .save(&SamuraiRunConfig::new(
                 h.project.clone(),
@@ -2912,6 +2980,28 @@ mod tests {
         assert_eq!(
             *calls.lock().unwrap(),
             vec!["cargo test --workspace".to_string()]
+        );
+
+        // The worktree the gate bootstrapped is GONE. A blocked launch
+        // writes no ACTIVE config, so the run shows up in no list and no UI
+        // surface offers to remove it — leaving it behind stranded a
+        // multi-GB directory and an orphan branch with no way back to them.
+        let managed = h
+            .worktrees
+            .list_managed_with_base(&PathBuf::from(&h.project), Some(h.base.path()))
+            .await
+            .unwrap();
+        assert!(
+            managed.is_empty(),
+            "a blocked launch must not leave its worktree behind: {managed:?}"
+        );
+        let git = Git::new(h.repo.path());
+        let branches = git.list_branches().await.unwrap();
+        assert!(
+            !branches
+                .iter()
+                .any(|b| !b.is_remote && b.name == "samurai-38"),
+            "…nor the branch it created"
         );
     }
 
@@ -3894,7 +3984,8 @@ mod tests {
         let worktree =
             ensure_epic_worktree(&h.worktrees, &h.project, "samurai-38", Some(h.base.path()))
                 .await
-                .unwrap();
+                .unwrap()
+                .path;
         h.run_configs
             .save(&SamuraiRunConfig::new(
                 h.project.clone(),
@@ -3962,7 +4053,8 @@ mod tests {
         let worktree =
             ensure_epic_worktree(&h.worktrees, &h.project, "samurai-38", Some(h.base.path()))
                 .await
-                .unwrap();
+                .unwrap()
+                .path;
 
         let report = run_cleanup(&h, "#38").await.unwrap();
         assert!(!report.config_archived);
@@ -3989,7 +4081,8 @@ mod tests {
         let worktree =
             ensure_epic_worktree(&h.worktrees, &h.project, "samurai-38", Some(h.base.path()))
                 .await
-                .unwrap();
+                .unwrap()
+                .path;
 
         let report = run_cleanup(&h, "#38").await.unwrap();
         assert_eq!(

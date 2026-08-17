@@ -855,11 +855,22 @@ pub fn run() {
                         "harvest",
                     )
                 });
-            let harvest_triage = Arc::new(commands::harvest::HarvestTriage::new(
-                journal_store.clone(),
-                commands::harvest::downloads_dir_string(),
-                harvest_deliver,
-            ));
+            // Every injection outcome reaches the Journal card: the panel
+            // announces "triage session opened — N entries will be injected
+            // there" at click time, so a failure that only reached the log
+            // left the user believing the journal was triaged.
+            let harvest_app = app.handle().clone();
+            let harvest_notify: commands::harvest::HarvestNotifyFn = Arc::new(move |outcome| {
+                let _ = harvest_app.emit(commands::harvest::HARVEST_EVENT, outcome);
+            });
+            let harvest_triage = Arc::new(
+                commands::harvest::HarvestTriage::new(
+                    journal_store.clone(),
+                    commands::harvest::downloads_dir_string(),
+                    harvest_deliver,
+                )
+                .with_notify(harvest_notify),
+            );
             app.manage(harvest_triage.clone());
             let _ = harvest_triage_slot.set(harvest_triage);
             // Samurai (issue #61): the resume handler — a fired park timer

@@ -1,3 +1,4 @@
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 // The spec asks for NotebookPen, which lucide-react 0.300.0 does not ship —
 // PenLine is the closest journal-writing glyph available.
@@ -23,6 +24,17 @@ import { cardClass, SectionHeader } from "./sectionChrome";
  * opens, so an empty journal never wastes a session.
  */
 const NOTHING_TO_HARVEST = "Nothing to harvest — no unconsumed journal entries.";
+
+/**
+ * What one injection attempt did, mirrored from the backend
+ * (`commands::harvest::HarvestInjectionOutcome`). `error` is `null` on
+ * success.
+ */
+interface HarvestInjectionOutcome {
+  sessionId: number;
+  injected: number;
+  error: string | null;
+}
 
 /** How many rows to show — the newest slice, same no-virtualization bar as the audit list. */
 const JOURNAL_TAIL = 50;
@@ -167,6 +179,45 @@ export function JournalSection() {
     refresh(() => cancelled);
     return () => {
       cancelled = true;
+    };
+  }, [refresh]);
+
+  /**
+   * What the injection ACTUALLY did. The success notice above is written at
+   * click time — before the terminal even opens — so without this a failed
+   * injection (no entries left, a dead PTY, a failed consumption commit)
+   * left the card claiming the journal had been triaged while the terminal
+   * sat at an empty prompt.
+   */
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: UnlistenFn | null = null;
+    listen<HarvestInjectionOutcome>("samurai-harvest-event", (e) => {
+      const { injected, error: failure } = e.payload;
+      if (failure) {
+        setNotice(null);
+        setError(failure);
+      } else {
+        setError(null);
+        setNotice(
+          `Triage prompt injected — ${injected} ${injected === 1 ? "entry" : "entries"} handed to the session`,
+        );
+      }
+      void refresh();
+    })
+      .then((fn) => {
+        if (disposed) {
+          fn();
+          return;
+        }
+        unlisten = fn;
+      })
+      .catch(() => {
+        // Event system unavailable (tests) — the card still works on reads.
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
     };
   }, [refresh]);
 

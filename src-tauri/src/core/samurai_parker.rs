@@ -156,6 +156,11 @@ struct SweepState {
     parked_epics: BTreeSet<(String, String)>,
     /// The latest known reset among the sweep's triggering hard events.
     resets_at: Option<DateTime<Utc>>,
+    /// The reset the LAST completed sweep armed its timers from. Kept after
+    /// the sweep disengages so a park that validates late — the session was
+    /// skipped as stuck, then its Stop finally landed — can still arm the
+    /// timer it would otherwise never get.
+    last_resets_at: Option<DateTime<Utc>>,
     /// Issue #63: this sweep was engaged EXTERNALLY (e.g. gh auth loss) — a
     /// condition with no reset time by design, so completion arms NO resume
     /// timers and emits NO per-epic `park_no_reset_time` noise (a human
@@ -337,10 +342,43 @@ impl SamuraiParker {
             .insert((snapshot.project.clone(), snapshot.epic.clone()));
         let this = self.clone();
         let session_id = snapshot.session_id;
+        let project = snapshot.project.clone();
+        let epic = snapshot.epic.clone();
         tauri::async_runtime::spawn(async move {
             (this.teardown)(session_id).await;
-            this.advance();
+            this.finish_park(&project, &epic);
         });
+    }
+
+    /// After a parked session's teardown: keep the sweep moving, or — when
+    /// the sweep already disengaged — arm this epic's timer here.
+    ///
+    /// A session skipped as stuck (`on_park_failed`) stops blocking the
+    /// sweep, so the sweep can complete while that park is still in flight.
+    /// When the park finally validates, `advance()` returns immediately on
+    /// the disengaged flag: the session was torn down with NO resume timer
+    /// and no trail. The epic is armed from the last sweep's reset instead.
+    fn finish_park(&self, project: &str, epic: &str) {
+        if self.parking_engaged() {
+            self.advance();
+            return;
+        }
+        let (late, resets_at) = {
+            let mut state = self.lock_state();
+            (
+                state
+                    .parked_epics
+                    .remove(&(project.to_string(), epic.to_string())),
+                state.last_resets_at,
+            )
+        };
+        if !late {
+            return;
+        }
+        log::warn!(
+            "samurai parker: epic {epic} parked AFTER its sweep completed — arming its resume timer now"
+        );
+        self.arm_resume_timer(project, epic, resets_at);
     }
 
     /// Chained from the injector when a park ladder exhausted its retries
@@ -526,6 +564,14 @@ impl SamuraiParker {
 
         // Nothing parkable right now: blocked (something is completing) or
         // done (every session terminal, skipped, or abandoned).
+        //
+        // Re-read the registry first: `register_session` runs OUTSIDE this
+        // lock, so an orchestrator that registered after the snapshot above
+        // was invisible here — the sweep completed, `engaged` cleared, and
+        // every later `advance()` returned at the top, leaving the fresh
+        // agent running at full throughput against the exhausted allowance
+        // the sweep exists to protect.
+        let sessions = self.supervisor.list_sessions();
         let blocked = sessions.iter().any(|s| {
             blocks_completion(
                 s.state,
@@ -565,6 +611,9 @@ impl SamuraiParker {
     fn complete_sweep(&self, state: &mut SweepState) -> bool {
         let parked_epics = std::mem::take(&mut state.parked_epics);
         let resets_at = state.resets_at.take();
+        if resets_at.is_some() {
+            state.last_resets_at = resets_at;
+        }
         let suppress_timers = std::mem::take(&mut state.suppress_timers);
         let pending_allclear = std::mem::take(&mut state.pending_allclear);
         state.failed.clear();
@@ -586,76 +635,98 @@ impl SamuraiParker {
             "samurai parker: park sweep complete — {} epic(s) to arm resume timers for",
             parked_epics.len()
         );
-        let armed = self.schedule.list();
         for (project, epic) in parked_epics {
-            match resets_at {
-                None => {
-                    // A guessed timer is worse than a human look (issue #60
-                    // point 4): ALERT instead of arming.
-                    log::error!(
-                        "samurai parker: no reset time known for epic {epic} — resume timer NOT armed (park_no_reset_time)"
-                    );
-                    self.audit.append(
-                        &project,
-                        AuditEvent::now(
-                            epic.clone(),
-                            AuditEventKind::Alert,
-                            0,
-                            0,
-                            json!({ "kind": "park_no_reset_time", "epic": epic }),
-                        ),
-                    );
-                }
-                Some(resets_at) => {
-                    let fire_at = fire_at_for(resets_at, &epic);
-                    let existing = armed
-                        .iter()
-                        .find(|e| e.project_path == project && e.epic == epic)
-                        .map(|e| e.fire_at.as_str());
-                    if !should_arm(existing, fire_at) {
-                        log::info!(
-                            "samurai parker: epic {epic} already has a later resume timer ({}) — kept",
-                            existing.unwrap_or_default()
-                        );
-                        continue;
-                    }
-                    let fire_at = fire_at.to_rfc3339();
-                    let entry = ScheduleEntry {
-                        project_path: project.clone(),
-                        epic: epic.clone(),
-                        fire_at: fire_at.clone(),
-                        reason: "park".to_string(),
-                        launch: None,
-                        held: false,
-                    };
-                    match self.schedule.arm(entry) {
-                        Ok(()) => {
-                            log::info!(
-                                "samurai parker: resume timer armed for epic {epic} at {fire_at}"
-                            );
-                            // Epic-level row (generation/session 0, like the
-                            // allowance ALERTs): the trail shows WHEN work
-                            // resumes without opening schedule.json.
-                            self.audit.append(
-                                &project,
-                                AuditEvent::now(
-                                    epic.clone(),
-                                    AuditEventKind::Park,
-                                    0,
-                                    0,
-                                    json!({ "phase": "timer_armed", "fire_at": fire_at }),
-                                ),
-                            );
-                        }
-                        Err(e) => log::error!(
-                            "samurai parker: failed to arm the resume timer for epic {epic}: {e}"
-                        ),
-                    }
-                }
-            }
+            self.arm_resume_timer(&project, &epic, resets_at);
         }
         self.engaged.store(false, Ordering::SeqCst);
         pending_allclear
+    }
+
+    /// Arms one epic's resume timer, or leaves the ALERT that explains why
+    /// none exists. Shared by sweep completion and the late-park path
+    /// ([`Self::on_parked`]), so a park that lands after the sweep already
+    /// disengaged gets exactly the same treatment.
+    fn arm_resume_timer(&self, project: &str, epic: &str, resets_at: Option<DateTime<Utc>>) {
+        let Some(resets_at) = resets_at else {
+            // A guessed timer is worse than a human look (issue #60
+            // point 4): ALERT instead of arming.
+            log::error!(
+                "samurai parker: no reset time known for epic {epic} — resume timer NOT armed (park_no_reset_time)"
+            );
+            self.audit.append(
+                project,
+                AuditEvent::now(
+                    epic.to_string(),
+                    AuditEventKind::Alert,
+                    0,
+                    0,
+                    json!({ "kind": "park_no_reset_time", "epic": epic }),
+                ),
+            );
+            return;
+        };
+        let fire_at = fire_at_for(resets_at, epic);
+        let armed = self.schedule.list();
+        let existing = armed
+            .iter()
+            .find(|e| e.project_path == project && e.epic == epic)
+            .map(|e| e.fire_at.as_str());
+        if !should_arm(existing, fire_at) {
+            log::info!(
+                "samurai parker: epic {epic} already has a later resume timer ({}) — kept",
+                existing.unwrap_or_default()
+            );
+            return;
+        }
+        let fire_at = fire_at.to_rfc3339();
+        let entry = ScheduleEntry {
+            project_path: project.to_string(),
+            epic: epic.to_string(),
+            fire_at: fire_at.clone(),
+            reason: "park".to_string(),
+            launch: None,
+            held: false,
+        };
+        match self.schedule.arm(entry) {
+            Ok(()) => {
+                log::info!("samurai parker: resume timer armed for epic {epic} at {fire_at}");
+                // Epic-level row (generation/session 0, like the
+                // allowance ALERTs): the trail shows WHEN work
+                // resumes without opening schedule.json.
+                self.audit.append(
+                    project,
+                    AuditEvent::now(
+                        epic.to_string(),
+                        AuditEventKind::Park,
+                        0,
+                        0,
+                        json!({ "phase": "timer_armed", "fire_at": fire_at }),
+                    ),
+                );
+            }
+            Err(e) => {
+                // The epic is parked and torn down; without a timer it never
+                // resumes. A log line alone made that read as a clean park,
+                // so this gets the same ALERT weight as a missing reset time.
+                log::error!(
+                    "samurai parker: failed to arm the resume timer for epic {epic}: {e} — ALERT"
+                );
+                self.audit.append(
+                    project,
+                    AuditEvent::now(
+                        epic.to_string(),
+                        AuditEventKind::Alert,
+                        0,
+                        0,
+                        json!({
+                            "kind": "park_timer_arm_failed",
+                            "epic": epic,
+                            "error": e,
+                        }),
+                    ),
+                );
+            }
+        }
     }
 
     /// Recover from a poisoned lock rather than panicking — event-path
@@ -685,6 +756,8 @@ mod tests {
     const RESETS_AT: &str = "2030-01-01T00:00:00Z";
     /// Default ack_timeout_secs, for backdating the injector's clocks.
     const TIMEOUT: Duration = Duration::from_secs(180);
+    /// Default max_turn_wait_secs — the stuck-wait cap.
+    const MAX_TURN_WAIT: Duration = Duration::from_secs(1800);
 
     // --- pure decisions ---
 
@@ -1381,6 +1454,62 @@ mod tests {
                 && r.details["instruction"] == "park"
         }));
         assert_eq!(*h.torn_down.lock().unwrap(), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn test_park_landing_after_the_sweep_completed_still_arms_its_timer() {
+        // A skipped (stuck/failed) park stops blocking the sweep, so the
+        // sweep can complete while that park is still in flight. When the
+        // Stop finally lands, the session parks and is torn down — and
+        // `advance()` returns straight away on the disengaged flag, so the
+        // epic used to lose its resume timer with no trail at all.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-late-park";
+        let repo_one = tempdir().unwrap();
+        init_parkable_repo(repo_one.path(), "#1", 1);
+        let repo_two = tempdir().unwrap();
+        init_parkable_repo(repo_two.path(), "#2", 1);
+        h.dirs
+            .lock()
+            .unwrap()
+            .insert(1, repo_one.path().to_string_lossy().into_owned());
+        h.dirs
+            .lock()
+            .unwrap()
+            .insert(2, repo_two.path().to_string_lossy().into_owned());
+        h.supervisor
+            .register_session(1, project.into(), "#1".into(), 1)
+            .unwrap();
+        h.supervisor
+            .register_session(2, project.into(), "#2".into(), 1)
+            .unwrap();
+        h.context.observe(&context_event(1, 90.0));
+        h.context.observe(&context_event(2, 10.0));
+
+        h.parker.on_allowance_event(&hard_event(Some(RESETS_AT)));
+
+        // Session 1 is on a very long turn: no Stop ever arrives, so the
+        // park is never even injected and the stuck-wait cap ALERTs. The
+        // entry stays TRACKED (it is still owed) but stops blocking, so the
+        // parker skips the session and finishes the sweep on session 2.
+        h.injector
+            .backdate_waiting(1, MAX_TURN_WAIT + Duration::from_secs(1));
+        h.injector.tick();
+        wait_until(|| state_of(&h.supervisor, 2) == Some(SupervisorState::ParkRequested)).await;
+        complete_park(&h, 2, 1);
+        wait_until(|| !h.parker.parking_engaged()).await;
+        assert_eq!(h.schedule.list().len(), 1, "only epic #2 armed so far");
+
+        // The long turn finally ends and session 1's park validates — after
+        // the sweep already disengaged.
+        complete_park(&h, 1, 1);
+
+        wait_until(|| h.schedule.list().len() == 2).await;
+        let mut epics: Vec<String> = h.schedule.list().into_iter().map(|e| e.epic).collect();
+        epics.sort();
+        assert_eq!(epics, vec!["#1".to_string(), "#2".to_string()]);
+        wait_until(|| h.torn_down.lock().unwrap().contains(&1)).await;
     }
 
     #[tokio::test]

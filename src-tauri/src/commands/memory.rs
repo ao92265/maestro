@@ -302,9 +302,19 @@ pub async fn write_memory_file(
             .await
             .map_err(|e| format!("Failed to create directory {}: {e}", parent.display()))?;
     }
-    tokio::fs::write(&path, content)
+    // Temp file + rename, never a write in place: MEMORY.md is loaded into
+    // every later session's context, and a crash, a full disk or a
+    // concurrent read during an in-place write leaves it truncated. Every
+    // other managed-file writer in this codebase already works this way.
+    let tmp = path.with_extension("md.tmp");
+    tokio::fs::write(&tmp, content)
         .await
-        .map_err(|e| format!("Failed to write {rel_path}: {e}"))
+        .map_err(|e| format!("Failed to write {rel_path}: {e}"))?;
+    if let Err(e) = tokio::fs::rename(&tmp, &path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(format!("Failed to write {rel_path}: {e}"));
+    }
+    Ok(())
 }
 
 /// Deletes one memory file. The MEMORY.md index is not rewritten — stale

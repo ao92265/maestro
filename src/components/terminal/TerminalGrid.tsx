@@ -1165,7 +1165,14 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
                 try {
                   await samuraiHarvestArm(sessionId);
                 } catch (err) {
+                  // Surfaced, not just logged: the Journal card has already
+                  // told the user the entries will be injected here, so a
+                  // silent failure leaves them believing the journal was
+                  // triaged while the terminal sits at an empty prompt.
                   console.error("[Harvest] Failed to arm the triage prompt:", err);
+                  setError(
+                    `Harvest triage prompt was not armed (${err instanceof Error ? err.message : String(err)}) — the journal entries were NOT injected`,
+                  );
                 }
               }
 
@@ -1897,7 +1904,13 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
     // Parked samurai terminal-state tiles do not count — see
     // `occupiedSlotCount`, shared with `addSession`.
     if (!reusable && occupiedSlotCount(current) >= MAX_SESSIONS) {
-      setError(`Cannot resume: maximum of ${MAX_SESSIONS} sessions per project`);
+      // The claim is consumed by now, so the launch is gone: say what did
+      // not happen rather than "cannot resume" — this path also carries
+      // harvest triage and samurai launches, whose own panels have already
+      // reported success.
+      setError(
+        `Could not open the requested session: maximum of ${MAX_SESSIONS} sessions per project — close one and try again`,
+      );
       return;
     }
     const base = reusable ?? createEmptySlot(mcpServers, skills, plugins);

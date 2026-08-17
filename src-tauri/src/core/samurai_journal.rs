@@ -307,11 +307,19 @@ impl JournalStore {
     pub fn commit_harvest(&self, report_date: &str, rendered: &[String]) -> Result<(), String> {
         chrono::NaiveDate::parse_from_str(report_date, "%Y-%m-%d")
             .map_err(|e| format!("invalid report date {report_date:?} (want YYYY-MM-DD): {e}"))?;
-        let rendered: std::collections::HashSet<&str> =
-            rendered.iter().map(String::as_str).collect();
+        // A COUNTED multiset, not a set: two agents recording the same
+        // category/text/project/agent in the same second produce byte-
+        // identical JSONL, and when the render cap withheld the duplicate a
+        // set-membership test still matched it — so a never-injected entry
+        // was marked consumed and archived undigested.
+        let mut unmatched: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for line in rendered {
+            *unmatched.entry(line.as_str()).or_insert(0) += 1;
+        }
         let _guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
         let journal_path = self.journal_path();
-        let (lines, _) = read_lines(&journal_path)?;
+        let (lines, original) = read_lines_with_bytes(&journal_path)?;
         // Lines before the CURRENT last marker are older than what will be
         // the previous marker once the new one lands — entries AND markers
         // there move out (the active file never holds more than two markers).
@@ -332,19 +340,29 @@ impl JournalStore {
         let mut marker_inserted = false;
         for (i, line) in lines.iter().enumerate() {
             match line {
-                RawLine::Entry(entry, original_raw) => {
-                    let raw = serde_json::to_string(entry)
-                        .map_err(|e| format!("failed to serialize journal entry: {e}"))?;
+                // Carried through VERBATIM, like the opaque arm below:
+                // re-serializing dropped any field an agent added that serde
+                // ignores on read, and changed the exact bytes `list()` hands
+                // back as a row's delete identity.
+                RawLine::Entry(_, original_raw) => {
                     if i < archive_before {
-                        archived.push_str(&raw);
+                        archived.push_str(original_raw);
                         archived.push('\n');
                     } else {
-                        if !marker_inserted && !rendered.contains(original_raw.as_str()) {
-                            kept.push_str(&marker_line);
-                            kept.push('\n');
-                            marker_inserted = true;
+                        if !marker_inserted {
+                            match unmatched.get_mut(original_raw.as_str()) {
+                                // One rendered copy accounted for.
+                                Some(remaining) if *remaining > 0 => *remaining -= 1,
+                                // The first line the harvest did NOT render:
+                                // the consumption boundary goes here.
+                                _ => {
+                                    kept.push_str(&marker_line);
+                                    kept.push('\n');
+                                    marker_inserted = true;
+                                }
+                            }
                         }
-                        kept.push_str(&raw);
+                        kept.push_str(original_raw);
                         kept.push('\n');
                     }
                 }
@@ -380,7 +398,12 @@ impl JournalStore {
         if !archived.is_empty() {
             append_raw(&self.archive_path(), &archived)?;
         }
-        atomic_write(&journal_path, &kept)
+        // Carrying, not plain: the rider tells every live agent to `>>` its
+        // friction into this file, and a plain rewrite silently erased any
+        // append that landed between the read above and the rename — including
+        // inside the Windows rename-retry sleeps. Same guarantee the delete
+        // path next door already had.
+        atomic_write_carrying_appends(&journal_path, kept, original)
     }
 
     /// Deletes every active-file line whose entry's raw JSONL text is
@@ -528,6 +551,20 @@ fn read_lines(path: &Path) -> Result<(Vec<RawLine>, u64), String> {
     Ok((lines, metadata.len()))
 }
 
+/// [`read_lines`] returning the exact bytes it parsed, for a caller that
+/// rewrites the file through [`atomic_write_carrying_appends`] — that guard
+/// compares against the precise image the content was built from.
+fn read_lines_with_bytes(path: &Path) -> Result<(Vec<RawLine>, Vec<u8>), String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(format!("failed to read journal file {path:?}: {e}")),
+    };
+    let content = String::from_utf8_lossy(&bytes);
+    let lines = parse_lines(&content, path);
+    Ok((lines, bytes))
+}
+
 /// Parses every non-blank line of `content` in file order (the shared body
 /// of [`read_lines`] and [`JournalStore::delete_entry_with_hook`], which
 /// additionally needs the exact source bytes `content` came from).
@@ -579,45 +616,7 @@ fn append_raw(path: &Path, data: &str) -> Result<(), String> {
         .map_err(|e| format!("failed to flush journal file {path:?}: {e}"))
 }
 
-/// Write to `<file>.tmp` then rename over the target (the
-/// `samurai_run_config::atomic_write_json` pattern): a crash leaves either
-/// the old file or the new one, never a torn journal. The fixed `.tmp` name
-/// cannot race itself — [`JournalStore::lock`] serializes writers.
-///
-/// On Windows the rename fails while another process holds the target open
-/// (e.g. an agent's shell `>>` append mid-rewrite), so it is retried a few
-/// times before propagating. Known loss window: an out-of-process append
-/// that lands between the caller reading the file and the rename winning is
-/// overwritten by the rewrite — accepted; the journal is advisory ops data
-/// and the rewrite path only runs during a harvest commit.
-fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create journal dir {parent:?}: {e}"))?;
-    }
-    let tmp = path.with_extension("jsonl.tmp");
-    std::fs::write(&tmp, content).map_err(|e| format!("failed to write {tmp:?}: {e}"))?;
-    let mut attempt = 0;
-    loop {
-        match std::fs::rename(&tmp, path) {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt < 4 => {
-                attempt += 1;
-                log::warn!(
-                    "rename of {tmp:?} over {path:?} failed (attempt {attempt}/5): {e} — retrying"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            Err(e) => {
-                return Err(format!(
-                    "failed to move {tmp:?} into place at {path:?}: {e}"
-                ));
-            }
-        }
-    }
-}
-
-/// [`atomic_write`] for the DELETE path (issue #100): a delete must never
+/// The journal's only file rewriter (issue #100): a rewrite must never
 /// eat a same-window out-of-process append (an agent's shell `>>`), and the
 /// Windows rename-retry sleeps stretch that window to ~500 ms — an append
 /// can land AFTER the caller's pre-write recheck but BEFORE a retried
@@ -1348,5 +1347,70 @@ mod tests {
                 ("never injected".to_string(), JournalEntryStatus::Unconsumed),
             ]
         );
+    }
+
+    #[test]
+    fn test_commit_harvest_counts_duplicate_lines_instead_of_matching_a_set() {
+        // Two agents recording the same category/text in the same second
+        // produce BYTE-IDENTICAL JSONL. When the render cap withheld the
+        // second copy, a set-membership boundary still matched it — so an
+        // entry that was never injected got archived undigested.
+        let dir = tempdir().unwrap();
+        let s = store(dir.path());
+        let duplicate = entry(JournalCategory::Error, "same second, same text");
+        s.append_entry(&duplicate).unwrap();
+        s.append_entry(&duplicate).unwrap();
+        let raws: Vec<String> = s
+            .unconsumed_with_raw()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.raw)
+            .collect();
+        assert_eq!(raws.len(), 2);
+        assert_eq!(raws[0], raws[1], "the two lines really are identical");
+
+        // Only the FIRST copy was rendered — the cap withheld the second.
+        s.commit_harvest("2026-08-13", &raws[..1].to_vec()).unwrap();
+
+        let statuses: Vec<JournalEntryStatus> = s
+            .list()
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|e| e.status)
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![JournalEntryStatus::Consumed, JournalEntryStatus::Unconsumed],
+            "the withheld duplicate stays unconsumed"
+        );
+    }
+
+    #[test]
+    fn test_commit_harvest_preserves_unknown_entry_fields_verbatim() {
+        // Agents hand-write this JSONL. An extra field serde ignores on read
+        // used to be dropped by the harvest's re-serialize, which also
+        // invalidated every untouched row's `raw` delete identity.
+        let dir = tempdir().unwrap();
+        let s = store(dir.path());
+        s.append_entry(&entry(JournalCategory::Error, "harvested"))
+            .unwrap();
+        let snapshot = rendered(&s, 1);
+        let extra =
+            r#"{"ts":"2026-08-13T10:00:00Z","category":"CONCERN","text":"hand written","severity":"high"}"#
+                .to_string();
+        append_raw(&s.journal_path(), &format!("{extra}\n")).unwrap();
+
+        s.commit_harvest("2026-08-13", &snapshot).unwrap();
+
+        let listed = s.list().unwrap().entries;
+        let survivor = listed
+            .iter()
+            .find(|e| e.entry.text == "hand written")
+            .expect("the hand-written entry survives");
+        assert_eq!(survivor.raw, extra, "carried through byte for byte");
+        assert_eq!(survivor.status, JournalEntryStatus::Unconsumed);
+        // …and the identity `list()` reports still deletes it.
+        assert_eq!(s.delete_entry(&survivor.raw).unwrap(), 1);
     }
 }

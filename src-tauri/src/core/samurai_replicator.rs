@@ -757,11 +757,38 @@ impl SamuraiReplicator {
     /// and recovery briefs always recompile the SAME workflow the run
     /// launched with.
     fn workflow_for(&self, project: &str, epic: &str) -> String {
-        let stored = self
-            .run_configs
-            .get()
-            .and_then(|s| s.get(project, epic))
-            .and_then(|c| c.workflow);
+        let stored = match self.run_configs.get() {
+            None => None,
+            Some(store) => match store.lookup(project, epic) {
+                super::samurai_run_config::ConfigLookup::Found(config) => config.workflow,
+                super::samurai_run_config::ConfigLookup::Missing => None,
+                // An UNREADABLE config used to be indistinguishable from a
+                // config that predates workflows, so a torn file silently
+                // swapped the run's edited process for the default template
+                // mid-run. The template is still the only thing left to
+                // compile, but the swap no longer happens in silence.
+                super::samurai_run_config::ConfigLookup::Unreadable(e) => {
+                    log::error!(
+                        "samurai replicator: run config for epic {epic} in {project} is unreadable ({e}) — the successor brief falls back to the DEFAULT workflow, ALERT"
+                    );
+                    self.audit.append(
+                        project,
+                        AuditEvent::now(
+                            epic.to_string(),
+                            AuditEventKind::Alert,
+                            0,
+                            0,
+                            json!({
+                                "kind": "workflow_config_unreadable",
+                                "epic": epic,
+                                "error": e,
+                            }),
+                        ),
+                    );
+                    None
+                }
+            },
+        };
         samurai_workflow::compiled_for_run(stored.as_ref())
     }
 
@@ -773,6 +800,14 @@ impl SamuraiReplicator {
     /// (today's ref-framed wording) when no store or config is bound, so a
     /// missing config never silently strips the GitHub steps from a real
     /// ref-based run.
+    /// The epic's verbatim launch request (issue #128), when its run config
+    /// recorded one. Only the NO-REFS recovery brief uses it: a prose run has
+    /// no GitHub issue to reconstruct the work order from, so without this
+    /// the recovering orchestrator gets git history and nothing else.
+    fn launch_text_for(&self, project: &str, epic: &str) -> Option<String> {
+        self.run_configs.get()?.get(project, epic)?.launch_text
+    }
+
     fn has_refs_for(&self, project: &str, epic: &str) -> bool {
         self.run_configs
             .get()
@@ -1007,6 +1042,8 @@ impl SamuraiReplicator {
                             repo_pin.as_deref(),
                             &workflow,
                             self.has_refs_for(&snapshot.project, &snapshot.epic),
+                            self.launch_text_for(&snapshot.project, &snapshot.epic)
+                                .as_deref(),
                         ),
                         samurai_prompts::journal_instruction(&default_journal_file()),
                     ),
@@ -1130,6 +1167,8 @@ impl SamuraiReplicator {
                         None,
                         &workflow,
                         self.has_refs_for(&snapshot.project, &snapshot.epic),
+                        self.launch_text_for(&snapshot.project, &snapshot.epic)
+                            .as_deref(),
                     ),
                     samurai_prompts::journal_instruction(&default_journal_file()),
                 ),
@@ -1183,6 +1222,8 @@ impl SamuraiReplicator {
                             Some(&pin),
                             &workflow,
                             this.has_refs_for(&snapshot.project, &snapshot.epic),
+                            this.launch_text_for(&snapshot.project, &snapshot.epic)
+                                .as_deref(),
                         ),
                         samurai_prompts::journal_instruction(&default_journal_file()),
                     );
@@ -1340,6 +1381,7 @@ impl SamuraiReplicator {
                         None,
                         &workflow,
                         self.has_refs_for(project, epic),
+                        self.launch_text_for(project, epic).as_deref(),
                     ),
                     samurai_prompts::journal_instruction(&default_journal_file()),
                 ),
@@ -1436,6 +1478,7 @@ impl SamuraiReplicator {
                                 repo_pin.as_deref(),
                                 &workflow,
                                 this.has_refs_for(&project, &epic),
+                                this.launch_text_for(&project, &epic).as_deref(),
                             ),
                             samurai_prompts::journal_instruction(&default_journal_file()),
                         ),

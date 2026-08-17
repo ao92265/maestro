@@ -897,11 +897,20 @@ fn finish_validation(
                                 parker.on_parked(&snapshot);
                             }
                         }
-                        // E.g. the watchdog declared the session DEAD mid-validation;
-                        // the parker's tick re-evaluates the sweep on its own.
-                        Err(e) => log::warn!(
-                            "samurai injector: PARKED transition for session {session_id} rejected: {e}"
-                        ),
+                        // E.g. the watchdog declared the session DEAD mid-validation.
+                        // The pending entry is removed just below, so without
+                        // telling the parker the session would sit in
+                        // PARK_REQUESTED with nothing pending: neither blocking
+                        // the sweep nor recorded as skipped, and the park would
+                        // die with no trail.
+                        Err(e) => {
+                            log::warn!(
+                                "samurai injector: PARKED transition for session {session_id} rejected: {e}"
+                            );
+                            if let Some(parker) = parker {
+                                parker.on_park_failed(session_id);
+                            }
+                        }
                     }
                 }
                 // The ack-only kinds have no written stage, so no validation
@@ -2084,7 +2093,7 @@ impl SamuraiInjector {
     /// runs without real waiting. See [`Self::backdate_injection`] for why
     /// this advances rather than rewinds the clock.
     #[cfg(test)]
-    fn backdate_waiting(&self, session_id: u32, by: Duration) {
+    pub(crate) fn backdate_waiting(&self, session_id: u32, by: Duration) {
         let mut pending = self.lock_pending();
         let p = pending.get_mut(&session_id).expect("no pending entry");
         p.waiting_since.backdate(by);

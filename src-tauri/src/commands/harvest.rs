@@ -196,6 +196,28 @@ fn unconsumed_or_refuse(journal: &JournalStore) -> Result<Vec<JournalEntry>, Str
 /// confirmed on the calling thread); tests capture the call.
 pub type DeliverFn = Arc<dyn Fn(u32, String) -> Result<(), String> + Send + Sync>;
 
+/// What an injection attempt actually did, for the UI that already told the
+/// user "triage session opened — N entries will be injected there". Every
+/// failure below used to be a `log::warn!`/`log::error!` and nothing else:
+/// the terminal just sat at an empty prompt while the Journal card still
+/// showed its success notice.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarvestInjectionOutcome {
+    pub session_id: u32,
+    /// Entries injected (and therefore consumed); 0 on every failure.
+    pub injected: usize,
+    /// `None` on success.
+    pub error: Option<String>,
+}
+
+/// Reports an injection attempt to the frontend. Production wires a Tauri
+/// event in `lib.rs`; tests collect the calls.
+pub type HarvestNotifyFn = Arc<dyn Fn(HarvestInjectionOutcome) + Send + Sync>;
+
+/// Tauri event name carrying a [`HarvestInjectionOutcome`].
+pub const HARVEST_EVENT: &str = "samurai-harvest-event";
+
 /// The interactive-harvest state machine: `arm` stages a just-launched
 /// session, the session's first `SessionStarted` hook signal injects the
 /// triage prompt and commits journal consumption. Managed as
@@ -209,6 +231,9 @@ pub struct HarvestTriage {
     /// session killed before its `SessionStarted` leaves a stale id here —
     /// harmless, session ids are never reused within a run.
     armed: Mutex<HashSet<u32>>,
+    /// Reports every injection outcome to the UI. `None` in tests that do
+    /// not assert on it.
+    notify: Option<HarvestNotifyFn>,
 }
 
 impl HarvestTriage {
@@ -218,6 +243,19 @@ impl HarvestTriage {
             downloads_dir,
             deliver,
             armed: Mutex::new(HashSet::new()),
+            notify: None,
+        }
+    }
+
+    /// [`Self::new`] plus the outcome reporter the Journal card renders.
+    pub fn with_notify(mut self, notify: HarvestNotifyFn) -> Self {
+        self.notify = Some(notify);
+        self
+    }
+
+    fn report(&self, outcome: HarvestInjectionOutcome) {
+        if let Some(notify) = &self.notify {
+            notify(outcome);
         }
     }
 
@@ -263,6 +301,11 @@ impl HarvestTriage {
             Ok(listed) => listed,
             Err(e) => {
                 log::error!("samurai harvest: journal read at injection failed: {e}");
+                self.report(HarvestInjectionOutcome {
+                    session_id,
+                    injected: 0,
+                    error: Some(format!("the journal could not be read: {e}")),
+                });
                 return;
             }
         };
@@ -271,6 +314,13 @@ impl HarvestTriage {
             log::warn!(
                 "samurai harvest: session {session_id} started but no unconsumed entries remain — nothing injected"
             );
+            self.report(HarvestInjectionOutcome {
+                session_id,
+                injected: 0,
+                error: Some(
+                    "no unconsumed journal entries remained by the time the session started — nothing was injected".to_string(),
+                ),
+            });
             return;
         }
         let entries: Vec<JournalEntry> = listed.iter().map(|l| l.entry.clone()).collect();
@@ -285,6 +335,13 @@ impl HarvestTriage {
             log::error!(
                 "samurai harvest: prompt injection into session {session_id} failed: {e} — journal entries stay unconsumed; click Harvest now again to retry"
             );
+            self.report(HarvestInjectionOutcome {
+                session_id,
+                injected: 0,
+                error: Some(format!(
+                    "the triage prompt never reached the terminal ({e}) — the entries stay unconsumed, click Harvest now again to retry"
+                )),
+            });
             return;
         }
         // Consumption flips NOW — exactly the snapshot rendered above,
@@ -303,10 +360,22 @@ impl HarvestTriage {
             log::error!(
                 "samurai harvest: consumption commit after injection into session {session_id} failed: {e} — entries stay unconsumed"
             );
+            self.report(HarvestInjectionOutcome {
+                session_id,
+                injected: snapshot_len,
+                error: Some(format!(
+                    "the entries were injected but not marked consumed ({e}) — they will be offered again next harvest"
+                )),
+            });
         } else {
             log::info!(
                 "samurai harvest: injected {snapshot_len} journal entries into session {session_id} for interactive triage"
             );
+            self.report(HarvestInjectionOutcome {
+                session_id,
+                injected: snapshot_len,
+                error: None,
+            });
         }
     }
 }
@@ -769,6 +838,82 @@ mod tests {
         triage.arm(7).unwrap();
         triage.on_session_started(7);
         assert_eq!(*attempts.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_every_injection_outcome_reaches_the_ui() {
+        // The Journal card announces "triage session opened — N entries will
+        // be injected there" at CLICK time. Failures that only reached the
+        // log left the user believing the journal had been triaged.
+        let dir = tempdir().unwrap();
+        let journal = Arc::new(JournalStore::new(dir.path().to_path_buf()));
+        journal
+            .append_entry(&JournalEntry::now(
+                JournalCategory::Error,
+                "boom",
+                None,
+                None,
+            ))
+            .unwrap();
+        let outcomes: Arc<Mutex<Vec<HarvestInjectionOutcome>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = outcomes.clone();
+        let notify: HarvestNotifyFn = Arc::new(move |o| sink.lock().unwrap().push(o));
+        let fail = Arc::new(Mutex::new(true));
+        let deliver: DeliverFn = Arc::new(move |_, _| {
+            let mut fail = fail.lock().unwrap();
+            if *fail {
+                *fail = false;
+                return Err("session not found".to_string());
+            }
+            Ok(())
+        });
+        let triage = HarvestTriage::new(journal.clone(), "/downloads".to_string(), deliver)
+            .with_notify(notify);
+
+        // 1. The write fails: reported, nothing consumed.
+        triage.arm(7).unwrap();
+        triage.on_session_started(7);
+        let reported = outcomes.lock().unwrap().clone();
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].session_id, 7);
+        assert_eq!(reported[0].injected, 0);
+        assert!(
+            reported[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("never reached the terminal"),
+            "{reported:?}"
+        );
+
+        // 2. The retry succeeds: reported with the injected count.
+        triage.arm(7).unwrap();
+        triage.on_session_started(7);
+        let reported = outcomes.lock().unwrap().clone();
+        assert_eq!(reported.len(), 2);
+        assert_eq!(reported[1].injected, 1);
+        assert_eq!(reported[1].error, None);
+
+        // 3. Nothing left to inject: also reported, not just logged.
+        triage.arm(8).unwrap_err();
+        triage
+            .armed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(8);
+        triage.on_session_started(8);
+        let reported = outcomes.lock().unwrap().clone();
+        assert_eq!(reported.len(), 3);
+        assert_eq!(reported[2].session_id, 8);
+        assert_eq!(reported[2].injected, 0);
+        assert!(
+            reported[2]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no unconsumed journal entries remained"),
+            "{reported:?}"
+        );
     }
 
     #[test]
