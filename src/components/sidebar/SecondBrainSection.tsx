@@ -346,7 +346,9 @@ export function SecondBrainSection() {
 
   const refresh = useCallback(async () => {
     try {
-      setFiles(await samuraiFilesList());
+      // Issue #140 regroups this panel by `groups`; until then it consumes
+      // the entries exactly as before.
+      setFiles((await samuraiFilesList()).entries);
       setError(null);
     } catch (err) {
       setFiles([]);

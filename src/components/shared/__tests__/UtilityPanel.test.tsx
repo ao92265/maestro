@@ -112,19 +112,23 @@ function mockInvoke() {
       case "samurai_list_runs":
         return [];
       case "samurai_files_list":
-        return [
-          {
-            kind: "HANDOFF",
-            path: "C:\\data\\worktrees\\maestro\\samurai-38\\.maestro\\handoffs\\38-gen2.md",
-            size_bytes: 4096,
-            modified_at: "2026-08-06T12:00:00Z",
-            project_path: "C:\\git\\maestro",
-            epic: "#38",
-            in_use: false,
-            has_live_session: false,
-            fire_at: null,
-          },
-        ];
+        return {
+          groups: [],
+          entries: [
+            {
+              group_id: "run:000000000000:38",
+              kind: "HANDOFF",
+              path: "C:\\data\\worktrees\\maestro\\samurai-38\\.maestro\\handoffs\\38-gen2.md",
+              size_bytes: 4096,
+              modified_at: "2026-08-06T12:00:00Z",
+              project_path: "C:\\git\\maestro",
+              epic: "#38",
+              in_use: false,
+              has_live_session: false,
+              fire_at: null,
+            },
+          ],
+        };
       default:
         return undefined;
     }

@@ -25,6 +25,7 @@ pub mod samurai_files;
 pub mod samurai_injector;
 pub mod samurai_journal;
 pub mod samurai_parker;
+pub mod samurai_pr_runs;
 pub mod samurai_progress;
 pub mod samurai_prompts;
 pub mod samurai_pty;

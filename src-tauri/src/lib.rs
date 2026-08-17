@@ -746,6 +746,11 @@ pub fn run() {
                 commands::ai_runner::artifact_base_dir("runs"),
             ));
             app.manage(run_configs.clone());
+            // Issue #139: PR-review run records, inside the same `runs` root
+            // so they fall under the existing managed-delete guard.
+            app.manage(Arc::new(core::samurai_pr_runs::PrRunStore::new(
+                commands::ai_runner::artifact_base_dir("runs"),
+            )));
             // PRD §8 row 1 (issue #45's `handoff_retention_days`): handoff
             // files auto-clean once their epic has completed — i.e. its run
             // config is ARCHIVED. One sweep per app start: it is the only
@@ -958,7 +963,9 @@ pub fn run() {
                 audit_log.append(
                     core::allowance_watcher::ACCOUNT_PROJECT,
                     core::samurai_audit::AuditEvent::now(
-                        "",
+                        // Issue #139: never an empty run id — a dropped
+                        // scheduled launch belongs to the account.
+                        core::allowance_watcher::ACCOUNT_RUN,
                         core::samurai_audit::AuditEventKind::Alert,
                         0,
                         0,

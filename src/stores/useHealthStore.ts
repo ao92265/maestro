@@ -102,8 +102,8 @@ async function checkMemory(now: number): Promise<HealthFlag[]> {
  * read. Throws so the caller can keep the area's last-known flags.
  */
 async function checkSecondBrain(): Promise<HealthFlag[]> {
-  const [files, config] = await Promise.all([samuraiFilesList(), samuraiGetConfig()]);
-  return evaluateSamuraiFiles(files, config.size_warn_bytes);
+  const [listing, config] = await Promise.all([samuraiFilesList(), samuraiGetConfig()]);
+  return evaluateSamuraiFiles(listing.entries, config.size_warn_bytes);
 }
 
 export const useHealthStore = create<HealthState & HealthActions>()((set, get) => ({

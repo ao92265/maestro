@@ -68,6 +68,10 @@ function buildTab(overrides: Partial<WorkspaceTab> = {}): WorkspaceTab {
 
 function fileEntry(overrides: Partial<SamuraiFileEntry> = {}): SamuraiFileEntry {
   return {
+    // Issue #139: every entry belongs to a run or a PR review. This panel
+    // still renders by kind (issue #140 regroups it), so the id is only
+    // carried, never read.
+    group_id: "run:000000000000:38",
     kind: "HANDOFF",
     path: "C:\\data\\worktrees\\maestro\\samurai-38\\.maestro\\handoffs\\38-gen2.md",
     size_bytes: 4096,
@@ -99,7 +103,7 @@ function mockInvoke(
   invokeMock.mockImplementation(async (cmd: string, args?: unknown) => {
     switch (cmd) {
       case "samurai_files_list":
-        return files;
+        return { groups: [], entries: files };
       case "samurai_audit_read":
         return { events: [], file_size_bytes: 0 };
       case "samurai_journal_list":

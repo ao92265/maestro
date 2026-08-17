@@ -50,6 +50,14 @@ pub const ALLOWANCE_EVENT_CHANNEL: &str = "samurai-allowance-event";
 /// per-project). Readable via `samurai_audit_read` with this exact string.
 pub const ACCOUNT_PROJECT: &str = "samurai-account";
 
+/// Pseudo-RUN the account-wide ALERT rows are stamped with when no session is
+/// under supervision (issue #139: every audit row names the run it belongs to,
+/// and an empty `epic` names nothing). Paired with [`ACCOUNT_PROJECT`] — the
+/// same pseudo-entity idiom, one level down. The Second Brain never builds a
+/// file group out of an audit row's run id, so this can never become the
+/// generic bucket issue #139 refuses.
+pub const ACCOUNT_RUN: &str = "account";
+
 /// Poll cadence — matches the frontend's 60s usage poll; the 30s response
 /// cache in `commands::usage` dedupes the actual API calls between the two.
 pub const POLL_INTERVAL_SECS: u64 = 60;
@@ -324,9 +332,10 @@ fn edge(
 /// backend-direct, never through a Tauri event listener.
 ///
 /// ALERT rows land in the audit log of every project with a supervised
-/// session (those are the runs a crossing is about); with none supervised
-/// they land in the [`ACCOUNT_PROJECT`] pseudo-project instead — an
-/// account-wide condition is never silent (issue #45 acceptance).
+/// session, stamped with THAT run's epic (those are the runs a crossing is
+/// about); with none supervised they land in the [`ACCOUNT_PROJECT`] /
+/// [`ACCOUNT_RUN`] pseudo-entities instead — an account-wide condition is
+/// never silent (issue #45 acceptance) and never unattributed (issue #139).
 pub fn spawn_allowance_loop(
     app: AppHandle,
     config: SharedSamuraiConfig,
@@ -398,15 +407,19 @@ pub fn spawn_allowance_loop(
                 continue;
             }
 
-            let mut projects: Vec<String> = supervisor
+            // One target per SUPERVISED RUN, not per project (issue #139):
+            // the row is stamped with the run it is about, so the Second
+            // Brain can slice the crossing into every affected run's
+            // timeline instead of dropping it into an unattributable bucket.
+            let mut targets: Vec<(String, String)> = supervisor
                 .list_sessions()
                 .into_iter()
-                .map(|s| s.project)
+                .map(|s| (s.project, s.epic))
                 .collect();
-            projects.sort();
-            projects.dedup();
-            if projects.is_empty() {
-                projects.push(ACCOUNT_PROJECT.to_string());
+            targets.sort();
+            targets.dedup();
+            if targets.is_empty() {
+                targets.push((ACCOUNT_PROJECT.to_string(), ACCOUNT_RUN.to_string()));
             }
 
             for event in &events {
@@ -418,12 +431,13 @@ pub fn spawn_allowance_loop(
                     }
                 };
                 log::info!("samurai allowance event: {details}");
-                for project in &projects {
+                for (project, epic) in &targets {
                     // generation/session_id 0: account-wide, not tied to
-                    // one orchestrator generation.
+                    // one orchestrator generation — but always attributed to
+                    // a run (issue #139).
                     audit.append(
                         project,
-                        AuditEvent::now("", AuditEventKind::Alert, 0, 0, details.clone()),
+                        AuditEvent::now(epic, AuditEventKind::Alert, 0, 0, details.clone()),
                     );
                 }
                 let _ = app.emit(ALLOWANCE_EVENT_CHANNEL, event);

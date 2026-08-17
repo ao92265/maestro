@@ -1206,6 +1206,7 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
                     slot.initialPrompt,
                     slot.briefDir,
                     slot.briefStem,
+                    slot.prRun,
                   );
                 } catch (err) {
                   console.error("[InitialPrompt] Failed to arm the initial prompt:", err);
@@ -1957,6 +1958,8 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       // Where a long initial prompt is staged as a brief file (issue #138).
       briefDir: launch.briefDir ?? null,
       briefStem: launch.briefStem ?? null,
+      // PR-review launches record themselves at the same hop (issue #139).
+      prRun: launch.prRun ?? null,
       // The History tab always names the exact directory to run in. Reusing the
       // pristine slot would otherwise inherit its worktreeMode, and any mode but
       // "project" sends launchSlotInner into prepareSessionWorktree — moving the

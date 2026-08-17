@@ -40,6 +40,7 @@ use std::sync::{Mutex, PoisonError};
 use serde::{Deserialize, Serialize};
 
 use super::samurai_config::SamuraiConfig;
+use super::samurai_pr_runs;
 use super::samurai_prompts::{epic_slug, RunRefs};
 use super::samurai_workflow::WorkflowGraph;
 use super::status_server::StatusServer;
@@ -59,6 +60,19 @@ pub enum RunConfigStatus {
     /// it on to ARCHIVED.
     Completed,
     Archived,
+}
+
+/// A ref's human title, captured best effort at launch (issue #139) so the
+/// Second Brain can label a run `Epic #38 — Samurai supervision` instead of
+/// `Epic #38`. snake_case on the wire like every samurai sibling; `ref` is a
+/// Rust keyword, hence the raw identifier — the serialized key is plain `ref`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefTitle {
+    /// The BARE ref (`38`), spelled exactly as [`SamuraiRunConfig::epics`] and
+    /// [`SamuraiRunConfig::issues`] hold it, so a title looks up by equality.
+    pub r#ref: String,
+    /// The issue/epic title as GitHub reported it.
+    pub title: String,
 }
 
 /// One epic's run config (PRD §5.8: "repo, epic ref, model prefs,
@@ -90,6 +104,16 @@ pub struct SamuraiRunConfig {
     /// [`epics`](Self::epics).
     #[serde(default)]
     pub issues: Vec<String>,
+    /// Titles for the refs above, captured best effort at launch (issue #139)
+    /// — the title half of the Second Brain's `Epic #38 — Samurai supervision`
+    /// label. `#[serde(default)]`: a config written before titles existed has
+    /// no such key, loads with an empty list, and simply labels refs-only.
+    /// A ref with no entry here is never blocked or hidden for it — which is
+    /// every samurai run today: nothing populates this yet, so run labels are
+    /// refs-only until the launch-time `gh` title lookup lands (#141). A PR
+    /// review's title travels on its own record and already renders.
+    #[serde(default)]
+    pub ref_titles: Vec<RefTitle>,
     /// The free-text launch request this run was started from, verbatim
     /// (issue #128) — the durable record of what the user asked for. `None`
     /// on configs written before free-text launches existed.
@@ -137,6 +161,7 @@ impl SamuraiRunConfig {
             epic: epic.into(),
             epics: Vec::new(),
             issues: Vec::new(),
+            ref_titles: Vec::new(),
             launch_text: None,
             repo_pin: None,
             worktree_path: worktree_path.into(),
@@ -335,6 +360,14 @@ impl RunConfigStore {
         for project in projects.flatten() {
             let dir = project.path();
             if !dir.is_dir() {
+                continue;
+            }
+            // `runs/pr/` holds PR-review records (issue #139), not run
+            // configs. It shares this root so those records fall inside an
+            // existing Samurai-managed delete root; skipping it by name is
+            // sound because a project directory is always
+            // `<sanitized-basename>-<hash12>`, which `pr` can never be.
+            if dir.file_name().and_then(|n| n.to_str()) == Some(samurai_pr_runs::PR_RUNS_DIR) {
                 continue;
             }
             let files = match std::fs::read_dir(&dir) {
@@ -565,6 +598,68 @@ mod tests {
         );
         assert!(path.exists());
         assert!(store.load_active().is_empty());
+    }
+
+    #[test]
+    fn test_ref_titles_roundtrip_and_default_to_empty() {
+        // Issue #139: the title half of a Second Brain run label. Absent on an
+        // old config (no key at all) → empty list, refs-only labels, no
+        // migration; present → byte-identical through the save/get roundtrip.
+        let dir = tempdir().unwrap();
+        let store = RunConfigStore::new(dir.path().to_path_buf());
+        let mut config = sample("C:/git/maestro", "#38");
+        assert!(config.ref_titles.is_empty(), "new configs start refs-only");
+        config.ref_titles = vec![RefTitle {
+            r#ref: "38".to_string(),
+            title: "Samurai supervision".to_string(),
+        }];
+
+        store.save(&config).unwrap();
+        let loaded = store.get("C:/git/maestro", "#38").unwrap();
+        assert_eq!(loaded.ref_titles, config.ref_titles);
+
+        // On the wire the key is plain `ref`, not the raw identifier.
+        let raw: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(store.config_path("C:/git/maestro", "#38")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw["ref_titles"][0]["ref"], "38");
+        assert_eq!(raw["ref_titles"][0]["title"], "Samurai supervision");
+
+        // A config written before the field existed still loads.
+        let old = store.config_path("C:/git/old", "#1");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(
+            &old,
+            r##"{"project_path":"C:/git/old","epic":"#1","worktree_path":"C:/git/old-wt",
+                "status":"ACTIVE","created_at":"2026-08-01T00:00:00+00:00"}"##,
+        )
+        .unwrap();
+        assert!(store.get("C:/git/old", "#1").unwrap().ref_titles.is_empty());
+    }
+
+    #[test]
+    fn test_pr_review_records_are_not_scanned_as_run_configs() {
+        // Issue #139: PR-review records share the `runs` root (so the existing
+        // delete guard covers them) but are NOT run configs — the scan must
+        // skip their directory outright, not fall into the corrupt-file
+        // warning path on every listing.
+        let dir = tempdir().unwrap();
+        let store = RunConfigStore::new(dir.path().to_path_buf());
+        store.save(&sample("C:/git/maestro", "#38")).unwrap();
+
+        let pr_dir = dir.path().join(samurai_pr_runs::PR_RUNS_DIR);
+        std::fs::create_dir_all(&pr_dir).unwrap();
+        std::fs::write(
+            pr_dir.join("nachogl1-maestro-142-x.json"),
+            r#"{"kind":"PR_REVIEW","pr":142,"title":"t","repo":"nachogl1/maestro",
+                "project_path":"C:/git/maestro","steps":["check"],"brief":null,
+                "session_id":7,"created_at":"2026-08-17T12:00:00+00:00"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(store.list_with_paths().len(), 1);
+        assert_eq!(store.load_active().len(), 1);
     }
 
     #[test]

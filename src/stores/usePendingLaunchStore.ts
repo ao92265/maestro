@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import type { PrReviewLaunch } from "@/lib/terminalPrompt";
 import type { AiMode } from "@/stores/useSessionStore";
 
 /**
@@ -66,6 +67,13 @@ export interface PendingLaunch {
    */
   briefDir?: string | null;
   briefStem?: string | null;
+  /**
+   * PR-review launch metadata (issue #139): passed to the same arm hop, which
+   * writes the review's persistent run record — the identity the Second Brain
+   * groups its brief and audit rows under. A review without it still runs; it
+   * simply leaves nothing on disk to group.
+   */
+  prRun?: PrReviewLaunch | null;
 }
 
 interface PendingLaunchState {

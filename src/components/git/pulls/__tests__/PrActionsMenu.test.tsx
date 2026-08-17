@@ -183,6 +183,39 @@ describe("PrActionsMenu", () => {
     expect(launch.briefStem).toBe("pr-123-check-review");
   });
 
+  it("records the review as a run so its artifacts have work to belong to", async () => {
+    // Issue #139: a PR review used to leave NOTHING on disk, so its brief and
+    // audit rows had no group. The launch now carries the record's metadata —
+    // PR, title, repo slug, checkout, ticked steps — and the backend adds the
+    // session id and the brief path at the arm hop.
+    render(<PrActionsMenu pr={buildPr()} repoPath={REPO_PATH} />);
+    openMenu();
+
+    fireEvent.click(checkboxFor("Review & post"));
+    fireEvent.click(screen.getByRole("button", { name: /Launch 2 steps/ }));
+
+    await waitFor(() => expect(usePendingLaunchStore.getState().pending).toHaveLength(1));
+    expect(usePendingLaunchStore.getState().pending[0].prRun).toEqual({
+      pr: 123,
+      title: "feat(pr): monitoring tower",
+      repo: "nachogl1/maestro",
+      project_path: REPO_PATH,
+      steps: ["check", "review"],
+    });
+  });
+
+  it("records an unparseable PR url as an empty repo slug rather than blocking", async () => {
+    // A slug that will not parse must never stop a review launching: the
+    // group still keys off the PR number within the checkout.
+    render(<PrActionsMenu pr={buildPr({ url: "not-a-github-url" })} repoPath={REPO_PATH} />);
+    openMenu();
+
+    fireEvent.click(screen.getByRole("button", { name: /Launch 1 step/ }));
+
+    await waitFor(() => expect(usePendingLaunchStore.getState().pending).toHaveLength(1));
+    expect(usePendingLaunchStore.getState().pending[0].prRun?.repo).toBe("");
+  });
+
   it("keeps the brief stem filesystem-safe for step ids with symbols or spaces", async () => {
     // Step ids come from the workflow editor, so they are free text: a stem
     // built from them must still be one legal file name.

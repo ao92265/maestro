@@ -26,7 +26,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 
 import type { SamuraiAuditEvent, SamuraiAuditEventPayload } from "@/lib/samurai";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
-import { ALERT_SENTENCES, AuditSection } from "../AuditSection";
+import { ALERT_SENTENCES, AuditSection, SAMURAI_ACCOUNT_RUN } from "../AuditSection";
 
 const invokeMock = vi.mocked(invoke);
 const listenMock = vi.mocked(listen);
@@ -208,6 +208,35 @@ describe("AuditSection (issue #46)", () => {
   // stylesheet, so the computed max-height/overflow it would need instead is
   // always the initial value. Deleted as untestable here; the bounded box is
   // covered by the browser QA pass, not by a class-string echo.
+
+  it("clusters the explicit account run id under the same Account-wide header", async () => {
+    // Issue #139: no audit row is written with an empty `epic` any more —
+    // genuinely account-wide rows carry `ACCOUNT_RUN`. Both spellings must
+    // still read as one cluster, so the panel does not sprout a raw
+    // "account" header next to the pre-#139 rows.
+    mockInvoke([
+      auditEvent({
+        event: "ALERT",
+        epic: "",
+        generation: 0,
+        session_id: 0,
+        ts: "2026-08-06T10:00:00Z",
+        details: { kind: "allowance_serialize_error" },
+      }),
+      auditEvent({
+        event: "ALERT",
+        epic: SAMURAI_ACCOUNT_RUN,
+        generation: 0,
+        session_id: 0,
+        ts: "2026-08-06T10:05:00Z",
+        details: { kind: "allowance_serialize_error" },
+      }),
+    ]);
+    render(<AuditSection />);
+
+    expect(await screen.findAllByText("Account-wide")).toHaveLength(2);
+    expect(screen.queryByText(SAMURAI_ACCOUNT_RUN)).not.toBeInTheDocument();
+  });
 
   it("shows the empty state when the log has no rows", async () => {
     mockInvoke([]);

@@ -416,9 +416,18 @@ function AuditRow({ event }: { event: SamuraiAuditEvent }) {
   );
 }
 
+/**
+ * The run id account-wide rows carry (allowance crossings, dropped scheduled
+ * launches) when nothing is supervised — mirrors `ACCOUNT_RUN` in
+ * `src-tauri/src/core/allowance_watcher.rs`. Since issue #139 no audit row is
+ * ever written with an empty `epic`; rows predating that still are, and both
+ * spellings cluster under the same header.
+ */
+export const SAMURAI_ACCOUNT_RUN = "account";
+
 /** One run's cluster of audit rows, newest-first (see {@link groupByRun}). */
 interface AuditRunGroup {
-  /** The raw epic string; empty for account-wide rows (e.g. allowance ALERTs). */
+  /** The raw epic string; empty for pre-#139 account-wide rows. */
   key: string;
   /** Cluster header text. */
   label: string;
@@ -448,7 +457,7 @@ function groupByRun(events: SamuraiAuditEvent[]): AuditRunGroup[] {
   }
   return order.map((key) => ({
     key,
-    label: key || "Account-wide",
+    label: key && key !== SAMURAI_ACCOUNT_RUN ? key : "Account-wide",
     events: buckets.get(key) ?? [],
   }));
 }

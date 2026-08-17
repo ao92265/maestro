@@ -1,6 +1,11 @@
 import { MoreVertical, Play } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { buildPrActionPrompt, prActionBriefStem, prActionLaunchName } from "@/lib/prActionPrompt";
+import {
+  buildPrActionPrompt,
+  githubRepoSlug,
+  prActionBriefStem,
+  prActionLaunchName,
+} from "@/lib/prActionPrompt";
 import {
   compilePrWorkflow,
   DEFAULT_PR_WORKFLOW,
@@ -120,6 +125,17 @@ export function PrActionsMenu({ pr, repoPath }: PrActionsMenuProps) {
       // one-line pointer at it instead.
       briefDir: projectPath || null,
       briefStem: prActionBriefStem(pr.number, selectedIds),
+      // Issue #139: a PR review used to leave NOTHING on disk, so its brief
+      // and audit rows had no work to belong to. The same arm hop writes a
+      // persistent record — PR, title, repo, steps — which is the review's
+      // identity in the Second Brain.
+      prRun: {
+        pr: pr.number,
+        title: pr.title,
+        repo: githubRepoSlug(pr.url) ?? "",
+        project_path: projectPath,
+        steps: selectedIds,
+      },
     });
     // Make sure the grid is mounted to consume the request — the project may
     // still be sitting on the idle landing view.

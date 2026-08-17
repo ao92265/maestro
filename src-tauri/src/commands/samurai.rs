@@ -19,12 +19,13 @@ use crate::commands::usage::{get_claude_usage, UsageData};
 use crate::core::samurai_audit::{AuditEvent, AuditEventKind, AuditLog, AuditReadResult};
 use crate::core::samurai_config::{SamuraiConfig, SharedSamuraiConfig};
 use crate::core::samurai_context::SamuraiContextStore;
-use crate::core::samurai_files::{self, SamuraiFileEntry, SamuraiFilesRoots};
+use crate::core::samurai_files::{self, SamuraiFileEntry, SamuraiFileGroup, SamuraiFilesRoots};
 use crate::core::samurai_injector::strip_extended_prefix;
 use crate::core::samurai_journal::{
     default_journal_file, JournalCategory, JournalEntry, JournalListResult, JournalStore,
 };
 use crate::core::samurai_parker::SamuraiParker;
+use crate::core::samurai_pr_runs::PrRunStore;
 use crate::core::samurai_prompts::{self, epic_slug, ref_slug, LaunchInput};
 use crate::core::samurai_replicator::{derive_repo_pin, SamuraiReplicator};
 use crate::core::samurai_resumer::latest_handoff_generation;
@@ -34,6 +35,7 @@ use crate::core::samurai_schedule::{
 };
 use crate::core::samurai_test_gate::{self, SamuraiTestGate, TestGateProgress};
 use crate::core::samurai_workflow::{self, WorkflowGraph};
+use crate::core::session_manager::SessionManager;
 use crate::core::supervisor::{SessionSnapshot, Supervisor};
 use crate::core::windows_process::StdCommandExt;
 use crate::core::worktree_manager::{project_name, WorktreeManager};
@@ -1625,25 +1627,47 @@ fn samurai_files_roots() -> SamuraiFilesRoots {
     }
 }
 
-/// Every Samurai-managed file (PRD §8) as one flat list: handoffs, run
-/// configs (active + archived), pending timers (with their fire time, for
-/// the "resumes at 14:32" rendering), per-project audit logs, and Phase 5
-/// journal/harvest reports once they exist. `in_use` marks entries
-/// referenced by an active run config, a live supervised session, or a
-/// pending timer. All logic lives in `core::samurai_files` (unit-tested
-/// there); this command only snapshots the managed stores.
+/// Every Samurai-managed artifact, grouped by the work it belongs to
+/// (issue #139). The wire shape of `core::samurai_files::list_files`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SamuraiFilesListing {
+    /// One per samurai run or PR review — never a generic bucket.
+    pub groups: Vec<SamuraiFileGroup>,
+    /// Every artifact, each carrying the `group_id` it belongs to.
+    pub entries: Vec<SamuraiFileEntry>,
+}
+
+/// The terminal sessions currently open — a PR review's group is live while
+/// the terminal it launched is (`core::samurai_files::list_files`).
+fn open_session_ids(sessions: &SessionManager) -> Vec<u32> {
+    sessions.all_sessions().into_iter().map(|s| s.id).collect()
+}
+
+/// Every Samurai-managed artifact (PRD §8), GROUPED by run or PR review
+/// (issue #139): briefs, handoffs, run configs (active + archived), PR-review
+/// records, pending timers (with their fire time, for the "resumes at 14:32"
+/// rendering), and each group's slice of the shared audit log and ops journal.
+/// `in_use` marks entries referenced by an active run config, a live
+/// supervised session, a pending timer or an open review terminal. All logic
+/// lives in `core::samurai_files` (unit-tested there); this command only
+/// snapshots the managed stores.
 #[tauri::command]
 pub fn samurai_files_list(
     supervisor: State<'_, Arc<Supervisor>>,
     schedule: State<'_, Arc<SamuraiSchedule>>,
     run_configs: State<'_, Arc<RunConfigStore>>,
-) -> Vec<SamuraiFileEntry> {
-    samurai_files::list_files(
+    pr_runs: State<'_, Arc<PrRunStore>>,
+    sessions: State<'_, SessionManager>,
+) -> SamuraiFilesListing {
+    let (groups, entries) = samurai_files::list_files(
         &samurai_files_roots(),
         &run_configs.list_with_paths(),
         &schedule.list(),
         &supervisor.list_sessions(),
-    )
+        &pr_runs.list_with_paths(),
+        &open_session_ids(&sessions),
+    );
+    SamuraiFilesListing { groups, entries }
 }
 
 /// Deletes one Samurai-managed file (user-initiated, UI confirms first —
@@ -1660,18 +1684,23 @@ pub fn samurai_file_delete(
     supervisor: State<'_, Arc<Supervisor>>,
     schedule: State<'_, Arc<SamuraiSchedule>>,
     run_configs: State<'_, Arc<RunConfigStore>>,
+    pr_runs: State<'_, Arc<PrRunStore>>,
+    sessions: State<'_, SessionManager>,
     path: String,
     force: bool,
 ) -> Result<(), String> {
     let roots = samurai_files_roots();
     let configs = run_configs.list_with_paths();
-    let entries = samurai_files::list_files(
+    let records = pr_runs.list_with_paths();
+    let (_, entries) = samurai_files::list_files(
         &roots,
         &configs,
         &schedule.list(),
         &supervisor.list_sessions(),
+        &records,
+        &open_session_ids(&sessions),
     );
-    samurai_files::delete_file(&roots, &configs, &entries, &path, force)
+    samurai_files::delete_file(&roots, &configs, &records, &entries, &path, force)
 }
 
 /// Biggest file [`samurai_file_read`] will hand to the webview: 2 MB. The
@@ -1748,13 +1777,17 @@ pub fn samurai_file_read(
     supervisor: State<'_, Arc<Supervisor>>,
     schedule: State<'_, Arc<SamuraiSchedule>>,
     run_configs: State<'_, Arc<RunConfigStore>>,
+    pr_runs: State<'_, Arc<PrRunStore>>,
+    sessions: State<'_, SessionManager>,
     path: String,
 ) -> Result<String, String> {
-    let entries = samurai_files::list_files(
+    let (_, entries) = samurai_files::list_files(
         &samurai_files_roots(),
         &run_configs.list_with_paths(),
         &schedule.list(),
         &supervisor.list_sessions(),
+        &pr_runs.list_with_paths(),
+        &open_session_ids(&sessions),
     );
     read_listed_file(&entries, &path)
 }
@@ -4093,6 +4126,7 @@ mod tests {
     /// Only `path` participates in the guard; the rest is presentation.
     fn listed_row(path: &Path) -> SamuraiFileEntry {
         SamuraiFileEntry {
+            group_id: "run:000000000000:38".to_string(),
             kind: SamuraiFileKind::Handoff,
             path: path.to_string_lossy().into_owned(),
             size_bytes: 0,
