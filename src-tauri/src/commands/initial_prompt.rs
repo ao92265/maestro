@@ -122,8 +122,9 @@ impl InitialPromptInjector {
     /// names the brief its review was actually delivered as, and this hop is
     /// the only place that knows which it was.
     ///
-    /// Does a blocking file write when it stages a brief; Tauri runs the
-    /// command below off the main thread.
+    /// Does a blocking file write when it stages a brief, which is why the
+    /// command below is `#[tauri::command(async)]` — Tauri then runs it off
+    /// the main thread instead of blocking the UI on the write.
     pub fn arm(
         &self,
         session_id: u32,
@@ -206,7 +207,13 @@ impl InitialPromptInjector {
 /// the session the terminal opened under, and the brief the prompt was
 /// actually staged as. A failed record write is logged, never surfaced: the
 /// review is armed and must run.
-#[tauri::command]
+///
+/// `(async)` because the body does real blocking I/O — a brief write of
+/// several KB, plus the PR record write — and a plain `#[tauri::command]` on a
+/// sync function runs on the MAIN thread, freezing the UI for the duration.
+/// The frontend still awaits the call, so the arm stays strictly ordered ahead
+/// of the CLI command TerminalGrid types next.
+#[tauri::command(async)]
 pub fn terminal_arm_initial_prompt(
     injector: State<'_, Arc<InitialPromptInjector>>,
     pr_runs: State<'_, Arc<PrRunStore>>,
@@ -448,9 +455,38 @@ mod tests {
     }
 
     #[test]
+    fn test_a_hostile_brief_stem_cannot_escape_the_brief_directory() {
+        // `brief_stem` is frontend text crossing the IPC boundary, so the
+        // sanitising has to happen backend-side: a traversal must resolve
+        // INSIDE `.maestro/briefs/`, never above it.
+        let dir = tempdir().unwrap();
+        let worktree = dir.path().join("checkout");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let (injector, delivered) = injector();
+        let prompt = long_prompt();
+
+        injector
+            .arm(5, &prompt, Some(target(&worktree, "../../escaped")))
+            .unwrap();
+        injector.on_session_started(5);
+
+        assert_eq!(
+            delivered.lock().unwrap()[0].1,
+            samurai_brief::pointer_instruction(".maestro/briefs/escaped.md")
+        );
+        assert!(worktree.join(".maestro/briefs/escaped.md").is_file());
+        assert!(!dir.path().join("escaped.md").exists(), "nothing escaped");
+    }
+
+    #[test]
     fn test_a_failed_brief_write_falls_back_to_the_flattened_prompt() {
         // No new failure mode: an unwritable brief (here `.maestro` occupied
-        // by a file) logs a warning and arms exactly what pre-#138 armed.
+        // by a file) arms exactly what pre-#138 armed.
+        //
+        // #138 c4 also asks for a logged warning. That half is pinned by code
+        // review only — `arm` emits `log::warn!` and nothing here asserts it,
+        // because capturing `log` output needs a process-global logger that
+        // would race every other test.
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join(".maestro"), "not a directory").unwrap();
         let (injector, delivered) = injector();

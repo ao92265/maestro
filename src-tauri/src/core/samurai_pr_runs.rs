@@ -12,9 +12,9 @@
 //! IS the group's identity ([`pr_group_id`]), exactly the way a run config is a
 //! run's.
 //!
-//! **Layout:** one file per launch at
-//! `<app data>/runs/<PR_RUNS_DIR>/<owner>-<repo>-<number>-<ts>.json`. Inside
-//! the `runs` root on purpose — that root is already a Samurai-managed delete
+//! **Layout:** one file per review terminal at
+//! `<app data>/runs/<PR_RUNS_DIR>/<owner>-<repo>-<number>-<session>.json`.
+//! Inside the `runs` root on purpose — that root is already a Samurai delete
 //! root (`samurai_files::delete_file`), so a record is deletable through the
 //! same guard as every other managed file with no new root to authorise. The
 //! `pr` subdirectory can never collide with a run config's project directory:
@@ -135,9 +135,10 @@ impl PrRunStore {
         }
     }
 
-    /// Writes one record, returning its path. One file per launch: the
-    /// timestamp in the name keeps a relaunch of the same PR from overwriting
-    /// the previous review's record (they share a group, not a file).
+    /// Writes one record, returning its path. One file per review TERMINAL
+    /// (see [`record_file_name`]): a relaunch of the same PR in a new terminal
+    /// keeps its own record — they share a group, not a file — while a re-arm
+    /// of the same terminal rewrites the one record it already has.
     pub fn record(&self, run: &PrReviewRun) -> Result<PathBuf, String> {
         std::fs::create_dir_all(&self.base_dir).map_err(|e| {
             format!(
@@ -179,13 +180,20 @@ impl PrRunStore {
     }
 }
 
-/// `<owner>-<repo>-<number>-<ts>.json`, every segment sanitized to
-/// `[a-z0-9-]`: `owner/repo` carries a slash and an RFC 3339 timestamp carries
-/// colons, neither of which is a legal Windows file name character.
+/// `<owner>-<repo>-<number>-<session>.json`, the repo segment sanitized to
+/// `[a-z0-9-]` because `owner/repo` carries a slash, which is not a legal
+/// Windows file name character.
+///
+/// Keyed on the SESSION, not the creation timestamp. A timestamp made the name
+/// unstable in both directions: two launches in the same tick produced the
+/// same name and overwrote each other, while a re-arm of one session — which
+/// replaces the staged prompt rather than queueing a second one
+/// (`InitialPromptInjector::arm`) — produced a second name and left one review
+/// with several records. One review terminal now owns exactly one record file,
+/// rewritten in place if it is re-armed.
 fn record_file_name(run: &PrReviewRun) -> String {
     let repo = sanitize(&run.repo);
-    let ts = sanitize(&run.created_at);
-    format!("{repo}-{}-{ts}.json", run.pr)
+    format!("{repo}-{}-{}.json", run.pr, run.session_id)
 }
 
 /// Lowercased, with every run of non-`[a-z0-9]` characters collapsed to one
@@ -271,10 +279,10 @@ mod tests {
     }
 
     #[test]
-    fn test_file_name_is_filesystem_safe_and_one_file_per_launch() {
-        // `owner/repo` carries a slash and the timestamp colons — neither is
-        // legal in a Windows file name, so both are sanitized. And a second
-        // review of the same PR must not overwrite the first record.
+    fn test_file_name_is_filesystem_safe_and_one_file_per_review_terminal() {
+        // `owner/repo` carries a slash, which is not legal in a Windows file
+        // name, so the repo segment is sanitized. And a second review of the
+        // same PR in another terminal must not overwrite the first record.
         let dir = tempdir().unwrap();
         let store = PrRunStore::new(dir.path().to_path_buf());
 
@@ -298,6 +306,38 @@ mod tests {
             .list_with_paths()
             .iter()
             .all(|(_, r)| r.brief.is_none()));
+    }
+
+    #[test]
+    fn test_relaunching_one_session_replaces_its_record_instead_of_duplicating() {
+        // The arm path is a REPLACE ("one session, one initial prompt"), so a
+        // re-arm must leave one record, not a second row for the same review.
+        // Two launches in the same tick must not collide either — the name is
+        // keyed on the session, never on the timestamp.
+        let dir = tempdir().unwrap();
+        let store = PrRunStore::new(dir.path().to_path_buf());
+
+        let mut first = PrReviewRun::now(launch(), 7, None);
+        first.created_at = "2026-08-17T12:00:00+00:00".to_string();
+        let mut rearmed = PrReviewRun::now(launch(), 7, Some("b.md".to_string()));
+        rearmed.created_at = "2026-08-17T12:00:00+00:00".to_string();
+        let mut other_session = PrReviewRun::now(launch(), 8, None);
+        other_session.created_at = "2026-08-17T12:00:00+00:00".to_string();
+
+        assert_eq!(
+            store.record(&first).unwrap(),
+            store.record(&rearmed).unwrap()
+        );
+        store.record(&other_session).unwrap();
+
+        let recorded = store.list_with_paths();
+        assert_eq!(recorded.len(), 2, "one record per session: {recorded:?}");
+        assert!(
+            recorded
+                .iter()
+                .any(|(_, r)| r.brief.as_deref() == Some("b.md")),
+            "the re-arm's record won: {recorded:?}"
+        );
     }
 
     #[test]
