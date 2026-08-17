@@ -1535,7 +1535,7 @@ mod tests {
         let info = parse_session_file(&path).expect("parsed");
         // No message timestamp -> mtime, which is recent, not the epoch.
         assert!(
-            info.last_active > "2020-01-01T00:00:00.000Z".to_string(),
+            info.last_active.as_str() > "2020-01-01T00:00:00.000Z",
             "expected an mtime-derived timestamp, got {}",
             info.last_active
         );

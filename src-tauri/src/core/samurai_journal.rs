@@ -1613,7 +1613,7 @@ mod tests {
         assert_eq!(raws[0], raws[1], "the two lines really are identical");
 
         // Only the FIRST copy was rendered — the cap withheld the second.
-        s.commit_harvest("2026-08-13", &raws[..1].to_vec()).unwrap();
+        s.commit_harvest("2026-08-13", &raws[..1]).unwrap();
 
         let statuses: Vec<JournalEntryStatus> = s
             .list()

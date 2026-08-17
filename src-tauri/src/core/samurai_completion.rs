@@ -759,12 +759,14 @@ mod tests {
         audit: AuditLog,
         /// Every (kind, number, repo pin) probe call, for count and
         /// pin-threading assertions (review F1).
-        calls: Arc<Mutex<Vec<(&'static str, u64, Option<String>)>>>,
+        calls: ProbeCalls,
         /// Session ids the completion kill tore down, in order.
         killed: Arc<Mutex<Vec<u32>>>,
         _dir: tempfile::TempDir,
     }
 
+    /// Recorded probe invocations: `(kind, number, repo pin)` per call, where
+    /// `kind` is `"issue"` or `"pr"`.
     type ProbeCalls = Arc<Mutex<Vec<(&'static str, u64, Option<String>)>>>;
 
     /// The common watcher/store/audit scaffolding around a pair of probes —

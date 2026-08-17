@@ -4723,6 +4723,9 @@ mod tests {
         );
     }
 
+    /// Captured `(session_id, data)` pairs a stubbed [`StdinWriter`] recorded.
+    type RecordedWrites = Arc<Mutex<Vec<(u32, String)>>>;
+
     /// Wires a real injector to the harness replicator and walks session 1
     /// (gen-2, epic-9) through the idle-gated handoff injection — the state
     /// every injector-delivery watch test starts from. Returns the injector
@@ -4731,7 +4734,7 @@ mod tests {
         h: &Harness,
         project: &str,
         writer: Option<StdinWriter>,
-    ) -> (SamuraiInjector, Arc<Mutex<Vec<(u32, String)>>>) {
+    ) -> (SamuraiInjector, RecordedWrites) {
         let dirs_for_resolver = h.dirs.clone();
         let session_dirs: SessionDirResolver =
             Arc::new(move |id| dirs_for_resolver.lock().unwrap().get(&id).cloned());

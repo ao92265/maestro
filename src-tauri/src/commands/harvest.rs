@@ -509,6 +509,9 @@ mod tests {
     use crate::core::samurai_journal::{JournalCategory, JournalEntryStatus};
     use tempfile::tempdir;
 
+    /// Captured `(session_id, prompt)` pairs handed to a stubbed [`DeliverFn`].
+    type DeliveredPrompts = Arc<Mutex<Vec<(u32, String)>>>;
+
     fn entry(
         ts: &str,
         category: JournalCategory,
@@ -531,7 +534,7 @@ mod tests {
     fn triage_with_journal(
         journal: Arc<JournalStore>,
         downloads: &str,
-    ) -> (HarvestTriage, Arc<Mutex<Vec<(u32, String)>>>) {
+    ) -> (HarvestTriage, DeliveredPrompts) {
         let delivered: Arc<Mutex<Vec<(u32, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = delivered.clone();
         let deliver: DeliverFn = Arc::new(move |session_id, prompt| {

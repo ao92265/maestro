@@ -132,8 +132,11 @@ pub fn terminal_arm_initial_prompt(
 mod tests {
     use super::*;
 
+    /// Captured `(session_id, prompt)` pairs handed to a stubbed [`DeliverFn`].
+    type DeliveredPrompts = Arc<Mutex<Vec<(u32, String)>>>;
+
     /// An injector whose deliveries are captured, plus the capture handle.
-    fn injector() -> (InitialPromptInjector, Arc<Mutex<Vec<(u32, String)>>>) {
+    fn injector() -> (InitialPromptInjector, DeliveredPrompts) {
         let delivered: Arc<Mutex<Vec<(u32, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = delivered.clone();
         let deliver: DeliverFn = Arc::new(move |session_id, prompt| {
