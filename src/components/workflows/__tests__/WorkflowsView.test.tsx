@@ -452,4 +452,24 @@ describe("workflow graph edits (pure rules)", () => {
   it("removing a missing edge is a no-op", () => {
     expect(removeWorkflowEdge(chain(), "a", "c")).toEqual(chain());
   });
+
+  it("an added box joins the run even when the walk ended on a cycle", () => {
+    // The walk stops at a revisit, so its tail can already HAVE an outgoing
+    // edge. Appending a second edge from that tail left the new box off the
+    // walk entirely — "Not in run" the moment it was created.
+    const cyclic: SamuraiWorkflowGraph = {
+      ...chain(),
+      edges: [
+        { from: "a", to: "b" },
+        { from: "b", to: "c" },
+        { from: "c", to: "a" },
+      ],
+    };
+    expect(workflowWalkOrder(cyclic)).toEqual(["a", "b", "c"]);
+
+    const next = addWorkflowNode(cyclic);
+
+    expect(workflowWalkOrder(next)).toEqual(["a", "b", "c", "step-1"]);
+    expect(next.edges.filter((e) => e.from === "c")).toEqual([{ from: "c", to: "step-1" }]);
+  });
 });

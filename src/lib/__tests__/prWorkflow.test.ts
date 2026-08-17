@@ -157,4 +157,27 @@ describe("prWorkflowNeedsWorktree", () => {
     expect(prWorkflowNeedsWorktree(["step-2"], graph)).toBe(false);
     expect(prWorkflowNeedsWorktree(["step-1"], graph)).toBe(true);
   });
+
+  it("matches on the instruction text, not just the id and label", () => {
+    // The text is what actually reaches the agent. A neutrally-named step
+    // that orders a commit used to compile into the prompt alongside the
+    // READ-ONLY workspace rule — contradictory orders, and no worktree.
+    const graph: SamuraiWorkflowGraph = {
+      nodes: [
+        { id: "step-1", label: "Apply patches", text: "commit and push the fix" },
+        { id: "step-2", label: "Look around", text: "read things" },
+      ],
+      edges: [{ from: "step-1", to: "step-2" }],
+      start: "step-1",
+    };
+    expect(prWorkflowNeedsWorktree(["step-1"], graph)).toBe(true);
+    expect(prWorkflowNeedsWorktree(["step-2"], graph)).toBe(false);
+  });
+
+  it("does not treat a read-only step as writing because of a substring", () => {
+    // `mergeable` contains "merge" — matching it would send every plain
+    // status check through a pointless worktree checkout.
+    expect(prWorkflowNeedsWorktree(["check"], DEFAULT_PR_WORKFLOW)).toBe(false);
+    expect(prWorkflowNeedsWorktree(["review"], DEFAULT_PR_WORKFLOW)).toBe(false);
+  });
 });

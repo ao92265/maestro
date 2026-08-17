@@ -117,6 +117,23 @@ describe("useSamuraiWorkflowStore (issue #91 persistence)", () => {
     await hydration;
   });
 
+  it("a corrupt persisted graph degrades to the default instead of hanging the launch", async () => {
+    // zustand's persist marks only a SUCCESSFUL hydration as finished, so a
+    // hydration that throws (an unparseable file) used to leave every
+    // launch gated on `workflowGraphForLaunch` waiting forever — the Launch
+    // button silently dead for the rest of the session.
+    backing.set(STORAGE_KEY, "{ this is not json");
+
+    await useSamuraiWorkflowStore.persist.rehydrate();
+
+    const settled = await Promise.race([
+      workflowGraphForLaunch().then(() => "settled"),
+      new Promise((resolve) => setTimeout(() => resolve("hung"), 1000)),
+    ]);
+    expect(settled).toBe("settled");
+    expect(useSamuraiWorkflowStore.getState().graph).toBeNull();
+  });
+
   it("workflowGraphForLaunch resolves the current graph once hydrated", async () => {
     expect(useSamuraiWorkflowStore.persist.hasHydrated()).toBe(true);
     expect(await workflowGraphForLaunch()).toBeNull();

@@ -25,21 +25,66 @@ type PrWorkflowState = {
 
 const lazyStore = new LazyStore("pr-workflow.json");
 
+/**
+ * A failed WRITE of the edited graph. Its own store rather than a field on
+ * the persisted one: writing the error back there would trigger another
+ * persist write on every failure.
+ */
+type PrWorkflowSaveErrorState = {
+  saveError: string | null;
+  setSaveError: (message: string | null) => void;
+};
+
+export const usePrWorkflowSaveError = create<PrWorkflowSaveErrorState>()((set) => ({
+  saveError: null,
+  setSaveError: (saveError) => set({ saveError }),
+}));
+
+function reportSaveError(message: string | null): void {
+  if (usePrWorkflowSaveError.getState().saveError !== message) {
+    usePrWorkflowSaveError.getState().setSaveError(message);
+  }
+}
+
 const tauriStorage: StateStorage = {
   getItem: async (name) => {
     try {
-      return (await lazyStore.get<string>(name)) ?? null;
-    } catch {
+      const raw = (await lazyStore.get<string>(name)) ?? null;
+      if (raw === null) return null;
+      // The persist middleware parses this with an unguarded `JSON.parse`,
+      // and zustand never marks a FAILED hydration as finished — a corrupt
+      // file would leave `hasHydrated()` false forever and hang every read
+      // gated on it. Degrade to "never edited" instead.
+      JSON.parse(raw);
+      return raw;
+    } catch (error) {
+      console.error("Failed to read the persisted PR workflow:", error);
       return null;
     }
   },
   setItem: async (name, value) => {
-    await lazyStore.set(name, value);
-    await lazyStore.save();
+    // An unhandled rejection here left the canvas showing an edit that was
+    // never written: the next app start would silently use the OLD graph.
+    try {
+      await lazyStore.set(name, value);
+      await lazyStore.save();
+      reportSaveError(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error("Failed to save the PR workflow:", error);
+      reportSaveError(message);
+    }
   },
   removeItem: async (name) => {
-    await lazyStore.delete(name);
-    await lazyStore.save();
+    try {
+      await lazyStore.delete(name);
+      await lazyStore.save();
+      reportSaveError(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error("Failed to clear the PR workflow:", error);
+      reportSaveError(message);
+    }
   },
 };
 
@@ -54,6 +99,19 @@ const tauriStorage: StateStorage = {
  *    workflow → {@link prWorkflowGraphForLaunch} awaits hydration.
  */
 let pendingEdit: { graph: SamuraiWorkflowGraph | null } | null = null;
+
+/**
+ * Hydration-FAILURE latch — see `useSamuraiWorkflowStore`. zustand marks only
+ * a SUCCESSFUL hydration as finished, so without this a failed read left
+ * every gated PR action waiting forever. Cleared when an attempt starts.
+ */
+let hydrationFailed = false;
+const hydrationFailureWaiters = new Set<() => void>();
+
+function markHydrationFailed(): void {
+  hydrationFailed = true;
+  for (const waiter of [...hydrationFailureWaiters]) waiter();
+}
 
 export const usePrWorkflowStore = create<PrWorkflowState>()(
   persist(
@@ -72,6 +130,15 @@ export const usePrWorkflowStore = create<PrWorkflowState>()(
       name: "maestro-pr-workflow",
       storage: createJSONStorage(() => tauriStorage),
       partialize: (state) => ({ graph: state.graph }),
+      onRehydrateStorage: () => {
+        // Called when an attempt STARTS; the returned callback when it ends.
+        hydrationFailed = false;
+        return (_state, error) => {
+          if (error === undefined) return;
+          console.error("Failed to load the persisted PR workflow:", error);
+          markHydrationFailed();
+        };
+      },
     },
   ),
 );
@@ -97,15 +164,18 @@ export async function prWorkflowGraphForLaunch(): Promise<SamuraiWorkflowGraph |
   const { persist: persistApi } = usePrWorkflowStore;
   if (!persistApi.hasHydrated()) {
     await new Promise<void>((resolve) => {
-      const unsubscribe = persistApi.onFinishHydration(() => {
+      let unsubscribe: () => void = () => {};
+      const settle = () => {
         unsubscribe();
+        hydrationFailureWaiters.delete(settle);
         resolve();
-      });
-      // Hydration may have finished between the check and the subscribe.
-      if (persistApi.hasHydrated()) {
-        unsubscribe();
-        resolve();
-      }
+      };
+      unsubscribe = persistApi.onFinishHydration(settle);
+      // Hydration may have finished between the check and the subscribe —
+      // and a FAILED one fires no finish listener at all, so the failure
+      // latch has to settle the gate or the read waits forever.
+      if (persistApi.hasHydrated() || hydrationFailed) settle();
+      else hydrationFailureWaiters.add(settle);
     });
   }
   return usePrWorkflowStore.getState().graph;

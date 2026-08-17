@@ -68,7 +68,7 @@ use super::samurai_injector::strip_extended_prefix;
 use super::samurai_parker::SamuraiParker;
 use super::samurai_prompts::{epic_slug, parse_handoff_generation};
 use super::samurai_replicator::SamuraiReplicator;
-use super::samurai_run_config::{RunConfigStatus, RunConfigStore};
+use super::samurai_run_config::{ConfigLookup, RunConfigStatus, RunConfigStore};
 use super::samurai_schedule::{SamuraiSchedule, ScheduleEntry};
 use super::supervisor::{SessionSnapshot, Supervisor};
 
@@ -124,9 +124,25 @@ fn next_generation(registry_max: Option<u32>, files_max: Option<u32>) -> Option<
 /// `pub(crate)`: cold-start reconciliation (issue #62) derives generations
 /// with the same scan.
 pub(crate) fn latest_handoff_generation(handoffs_dir: &Path, epic: &str) -> Option<u32> {
+    scan_handoff_generation(handoffs_dir, epic).unwrap_or(None)
+}
+
+/// [`latest_handoff_generation`] with "the directory could not be read" kept
+/// distinct from "no handoff matches". A missing directory is `Ok(None)` — a
+/// worktree legitimately has none — but any other io error is an `Err`, so
+/// the resume path can defer instead of concluding the run has nothing to
+/// resume from and destroying its timer.
+pub(crate) fn scan_handoff_generation(
+    handoffs_dir: &Path,
+    epic: &str,
+) -> Result<Option<u32>, std::io::Error> {
     let prefix = format!("{}-gen", epic_slug(epic));
-    std::fs::read_dir(handoffs_dir)
-        .ok()?
+    let read_dir = match std::fs::read_dir(handoffs_dir) {
+        Ok(read_dir) => read_dir,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    Ok(read_dir
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -135,7 +151,7 @@ pub(crate) fn latest_handoff_generation(handoffs_dir: &Path, epic: &str) -> Opti
                 || name == format!("{prefix}-{generation}.md"))
             .then_some(generation)
         })
-        .max()
+        .max())
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +262,31 @@ impl SamuraiResumer {
         // park and fire. Anything but an ACTIVE config drops the timer (the
         // fired entry self-cleans, nothing re-arms) with an audit note
         // instead of spawning a successor into a finished worktree.
-        let config = self.run_configs.get(&entry.project_path, &entry.epic);
+        // An UNREADABLE config is not evidence the run ended: a torn or
+        // locked file used to read exactly like a missing one, so the timer
+        // was dropped ("status": "MISSING") and a live parked run never
+        // resumed. Defer instead — the next tick re-reads the file.
+        let config = match self.run_configs.lookup(&entry.project_path, &entry.epic) {
+            ConfigLookup::Found(config) => Some(*config),
+            ConfigLookup::Missing => None,
+            ConfigLookup::Unreadable(e) => {
+                log::warn!(
+                    "samurai resumer: timer for epic {} in {} fired but its run config could not be read ({e}) — deferring, not dropping",
+                    entry.epic,
+                    entry.project_path,
+                );
+                self.append_alert(
+                    &entry,
+                    json!({
+                        "kind": "resume_config_unreadable",
+                        "epic": entry.epic,
+                        "error": e,
+                    }),
+                );
+                self.defer(schedule, &entry);
+                return;
+            }
+        };
         let status = config.as_ref().map(|c| c.status);
         let Some(config) = config.filter(|c| c.status == RunConfigStatus::Active) else {
             let status_value = match status {
@@ -317,10 +357,33 @@ impl SamuraiResumer {
             .filter(|s| s.project == entry.project_path && s.epic == entry.epic)
             .map(|s| s.generation)
             .max();
-        let files_max = latest_handoff_generation(
+        // An unreadable handoffs directory is NOT "this run has no handoff":
+        // with an empty registry — the normal state right after a park and
+        // teardown — that conflation sent the timer down the terminal
+        // `resume_no_handoff` branch, which never re-arms, destroying the
+        // timer of a run whose handoff files were sitting on disk.
+        let files_max = match scan_handoff_generation(
             &Path::new(&working_dir).join(".maestro").join("handoffs"),
             &entry.epic,
-        );
+        ) {
+            Ok(files_max) => files_max,
+            Err(e) => {
+                log::warn!(
+                    "samurai resumer: handoffs directory for epic {} in {working_dir} could not be read ({e}) — deferring, not dropping",
+                    entry.epic,
+                );
+                self.append_alert(
+                    &entry,
+                    json!({
+                        "kind": "resume_handoffs_unreadable",
+                        "epic": entry.epic,
+                        "error": e.to_string(),
+                    }),
+                );
+                self.defer(schedule, &entry);
+                return;
+            }
+        };
         let Some((prior, generation)) = next_generation(registry_max, files_max) else {
             log::error!(
                 "samurai resumer: epic {} in {working_dir} has no handoff files and no registry generations — nothing to resume from, ALERT",
@@ -995,6 +1058,94 @@ mod tests {
         // A cleanup can delete the config outright; a timer without a run
         // is stale by definition.
         assert_fire_dropped_as_not_active(|_, _| {}, "C:/git/proj-res-noconfig", "MISSING").await;
+    }
+
+    #[tokio::test]
+    async fn test_fire_with_unreadable_run_config_defers_instead_of_dropping() {
+        // A torn or locked config file used to read exactly like a deleted
+        // one, so the timer was dropped as "MISSING" and a live parked run
+        // never resumed. Unreadable is not evidence the run ended: defer.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-res-torn-config";
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        h.run_configs
+            .save(&SamuraiRunConfig::new(
+                project,
+                "#37",
+                repo.path().to_string_lossy().into_owned(),
+            ))
+            .unwrap();
+        let (config_path, _) = h.run_configs.list_with_paths().into_iter().next().unwrap();
+        std::fs::write(&config_path, "{ this is not json").unwrap();
+
+        h.resumer.on_fire(entry(project, "#37"));
+
+        let rows = wait_for_row(&h.audit, project, |r| {
+            r.details["kind"] == "resume_config_unreadable"
+        })
+        .await;
+        assert!(rows
+            .iter()
+            .any(|r| r.details["kind"] == "resume_config_unreadable"));
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.details["kind"] == "resume_run_not_active"),
+            "an unreadable config must never be reported as a finished run"
+        );
+        assert_eq!(
+            h.schedule.list().len(),
+            1,
+            "the timer is re-armed, not destroyed"
+        );
+        assert!(h.spawns.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fire_with_unreadable_handoffs_dir_defers_instead_of_dropping() {
+        // Same conflation one layer down: an unreadable handoffs directory
+        // read as "this run has no handoff", which is a TERMINAL branch —
+        // the timer of a run whose handoffs were on disk was destroyed.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-res-torn-handoffs";
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        h.run_configs
+            .save(&SamuraiRunConfig::new(
+                project,
+                "#37",
+                repo.path().to_string_lossy().into_owned(),
+            ))
+            .unwrap();
+        // A FILE where the handoffs directory belongs: read_dir errors with
+        // something other than NotFound.
+        std::fs::create_dir_all(repo.path().join(".maestro")).unwrap();
+        std::fs::write(repo.path().join(".maestro").join("handoffs"), "not a dir").unwrap();
+
+        h.resumer.on_fire(entry(project, "#37"));
+
+        let rows = wait_for_row(&h.audit, project, |r| {
+            r.details["kind"] == "resume_handoffs_unreadable"
+        })
+        .await;
+        assert!(rows
+            .iter()
+            .any(|r| r.details["kind"] == "resume_handoffs_unreadable"));
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.details["kind"] == "resume_no_handoff"),
+            "an unreadable directory must never be reported as 'nothing to resume from'"
+        );
+        assert_eq!(
+            h.schedule.list().len(),
+            1,
+            "the timer is re-armed, not destroyed"
+        );
+        assert!(h.spawns.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

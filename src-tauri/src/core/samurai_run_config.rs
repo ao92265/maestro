@@ -161,6 +161,19 @@ impl SamuraiRunConfig {
     }
 }
 
+/// What a single-config read found: the config, nothing at all, or a file
+/// that exists but could not be read. The third case is deliberately NOT
+/// folded into the second — "unreadable" is not evidence that a run ended.
+#[derive(Debug)]
+pub enum ConfigLookup {
+    /// Boxed: the config dwarfs the other variants (clippy's
+    /// `large_enum_variant`), and this value is moved out immediately.
+    Found(Box<SamuraiRunConfig>),
+    Missing,
+    /// The file exists but could not be read/parsed; carries the reason.
+    Unreadable(String),
+}
+
 /// The on-disk store. Constructed once at app setup (rooted at
 /// `artifact_base_dir("runs")`) and managed as `Arc<RunConfigStore>`; tests
 /// root it at a tempdir.
@@ -231,15 +244,30 @@ impl RunConfigStore {
 
     /// The config for `(project, epic)`, if a readable one exists. Corrupt
     /// files read as `None` (with a warning).
+    ///
+    /// Callers that must not treat "unreadable" as "the run is over" — the
+    /// resume timer above all — use [`Self::lookup`] instead.
     pub fn get(&self, project: &str, epic: &str) -> Option<SamuraiRunConfig> {
+        match self.lookup(project, epic) {
+            ConfigLookup::Found(config) => Some(*config),
+            ConfigLookup::Missing | ConfigLookup::Unreadable(_) => None,
+        }
+    }
+
+    /// [`Self::get`] with "the file is not there" kept distinct from "the
+    /// file is there and could not be read". Collapsing the two makes a
+    /// torn or locked config look exactly like a finished run, which is how
+    /// a live parked run ended up stranded behind a false "the run is over"
+    /// trail.
+    pub fn lookup(&self, project: &str, epic: &str) -> ConfigLookup {
         let _guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
         let path = self.config_path(&normalize_project(project), epic);
         match read_config(&path) {
-            Ok(config) => Some(config),
-            Err(ReadError::Missing) => None,
+            Ok(config) => ConfigLookup::Found(Box::new(config)),
+            Err(ReadError::Missing) => ConfigLookup::Missing,
             Err(ReadError::Other(e)) => {
                 log::warn!("samurai run-config: unreadable config {path:?}: {e}");
-                None
+                ConfigLookup::Unreadable(e)
             }
         }
     }

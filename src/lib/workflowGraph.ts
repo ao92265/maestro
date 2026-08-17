@@ -129,9 +129,17 @@ export function addWorkflowNode(graph: SamuraiWorkflowGraph, label?: string): Sa
   const tail: string | undefined = walk[walk.length - 1];
   const node: SamuraiWorkflowNode =
     label === undefined ? { id, text: "" } : { id, text: "", label };
+  // The tail can already have an outgoing edge — the walk also stops on a
+  // REVISIT, not just on a dead end. The compile follows the first outgoing
+  // edge, so merely appending a second one left the new box off the run.
+  // Same rule as `connectWorkflow`: rewiring the tail drops its old edges.
+  const edges =
+    tail !== undefined
+      ? [...graph.edges.filter((e) => e.from !== tail), { from: tail, to: id }]
+      : graph.edges;
   return {
     nodes: [...graph.nodes, node],
-    edges: tail !== undefined ? [...graph.edges, { from: tail, to: id }] : graph.edges,
+    edges,
     start: graph.nodes.length === 0 ? id : graph.start,
   };
 }

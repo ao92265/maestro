@@ -116,17 +116,24 @@ export function compilePrWorkflow(graph: SamuraiWorkflowGraph, selectedIds: stri
   return parts.join(" ");
 }
 
-/** Steps whose id or label says they WRITE (they need a checkout to work in). */
-const WRITE_STEP = /fix|merge|push|commit/i;
+/**
+ * Steps that WRITE (they need a checkout to work in). Whole words only:
+ * `mergeable` — which the read-only status step asks `gh` for — must not
+ * read as "merge".
+ */
+const WRITE_STEP = /\b(fix|merge|push|commit)\b/i;
 
 /**
  * Whether the selected steps need a temporary worktree.
  *
  * Deliberately a simple, visible heuristic rather than a stored per-node
- * flag: a step is treated as write-access when its id or its display label
- * (so `node.label`, or the text prefix that stands in for a missing one)
- * matches {@link WRITE_STEP}. Read-only selections (check, review) therefore
- * run in place; anything that fixes or merges gets a worktree.
+ * flag: a step is treated as write-access when its id, its display label
+ * (so `node.label`, or the text prefix that stands in for a missing one) or
+ * its INSTRUCTION TEXT matches {@link WRITE_STEP}. The text counts because
+ * it is what actually reaches the agent — a step labelled "Apply patches"
+ * whose text orders a push otherwise compiled into the prompt with no
+ * worktree and alongside the READ-ONLY workspace rule. Read-only selections
+ * (check, review) still run in place.
  */
 export function prWorkflowNeedsWorktree(
   selectedIds: string[],
@@ -134,6 +141,8 @@ export function prWorkflowNeedsWorktree(
 ): boolean {
   const wanted = new Set(selectedIds);
   return prWorkflowStepsInOrder(graph).some(
-    (step) => wanted.has(step.id) && (WRITE_STEP.test(step.id) || WRITE_STEP.test(step.label)),
+    (step) =>
+      wanted.has(step.id) &&
+      (WRITE_STEP.test(step.id) || WRITE_STEP.test(step.label) || WRITE_STEP.test(step.text)),
   );
 }

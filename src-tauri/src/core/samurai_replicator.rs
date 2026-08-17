@@ -677,7 +677,10 @@ pub struct SamuraiReplicator {
     write_stdin: StdinWriter,
     /// Issue #103: the Enter-only resend for the post-delivery watch.
     resend_enter: EnterResender,
-    pending: Mutex<Vec<PendingRitual>>,
+    /// `Arc` for the same reason as `delivered`: a delivery whose body write
+    /// FAILED re-arms its entry from the outcome callback, long after
+    /// `observe_hook` returned.
+    pending: Arc<Mutex<Vec<PendingRitual>>>,
     /// Issue #103: instructions typed in but not yet proven submitted.
     /// `Arc` so the delivery-outcome callback (issue #109) can arm a watch
     /// after the call that spawned the write returned.
@@ -718,7 +721,7 @@ impl SamuraiReplicator {
             emit_spawn,
             write_stdin,
             resend_enter,
-            pending: Mutex::new(Vec::new()),
+            pending: Arc::new(Mutex::new(Vec::new())),
             delivered: Arc::new(Mutex::new(Vec::new())),
             absorber: std::sync::OnceLock::new(),
             run_configs: std::sync::OnceLock::new(),
@@ -904,9 +907,14 @@ impl SamuraiReplicator {
         {
             Ok(killed) => killed,
             Err(e) => {
-                log::warn!(
-                    "samurai replicator: Killed transition for session {} rejected ({e}) — successor not staged",
-                    snapshot.session_id
+                // The predecessor's PTY is already torn down at this point,
+                // so the epic chain stops here. Every other abort path in
+                // this module raises `successor_spawn_failed`; this one used
+                // to return with nothing but a log line, leaving the run
+                // dead with no trail a human could find.
+                self.alert_spawn_failed(
+                    &snapshot,
+                    &format!("the KILLED transition was rejected ({e}) — successor not staged"),
                 );
                 return;
             }
@@ -1435,18 +1443,50 @@ impl SamuraiReplicator {
                     )
                 }
             };
+            this.finish_ritual_decision(&project, &epic, generation, instruction, recovery, &spawn);
+        });
+    }
+
+    /// Tail of [`Self::spawn_generation`]'s ritual-decision task: writes the
+    /// decided instruction onto the staged entry and emits the spawn.
+    ///
+    /// The emit is CONDITIONAL on the entry still being staged. The decision
+    /// runs asynchronously, so the entry can disappear underneath it —
+    /// `cleanup_epic_inner` cancels an epic's pending entries "before any
+    /// deletion so no re-emit can be armed", but an in-flight decision is
+    /// not covered by that cancel. Emitting anyway opened a terminal into a
+    /// worktree the cleanup had already deleted (or a second terminal for a
+    /// generation that was already delivered).
+    fn finish_ritual_decision(
+        &self,
+        project: &str,
+        epic: &str,
+        generation: u32,
+        instruction: String,
+        recovery: bool,
+        spawn: &SuccessorSpawn,
+    ) {
+        let staged = {
+            let mut pending = self.lock_pending();
+            match pending
+                .iter_mut()
+                .find(|p| p.generation == generation && p.epic == epic && p.project == project)
             {
-                let mut pending = this.lock_pending();
-                if let Some(p) = pending
-                    .iter_mut()
-                    .find(|p| p.generation == generation && p.epic == epic && p.project == project)
-                {
+                Some(p) => {
                     p.instruction = instruction;
                     p.recovery = recovery;
+                    true
                 }
+                None => false,
             }
-            (this.emit_spawn)(&spawn);
-        });
+        };
+        if !staged {
+            log::info!(
+                "samurai replicator: gen-{generation} entry for epic {epic} vanished while its ritual was decided — no spawn emitted"
+            );
+            return;
+        }
+        (self.emit_spawn)(spawn);
     }
 
     /// Issue #63: the gen-1 LAUNCH entry point — the P3.5 launcher's seam.
@@ -1727,14 +1767,13 @@ impl SamuraiReplicator {
             } else {
                 "successor_ritual"
             };
-            let PendingRitual {
-                project,
-                epic,
-                generation,
-                instruction,
-                launch,
-                ..
-            } = p;
+            let project = p.project.clone();
+            let epic = p.epic.clone();
+            let generation = p.generation;
+            let launch = p.launch;
+            // The body the writer types in. `p` keeps its own copy so a
+            // failed write can re-arm the entry verbatim (below).
+            let instruction = p.instruction.clone();
             // Issue #109: the `delivered` audit row and the Enter-resend
             // watch (issue #103) both hang off the writer's verdict — the
             // row used to be written before the async PTY write completed,
@@ -1743,6 +1782,11 @@ impl SamuraiReplicator {
             // watch a mutex push), the DeliveryOutcome contract.
             let audit = self.audit.clone();
             let delivered = self.delivered.clone();
+            // A failed write must not destroy the only copy of the brief:
+            // the claim above already removed the entry, so the failure arm
+            // puts it back and the successor's next SessionStarted
+            // re-delivers it.
+            let pending = self.pending.clone();
             let (excerpt, total_chars) = super::samurai_audit::instruction_excerpt(&instruction);
             let outcome: super::samurai_pty::DeliveryOutcome = Box::new(move |result| {
                 match result {
@@ -1787,8 +1831,10 @@ impl SamuraiReplicator {
                         // The body never reached the PTY: a distinct ALERT
                         // instead of a false 'delivered' row, and no watch —
                         // there is nothing in the input box to re-submit.
+                        // The entry itself goes back on the pending list so
+                        // the brief is not lost with the failed write.
                         log::error!(
-                            "samurai replicator: {instruction_kind} for session {session_id} never reached the PTY ({error}) — ALERT"
+                            "samurai replicator: {instruction_kind} for session {session_id} never reached the PTY ({error}) — re-armed, ALERT"
                         );
                         audit.append(
                             &project,
@@ -1802,9 +1848,14 @@ impl SamuraiReplicator {
                                     "instruction": instruction_kind,
                                     "source": "replicator",
                                     "error": error,
+                                    "rearmed": true,
                                 }),
                             ),
                         );
+                        pending
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(p);
                     }
                 }
             });
@@ -4473,6 +4524,159 @@ mod tests {
                 .iter()
                 .any(|r| r.event == AuditEventKind::Inject && r.details["phase"] == "delivered"),
             "a failed write must never leave a 'delivered' row"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rejected_killed_transition_alerts_instead_of_aborting_silently() {
+        // The predecessor is already torn down when the KILLED transition
+        // runs, so a rejection (the session was removed concurrently) ends
+        // the epic chain. It must leave a `successor_spawn_failed` ALERT
+        // like every other abort path, not just a log line.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-rep-killed-rejected";
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        write_handoff(repo.path(), "epic-9", 2, &"f".repeat(40));
+        let snapshot = to_handoff_written(&h.supervisor, project, "epic-9", 2);
+
+        // The session vanishes underneath the replication (user closed the
+        // terminal, watchdog reaped it): KILLED can no longer be applied.
+        assert!(h.supervisor.remove_session(snapshot.session_id));
+
+        h.replicator
+            .clone()
+            .replicate(snapshot, repo.path().to_string_lossy().into_owned())
+            .await;
+
+        let mut rows = Vec::new();
+        for _ in 0..200 {
+            rows = h.audit.read(project, None, None).await.unwrap().events;
+            if rows
+                .iter()
+                .any(|r| r.details["kind"] == "successor_spawn_failed")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let alert = rows
+            .iter()
+            .find(|r| r.details["kind"] == "successor_spawn_failed")
+            .expect("a rejected KILLED transition raises successor_spawn_failed");
+        assert_eq!(alert.event, AuditEventKind::Alert);
+        assert!(
+            alert.details["failure"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("KILLED transition was rejected"),
+            "the ALERT names the rejection: {:?}",
+            alert.details
+        );
+        assert!(h.replicator.pending_view(3).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_ritual_decision_does_not_emit_a_spawn_for_a_cancelled_entry() {
+        // `cleanup_epic_inner` cancels an epic's staged entries before it
+        // deletes the worktree, but a ritual decision already in flight is
+        // not covered by that cancel. Emitting its spawn anyway opened a
+        // terminal into a directory the cleanup had just deleted.
+        let dir = tempdir().unwrap();
+        let project = "C:/git/proj-rep-cancelled-emit";
+        let spawn = SuccessorSpawn {
+            project: project.to_string(),
+            epic: "epic-9".to_string(),
+            generation: 3,
+            working_dir: project.to_string(),
+            session_name: "samurai gen-3 9".to_string(),
+            model: None,
+        };
+
+        // Nothing staged (the cleanup cancelled it while the decision ran):
+        // the decision emits nothing at all.
+        let cancelled = harness(dir.path());
+        cancelled.replicator.finish_ritual_decision(
+            project,
+            "epic-9",
+            3,
+            "decided".into(),
+            false,
+            &spawn,
+        );
+        assert!(
+            cancelled.spawns.lock().unwrap().is_empty(),
+            "a vanished entry emits no spawn"
+        );
+
+        // Still staged: the decision lands on the entry, and the spawn goes out.
+        let staged = harness(dir.path());
+        stage_successor(&staged, project).await;
+        let before = staged.spawns.lock().unwrap().len();
+        staged.replicator.finish_ritual_decision(
+            project,
+            "epic-9",
+            3,
+            "decided".into(),
+            false,
+            &spawn,
+        );
+        assert_eq!(staged.replicator.pending_view(3).unwrap().1, "decided");
+        assert_eq!(staged.spawns.lock().unwrap().len(), before + 1);
+    }
+
+    #[tokio::test]
+    async fn test_failed_body_write_rearms_the_ritual_for_the_next_start() {
+        // A failed body write must not DESTROY the staged brief: the entry
+        // is claimed out of `pending` before the write is attempted, so
+        // dropping it on failure left a registered, supervised orchestrator
+        // sitting at an empty prompt with nothing to re-deliver. The entry
+        // is re-armed instead — the next SessionStarted delivers it.
+        let dir = tempdir().unwrap();
+        let attempts: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let attempts_rec = attempts.clone();
+        let writes: Arc<Mutex<Vec<(u32, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let writes_rec = writes.clone();
+        let fail_first = Arc::new(Mutex::new(true));
+        let flaky: StdinWriter = Arc::new(move |id, data, outcome| {
+            attempts_rec.lock().unwrap().push(id);
+            let mut first = fail_first.lock().unwrap();
+            if *first {
+                *first = false;
+                outcome(Err("pty busy".to_string()));
+            } else {
+                writes_rec.lock().unwrap().push((id, data));
+                outcome(Ok(()));
+            }
+        });
+        let h = harness_with_writer(dir.path(), Some(flaky));
+        let project = "C:/git/proj-109-rearm";
+        stage_successor(&h, project).await;
+        let details = h.replicator.spawn_details(project, "epic-9", 3).unwrap();
+        let snapshot = h
+            .supervisor
+            .register_session_with_details(2, project.into(), "epic-9".into(), 3, details)
+            .unwrap();
+        h.replicator.on_registered(&snapshot);
+
+        h.replicator.observe_hook(&session_started(2));
+        assert_eq!(*attempts.lock().unwrap(), vec![2]);
+        assert!(
+            h.replicator.pending_view(3).is_some(),
+            "a failed delivery re-arms the entry instead of dropping the brief"
+        );
+
+        // The next SessionStarted re-delivers the SAME brief.
+        h.replicator.observe_hook(&session_started(2));
+        assert_eq!(*attempts.lock().unwrap(), vec![2, 2]);
+        let delivered = writes.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].0, 2);
+        assert!(delivered[0].1.contains("generation 3"));
+        assert!(
+            h.replicator.pending_view(3).is_none(),
+            "the successful delivery completes the entry"
         );
     }
 

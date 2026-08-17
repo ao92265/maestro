@@ -196,10 +196,16 @@ impl SamuraiSchedule {
         entry.project_path = normalize_project(&entry.project_path);
         let snapshot = {
             let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-            entries.retain(|e| !(e.project_path == entry.project_path && e.epic == entry.epic));
-            entries.push(entry);
-            persist(&self.path, &entries)?;
-            entries.clone()
+            // Persist a CANDIDATE list and only commit it to memory once the
+            // write succeeded. Mutating first left memory and disk disagreeing
+            // whenever the write failed: the timer was gone from this session
+            // and reloaded as a stale entry on the next start.
+            let mut candidate = entries.clone();
+            candidate.retain(|e| !(e.project_path == entry.project_path && e.epic == entry.epic));
+            candidate.push(entry);
+            persist(&self.path, &candidate)?;
+            *entries = candidate.clone();
+            candidate
         };
         self.notify_change(&snapshot);
         Ok(())
@@ -211,13 +217,17 @@ impl SamuraiSchedule {
         let project = normalize_project(project);
         let snapshot = {
             let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-            let before = entries.len();
-            entries.retain(|e| !(e.project_path == project && e.epic == epic));
-            if entries.len() == before {
+            // Same persist-then-commit order as `arm`: a launch cancels the
+            // parked run's timer, and a failed write used to drop that timer
+            // from memory anyway — the run then never resumed.
+            let mut candidate = entries.clone();
+            candidate.retain(|e| !(e.project_path == project && e.epic == epic));
+            if candidate.len() == entries.len() {
                 return Ok(false);
             }
-            persist(&self.path, &entries)?;
-            entries.clone()
+            persist(&self.path, &candidate)?;
+            *entries = candidate.clone();
+            candidate
         };
         self.notify_change(&snapshot);
         Ok(true)
@@ -604,6 +614,46 @@ mod tests {
         let mut epics: Vec<String> = schedule.list().into_iter().map(|e| e.epic).collect();
         epics.sort();
         assert_eq!(epics, vec!["#37".to_string(), "#9".to_string()]);
+    }
+
+    #[test]
+    fn test_a_failed_persist_leaves_memory_and_disk_agreeing() {
+        // A write failure (file lock, full disk, AV) must not commit the
+        // change to memory: `cancel` is called on the launch path, and a
+        // half-applied cancel dropped a parked run's resume timer for the
+        // rest of the session while the disk copy still held it.
+        let dir = tempdir().unwrap();
+        let (cb, _) = collector();
+        let (schedule, _task) = SamuraiSchedule::new(dir.path().to_path_buf(), cb, None);
+        schedule
+            .arm(entry("C:/git/alpha", "#37", &in_one_hour()))
+            .unwrap();
+        schedule
+            .arm(entry("C:/git/alpha", "#38", &in_one_hour()))
+            .unwrap();
+
+        // A directory where the temp file goes: every later write fails.
+        std::fs::create_dir(dir.path().join("schedule.json.tmp")).unwrap();
+
+        assert!(schedule
+            .arm(entry("C:/git/alpha", "#39", &in_one_hour()))
+            .is_err());
+        let mut epics: Vec<String> = schedule.list().into_iter().map(|e| e.epic).collect();
+        epics.sort();
+        assert_eq!(
+            epics,
+            vec!["#37".to_string(), "#38".to_string()],
+            "a failed arm leaves the in-memory list untouched"
+        );
+
+        assert!(schedule.cancel("C:/git/alpha", "#37").is_err());
+        let mut epics: Vec<String> = schedule.list().into_iter().map(|e| e.epic).collect();
+        epics.sort();
+        assert_eq!(
+            epics,
+            vec!["#37".to_string(), "#38".to_string()],
+            "a failed cancel leaves the timer armed"
+        );
     }
 
     #[test]
