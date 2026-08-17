@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The persisted zustand stores hydrate through the Tauri store plugin at
@@ -42,7 +42,12 @@ beforeAll(async () => {
 });
 
 import { formatFireDateTime } from "@/lib/parkTime";
-import { SAMURAI_IN_USE_ERROR_PREFIX, type SamuraiFileEntry } from "@/lib/samurai";
+import {
+  SAMURAI_IN_USE_ERROR_PREFIX,
+  type SamuraiAuditEvent,
+  type SamuraiFileEntry,
+  type SamuraiFileGroup,
+} from "@/lib/samurai";
 import { useHealthStore } from "@/stores/useHealthStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 import { SecondBrainSection } from "../SecondBrainSection";
@@ -66,12 +71,29 @@ function buildTab(overrides: Partial<WorkspaceTab> = {}): WorkspaceTab {
   };
 }
 
+/** The default run group every {@link fileEntry} belongs to (issue #139). */
+const RUN_GROUP_ID = "run:000000000000:38";
+
+function fileGroup(overrides: Partial<SamuraiFileGroup> = {}): SamuraiFileGroup {
+  return {
+    id: RUN_GROUP_ID,
+    kind: "RUN",
+    label: "Epic #38 — Samurai supervision",
+    refs: ["#38"],
+    project_path: "C:\\git\\maestro",
+    created_at: new Date(Date.now() - 2 * 3600_000).toISOString(),
+    is_live: false,
+    audit_rows: 0,
+    journal_entries: 0,
+    ...overrides,
+  };
+}
+
 function fileEntry(overrides: Partial<SamuraiFileEntry> = {}): SamuraiFileEntry {
   return {
-    // Issue #139: every entry belongs to a run or a PR review. This panel
-    // still renders by kind (issue #140 regroups it), so the id is only
-    // carried, never read.
-    group_id: "run:000000000000:38",
+    // Issue #139/#140: every entry belongs to a run or a PR review, and the
+    // panel renders one card per group keyed on this id.
+    group_id: RUN_GROUP_ID,
     kind: "HANDOFF",
     path: "C:\\data\\worktrees\\maestro\\samurai-38\\.maestro\\handoffs\\38-gen2.md",
     size_bytes: 4096,
@@ -92,20 +114,26 @@ function fileEntry(overrides: Partial<SamuraiFileEntry> = {}): SamuraiFileEntry 
  * `samurai_harvest_read` returns. `fileReads` maps a path to what
  * `samurai_file_read` resolves with; an `{ error }` value makes it reject
  * with that string instead — the backend's refusals are plain strings, not
- * Error objects (issue #82).
+ * Error objects (issue #82). `groups` is the grouped listing's card list
+ * (issue #140), defaulting to one default-labelled group per distinct
+ * `group_id` in `files`; `auditEvents` is what the audit stream reads.
  */
 function mockInvoke(
   files: SamuraiFileEntry[],
   deleteRejections: Record<string, string> = {},
   harvestMarkdown = "## Harvest 2026-08-06\n\nYesterday's bottleneck was CI.",
   fileReads: Record<string, string | { error: string }> = {},
+  groups: SamuraiFileGroup[] = [...new Set(files.map((f) => f.group_id))].map((id) =>
+    fileGroup({ id }),
+  ),
+  auditEvents: SamuraiAuditEvent[] = [],
 ) {
   invokeMock.mockImplementation(async (cmd: string, args?: unknown) => {
     switch (cmd) {
       case "samurai_files_list":
-        return { groups: [], entries: files };
+        return { groups, entries: files };
       case "samurai_audit_read":
-        return { events: [], file_size_bytes: 0 };
+        return { events: auditEvents, file_size_bytes: 0 };
       case "samurai_journal_list":
         return { entries: [], file_size_bytes: 0 };
       case "samurai_harvest_read":
@@ -157,7 +185,46 @@ describe("SecondBrainSection (issue #66)", () => {
     expect(await screen.findByText("38-gen2.md")).toBeInTheDocument();
   });
 
-  it("groups files by kind with sizes, ages and human-readable timers", async () => {
+  it("renders one card per group, with every file under its own group", async () => {
+    const run = fileGroup();
+    const review = fileGroup({
+      id: "pr:nachogl1/maestro#142",
+      kind: "PR_REVIEW",
+      label: "PR #142 — fix journal splitting",
+      refs: ["#142"],
+      created_at: new Date(Date.now() - 3 * 3600_000).toISOString(),
+    });
+    mockInvoke(
+      [
+        fileEntry(), // HANDOFF, 4 KB, 2h old — the run's
+        fileEntry({
+          group_id: review.id,
+          kind: "BRIEF",
+          path: "C:\\git\\maestro\\.maestro\\briefs\\pr-142-check+review.md",
+          epic: null,
+        }),
+      ],
+      {},
+      undefined,
+      {},
+      [run, review],
+    );
+    render(<SecondBrainSection />);
+
+    const cards = await screen.findAllByTestId("file-group");
+    expect(cards).toHaveLength(2);
+    expect(within(cards[0]).getByText(run.label)).toBeInTheDocument();
+    expect(within(cards[0]).getByText("38-gen2.md")).toBeInTheDocument();
+    expect(within(cards[0]).queryByText("pr-142-check+review.md")).toBeNull();
+    expect(within(cards[1]).getByText(review.label)).toBeInTheDocument();
+    expect(within(cards[1]).getByText("pr-142-check+review.md")).toBeInTheDocument();
+    // Nowhere else: exactly one row per file, panel-wide.
+    expect(screen.getAllByText("38-gen2.md")).toHaveLength(1);
+    // Card header: file count + total size (PRD sketch "6 files · 84 KB").
+    expect(within(cards[0]).getByText("1 file · 4 KB")).toBeInTheDocument();
+  });
+
+  it("tags a row with its kind and never renders a kind-named section header", async () => {
     mockInvoke([
       fileEntry(), // HANDOFF, 4 KB, 2h old
       fileEntry({
@@ -175,18 +242,26 @@ describe("SecondBrainSection (issue #66)", () => {
     ]);
     render(<SecondBrainSection />);
 
-    // Group headers, in kind order; JOURNAL/HARVEST stay hidden (no files),
-    // AUDIT_LOG shows its empty hint instead. The one "Journal" text is the
-    // JournalSection card header (issue #71), not a files group.
-    expect(await screen.findByText("Handoffs")).toBeInTheDocument();
-    expect(screen.getByText("Run configs")).toBeInTheDocument();
-    expect(screen.getByText("Timers")).toBeInTheDocument();
-    expect(screen.getByText("Audit logs")).toBeInTheDocument();
+    // Kind is a per-row tag …
+    expect(await screen.findByText("handoff")).toBeInTheDocument();
+    expect(screen.getByText("config")).toBeInTheDocument();
+    expect(screen.getByText("timer")).toBeInTheDocument();
+    // … never a section header, and there is no System/Other card either.
+    for (const header of [
+      "Handoffs",
+      "Run configs",
+      "Timers",
+      "Audit logs",
+      "Harvest reports",
+      "System",
+      "Other",
+    ]) {
+      expect(screen.queryByText(header)).toBeNull();
+    }
+    // The one "Journal" text is the JournalSection card header (issue #71).
     expect(screen.getAllByText("Journal")).toHaveLength(1);
-    expect(screen.queryByText("Harvest reports")).toBeNull();
-    expect(screen.getByText("None.")).toBeInTheDocument();
 
-    // Row details: basename or epic, size + age, timer fire time, in-use.
+    // Row details survive the regroup: basename or epic, size + age, timer.
     expect(screen.getByText("38-gen2.md")).toBeInTheDocument();
     expect(screen.getByText("4 KB · 2h ago")).toBeInTheDocument();
     expect(screen.getByText("2.5 MB · 2h ago")).toBeInTheDocument();
@@ -194,20 +269,187 @@ describe("SecondBrainSection (issue #66)", () => {
     expect(screen.getAllByText("IN USE")).toHaveLength(2);
   });
 
-  it("shows the Journal and Harvest reports groups once files exist", async () => {
-    mockInvoke([
-      fileEntry({ kind: "JOURNAL", path: "C:\\appdata\\samurai\\journal.jsonl", epic: null }),
-      fileEntry({
-        kind: "HARVEST_REPORT",
-        path: "C:\\appdata\\samurai\\harvest-2026-08.md",
-        epic: null,
-      }),
-    ]);
+  it("renders the backend's card order — live pinned first, then newest first", async () => {
+    // `samurai_files.rs` already sorts (!is_live, created_at desc); the panel
+    // must render that order as given rather than re-sorting it. The live
+    // group is deliberately the OLDEST, so a timestamp-only order would fail.
+    const live = fileGroup({
+      id: "run:a:1",
+      label: "Epic #1 — live",
+      is_live: true,
+      created_at: "2026-08-01T09:00:00Z",
+    });
+    const newest = fileGroup({
+      id: "run:b:2",
+      label: "Epic #2 — newest finished",
+      created_at: "2026-08-17T09:00:00Z",
+    });
+    const oldest = fileGroup({
+      id: "run:c:3",
+      label: "Epic #3 — oldest finished",
+      created_at: "2026-08-10T09:00:00Z",
+    });
+    mockInvoke(
+      [live, newest, oldest].map((g) => fileEntry({ group_id: g.id })),
+      {},
+      undefined,
+      {},
+      [live, newest, oldest],
+    );
     render(<SecondBrainSection />);
 
-    expect(await screen.findByText("Harvest reports")).toBeInTheDocument();
-    // Files group header + JournalSection card header (issue #71).
-    expect(screen.getAllByText("Journal")).toHaveLength(2);
+    const cards = await screen.findAllByTestId("file-group");
+    expect(cards.map((card) => within(card).getByTestId("file-group-label").textContent)).toEqual([
+      "Epic #1 — live",
+      "Epic #2 — newest finished",
+      "Epic #3 — oldest finished",
+    ]);
+    expect(within(cards[0]).getByText("LIVE")).toBeInTheDocument();
+    expect(within(cards[1]).queryByText("LIVE")).toBeNull();
+  });
+
+  it("collapses only the card whose header was clicked", async () => {
+    const review = fileGroup({
+      id: "pr:nachogl1/maestro#142",
+      kind: "PR_REVIEW",
+      label: "PR #142 — fix journal splitting",
+      created_at: new Date(Date.now() - 3 * 3600_000).toISOString(),
+    });
+    mockInvoke(
+      [
+        fileEntry(),
+        fileEntry({
+          group_id: review.id,
+          kind: "BRIEF",
+          path: "C:\\git\\maestro\\.maestro\\briefs\\pr-142-check+review.md",
+        }),
+      ],
+      {},
+      undefined,
+      {},
+      [fileGroup(), review],
+    );
+    render(<SecondBrainSection />);
+    expect(await screen.findByText("38-gen2.md")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Epic #38/ }));
+    expect(screen.queryByText("38-gen2.md")).toBeNull();
+    // The other card is untouched.
+    expect(screen.getByText("pr-142-check+review.md")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Epic #38/ }));
+    expect(screen.getByText("38-gen2.md")).toBeInTheDocument();
+  });
+
+  it("searches on group label and on file name, expanding the matching card", async () => {
+    const review = fileGroup({
+      id: "pr:nachogl1/maestro#142",
+      kind: "PR_REVIEW",
+      label: "PR #142 — fix journal splitting",
+      created_at: new Date(Date.now() - 3 * 3600_000).toISOString(),
+    });
+    mockInvoke(
+      [
+        fileEntry(),
+        fileEntry({
+          group_id: review.id,
+          kind: "BRIEF",
+          path: "C:\\git\\maestro\\.maestro\\briefs\\pr-142-check+review.md",
+        }),
+      ],
+      {},
+      undefined,
+      {},
+      [fileGroup(), review],
+    );
+    render(<SecondBrainSection />);
+    expect(await screen.findByText("38-gen2.md")).toBeInTheDocument();
+
+    const search = screen.getByLabelText("Search runs and files");
+    // By the PR's title: only that card survives.
+    fireEvent.change(search, { target: { value: "journal splitting" } });
+    expect(screen.getAllByTestId("file-group")).toHaveLength(1);
+    expect(screen.getByText(review.label)).toBeInTheDocument();
+    expect(screen.queryByText("38-gen2.md")).toBeNull();
+
+    // By file name: the card holding it shows, expanded even though the user
+    // had collapsed it before searching.
+    fireEvent.change(search, { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: /Epic #38/ }));
+    expect(screen.queryByText("38-gen2.md")).toBeNull();
+    fireEvent.change(search, { target: { value: "38-gen2" } });
+    expect(screen.getAllByTestId("file-group")).toHaveLength(1);
+    expect(screen.getByText("38-gen2.md")).toBeInTheDocument();
+  });
+
+  it("shows per-group audit and journal counts and filters the audit view to a group", async () => {
+    const review = fileGroup({
+      id: "pr:nachogl1/maestro#142",
+      kind: "PR_REVIEW",
+      label: "PR #142 — fix journal splitting",
+      created_at: new Date(Date.now() - 3 * 3600_000).toISOString(),
+      audit_rows: 6,
+    });
+    const auditPath = "C:\\appdata\\samurai\\audit\\maestro.jsonl";
+    mockInvoke(
+      [
+        fileEntry({ kind: "AUDIT_LOG", path: auditPath }),
+        fileEntry({ kind: "JOURNAL", path: "C:\\appdata\\samurai\\journal.jsonl" }),
+        fileEntry({ group_id: review.id, kind: "AUDIT_LOG", path: auditPath, epic: null }),
+      ],
+      {},
+      undefined,
+      {},
+      [fileGroup({ audit_rows: 37, journal_entries: 4 }), review],
+      [
+        {
+          ts: "2026-08-17T09:00:00Z",
+          epic: "#38",
+          event: "SPAWN",
+          generation: 1,
+          session_id: 1,
+          details: {},
+        },
+        {
+          ts: "2026-08-17T10:00:00Z",
+          epic: "pr:nachogl1/maestro#142",
+          event: "COMPLETE",
+          generation: 0,
+          session_id: 2,
+          details: {},
+        },
+      ],
+    );
+    render(<SecondBrainSection />);
+
+    // Counts come off the GROUP, not the shared file's size.
+    expect(await screen.findByText("37 rows")).toBeInTheDocument();
+    expect(screen.getByText("4 entries")).toBeInTheDocument();
+    expect(screen.getByText("6 rows")).toBeInTheDocument();
+
+    // A run filters the audit view by its epic …
+    fireEvent.click(
+      screen.getByRole("button", { name: "Show audit rows for Epic #38 — Samurai supervision" }),
+    );
+    expect(screen.getByText(/Session spawned/)).toBeInTheDocument();
+    expect(screen.queryByText("Run completed")).toBeNull();
+
+    // … a PR review by its group id (its rows carry no epic).
+    fireEvent.click(screen.getByRole("button", { name: `Show audit rows for ${review.label}` }));
+    expect(screen.getByText("Run completed")).toBeInTheDocument();
+    expect(screen.queryByText(/Session spawned/)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear audit filter" }));
+    expect(screen.getByText(/Session spawned/)).toBeInTheDocument();
+    expect(screen.getByText("Run completed")).toBeInTheDocument();
+  });
+
+  it("renders the empty state when nothing has run yet", async () => {
+    mockInvoke([], {}, undefined, {}, []);
+    render(<SecondBrainSection />);
+
+    expect(await screen.findByText("No runs or PR reviews yet.")).toBeInTheDocument();
+    expect(screen.queryAllByTestId("file-group")).toHaveLength(0);
   });
 
   it("deletes a file only after the user confirms", async () => {

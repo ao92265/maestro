@@ -497,7 +497,26 @@ function mergeAuditRows(
   return [...extra, ...read].slice(0, AUDIT_TAIL);
 }
 
-export function AuditSection() {
+/**
+ * A group's slice of the audit stream (issue #140): the Second Brain's per-run
+ * / per-PR-review audit row focuses this view instead of opening a second one.
+ * `runId` is what the rows' `epic` must equal — a run's epic identity string,
+ * or the `pr:<owner/repo>#<number>` id a PR review's rows are stamped with.
+ */
+export interface AuditRunFilter {
+  runId: string;
+  /** The group's label, for the "showing … only" line. */
+  label: string;
+}
+
+export function AuditSection({
+  filter = null,
+  onClearFilter,
+}: {
+  /** Show only this group's rows; null (the default) shows every row. */
+  filter?: AuditRunFilter | null;
+  onClearFilter?: () => void;
+} = {}) {
   const tabs = useWorkspaceStore((s) => s.tabs);
   const activeTab = tabs.find((t) => t.active);
   const projectPath = activeTab?.projectPath ?? "";
@@ -577,6 +596,12 @@ export function AuditSection() {
     }
   };
 
+  // Issue #140: the Second Brain's per-group audit row focuses this stream on
+  // one run / PR review rather than opening a second audit surface. The rows
+  // carry that identity in their `epic`.
+  const visible =
+    events === null || filter === null ? events : events.filter((e) => e.epic === filter.runId);
+
   return (
     <div className={cardClass}>
       <SectionHeader
@@ -584,9 +609,9 @@ export function AuditSection() {
         label="Samurai Audit"
         iconColor="text-maestro-accent"
         badge={
-          events && events.length > 0 ? (
+          visible && visible.length > 0 ? (
             <span className="rounded-full bg-maestro-accent/20 px-1.5 text-[10px] font-bold text-maestro-accent">
-              {events.length}
+              {visible.length}
             </span>
           ) : undefined
         }
@@ -619,20 +644,35 @@ export function AuditSection() {
         {fileSizeBytes > 0 ? ` ${Math.max(1, Math.round(fileSizeBytes / 1024))} KB on disk.` : ""}
       </p>
       {error && <p className="mb-2 text-[11px] text-maestro-red">{error}</p>}
-      {events === null ? (
+      {filter && (
+        <div className="mb-2 flex items-center gap-1.5 text-[11px]">
+          <span className="min-w-0 flex-1 truncate text-maestro-accent">
+            Showing {filter.label} only
+          </span>
+          <button
+            type="button"
+            onClick={onClearFilter}
+            aria-label="Clear audit filter"
+            className="shrink-0 rounded px-1 py-px text-maestro-muted hover:bg-maestro-surface hover:text-maestro-text"
+          >
+            Clear
+          </button>
+        </div>
+      )}
+      {visible === null ? (
         <div className="flex items-center gap-2 px-1 py-2 text-[11px] text-maestro-muted">
           <Loader2 size={12} className="animate-spin" /> Loading…
         </div>
-      ) : events.length === 0 ? (
+      ) : visible.length === 0 ? (
         <p className="px-1 py-2 text-[11px] italic text-maestro-muted">
-          No audit events for this project.
+          {filter ? `No audit rows for ${filter.label}.` : "No audit events for this project."}
         </p>
       ) : (
         // Bounded + scrollable (issue #123): without this, a long-running
         // project's audit rows push the Files card ever further down the
         // Second Brain panel instead of scrolling in place.
         <div data-testid="audit-events" className="max-h-[40vh] space-y-2 overflow-y-auto">
-          {groupByRun(events).map((run) => (
+          {groupByRun(visible).map((run) => (
             <div key={run.key}>
               <div className="mb-0.5 px-1 text-[10px] font-semibold uppercase tracking-wide text-maestro-muted">
                 {run.label}
