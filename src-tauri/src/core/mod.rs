@@ -17,6 +17,7 @@ pub mod plugin_manager;
 pub mod process_manager;
 pub mod samurai_audit;
 pub mod samurai_auth_watch;
+pub mod samurai_brief;
 pub mod samurai_completion;
 pub mod samurai_config;
 pub mod samurai_context;

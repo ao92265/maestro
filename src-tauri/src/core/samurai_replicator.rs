@@ -82,6 +82,7 @@ use crate::commands::ai_runner::{strip_ansi, truncate_chars};
 
 use super::claude_event::ClaudeEvent;
 use super::samurai_audit::{AuditEvent, AuditEventKind, AuditLog};
+use super::samurai_brief;
 use super::samurai_config::SharedSamuraiConfig;
 use super::samurai_injector::{strip_extended_prefix, AgeableInstant, SessionDirResolver};
 use super::samurai_journal::default_journal_file;
@@ -278,6 +279,39 @@ fn read_handoff_tolerant(dir: &Path, epic: &str, generation: u32) -> Option<(Str
             }
         }
     }
+}
+
+/// Issue #137: what a decided instruction is actually DELIVERED as — a brief
+/// file in the run worktree plus a one-line pointer at it when the text is
+/// too long to type reliably, the text itself when it is short enough for
+/// the existing inline transport.
+///
+/// The file write is blocking, so it runs on the blocking pool like every
+/// other file write in this module; a join failure falls back to the full
+/// text, exactly like a failed write inside
+/// [`samurai_brief::deliverable_instruction`] — the brief file can only ever
+/// improve delivery, never block it.
+async fn brief_or_inline(working_dir: &str, name: String, instruction: String) -> String {
+    let worktree = PathBuf::from(working_dir);
+    let inline = instruction.clone();
+    tokio::task::spawn_blocking(move || {
+        samurai_brief::deliverable_instruction(&worktree, &name, instruction)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        log::warn!(
+            "samurai replicator: the brief write task failed ({e}) — typing the full instruction inline instead"
+        );
+        inline
+    })
+}
+
+/// The brief file name for one staged ritual (issue #137):
+/// `gen-<N>-ritual` / `gen-<N>-recovery`, named for the generation that
+/// reads it.
+fn ritual_brief_name(generation: u32, recovery: bool) -> String {
+    let kind = if recovery { "recovery" } else { "ritual" };
+    format!("gen-{generation}-{kind}")
 }
 
 /// Whether one pending ritual has waited too long for its successor to
@@ -1051,6 +1085,15 @@ impl SamuraiReplicator {
                 )
             }
         };
+        // Issue #137: a ritual is several KB — far past what the PTY can be
+        // trusted to carry — so it is written into the worktree and the
+        // successor is handed a one-line pointer at it.
+        let instruction = brief_or_inline(
+            &working_dir,
+            ritual_brief_name(generation, recovery),
+            instruction,
+        )
+        .await;
         let spawn = SuccessorSpawn {
             project: snapshot.project.clone(),
             epic: snapshot.epic.clone(),
@@ -1195,38 +1238,48 @@ impl SamuraiReplicator {
         let snapshot = snapshot.clone();
         tauri::async_runtime::spawn(async move {
             // Finding D: derive the `--repo` pin (blocking git → blocking
-            // pool) and swap the staged instruction to the pinned wording.
-            // Safe ordering: the ritual is only ever delivered on the
-            // successor's SessionStarted, which cannot precede the spawn
-            // event emitted at the end of this task.
+            // pool) and re-stage the instruction — pinned when the remote
+            // resolved, and (issue #137) as a brief FILE plus a one-line
+            // pointer, which is the write the synchronous staging above
+            // deliberately could not do. Safe ordering: the ritual is only
+            // ever delivered on the successor's SessionStarted, which cannot
+            // precede the spawn event emitted at the end of this task.
             let pin_dir = PathBuf::from(working_dir.clone());
             let repo_pin = tokio::task::spawn_blocking(move || derive_repo_pin(&pin_dir))
                 .await
                 .unwrap_or(None);
-            if let Some(pin) = repo_pin {
-                // Issue #91: resolved before the lock, like the staging path.
-                let workflow = this.workflow_for(&snapshot.project, &snapshot.epic);
+            // Issue #91: resolved before the lock, like the staging path.
+            let workflow = this.workflow_for(&snapshot.project, &snapshot.epic);
+            // Issue #72 / fix M4: the re-stage must not drop the journaling
+            // rider the staged brief already carried. An unresolved pin
+            // recomputes the identical unpinned text the staging path built.
+            let instruction = format!(
+                "{} {}",
+                samurai_prompts::recovery_ritual_instruction(
+                    &snapshot.epic,
+                    snapshot.generation,
+                    repo_pin.as_deref(),
+                    &workflow,
+                    this.has_refs_for(&snapshot.project, &snapshot.epic),
+                    this.launch_text_for(&snapshot.project, &snapshot.epic)
+                        .as_deref(),
+                ),
+                samurai_prompts::journal_instruction(&default_journal_file()),
+            );
+            let instruction = brief_or_inline(
+                &working_dir,
+                ritual_brief_name(generation, true),
+                instruction,
+            )
+            .await;
+            {
                 let mut pending = this.lock_pending();
                 if let Some(p) = pending.iter_mut().find(|p| {
                     p.generation == generation
                         && p.epic == snapshot.epic
                         && p.project == snapshot.project
                 }) {
-                    // Issue #72 / fix M4: the pin swap must not drop the
-                    // journaling rider the staged brief already carried.
-                    p.instruction = format!(
-                        "{} {}",
-                        samurai_prompts::recovery_ritual_instruction(
-                            &snapshot.epic,
-                            snapshot.generation,
-                            Some(&pin),
-                            &workflow,
-                            this.has_refs_for(&snapshot.project, &snapshot.epic),
-                            this.launch_text_for(&snapshot.project, &snapshot.epic)
-                                .as_deref(),
-                        ),
-                        samurai_prompts::journal_instruction(&default_journal_file()),
-                    );
+                    p.instruction = instruction;
                 }
             }
             // The watchdog does not stop the transcript watcher, so the dead
@@ -1486,6 +1539,14 @@ impl SamuraiReplicator {
                     )
                 }
             };
+            // Issue #137: the decided ritual is delivered as a brief file
+            // plus a pointer — the same treatment `replicate` gives its own.
+            let instruction = brief_or_inline(
+                &working_dir,
+                ritual_brief_name(generation, recovery),
+                instruction,
+            )
+            .await;
             this.finish_ritual_decision(&project, &epic, generation, instruction, recovery, &spawn);
         });
     }
@@ -1542,8 +1603,8 @@ impl SamuraiReplicator {
     /// event re-emitted per timeout window while unregistered (bounded by
     /// [`MAX_SPAWN_EMITS`], closed out with a `spawn_dropped` ALERT), and
     /// the brief typed in on the session's first `SessionStarted`. Fully
-    /// synchronous — there is no file or git I/O to defer, the instruction
-    /// is already complete.
+    /// synchronous — the instruction is already complete, and the only I/O
+    /// is the one small brief-file write (issue #137).
     pub fn spawn_first_generation(
         self: &Arc<Self>,
         project: &str,
@@ -1553,6 +1614,17 @@ impl SamuraiReplicator {
     ) {
         let generation = 1;
         let working_dir = strip_extended_prefix(working_dir).to_string();
+        // Issue #137: the launch brief is the longest payload Maestro
+        // delivers and the one observed arriving spliced mid-word — it goes
+        // to a file in the worktree and gen-1 is handed a pointer at it. One
+        // small write, on the launch command's own async path (which already
+        // wrote the run config synchronously); a failure keeps today's
+        // inline delivery.
+        let instruction = samurai_brief::deliverable_instruction(
+            Path::new(&working_dir),
+            &format!("gen-{generation}-launch"),
+            instruction,
+        );
         let spawn = SuccessorSpawn {
             project: project.to_string(),
             epic: epic.to_string(),
@@ -2381,6 +2453,18 @@ mod tests {
         }
     }
 
+    /// What the agent actually reads for a staged instruction (issue #137):
+    /// a staged POINTER is followed to the brief file it names; a short
+    /// instruction was typed inline and is returned as it stands.
+    fn brief_text(worktree: &Path, staged: &str) -> String {
+        let Some(rest) = staged.strip_prefix("[Maestro Samurai] Read `") else {
+            return staged.to_string();
+        };
+        let relpath = rest.split('`').next().expect("the pointer names a path");
+        std::fs::read_to_string(worktree.join(relpath))
+            .unwrap_or_else(|e| panic!("the pointed-to brief {relpath} must exist: {e}"))
+    }
+
     /// `git init` + one commit, returning nothing; identity is repo-local.
     fn init_repo(dir: &Path) {
         let run = |args: &[&str]| {
@@ -2634,9 +2718,11 @@ mod tests {
             strip_extended_prefix(&repo.path().to_string_lossy()).to_string()
         );
 
-        // HEAD matched → the staged ritual skips verify.
-        let (registered, instruction) = h.replicator.pending_view(3).unwrap();
+        // HEAD matched → the staged ritual skips verify. (Issue #137: the
+        // ritual itself lives in a brief file; what is staged points at it.)
+        let (registered, staged) = h.replicator.pending_view(3).unwrap();
         assert_eq!(registered, None);
+        let instruction = brief_text(repo.path(), &staged);
         assert!(instruction.contains("SKIP"));
         assert!(instruction.contains("generation 3"));
         assert!(!instruction.contains('\n'));
@@ -2668,8 +2754,9 @@ mod tests {
         h.replicator.on_handoff_written(&snapshot);
         wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
 
-        let (registered, instruction) = h.replicator.pending_view(3).unwrap();
+        let (registered, staged) = h.replicator.pending_view(3).unwrap();
         assert_eq!(registered, None);
+        let instruction = brief_text(repo.path(), &staged);
         assert!(!instruction.contains("RECOVERY MODE"), "{instruction}");
         assert!(instruction.contains("SKIP"), "HEAD matched: {instruction}");
         // Fix C2: the brief must name the path the handoff was ACTUALLY
@@ -2699,7 +2786,8 @@ mod tests {
         h.replicator.on_handoff_written(&snapshot);
         wait_until(|| h.replicator.pending_view(3).is_some()).await;
 
-        let (_, instruction) = h.replicator.pending_view(3).unwrap();
+        let (_, staged) = h.replicator.pending_view(3).unwrap();
+        let instruction = brief_text(repo.path(), &staged);
         assert!(instruction.contains("MUST run every command"));
         assert!(!instruction.contains("SKIP"));
     }
@@ -2722,7 +2810,8 @@ mod tests {
         h.replicator.on_handoff_written(&snapshot);
         wait_until(|| state_of(&h.supervisor, 1) == Some(SupervisorState::Killed)).await;
         wait_until(|| h.replicator.pending_view(3).is_some()).await;
-        let (_, instruction) = h.replicator.pending_view(3).unwrap();
+        let (_, staged) = h.replicator.pending_view(3).unwrap();
+        let instruction = brief_text(not_a_repo.path(), &staged);
         assert!(instruction.contains("MUST run every command"));
         assert!(!instruction.contains("RECOVERY"));
     }
@@ -2763,7 +2852,7 @@ mod tests {
 
     /// Stages a gen-3 successor for epic-9 (HEAD mismatch variant — the
     /// gate does not matter for the delivery tests) and returns the project.
-    async fn stage_successor(h: &Harness, project: &str) {
+    async fn stage_successor(h: &Harness, project: &str) -> tempfile::TempDir {
         let repo = tempdir().unwrap();
         init_repo(repo.path());
         write_handoff(repo.path(), "epic-9", 2, &"f".repeat(40));
@@ -2774,6 +2863,10 @@ mod tests {
         let snapshot = to_handoff_written(&h.supervisor, project, "epic-9", 2);
         h.replicator.on_handoff_written(&snapshot);
         wait_until(|| h.replicator.pending_view(3).is_some()).await;
+        // Returned so callers that read the staged brief FILE (issue #137)
+        // keep the worktree alive; dropping it deletes the worktree, which
+        // is all the other callers ever needed.
+        repo
     }
 
     fn session_started(session_id: u32) -> ClaudeEvent {
@@ -2790,7 +2883,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         let project = "C:/git/proj-rep-arm";
-        stage_successor(&h, project).await;
+        let repo = stage_successor(&h, project).await;
 
         // The registration command's flow: linking details, register with
         // them, notify the replicator.
@@ -2839,8 +2932,11 @@ mod tests {
         assert_eq!(writes[0].0, 2);
         assert!(!writes[0].1.contains('\r'), "no submit key in the payload");
         assert!(!writes[0].1.contains('\n'));
-        assert!(writes[0].1.contains("generation 3"));
-        assert!(writes[0].1.contains(".maestro/handoffs/epic-9-gen2.md"));
+        // Issue #137: the payload is the POINTER; the ritual it names is on
+        // disk in the worktree.
+        let delivered = brief_text(repo.path(), &writes[0].1);
+        assert!(delivered.contains("generation 3"));
+        assert!(delivered.contains(".maestro/handoffs/epic-9-gen2.md"));
 
         // Issue #101: the delivered ritual lands an INJECT audit row with a
         // bounded excerpt of the exact text typed in.
@@ -3147,9 +3243,9 @@ mod tests {
         wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
         assert_eq!(*h.torn_down.lock().unwrap(), vec![1]);
         assert_eq!(h.spawns.lock().unwrap()[0].generation, 3);
-        let (_, instruction) = h.replicator.pending_view(3).unwrap();
+        let (_, staged) = h.replicator.pending_view(3).unwrap();
         assert!(
-            instruction.contains("SKIP"),
+            brief_text(repo.path(), &staged).contains("SKIP"),
             "HEAD matched → verify skipped"
         );
     }
@@ -3294,7 +3390,8 @@ mod tests {
         );
         let spawn = h.spawns.lock().unwrap()[0].clone();
         assert_eq!(spawn.generation, 2, "the successor is generation 2");
-        let (_, ritual) = h.replicator.pending_view(2).unwrap();
+        let (_, staged) = h.replicator.pending_view(2).unwrap();
+        let ritual = brief_text(repo.path(), &staged);
         assert!(
             ritual.contains("SKIP"),
             "HEAD matches the handoff, so the successor skips verify: {ritual}"
@@ -3510,7 +3607,8 @@ mod tests {
         // The kill still happened (this is the killed path, not DEAD) …
         assert_eq!(*h.torn_down.lock().unwrap(), vec![1]);
         // … but the staged instruction is the RECOVERY ritual.
-        let (_, instruction) = h.replicator.pending_view(3).unwrap();
+        let (_, staged) = h.replicator.pending_view(3).unwrap();
+        let instruction = brief_text(repo.path(), &staged);
         assert!(instruction.contains("RECOVERY MODE"));
         assert!(instruction.contains(".maestro/handoffs/epic-9-gen3-recovery.md"));
         assert!(!instruction.contains("MUST run every command"));
@@ -3572,15 +3670,18 @@ mod tests {
         // torn down — the tile stays for the human to dismiss.
         assert_eq!(h.replicator.pending_count(3), 1);
         assert!(h.torn_down.lock().unwrap().is_empty());
-        let (_, instruction) = h.replicator.pending_view(3).unwrap();
+
+        // One spawn event, emitted after the digest file is written.
+        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
+        // The staged brief is final once the spawn is out (issue #137: the
+        // async task writes the brief file and stages the pointer at it).
+        let (_, staged) = h.replicator.pending_view(3).unwrap();
+        let instruction = brief_text(repo.path(), &staged);
         assert!(instruction.contains("RECOVERY MODE"));
         // Fix M4: the journaling rider rides the DEAD-recovery brief.
         assert!(instruction.contains("journal.jsonl"));
         assert!(instruction.contains("\"BOTTLENECK\""));
         assert!(!instruction.contains('\n'));
-
-        // One spawn event, emitted after the digest file is written.
-        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
         {
             let spawns = h.spawns.lock().unwrap();
             assert_eq!(spawns.len(), 1);
@@ -3620,7 +3721,7 @@ mod tests {
         let writes = h.writes.lock().unwrap().clone();
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].0, 2);
-        assert!(writes[0].1.contains("RECOVERY MODE"));
+        assert!(brief_text(repo.path(), &writes[0].1).contains("RECOVERY MODE"));
         assert!(!writes[0].1.contains('\r'), "no submit key in the payload");
 
         // The successor's SPAWN audit row carries the recovery mark.
@@ -3713,7 +3814,8 @@ mod tests {
         // event, so once the spawn is out the instruction is final.
         wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
 
-        let (_, instruction) = h.replicator.pending_view(3).unwrap();
+        let (_, staged) = h.replicator.pending_view(3).unwrap();
+        let instruction = brief_text(repo.path(), &staged);
         assert!(instruction.contains("RECOVERY MODE"));
         assert_eq!(
             instruction.matches("--repo nachogl1/maestro").count(),
@@ -3743,7 +3845,8 @@ mod tests {
         h.replicator.on_dead(&snapshot);
         wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
 
-        let (_, instruction) = h.replicator.pending_view(3).unwrap();
+        let (_, staged) = h.replicator.pending_view(3).unwrap();
+        let instruction = brief_text(repo.path(), &staged);
         assert!(instruction.contains("RECOVERY MODE"));
         // No pinned `gh` usage (the caution itself mentions the missing pin).
         assert!(!instruction.contains("passing `--repo"));
@@ -4026,7 +4129,8 @@ mod tests {
         h.replicator
             .spawn_generation(project, "epic-9", &working_dir, 4, Some(3), "resume_timer");
         wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
-        let (_, instruction) = h.replicator.pending_view(4).unwrap();
+        let (_, staged) = h.replicator.pending_view(4).unwrap();
+        let instruction = brief_text(repo.path(), &staged);
         assert!(
             instruction.contains("Step 1: custom implement ritual"),
             "{instruction}"
@@ -4046,7 +4150,8 @@ mod tests {
         h.replicator
             .spawn_generation(project, "epic-88", &working_dir, 6, Some(5), "resume_timer");
         wait_until(|| h.spawns.lock().unwrap().len() >= 2).await;
-        let (_, instruction) = h.replicator.pending_view(6).unwrap();
+        let (_, staged) = h.replicator.pending_view(6).unwrap();
+        let instruction = brief_text(repo.path(), &staged);
         assert!(instruction.contains("RECOVERY MODE"), "{instruction}");
         assert!(
             instruction.contains("Step 2: Run a fresh-eyes review"),
@@ -4085,8 +4190,9 @@ mod tests {
         assert_eq!(spawns[0].working_dir, working_dir);
 
         // Handoff present + HEAD match → the normal ritual, verify skipped.
-        let (registered, instruction) = h.replicator.pending_view(4).unwrap();
+        let (registered, staged) = h.replicator.pending_view(4).unwrap();
         assert_eq!(registered, None);
+        let instruction = brief_text(repo.path(), &staged);
         assert!(instruction.contains("SKIP"));
         assert!(instruction.contains("generation 4"));
         assert!(instruction.contains(".maestro/handoffs/epic-9-gen3.md"));
@@ -4126,7 +4232,8 @@ mod tests {
         );
         wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
 
-        let (_, instruction) = h.replicator.pending_view(4).unwrap();
+        let (_, staged) = h.replicator.pending_view(4).unwrap();
+        let instruction = brief_text(repo.path(), &staged);
         assert!(instruction.contains("RECOVERY"));
         assert!(instruction.contains("generation 4"));
         // Fix M4: the fresh-spawn recovery brief carries the journaling
@@ -4695,7 +4802,7 @@ mod tests {
         });
         let h = harness_with_writer(dir.path(), Some(flaky));
         let project = "C:/git/proj-109-rearm";
-        stage_successor(&h, project).await;
+        let repo = stage_successor(&h, project).await;
         let details = h.replicator.spawn_details(project, "epic-9", 3).unwrap();
         let snapshot = h
             .supervisor
@@ -4716,7 +4823,7 @@ mod tests {
         let delivered = writes.lock().unwrap().clone();
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].0, 2);
-        assert!(delivered[0].1.contains("generation 3"));
+        assert!(brief_text(repo.path(), &delivered[0].1).contains("generation 3"));
         assert!(
             h.replicator.pending_view(3).is_none(),
             "the successful delivery completes the entry"
@@ -5087,5 +5194,139 @@ mod tests {
         }
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].session_id, 9);
+    }
+
+    // --- issue #137: long briefs are delivered as FILES, not typed ---
+
+    #[tokio::test]
+    async fn test_gen_1_launch_stages_a_pointer_at_a_launch_brief_file() {
+        // The gen-1 brief is the longest payload Maestro types, and the one
+        // observed arriving spliced. What gets staged — and therefore typed
+        // — is now a one-line pointer; the brief itself is on disk.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-brief-launch";
+        let worktree = tempdir().unwrap();
+        let brief = samurai_prompts::launch_instruction(
+            &samurai_prompts::RunRefs::epics_only("#38"),
+            Some("nachogl1/maestro"),
+            &samurai_workflow::compiled_for_run(None),
+        );
+        let working_dir = worktree.path().to_string_lossy().into_owned();
+
+        h.replicator
+            .spawn_first_generation(project, "#38", &working_dir, brief.clone());
+
+        let (_, staged) = h.replicator.pending_view(1).unwrap();
+        assert_eq!(
+            staged,
+            samurai_brief::pointer_instruction(".maestro/briefs/gen-1-launch.md")
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.path().join(".maestro/briefs/gen-1-launch.md"))
+                .unwrap(),
+            brief,
+            "the brief on disk is what the caller composed, byte for byte"
+        );
+        // And what reaches the PTY is one frame, so no chunk boundary can
+        // splice it.
+        let details = h.replicator.spawn_details(project, "#38", 1).unwrap();
+        let snapshot = h
+            .supervisor
+            .register_session_with_details(5, project.into(), "#38".into(), 1, details)
+            .unwrap();
+        h.replicator.on_registered(&snapshot);
+        h.replicator.observe_hook(&session_started(5));
+        let writes = h.writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0], (5, staged.clone()));
+        assert_eq!(
+            crate::core::samurai_pty::chunk_frames(&staged).len(),
+            1,
+            "the pointer must be typed as a single frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_successor_ritual_is_staged_as_a_brief_file() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-brief-ritual";
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        let head = read_repo_head(repo.path()).unwrap();
+        write_handoff(repo.path(), "epic-9", 2, &head);
+        h.dirs
+            .lock()
+            .unwrap()
+            .insert(1, repo.path().to_string_lossy().into_owned());
+        let snapshot = to_handoff_written(&h.supervisor, project, "epic-9", 2);
+
+        h.replicator.on_handoff_written(&snapshot);
+        wait_until(|| h.replicator.pending_view(3).is_some()).await;
+
+        let (_, staged) = h.replicator.pending_view(3).unwrap();
+        assert_eq!(
+            staged,
+            samurai_brief::pointer_instruction(".maestro/briefs/gen-3-ritual.md")
+        );
+        // The ritual itself is intact in the file the pointer names.
+        let brief = brief_text(repo.path(), &staged);
+        assert!(brief.contains("SKIP"), "{brief}");
+        assert!(brief.contains("generation 3"), "{brief}");
+        assert!(brief.contains("journal.jsonl"), "{brief}");
+    }
+
+    #[tokio::test]
+    async fn test_recovery_ritual_is_staged_as_a_brief_file() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-brief-recovery";
+        let repo = tempdir().unwrap();
+        init_repo(repo.path());
+        h.dirs
+            .lock()
+            .unwrap()
+            .insert(1, repo.path().to_string_lossy().into_owned());
+        let snapshot = to_dead(&h.supervisor, project, "epic-9", 2);
+
+        h.replicator.on_dead(&snapshot);
+        // The `--repo` pin swap runs on the async task; the brief is written
+        // there too, before the spawn event the successor follows.
+        wait_until(|| !h.spawns.lock().unwrap().is_empty()).await;
+
+        let (_, staged) = h.replicator.pending_view(3).unwrap();
+        assert_eq!(
+            staged,
+            samurai_brief::pointer_instruction(".maestro/briefs/gen-3-recovery.md")
+        );
+        let brief = brief_text(repo.path(), &staged);
+        assert!(brief.contains("RECOVERY MODE"), "{brief}");
+        assert!(brief.contains("journal.jsonl"), "{brief}");
+    }
+
+    #[tokio::test]
+    async fn test_a_worktree_that_cannot_take_a_brief_keeps_the_inline_text() {
+        // No new failure mode: when the brief cannot be written, the agent
+        // gets exactly the payload it got before issue #137.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let worktree = tempdir().unwrap();
+        // `.maestro` occupied by a file → the brief directory cannot exist.
+        std::fs::write(worktree.path().join(".maestro"), "not a directory").unwrap();
+        let brief = samurai_prompts::launch_instruction(
+            &samurai_prompts::RunRefs::epics_only("#38"),
+            None,
+            &samurai_workflow::compiled_for_run(None),
+        );
+
+        h.replicator.spawn_first_generation(
+            "C:/git/proj-brief-fallback",
+            "#38",
+            &worktree.path().to_string_lossy(),
+            brief.clone(),
+        );
+
+        assert_eq!(h.replicator.pending_view(1).unwrap().1, brief);
     }
 }
