@@ -50,6 +50,25 @@ const NOUN: &str = "harvest report";
 /// paste — past ~4 KiB the PTY submit's scaled delay is already capped, see
 /// `core::samurai_pty::submit_delay`).
 const MAX_ENTRIES_CHARS: usize = 12_000;
+/// Chars held back from [`MAX_ENTRIES_CHARS`] for everything
+/// [`render_entry`] wraps around an entry's TEXT, so a split part always
+/// renders whole instead of falling to the truncation backstop. Summed from
+/// the pieces that prefix the text: the `"- "` bullet plus the ` — `
+/// separator (5); a timestamp (64 — RFC 3339 needs ~35, but agents
+/// hand-write the field); a space plus the longest category wire spelling,
+/// `IMPROVEMENT` (12); ` project=` plus a Windows `MAX_PATH` project path
+/// (269); ` agent=` plus an agent name (71). Deliberately generous: none of
+/// those fields is length-checked on disk, so this is headroom rather than
+/// a proof — [`truncate_chars_inline`] stays the last-ditch backstop for
+/// the pathological line.
+const RENDER_OVERHEAD_RESERVE_CHARS: usize = 5 + 64 + 12 + 269 + 71;
+/// Per-entry TEXT budget the harvest splits oversized journal entries to
+/// (issue #135): what is left of the prompt cap once the render overhead is
+/// reserved. A part sized to this renders as ONE whole entry inside
+/// [`MAX_ENTRIES_CHARS`], which is exactly what
+/// [`JournalStore::split_oversized_unconsumed`] needs to guarantee that
+/// every part is deliverable.
+const MAX_ENTRY_TEXT_CHARS: usize = MAX_ENTRIES_CHARS - RENDER_OVERHEAD_RESERVE_CHARS;
 /// The empty-journal refusal — pinned by test, surfaced verbatim in the UI.
 const NOTHING_TO_HARVEST: &str = "Nothing to harvest — no unconsumed journal entries.";
 
@@ -126,7 +145,9 @@ fn truncate_chars_inline(s: &str, max_chars: usize) -> String {
 /// never mid-entry, so what the session triages is exactly what
 /// [`JournalStore::commit_harvest`] consumes (fix M2 semantics carried over
 /// from the headless runner). Always renders at least one entry — a single
-/// oversized entry is char-capped as a backstop so the paste stays bounded.
+/// oversized entry is char-capped as a backstop so the paste stays bounded
+/// (issue #135 splits oversized entries on disk before this runs, so the
+/// backstop now only fires when that split failed).
 /// Withheld entries are counted in a final data note and stay unconsumed
 /// for the next harvest. Returns the block plus the number of entries
 /// rendered — the injection's `snapshot_len` consumption boundary.
@@ -312,6 +333,21 @@ impl HarvestTriage {
             .remove(&session_id)
         {
             return;
+        }
+        // Oversized entries are split on disk FIRST (issue #135), so the
+        // lines listed, rendered and content-anchored below are already the
+        // whole part-entries the cap machinery can deliver — instead of one
+        // undeliverable entry that would be char-truncated and then consumed
+        // with its tail unread. Advisory, like the harvest itself: a split
+        // that fails must not cost the user the harvest, and
+        // `truncate_chars_inline` still bounds the paste.
+        if let Err(e) = self
+            .journal
+            .split_oversized_unconsumed(MAX_ENTRY_TEXT_CHARS)
+        {
+            log::warn!(
+                "samurai harvest: splitting oversized journal entries failed: {e} — harvesting the entries as they are"
+            );
         }
         // Built at injection time, not arm time: entries appended while the
         // terminal was booting are included (and consumed) too. The raw
@@ -706,6 +742,73 @@ mod tests {
         // The oversized run itself must not survive the cap.
         assert!(!block.contains(&"x".repeat(MAX_ENTRIES_CHARS + 1)));
         assert!(!block.contains("withheld"), "nothing was withheld");
+    }
+
+    #[test]
+    fn test_oversized_entry_is_split_and_delivered_across_harvests() {
+        // Issue #135, end to end: an entry too long for one prompt used to be
+        // char-truncated, consumed and archived — everything past the cut was
+        // never delivered to any harvest. It is now split on disk into whole
+        // part-entries, so consecutive harvests deliver ALL of it, oldest
+        // part first, and nothing is truncated, lost or stalled.
+        let dir = tempdir().unwrap();
+        let journal = Arc::new(JournalStore::new(dir.path().to_path_buf()));
+        // Position-sensitive filler: a lost or reordered chunk shows up in
+        // the reassembly a `"x".repeat` would hide.
+        let original: String = (0..MAX_ENTRY_TEXT_CHARS * 5 / 2)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        journal
+            .append_entry(&entry(
+                "2026-08-17T10:00:00+00:00",
+                JournalCategory::Bottleneck,
+                &original,
+                None,
+                None,
+            ))
+            .unwrap();
+        let (triage, delivered) = triage_with_journal(journal.clone(), "/downloads");
+
+        // The entries block is the prompt's tail, so the delivered part text
+        // is everything after the rendered entry's ` — ` separator.
+        let part_body = |prompt: &str| -> String {
+            let block = prompt.split("ENTRIES: ").last().unwrap();
+            let (marker, body) = block.split_once("] ").unwrap();
+            assert!(marker.contains("[part "), "{marker}");
+            // The still-withheld parts are announced in a trailing data
+            // note; only the part's own text belongs to the reassembly.
+            match body.split_once(" (+") {
+                Some((text, note)) => {
+                    assert!(note.ends_with("withheld to the next harvest)"), "{note}");
+                    text.to_string()
+                }
+                None => body.to_string(),
+            }
+        };
+
+        let mut reassembled = String::new();
+        let mut harvests = 0usize;
+        while triage.arm(1 + harvests as u32).is_ok() {
+            triage.on_session_started(1 + harvests as u32);
+            harvests += 1;
+            assert!(harvests < 10, "the harvest must drain, not stall");
+            let prompt = delivered.lock().unwrap().last().unwrap().1.clone();
+            assert!(
+                !prompt.contains("[... truncated ...]"),
+                "a split part must never hit the truncation backstop"
+            );
+            assert!(
+                prompt.contains(&format!("[part {harvests}/")),
+                "parts are delivered oldest-first"
+            );
+            reassembled.push_str(&part_body(&prompt));
+        }
+
+        assert!(harvests > 1, "an oversized entry spans several harvests");
+        assert_eq!(reassembled, original, "every char reached a harvest");
+        assert!(statuses(&journal)
+            .iter()
+            .all(|s| *s == JournalEntryStatus::Consumed));
     }
 
     #[test]

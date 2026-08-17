@@ -37,6 +37,19 @@
 //! appended bytes through untouched — and the rewrite re-verifies again
 //! before every rename attempt, because the Windows rename-retry sleeps
 //! (up to ~500 ms) are the widest append window of all.
+//!
+//! **Oversized entries (issue #135):** the harvest renders WHOLE entries
+//! only, so a single entry longer than its prompt cap used to be
+//! char-truncated inline, counted as rendered, marked consumed and then
+//! archived — everything past the cut was never delivered to any harvest.
+//! Capping at write time would not help: agents append raw JSONL straight
+//! from shell prompts, entirely outside [`JournalStore::append_entry`]. So
+//! the fix lives at harvest time and on disk:
+//! [`JournalStore::split_oversized_unconsumed`] rewrites an oversized
+//! UNCONSUMED entry as N `[part k/N] ` part-entries, each a whole entry
+//! that flows through the existing whole-entry cap over consecutive
+//! harvests. Nothing is truncated, nothing is lost, and nothing stalls —
+//! every harvest consumes at least the part it rendered.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -523,6 +536,222 @@ impl JournalStore {
         }
         unreachable!("loop always returns or errors within MAX_ATTEMPTS")
     }
+
+    /// Rewrites every UNCONSUMED entry whose text is longer than
+    /// `max_text_chars` as N `[part k/N] ` part-entries, in place and in
+    /// file order. Returns how many entries were split.
+    ///
+    /// **Why on disk, at harvest time (issue #135).** The harvest prompt
+    /// renders WHOLE entries only and stops before its char cap, so a
+    /// single entry bigger than the whole cap had nowhere to go: it was
+    /// char-truncated inline, counted as rendered, marked consumed and then
+    /// archived — every char past the cut was never delivered to any
+    /// harvest, silently. Capping at write time cannot fix that: agents
+    /// append raw JSONL lines straight from shell prompts, never through
+    /// [`JournalStore::append_entry`]. Splitting the line on disk instead
+    /// turns one undeliverable entry into N deliverable ones, each a whole
+    /// entry that flows through the existing cap machinery — the first part
+    /// goes into this harvest, the rest roll into the next ones. Nothing is
+    /// truncated, nothing is lost, and nothing stalls, because every
+    /// harvest consumes at least the part it rendered.
+    ///
+    /// **What is touched.** Only entries after the last harvest marker.
+    /// Consumed and archived entries have already been digested — rewriting
+    /// them would churn history and invalidate `raw` delete identities for
+    /// no gain — and marker lines and [`RawLine::Opaque`] lines are carried
+    /// through byte-verbatim, the same contract
+    /// [`JournalStore::delete_entry`] honours. A part keeps the original's
+    /// `ts`, `category`, `project` and `agent`, so provenance survives; a
+    /// hand-written extra field serde ignores on read does NOT survive the
+    /// split of that one line (the parts are freshly serialized) — the
+    /// accepted cost of turning one line into many.
+    ///
+    /// **Idempotence.** The `[part k/N] ` marker is charged against
+    /// `max_text_chars`, not added on top of it, so every part this writes
+    /// is already under budget and the next harvest's pass leaves it alone
+    /// — parts never nest.
+    ///
+    /// **Race safety.** Identical to the delete path: the whole
+    /// read-rewrite runs under [`JournalStore::lock`], and an out-of-process
+    /// append (an agent's shell `>>`) landing in the write window is carried
+    /// through rather than overwritten — re-read before the write, and again
+    /// before every rename attempt in
+    /// [`atomic_write_carrying_appends`]. When nothing is oversized, the
+    /// file is not rewritten at all.
+    pub fn split_oversized_unconsumed(&self, max_text_chars: usize) -> Result<usize, String> {
+        self.split_oversized_unconsumed_with_hook(max_text_chars, || {})
+    }
+
+    /// [`JournalStore::split_oversized_unconsumed`]'s body, with a test-only
+    /// hook fired once — right after the split content is computed and
+    /// before the pre-write recheck — so a test can land a same-window
+    /// external append exactly there (the
+    /// [`JournalStore::delete_entry_with_hook`] convention).
+    fn split_oversized_unconsumed_with_hook(
+        &self,
+        max_text_chars: usize,
+        on_after_split: impl FnOnce(),
+    ) -> Result<usize, String> {
+        let _guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let path = self.journal_path();
+        let mut hook = Some(on_after_split);
+        const MAX_ATTEMPTS: usize = 5;
+        for attempt in 0..MAX_ATTEMPTS {
+            let original = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+                Err(e) => return Err(format!("failed to read journal file {path:?}: {e}")),
+            };
+            let text = String::from_utf8(original.clone())
+                .map_err(|e| format!("journal file {path:?} is not valid UTF-8: {e}"))?;
+            let lines = parse_lines(&text, &path);
+            let last_marker = lines.iter().rposition(|l| matches!(l, RawLine::Marker(..)));
+
+            let mut split = 0usize;
+            let mut kept = String::new();
+            for (i, line) in lines.iter().enumerate() {
+                let parts = match line {
+                    RawLine::Entry(entry, _) if is_unconsumed(i, last_marker) => {
+                        split_into_parts(entry, max_text_chars)
+                    }
+                    _ => None,
+                };
+                match parts {
+                    Some(parts) => {
+                        for part in &parts {
+                            let raw = serde_json::to_string(part).map_err(|e| {
+                                format!("failed to serialize split journal entry: {e}")
+                            })?;
+                            kept.push_str(&raw);
+                            kept.push('\n');
+                        }
+                        split += 1;
+                    }
+                    None => {
+                        kept.push_str(line.raw());
+                        kept.push('\n');
+                    }
+                }
+            }
+            if split == 0 {
+                return Ok(0);
+            }
+            if let Some(h) = hook.take() {
+                h();
+            }
+
+            let current = std::fs::read(&path)
+                .map_err(|e| format!("failed to read journal file {path:?}: {e}"))?;
+            if current == original {
+                atomic_write_carrying_appends(&path, kept, current)?;
+                return Ok(split);
+            }
+            if current.len() > original.len() && current.starts_with(&original) {
+                // A same-window out-of-process append — carry its exact
+                // bytes into the rewrite so it is never lost.
+                kept.push_str(&String::from_utf8_lossy(&current[original.len()..]));
+                atomic_write_carrying_appends(&path, kept, current)?;
+                return Ok(split);
+            }
+            // Neither unchanged nor our bytes plus an appended tail — should
+            // be impossible under the append-only contract; retry with a
+            // fresh read rather than risk writing over content we never saw.
+            if attempt + 1 == MAX_ATTEMPTS {
+                return Err(format!(
+                    "journal file {path:?} changed unexpectedly while splitting oversized entries; try again"
+                ));
+            }
+        }
+        unreachable!("loop always returns or errors within MAX_ATTEMPTS")
+    }
+}
+
+/// Whether the entry at position `idx` sits after the last harvest marker —
+/// the `UNCONSUMED` half of [`entry_status`], the only region
+/// [`JournalStore::split_oversized_unconsumed`] may rewrite.
+fn is_unconsumed(idx: usize, last_marker: Option<usize>) -> bool {
+    match last_marker {
+        None => true,
+        Some(last) => idx > last,
+    }
+}
+
+/// The literal characters of a `[part k/N] ` marker, both numbers excluded.
+const PART_MARKER_LITERAL_CHARS: usize = "[part /] ".len();
+
+/// Chunk size and part count for splitting `total_chars` characters so that
+/// every part's FINAL text — its `[part k/N] ` marker included — still fits
+/// `max_text_chars`. Charging the marker to the budget rather than adding it
+/// on top is what makes the split idempotent: the next harvest must not
+/// re-split a part this one already wrote.
+///
+/// The two quantities feed back on each other — a wider marker shrinks the
+/// chunk, a smaller chunk can need one more part, and one more part can
+/// widen the marker again — so the plan is iterated to a fixed point. It
+/// terminates because the marker grows with the LOGARITHM of the part count
+/// while the part count grows only as the chunk shrinks. `None` when the
+/// budget cannot even hold a marker, so no split is possible.
+fn chunk_plan(total_chars: usize, max_text_chars: usize) -> Option<(usize, usize)> {
+    // An entry only reaches here when it is over budget, so it needs at
+    // least two parts — the smallest count worth planning for.
+    let mut parts = 2usize;
+    loop {
+        let marker = PART_MARKER_LITERAL_CHARS + 2 * digit_count(parts);
+        let chunk = max_text_chars.checked_sub(marker).filter(|c| *c > 0)?;
+        let needed = total_chars.div_ceil(chunk);
+        if needed <= parts {
+            return Some((chunk, needed));
+        }
+        parts = needed;
+    }
+}
+
+/// Decimal width of `n`, the marker's share of the budget per number.
+fn digit_count(n: usize) -> usize {
+    let mut digits = 1;
+    let mut rest = n / 10;
+    while rest > 0 {
+        digits += 1;
+        rest /= 10;
+    }
+    digits
+}
+
+/// `entry` re-expressed as N `[part k/N] ` part-entries when its text is
+/// over `max_text_chars`, else `None` (the line is then carried through
+/// verbatim). Chunking is by CHARS, so a multi-byte char is never cut in
+/// half, and concatenating the parts' bodies in order reproduces the
+/// original text exactly — the no-data-loss contract of issue #135.
+fn split_into_parts(entry: &JournalEntry, max_text_chars: usize) -> Option<Vec<JournalEntry>> {
+    let chars: Vec<char> = entry.text.chars().collect();
+    if chars.len() <= max_text_chars {
+        return None;
+    }
+    let (chunk_chars, parts) = chunk_plan(chars.len(), max_text_chars).or_else(|| {
+        log::warn!(
+            "journal: entry of {} chars is over the {max_text_chars}-char harvest budget but the budget cannot hold a part marker — left unsplit",
+            chars.len()
+        );
+        None
+    })?;
+    Some(
+        chars
+            .chunks(chunk_chars)
+            .enumerate()
+            .map(|(i, chunk)| JournalEntry {
+                ts: entry.ts.clone(),
+                category: entry.category,
+                text: format!(
+                    "[part {}/{}] {}",
+                    i + 1,
+                    parts,
+                    chunk.iter().collect::<String>()
+                ),
+                project: entry.project.clone(),
+                agent: entry.agent.clone(),
+            })
+            .collect(),
+    )
 }
 
 /// Positions of the last and second-to-last markers, when present.
@@ -678,8 +907,11 @@ fn atomic_write_carrying_appends_with(
                 expected = current;
             }
             Ok(_) => {
+                // "rewriting", not "deleting": delete is no longer the only
+                // caller — the oversized-entry split (issue #135) shares
+                // this rewriter.
                 return Err(format!(
-                    "journal file {path:?} changed unexpectedly while deleting; try again"
+                    "journal file {path:?} changed unexpectedly while rewriting; try again"
                 ));
             }
             // Vanished out from under us: nothing to carry — the rename
@@ -1423,5 +1655,210 @@ mod tests {
         assert_eq!(survivor.status, JournalEntryStatus::Unconsumed);
         // …and the identity `list()` reports still deletes it.
         assert_eq!(s.delete_entry(&survivor.raw).unwrap(), 1);
+    }
+
+    // --- issue #135: oversized-entry split ---
+
+    /// A position-sensitive filler of `len` chars: a lost, duplicated or
+    /// reordered chunk changes the reassembled string, which `"x".repeat`
+    /// could never show.
+    fn filler(len: usize) -> String {
+        (0..len)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect()
+    }
+
+    /// The text of `part` with its `[part k/N] ` marker stripped, asserting
+    /// the marker is the expected one — the reassembly contract.
+    fn part_body(part: &JournalEntry, k: usize, n: usize) -> String {
+        let marker = format!("[part {k}/{n}] ");
+        part.text
+            .strip_prefix(&marker)
+            .unwrap_or_else(|| panic!("part {k} must start with {marker:?}: {}", part.text))
+            .to_string()
+    }
+
+    #[test]
+    fn test_split_oversized_unconsumed_reproduces_the_original_text_exactly() {
+        // The whole point of splitting instead of truncating: every char of
+        // the original entry survives, in order, spread over whole parts
+        // that each fit the harvest's per-entry budget.
+        let dir = tempdir().unwrap();
+        let s = store(dir.path());
+        const BUDGET: usize = 100;
+        let original = filler(BUDGET * 3);
+        s.append_entry(&entry(JournalCategory::Error, &original))
+            .unwrap();
+
+        assert_eq!(s.split_oversized_unconsumed(BUDGET).unwrap(), 1);
+
+        let parts: Vec<JournalEntry> = s.unconsumed().unwrap();
+        assert!(parts.len() > 1, "an oversized entry must become N parts");
+        let n = parts.len();
+        let mut reassembled = String::new();
+        for (i, part) in parts.iter().enumerate() {
+            assert!(
+                part.text.chars().count() <= BUDGET,
+                "part {} is over the budget: {}",
+                i + 1,
+                part.text.chars().count()
+            );
+            reassembled.push_str(&part_body(part, i + 1, n));
+        }
+        assert_eq!(reassembled, original, "no char lost, none duplicated");
+
+        // Idempotent: the parts it just wrote are already under budget, so a
+        // second pass (the next harvest) must not re-split them.
+        let before = std::fs::read(dir.path().join(JOURNAL_FILE)).unwrap();
+        assert_eq!(s.split_oversized_unconsumed(BUDGET).unwrap(), 0);
+        assert_eq!(
+            std::fs::read(dir.path().join(JOURNAL_FILE)).unwrap(),
+            before
+        );
+        assert!(!dir.path().join("journal.jsonl.tmp").exists());
+    }
+
+    #[test]
+    fn test_split_preserves_ts_category_project_and_agent_on_every_part() {
+        // A part is a WHOLE entry: it must carry the same provenance as the
+        // line it replaced, or the harvest renders parts the user cannot
+        // attribute back to a project or an agent.
+        let dir = tempdir().unwrap();
+        let s = store(dir.path());
+        const BUDGET: usize = 80;
+        let oversized = JournalEntry {
+            ts: "2026-08-17T10:00:00+00:00".to_string(),
+            category: JournalCategory::Bottleneck,
+            text: filler(BUDGET * 3),
+            project: Some(r"C:\git\maestro".to_string()),
+            agent: Some("orchestrator-gen1".to_string()),
+        };
+        s.append_entry(&oversized).unwrap();
+
+        assert_eq!(s.split_oversized_unconsumed(BUDGET).unwrap(), 1);
+
+        let parts = s.unconsumed().unwrap();
+        assert!(parts.len() > 1);
+        for part in &parts {
+            assert_eq!(part.ts, oversized.ts);
+            assert_eq!(part.category, oversized.category);
+            assert_eq!(part.project, oversized.project);
+            assert_eq!(part.agent, oversized.agent);
+        }
+    }
+
+    #[test]
+    fn test_split_leaves_consumed_archived_marker_and_opaque_lines_byte_identical() {
+        // Only the UNCONSUMED region is rewritten. Everything a harvest has
+        // already digested — and every line the parser could not read — must
+        // ride through byte-for-byte and in order, exactly like the delete
+        // path's contract.
+        let dir = tempdir().unwrap();
+        const BUDGET: usize = 60;
+        let archived =
+            serde_json::to_string(&entry(JournalCategory::Error, &filler(BUDGET * 3))).unwrap();
+        let old_marker = serde_json::to_string(&HarvestMarker::now("2026-08-06")).unwrap();
+        let consumed =
+            serde_json::to_string(&entry(JournalCategory::Skill, &filler(BUDGET * 3))).unwrap();
+        let last_marker = serde_json::to_string(&HarvestMarker::now("2026-08-07")).unwrap();
+        let opaque = "{ garbage not json".to_string();
+        let unconsumed =
+            serde_json::to_string(&entry(JournalCategory::Concern, &filler(BUDGET * 3))).unwrap();
+        let untouched = [&archived, &old_marker, &consumed, &last_marker, &opaque];
+        let path = dir.path().join(JOURNAL_FILE);
+        std::fs::write(
+            &path,
+            format!(
+                "{archived}\n{old_marker}\n{consumed}\n{last_marker}\n{opaque}\n{unconsumed}\n"
+            ),
+        )
+        .unwrap();
+
+        let s = store(dir.path());
+        assert_eq!(
+            s.split_oversized_unconsumed(BUDGET).unwrap(),
+            1,
+            "only the unconsumed oversized entry is split"
+        );
+
+        let after: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        for (i, expected) in untouched.iter().enumerate() {
+            assert_eq!(&&after[i], expected, "line {i} must be byte-identical");
+        }
+        assert!(after.len() > untouched.len() + 1, "the last line was split");
+        assert!(!after.contains(&unconsumed), "the oversized line is gone");
+    }
+
+    #[test]
+    fn test_split_leaves_an_under_budget_entry_untouched() {
+        // No oversized entry means no rewrite at all — not a rewrite that
+        // happens to produce the same lines: the file bytes must be the very
+        // same ones, so no `raw` delete identity is ever invalidated.
+        let dir = tempdir().unwrap();
+        let s = store(dir.path());
+        const BUDGET: usize = 100;
+        s.append_entry(&entry(JournalCategory::Error, &filler(BUDGET)))
+            .unwrap();
+        let before = std::fs::read(dir.path().join(JOURNAL_FILE)).unwrap();
+
+        assert_eq!(s.split_oversized_unconsumed(BUDGET).unwrap(), 0);
+
+        assert_eq!(
+            std::fs::read(dir.path().join(JOURNAL_FILE)).unwrap(),
+            before
+        );
+        assert!(!dir.path().join("journal.jsonl.tmp").exists());
+        // A journal that was never written is a no-op too, not an error.
+        let never_written = store(&dir.path().join("never-written"));
+        assert_eq!(never_written.split_oversized_unconsumed(BUDGET).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_split_preserves_concurrent_append() {
+        // Same guarantee the delete path has: an agent's shell `>>` landing
+        // between the read and the rename must be carried into the rewrite,
+        // never overwritten by it. The hook lands it exactly in that gap.
+        let dir = tempdir().unwrap();
+        let s = store(dir.path());
+        const BUDGET: usize = 100;
+        s.append_entry(&entry(JournalCategory::Error, &filler(BUDGET * 2)))
+            .unwrap();
+
+        let path = dir.path().join(JOURNAL_FILE);
+        let appended_line =
+            serde_json::to_string(&entry(JournalCategory::Concern, "landed mid-split")).unwrap();
+
+        let split = s
+            .split_oversized_unconsumed_with_hook(BUDGET, || {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap();
+                writeln!(f, "{appended_line}").unwrap();
+            })
+            .unwrap();
+
+        assert_eq!(split, 1);
+        let texts: Vec<String> = s
+            .unconsumed()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.text)
+            .collect();
+        assert!(
+            texts.len() > 2,
+            "the parts plus the appended entry: {texts:?}"
+        );
+        assert_eq!(
+            texts.last().map(String::as_str),
+            Some("landed mid-split"),
+            "the same-window append survives, last in file order"
+        );
+        assert!(!dir.path().join("journal.jsonl.tmp").exists());
     }
 }
