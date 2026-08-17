@@ -26,13 +26,22 @@
 //! rule), so [`normalize_prompt`] collapses every whitespace run — newlines
 //! included — to a single space before the text is ever handed to the PTY. A
 //! caller cannot get this wrong from TypeScript.
+//!
+//! Flattening keeps the PTY safe but destroys a long prompt's structure, and
+//! a multi-KB payload is not reliably delivered even flattened (issue #137).
+//! So a caller may also name a brief target ([`BriefTarget`]): an over-budget
+//! prompt is then written UNFLATTENED through `core::samurai_brief` and what
+//! is typed is the one-line pointer at that file. Normalization still runs on
+//! whatever is actually typed, so the invariant above is unchanged.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tauri::State;
 
 use super::harvest::DeliverFn;
+use crate::core::samurai_brief;
 
 /// The all-whitespace refusal — pinned by test, surfaced to the caller.
 const EMPTY_PROMPT: &str = "Cannot launch with an empty initial prompt.";
@@ -45,6 +54,31 @@ const EMPTY_PROMPT: &str = "Cannot launch with an empty initial prompt.";
 /// input that would otherwise submit itself half-typed.
 pub fn normalize_prompt(prompt: &str) -> String {
     prompt.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Where a long prompt is staged as a brief FILE instead of being typed
+/// (issue #138): `dir` is the checkout whose `.maestro/briefs/` receives it —
+/// the same layout `core::samurai_brief` writes for samurai runs — and `stem`
+/// names the file within it. A caller that supplies no target keeps the
+/// inline delivery, whatever the prompt's size.
+pub struct BriefTarget {
+    pub dir: PathBuf,
+    pub stem: String,
+}
+
+/// The command's two optional params folded into one target. Both halves are
+/// required and neither may be blank: a directory without a stem (or the
+/// reverse) names no file, and treating it as one would write `.md` at the
+/// brief root.
+fn brief_target(dir: Option<String>, stem: Option<String>) -> Option<BriefTarget> {
+    let (dir, stem) = (dir?, stem?);
+    if dir.trim().is_empty() || stem.trim().is_empty() {
+        return None;
+    }
+    Some(BriefTarget {
+        dir: PathBuf::from(dir),
+        stem,
+    })
 }
 
 /// The initial-prompt state machine: [`InitialPromptInjector::arm`] stages a
@@ -68,20 +102,52 @@ impl InitialPromptInjector {
     }
 
     /// Stages `prompt` for injection on `session_id`'s first
-    /// `SessionStarted`. The prompt is normalized here, so what is stored is
-    /// already the exact single line that will be typed. Refuses (pinned
-    /// message) a prompt that is empty once normalized — arming it would
-    /// submit a blank turn. Re-arming the same session before it starts
-    /// REPLACES the staged prompt: one session gets one initial prompt.
-    pub fn arm(&self, session_id: u32, prompt: &str) -> Result<(), String> {
+    /// `SessionStarted`. What is stored is always the exact single line that
+    /// will be typed. Refuses (pinned message) a prompt that is empty once
+    /// normalized — arming it would submit a blank turn. Re-arming the same
+    /// session before it starts REPLACES the staged prompt: one session gets
+    /// one initial prompt.
+    ///
+    /// With a `brief` target, a prompt too long to type safely
+    /// (`samurai_brief::INLINE_MAX_BYTES`, measured on the flattened text —
+    /// that is what would have gone to the PTY) is written to a brief file
+    /// UNFLATTENED, and the one-line pointer at it is armed instead. So the
+    /// agent reads the prompt's real structure while the PTY still only ever
+    /// sees a single short line. Without a target — or when the write fails —
+    /// the flattened prompt is armed exactly as before.
+    ///
+    /// Does a blocking file write when it stages a brief; Tauri runs the
+    /// command below off the main thread.
+    pub fn arm(
+        &self,
+        session_id: u32,
+        prompt: &str,
+        brief: Option<BriefTarget>,
+    ) -> Result<(), String> {
         let normalized = normalize_prompt(prompt);
         if normalized.is_empty() {
             return Err(EMPTY_PROMPT.to_string());
         }
+        let armed = brief
+            .filter(|_| normalized.len() > samurai_brief::INLINE_MAX_BYTES)
+            .and_then(|target| {
+                match samurai_brief::write_brief(&target.dir, &target.stem, prompt) {
+                    Ok(relpath) => Some(normalize_prompt(&samurai_brief::pointer_instruction(
+                        &relpath,
+                    ))),
+                    Err(e) => {
+                        log::warn!(
+                            "initial prompt: {e} — arming the flattened prompt inline instead"
+                        );
+                        None
+                    }
+                }
+            })
+            .unwrap_or(normalized);
         self.armed
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(session_id, normalized);
+            .insert(session_id, armed);
         Ok(())
     }
 
@@ -119,21 +185,46 @@ impl InitialPromptInjector {
 /// set strictly ahead of claude's SessionStart hook — the same ordering the
 /// samurai successor registration and the harvest arm rely on. The prompt is
 /// whitespace-normalized backend-side; callers may pass multi-line text.
+///
+/// `brief_dir` + `brief_stem` are optional: supplying both lets a long prompt
+/// be staged as `<brief_dir>/.maestro/briefs/<brief_stem>.md` and delivered as
+/// a pointer (issue #138). Callers that omit them keep the inline delivery.
 #[tauri::command]
 pub fn terminal_arm_initial_prompt(
     injector: State<'_, Arc<InitialPromptInjector>>,
     session_id: u32,
     prompt: String,
+    brief_dir: Option<String>,
+    brief_stem: Option<String>,
 ) -> Result<(), String> {
-    injector.arm(session_id, &prompt)
+    injector.arm(session_id, &prompt, brief_target(brief_dir, brief_stem))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     /// Captured `(session_id, prompt)` pairs handed to a stubbed [`DeliverFn`].
     type DeliveredPrompts = Arc<Mutex<Vec<(u32, String)>>>;
+
+    /// A multi-line prompt whose FLATTENED form is over the inline budget —
+    /// the shape a PR action launch produces once several steps are ticked.
+    fn long_prompt() -> String {
+        format!(
+            "You are monitoring one GitHub pull request.\n\n{}\nStep 1: check the status.\n",
+            "RULE: read every existing comment on the PR before you write one.\n".repeat(12)
+        )
+    }
+
+    /// The brief target a PR action launch passes: the project checkout plus
+    /// the run's stem.
+    fn target(dir: &std::path::Path, stem: &str) -> BriefTarget {
+        BriefTarget {
+            dir: dir.to_path_buf(),
+            stem: stem.to_string(),
+        }
+    }
 
     /// An injector whose deliveries are captured, plus the capture handle.
     fn injector() -> (InitialPromptInjector, DeliveredPrompts) {
@@ -166,10 +257,10 @@ mod tests {
     fn test_arm_refuses_an_empty_prompt_with_the_pinned_message() {
         let (injector, delivered) = injector();
         assert_eq!(
-            injector.arm(7, "   \n\t  ").unwrap_err(),
+            injector.arm(7, "   \n\t  ", None).unwrap_err(),
             "Cannot launch with an empty initial prompt."
         );
-        assert_eq!(injector.arm(7, "").unwrap_err(), EMPTY_PROMPT);
+        assert_eq!(injector.arm(7, "", None).unwrap_err(), EMPTY_PROMPT);
         // Nothing armed: a SessionStarted delivers nothing.
         injector.on_session_started(7);
         assert!(delivered.lock().unwrap().is_empty());
@@ -179,7 +270,7 @@ mod tests {
     fn test_injection_happens_once_on_the_armed_session_only() {
         let (injector, delivered) = injector();
         injector
-            .arm(42, "read CLAUDE.md\nthen summarise it")
+            .arm(42, "read CLAUDE.md\nthen summarise it", None)
             .unwrap();
 
         // An unrelated session's start delivers nothing.
@@ -204,11 +295,11 @@ mod tests {
     #[test]
     fn test_sessions_keep_their_own_prompts_and_rearm_replaces() {
         let (injector, delivered) = injector();
-        injector.arm(1, "prompt one").unwrap();
-        injector.arm(2, "prompt two").unwrap();
+        injector.arm(1, "prompt one", None).unwrap();
+        injector.arm(2, "prompt two", None).unwrap();
         // One session gets ONE initial prompt: a re-arm before the session
         // starts replaces, never queues.
-        injector.arm(1, "prompt one revised").unwrap();
+        injector.arm(1, "prompt one revised", None).unwrap();
 
         injector.on_session_started(2);
         injector.on_session_started(1);
@@ -219,6 +310,161 @@ mod tests {
                 (1, "prompt one revised".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn test_a_long_prompt_with_a_brief_target_arms_the_pointer_at_a_verbatim_brief() {
+        // The #138 fix: a multi-KB PR action prompt is no longer typed at all.
+        // What is typed is a one-line pointer; what the agent reads is the
+        // ORIGINAL prompt, newlines and all.
+        let dir = tempdir().unwrap();
+        let (injector, delivered) = injector();
+        let prompt = long_prompt();
+        assert!(normalize_prompt(&prompt).len() > samurai_brief::INLINE_MAX_BYTES);
+
+        injector
+            .arm(5, &prompt, Some(target(dir.path(), "pr-138-check-review")))
+            .unwrap();
+        injector.on_session_started(5);
+
+        let d = delivered.lock().unwrap();
+        assert_eq!(d.len(), 1);
+        assert_eq!(
+            d[0].1,
+            samurai_brief::pointer_instruction(".maestro/briefs/pr-138-check-review.md")
+        );
+        // Still PTY-safe: the typed text is one line, well under the payload
+        // size that was observed arriving spliced.
+        assert!(!d[0].1.contains('\n'), "{}", d[0].1);
+        assert!(!d[0].1.contains('\r'), "{}", d[0].1);
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".maestro/briefs/pr-138-check-review.md"))
+                .unwrap(),
+            prompt,
+            "the brief holds the original prompt byte for byte"
+        );
+        assert!(prompt.contains('\n'), "its structure survived");
+    }
+
+    #[test]
+    fn test_a_long_prompt_without_a_brief_target_is_armed_flattened_inline() {
+        // Regression pin: a caller that stages no brief gets EXACTLY today's
+        // behaviour — the whole prompt, flattened onto one line.
+        let (injector, delivered) = injector();
+        let prompt = long_prompt();
+
+        injector.arm(5, &prompt, None).unwrap();
+        injector.on_session_started(5);
+
+        let d = delivered.lock().unwrap();
+        assert_eq!(d[0].1, normalize_prompt(&prompt));
+        assert!(d[0].1.len() > samurai_brief::INLINE_MAX_BYTES);
+        assert!(!d[0].1.contains('\n'));
+    }
+
+    #[test]
+    fn test_a_short_prompt_with_a_brief_target_stays_inline_and_writes_no_file() {
+        // Short prompts keep the delivery that already works — routing them
+        // through a file would add an unread-file failure mode for nothing.
+        let dir = tempdir().unwrap();
+        let (injector, delivered) = injector();
+
+        injector
+            .arm(
+                5,
+                "review the diff\nand summarise it",
+                Some(target(dir.path(), "pr-138-check")),
+            )
+            .unwrap();
+        injector.on_session_started(5);
+
+        assert_eq!(
+            delivered.lock().unwrap()[0].1,
+            "review the diff and summarise it"
+        );
+        assert!(
+            !dir.path().join(samurai_brief::BRIEF_DIR).exists(),
+            "no brief written"
+        );
+    }
+
+    #[test]
+    fn test_a_failed_brief_write_falls_back_to_the_flattened_prompt() {
+        // No new failure mode: an unwritable brief (here `.maestro` occupied
+        // by a file) logs a warning and arms exactly what pre-#138 armed.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(".maestro"), "not a directory").unwrap();
+        let (injector, delivered) = injector();
+        let prompt = long_prompt();
+
+        injector
+            .arm(5, &prompt, Some(target(dir.path(), "pr-138-check")))
+            .unwrap();
+        injector.on_session_started(5);
+
+        assert_eq!(delivered.lock().unwrap()[0].1, normalize_prompt(&prompt));
+    }
+
+    #[test]
+    fn test_a_brief_target_does_not_soften_the_empty_prompt_refusal() {
+        let dir = tempdir().unwrap();
+        let (injector, delivered) = injector();
+
+        assert_eq!(
+            injector
+                .arm(7, "  \r\n\t ", Some(target(dir.path(), "pr-138-check")))
+                .unwrap_err(),
+            EMPTY_PROMPT
+        );
+
+        injector.on_session_started(7);
+        assert!(delivered.lock().unwrap().is_empty());
+        assert!(
+            !dir.path().join(samurai_brief::BRIEF_DIR).exists(),
+            "a refused prompt writes nothing"
+        );
+    }
+
+    #[test]
+    fn test_a_brief_armed_session_still_injects_exactly_once() {
+        // Disarm-BEFORE-deliver is unchanged by the brief route: a later
+        // SessionStarted in the same terminal (e.g. `/clear`) re-types
+        // nothing, and a re-arm before the session starts replaces.
+        let dir = tempdir().unwrap();
+        let (injector, delivered) = injector();
+        let prompt = long_prompt();
+        injector
+            .arm(5, &prompt, Some(target(dir.path(), "pr-138-check")))
+            .unwrap();
+        injector
+            .arm(5, &prompt, Some(target(dir.path(), "pr-138-check-review")))
+            .unwrap();
+
+        injector.on_session_started(5);
+        injector.on_session_started(5);
+
+        let d = delivered.lock().unwrap();
+        assert_eq!(d.len(), 1);
+        assert_eq!(
+            d[0].1,
+            samurai_brief::pointer_instruction(".maestro/briefs/pr-138-check-review.md")
+        );
+    }
+
+    #[test]
+    fn test_a_brief_target_needs_both_halves_to_be_present() {
+        // The command's optional params: anything short of a directory AND a
+        // stem is "no brief target", which is today's inline behaviour.
+        assert!(brief_target(None, None).is_none());
+        assert!(brief_target(Some("C:/proj".into()), None).is_none());
+        assert!(brief_target(None, Some("pr-138-check".into())).is_none());
+        assert!(brief_target(Some("  ".into()), Some("pr-138-check".into())).is_none());
+        assert!(brief_target(Some("C:/proj".into()), Some("  ".into())).is_none());
+
+        let staged = brief_target(Some("C:/proj".into()), Some("pr-138-check".into())).unwrap();
+        assert_eq!(staged.dir, PathBuf::from("C:/proj"));
+        assert_eq!(staged.stem, "pr-138-check");
     }
 
     #[test]
@@ -234,14 +480,14 @@ mod tests {
         });
         let injector = InitialPromptInjector::new(deliver);
 
-        injector.arm(7, "do the thing").unwrap();
+        injector.arm(7, "do the thing", None).unwrap();
         injector.on_session_started(7);
         assert_eq!(*attempts.lock().unwrap(), 1, "one delivery attempt");
 
         injector.on_session_started(7);
         assert_eq!(*attempts.lock().unwrap(), 1, "disarmed by the attempt");
 
-        injector.arm(7, "do the thing").unwrap();
+        injector.arm(7, "do the thing", None).unwrap();
         injector.on_session_started(7);
         assert_eq!(*attempts.lock().unwrap(), 2, "a fresh arm retries cleanly");
     }

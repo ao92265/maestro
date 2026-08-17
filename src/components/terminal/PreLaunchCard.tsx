@@ -89,6 +89,12 @@ export interface SessionSlot {
    * created slots.
    */
   initialPrompt?: string | null;
+  /**
+   * Where a long `initialPrompt` is staged as a brief file, and under what
+   * stem (issue #138). Never set for manually created slots.
+   */
+  briefDir?: string | null;
+  briefStem?: string | null;
 }
 
 interface PreLaunchCardProps {

@@ -58,6 +58,14 @@ export interface PendingLaunch {
    * injected prompt submits a partial message).
    */
   initialPrompt?: string | null;
+  /**
+   * Where a long `initialPrompt` is staged as a brief FILE instead of being
+   * typed (issue #138): the checkout whose `.maestro/briefs/` receives it,
+   * plus the file stem. Both are needed for the backend to use them; a launch
+   * that leaves them unset has its prompt typed inline, whatever its size.
+   */
+  briefDir?: string | null;
+  briefStem?: string | null;
 }
 
 interface PendingLaunchState {

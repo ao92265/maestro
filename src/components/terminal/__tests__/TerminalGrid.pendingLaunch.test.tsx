@@ -271,6 +271,10 @@ describe("TerminalGrid pending samurai launch", () => {
       // Multi-line on purpose: the backend flattens it, the grid passes it
       // through verbatim.
       initialPrompt: "review the diff\nand summarise it",
+      // Issue #138: a caller may also name where a long prompt is staged as a
+      // brief file; the grid passes both halves straight through.
+      briefDir: "C:/proj",
+      briefStem: "pr-123-check-review",
     });
 
     render(<TerminalGrid projectPath="C:/proj" tabId="tab-1" isActive />);
@@ -279,7 +283,12 @@ describe("TerminalGrid pending samurai launch", () => {
 
     // Armed exactly once, with the launched session's id and the raw prompt…
     await waitFor(() => expect(initialPromptArmMock).toHaveBeenCalledTimes(1));
-    expect(initialPromptArmMock).toHaveBeenCalledWith(1, "review the diff\nand summarise it");
+    expect(initialPromptArmMock).toHaveBeenCalledWith(
+      1,
+      "review the diff\nand summarise it",
+      "C:/proj",
+      "pr-123-check-review",
+    );
     // …and strictly before the CLI command went to the PTY.
     await waitFor(() => expect(writeStdinMock).toHaveBeenCalled());
     expect(initialPromptArmMock.mock.invocationCallOrder[0]).toBeLessThan(

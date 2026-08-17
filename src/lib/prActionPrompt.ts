@@ -57,6 +57,31 @@ export function prActionLaunchName(prNumber: number, stepIds: string[]): string 
   return `PR #${prNumber} ${suffix}`;
 }
 
+/** Longest sanitised step chain kept in a brief stem before it is counted instead. */
+const MAX_BRIEF_STEM_STEPS_CHARS = 40;
+
+/**
+ * The file stem of the brief this launch is staged as (issue #138):
+ * `pr-123-check-review`. The backend writes it to
+ * `<project>/.maestro/briefs/<stem>.md` and types a pointer at it instead of
+ * the multi-KB prompt itself.
+ *
+ * Step ids are free text from the workflow editor, so everything outside
+ * `a-z0-9` collapses to a single dash — a `+`, a space or a `../` can never
+ * reach the filesystem — and a long chain becomes a count so the file name
+ * stays short (Windows path limits).
+ */
+export function prActionBriefStem(prNumber: number, stepIds: string[]): string {
+  const slug = stepIds
+    .join("-")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (!slug) return `pr-${prNumber}`;
+  const suffix = slug.length <= MAX_BRIEF_STEM_STEPS_CHARS ? slug : `${stepIds.length}-steps`;
+  return `pr-${prNumber}-${suffix}`;
+}
+
 /** How the agent is told to get a repo slug when the URL did not yield one. */
 function repoPinRule(slug: string | null, repoPath: string): string {
   if (slug) {

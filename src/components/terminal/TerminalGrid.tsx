@@ -1201,7 +1201,12 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
               // user just types the prompt themselves.
               if (slot.initialPrompt && slot.mode === "Claude") {
                 try {
-                  await terminalArmInitialPrompt(sessionId, slot.initialPrompt);
+                  await terminalArmInitialPrompt(
+                    sessionId,
+                    slot.initialPrompt,
+                    slot.briefDir,
+                    slot.briefStem,
+                  );
                 } catch (err) {
                   console.error("[InitialPrompt] Failed to arm the initial prompt:", err);
                 }
@@ -1949,6 +1954,9 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
       // Generic initial prompt (any caller): armed right before the CLI
       // launches, typed into the PTY on the session's first SessionStarted.
       initialPrompt: launch.initialPrompt ?? null,
+      // Where a long initial prompt is staged as a brief file (issue #138).
+      briefDir: launch.briefDir ?? null,
+      briefStem: launch.briefStem ?? null,
       // The History tab always names the exact directory to run in. Reusing the
       // pristine slot would otherwise inherit its worktreeMode, and any mode but
       // "project" sends launchSlotInner into prepareSessionWorktree — moving the

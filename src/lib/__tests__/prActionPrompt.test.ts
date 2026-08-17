@@ -3,6 +3,7 @@ import {
   buildPrActionPrompt,
   githubRepoSlug,
   type PrActionPromptInput,
+  prActionBriefStem,
   prActionLaunchName,
 } from "../prActionPrompt";
 
@@ -64,6 +65,29 @@ describe("prActionLaunchName", () => {
   it("counts the steps instead when the chain would be long", () => {
     expect(prActionLaunchName(123, ["investigate-everything", "review-and-post-the-notes"])).toBe(
       "PR #123 2 steps",
+    );
+  });
+});
+
+describe("prActionBriefStem", () => {
+  it("names the brief after the PR and the ticked steps", () => {
+    expect(prActionBriefStem(123, ["check"])).toBe("pr-123-check");
+    expect(prActionBriefStem(123, ["check", "review"])).toBe("pr-123-check-review");
+  });
+
+  it("keeps only characters a file name can carry", () => {
+    expect(prActionBriefStem(123, ["triage + verdict", "post NOTES"])).toBe(
+      "pr-123-triage-verdict-post-notes",
+    );
+    expect(prActionBriefStem(123, ["../escape"])).toBe("pr-123-escape");
+    // Step ids with nothing usable in them still leave a legal stem.
+    expect(prActionBriefStem(123, ["***"])).toBe("pr-123");
+    expect(prActionBriefStem(123, [])).toBe("pr-123");
+  });
+
+  it("counts the steps instead when the chain would make a long name", () => {
+    expect(prActionBriefStem(123, ["investigate-everything", "review-and-post-the-notes"])).toBe(
+      "pr-123-2-steps",
     );
   });
 });

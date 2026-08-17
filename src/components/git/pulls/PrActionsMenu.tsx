@@ -1,6 +1,6 @@
 import { MoreVertical, Play } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { buildPrActionPrompt, prActionLaunchName } from "@/lib/prActionPrompt";
+import { buildPrActionPrompt, prActionBriefStem, prActionLaunchName } from "@/lib/prActionPrompt";
 import {
   compilePrWorkflow,
   DEFAULT_PR_WORKFLOW,
@@ -114,6 +114,12 @@ export function PrActionsMenu({ pr, repoPath }: PrActionsMenuProps) {
         compiledSteps,
         needsWorktree: prWorkflowNeedsWorktree(selectedIds, launchGraph),
       }),
+      // This prompt is several KB with every step ticked — too big to type
+      // into the PTY reliably (issue #138). Naming a brief target lets the
+      // backend stage it as a file in the project checkout and type a
+      // one-line pointer at it instead.
+      briefDir: projectPath || null,
+      briefStem: prActionBriefStem(pr.number, selectedIds),
     });
     // Make sure the grid is mounted to consume the request — the project may
     // still be sitting on the idle landing view.

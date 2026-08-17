@@ -167,6 +167,47 @@ describe("PrActionsMenu", () => {
     await waitFor(() => expect(screen.queryByLabelText("Check status")).not.toBeInTheDocument());
   });
 
+  it("stages the prompt as a brief file in the project checkout", async () => {
+    // Issue #138: the launch names where the prompt is written and under what
+    // stem, so the backend types a one-line pointer instead of a multi-KB
+    // payload the PTY delivers in spliced fragments.
+    render(<PrActionsMenu pr={buildPr()} repoPath={REPO_PATH} />);
+    openMenu();
+
+    fireEvent.click(checkboxFor("Review & post"));
+    fireEvent.click(screen.getByRole("button", { name: /Launch 2 steps/ }));
+
+    await waitFor(() => expect(usePendingLaunchStore.getState().pending).toHaveLength(1));
+    const launch = usePendingLaunchStore.getState().pending[0];
+    expect(launch.briefDir).toBe(REPO_PATH);
+    expect(launch.briefStem).toBe("pr-123-check-review");
+  });
+
+  it("keeps the brief stem filesystem-safe for step ids with symbols or spaces", async () => {
+    // Step ids come from the workflow editor, so they are free text: a stem
+    // built from them must still be one legal file name.
+    usePrWorkflowStore.setState({
+      graph: {
+        nodes: [
+          { id: "triage + verdict", label: "Triage", text: "Custom triage ritual." },
+          { id: "post NOTES", label: "Post", text: "Custom posting ritual." },
+        ],
+        edges: [{ from: "triage + verdict", to: "post NOTES" }],
+        start: "triage + verdict",
+      },
+    });
+    render(<PrActionsMenu pr={buildPr()} repoPath={REPO_PATH} />);
+    openMenu();
+
+    fireEvent.click(checkboxFor("Post"));
+    fireEvent.click(screen.getByRole("button", { name: /Launch 2 steps/ }));
+
+    await waitFor(() => expect(usePendingLaunchStore.getState().pending).toHaveLength(1));
+    expect(usePendingLaunchStore.getState().pending[0].briefStem).toBe(
+      "pr-123-triage-verdict-post-notes",
+    );
+  });
+
   it("launches the edited workflow verbatim: custom steps, edge order, no default text", async () => {
     // A fully user-edited graph: custom texts, node-array order REVERSED
     // relative to the edge order (so the prompt order can only come from the

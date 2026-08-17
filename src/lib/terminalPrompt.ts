@@ -23,7 +23,23 @@ import { invoke } from "@tauri-apps/api/core";
  * a single space before typing, because a newline inside an injected prompt
  * submits a partial message. Rejects when the prompt is empty once
  * normalized.
+ *
+ * `briefDir` + `briefStem` are optional (issue #138): supplying both lets the
+ * backend write a long prompt UNFLATTENED to
+ * `<briefDir>/.maestro/briefs/<briefStem>.md` and type a one-line pointer at
+ * it, which is the only payload size the PTY delivers reliably. Omitting them
+ * keeps the inline delivery.
  */
-export function terminalArmInitialPrompt(sessionId: number, prompt: string): Promise<void> {
-  return invoke("terminal_arm_initial_prompt", { sessionId, prompt });
+export function terminalArmInitialPrompt(
+  sessionId: number,
+  prompt: string,
+  briefDir?: string | null,
+  briefStem?: string | null,
+): Promise<void> {
+  return invoke("terminal_arm_initial_prompt", {
+    sessionId,
+    prompt,
+    briefDir: briefDir ?? null,
+    briefStem: briefStem ?? null,
+  });
 }
