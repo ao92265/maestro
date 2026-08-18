@@ -245,22 +245,39 @@ fn corrective_instruction_for(
 }
 
 /// Brief-file stem for one pending instruction (issue #143), mirroring
-/// `samurai_replicator::ritual_brief_name`'s naming but keyed on
+/// [`samurai_replicator::ritual_brief_name`]'s naming but keyed on
 /// [`PendingKind`] + corrective + wind-down episode instead of
-/// launch/ritual/recovery. Distinct prefixes from the replicator's own
-/// `gen-<N>-launch/ritual/recovery` stems so both controllers can write into
-/// the same `.maestro/briefs/` directory without colliding.
+/// launch/ritual/recovery. Distinct kind words from the replicator's own
+/// `launch`/`ritual`/`recovery` stems so both controllers can write into the
+/// same `.maestro/briefs/` directory without colliding.
+///
+/// Issue #152: the stem is EPIC-SCOPED — `<epic>-gen-<N>-<kind>`, the epic
+/// sanitized through [`samurai_prompts::epic_slug`], the same slug
+/// `samurai_prompts::handoff_file_relpath` already puts in every handoff
+/// filename. `generation` is per-session, so two epics running against one
+/// working directory both reach gen-1 and, without the epic in the stem,
+/// silently overwrote each other's brief — handing an agent another epic's
+/// instructions. Going through `epic_slug` also means two spellings of one
+/// epic (`#38`, `38`) still name one brief, exactly as they name one handoff.
+///
+/// An empty or unusable epic keeps `epic_slug`'s own `epic` fallback, so the
+/// stem degrades to `epic-gen-<N>-<kind>` — always a valid, non-empty name,
+/// never a bare `-gen-1` and never a panic. Two unknown-epic runs in one
+/// directory can still share a brief; that is the pre-#152 behaviour, and no
+/// better key exists at this layer.
 fn injector_brief_name(
+    epic: &str,
     kind: PendingKind,
     generation: u32,
     corrective: bool,
     episode: u32,
 ) -> String {
+    let slug = samurai_prompts::epic_slug(epic);
     let base = match kind {
-        PendingKind::Handoff => format!("gen-{generation}-handoff"),
-        PendingKind::Park => format!("gen-{generation}-park"),
-        PendingKind::SoftWinddown => format!("gen-{generation}-winddown-{episode}"),
-        PendingKind::WinddownAllClear => format!("gen-{generation}-allclear-{episode}"),
+        PendingKind::Handoff => format!("{slug}-gen-{generation}-handoff"),
+        PendingKind::Park => format!("{slug}-gen-{generation}-park"),
+        PendingKind::SoftWinddown => format!("{slug}-gen-{generation}-winddown-{episode}"),
+        PendingKind::WinddownAllClear => format!("{slug}-gen-{generation}-allclear-{episode}"),
     };
     if corrective {
         format!("{base}-corrective")
@@ -1727,7 +1744,7 @@ impl SamuraiInjector {
         let name = self
             .lock_pending()
             .get(&session_id)
-            .map(|p| injector_brief_name(p.kind, p.generation, p.corrective, p.episode));
+            .map(|p| injector_brief_name(&p.epic, p.kind, p.generation, p.corrective, p.episode));
         match (name, (self.session_dirs)(session_id)) {
             (Some(name), Some(dir)) => {
                 samurai_brief::deliverable_instruction(&PathBuf::from(dir), &name, data)
@@ -3325,29 +3342,100 @@ mod tests {
     #[test]
     fn test_injector_brief_name_shape() {
         assert_eq!(
-            injector_brief_name(PendingKind::Handoff, 3, false, 0),
-            "gen-3-handoff"
+            injector_brief_name("#38", PendingKind::Handoff, 3, false, 0),
+            "38-gen-3-handoff"
         );
         assert_eq!(
-            injector_brief_name(PendingKind::Handoff, 3, true, 0),
-            "gen-3-handoff-corrective"
+            injector_brief_name("#38", PendingKind::Handoff, 3, true, 0),
+            "38-gen-3-handoff-corrective"
         );
         assert_eq!(
-            injector_brief_name(PendingKind::Park, 3, false, 0),
-            "gen-3-park"
+            injector_brief_name("#38", PendingKind::Park, 3, false, 0),
+            "38-gen-3-park"
         );
         assert_eq!(
-            injector_brief_name(PendingKind::Park, 3, true, 0),
-            "gen-3-park-corrective"
+            injector_brief_name("#38", PendingKind::Park, 3, true, 0),
+            "38-gen-3-park-corrective"
         );
         assert_eq!(
-            injector_brief_name(PendingKind::SoftWinddown, 3, false, 1),
-            "gen-3-winddown-1"
+            injector_brief_name("#38", PendingKind::SoftWinddown, 3, false, 1),
+            "38-gen-3-winddown-1"
         );
         assert_eq!(
-            injector_brief_name(PendingKind::WinddownAllClear, 3, false, 1),
-            "gen-3-allclear-1"
+            injector_brief_name("#38", PendingKind::WinddownAllClear, 3, false, 1),
+            "38-gen-3-allclear-1"
         );
+    }
+
+    /// Issue #152: `generation` is per-session, so two epics sharing one
+    /// working directory both reach gen-1 — an unscoped stem had them
+    /// overwrite each other's brief.
+    #[test]
+    fn test_injector_brief_names_are_epic_scoped_so_two_epics_never_share_a_brief() {
+        for kind in [
+            PendingKind::Handoff,
+            PendingKind::Park,
+            PendingKind::SoftWinddown,
+            PendingKind::WinddownAllClear,
+        ] {
+            for corrective in [false, true] {
+                assert_ne!(
+                    injector_brief_name("#38", kind, 1, corrective, 1),
+                    injector_brief_name("#41", kind, 1, corrective, 1),
+                    "two epics at gen-1 must not share one brief ({kind:?}, corrective={corrective})"
+                );
+            }
+        }
+        // Two spellings of ONE epic still name one brief — the same
+        // unification every other samurai surface gets from `epic_slug`.
+        assert_eq!(
+            injector_brief_name("#38", PendingKind::Handoff, 1, false, 0),
+            injector_brief_name("38", PendingKind::Handoff, 1, false, 0)
+        );
+    }
+
+    /// Issue #152: an empty or unusable epic keeps `epic_slug`'s `epic`
+    /// fallback, so the stem is a valid name and never a bare `-gen-1`.
+    #[test]
+    fn test_injector_brief_name_falls_back_for_an_unknown_epic() {
+        assert_eq!(
+            injector_brief_name("", PendingKind::Handoff, 1, false, 0),
+            "epic-gen-1-handoff"
+        );
+        assert_eq!(
+            injector_brief_name("###", PendingKind::Park, 1, true, 0),
+            "epic-gen-1-park-corrective"
+        );
+    }
+
+    /// Issue #152 kept the #143 guarantee: both controllers write into the
+    /// same `.maestro/briefs/`, so their stems must stay disjoint even now
+    /// that both carry the epic.
+    #[test]
+    fn test_injector_and_replicator_brief_names_never_collide() {
+        use crate::core::samurai_replicator::ritual_brief_name;
+        for epic in ["#38", ""] {
+            for generation in [1, 3] {
+                let replicator = [
+                    ritual_brief_name(epic, generation, false),
+                    ritual_brief_name(epic, generation, true),
+                ];
+                for kind in [
+                    PendingKind::Handoff,
+                    PendingKind::Park,
+                    PendingKind::SoftWinddown,
+                    PendingKind::WinddownAllClear,
+                ] {
+                    for corrective in [false, true] {
+                        let ours = injector_brief_name(epic, kind, generation, corrective, 1);
+                        assert!(
+                            !replicator.contains(&ours),
+                            "injector stem {ours} collides with a replicator stem"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -3374,7 +3462,7 @@ mod tests {
 
         let staged = injector.deliverable(1, instruction.clone());
 
-        let relpath = format!("{}/gen-3-handoff.md", samurai_brief::BRIEF_DIR);
+        let relpath = format!("{}/epic-7-gen-3-handoff.md", samurai_brief::BRIEF_DIR);
         assert_eq!(staged, samurai_brief::pointer_instruction(&relpath));
         assert_eq!(
             std::fs::read_to_string(repo.path().join(&relpath)).unwrap(),
@@ -3401,7 +3489,7 @@ mod tests {
             "fixture assumption"
         );
         let staged = injector.deliverable(1, park.clone());
-        let relpath = format!("{}/gen-2-park.md", samurai_brief::BRIEF_DIR);
+        let relpath = format!("{}/epic-9-gen-2-park.md", samurai_brief::BRIEF_DIR);
         assert_eq!(staged, samurai_brief::pointer_instruction(&relpath));
         assert_eq!(
             std::fs::read_to_string(repo.path().join(&relpath)).unwrap(),
@@ -3420,7 +3508,10 @@ mod tests {
             "fixture assumption"
         );
         let staged = injector.deliverable(1, park_corrective.clone());
-        let relpath = format!("{}/gen-2-park-corrective.md", samurai_brief::BRIEF_DIR);
+        let relpath = format!(
+            "{}/epic-9-gen-2-park-corrective.md",
+            samurai_brief::BRIEF_DIR
+        );
         assert_eq!(staged, samurai_brief::pointer_instruction(&relpath));
         assert_eq!(
             std::fs::read_to_string(repo.path().join(&relpath)).unwrap(),
@@ -3446,7 +3537,10 @@ mod tests {
             "fixture assumption"
         );
         let staged = injector.deliverable(2, handoff_corrective.clone());
-        let relpath = format!("{}/gen-5-handoff-corrective.md", samurai_brief::BRIEF_DIR);
+        let relpath = format!(
+            "{}/epic-9-gen-5-handoff-corrective.md",
+            samurai_brief::BRIEF_DIR
+        );
         assert_eq!(staged, samurai_brief::pointer_instruction(&relpath));
         assert_eq!(
             std::fs::read_to_string(repo.path().join(&relpath)).unwrap(),
@@ -3606,7 +3700,7 @@ mod tests {
 
         let typed = captured.lock().unwrap().clone().expect("delivery captured");
         let full = samurai_prompts::handoff_instruction("epic-7", 3);
-        let relpath = format!("{}/gen-3-handoff.md", samurai_brief::BRIEF_DIR);
+        let relpath = format!("{}/epic-7-gen-3-handoff.md", samurai_brief::BRIEF_DIR);
         assert_eq!(typed, samurai_brief::pointer_instruction(&relpath));
         assert_ne!(typed, full);
         assert_eq!(

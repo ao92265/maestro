@@ -307,11 +307,34 @@ async fn brief_or_inline(working_dir: &str, name: String, instruction: String) -
 }
 
 /// The brief file name for one staged ritual (issue #137):
-/// `gen-<N>-ritual` / `gen-<N>-recovery`, named for the generation that
-/// reads it.
-fn ritual_brief_name(generation: u32, recovery: bool) -> String {
+/// `<epic>-gen-<N>-ritual` / `<epic>-gen-<N>-recovery`, named for the epic and
+/// the generation that reads it.
+///
+/// Issue #152: the epic is part of the stem, sanitized through
+/// [`samurai_prompts::epic_slug`] — the same slug
+/// [`samurai_prompts::handoff_file_relpath`] already puts in every handoff
+/// filename. `generation` is per-session, so two epics running against one
+/// working directory both reach gen-1 and, without the epic in the stem,
+/// silently overwrote each other's ritual brief. Going through `epic_slug`
+/// also means two spellings of one epic (`#38`, `38`) still name one brief,
+/// exactly as they name one handoff.
+///
+/// An empty or unusable epic keeps `epic_slug`'s own `epic` fallback, so the
+/// stem degrades to `epic-gen-<N>-ritual` — always a valid, non-empty name,
+/// never a bare `-gen-1` and never a panic.
+///
+/// The `ritual`/`recovery` kind words stay distinct from
+/// `samurai_injector::injector_brief_name`'s, so the two controllers still
+/// never collide in the shared `.maestro/briefs/` directory.
+///
+/// `pub(crate)` only so the injector's tests can assert that non-collision
+/// against the real function rather than a copied literal.
+pub(crate) fn ritual_brief_name(epic: &str, generation: u32, recovery: bool) -> String {
     let kind = if recovery { "recovery" } else { "ritual" };
-    format!("gen-{generation}-{kind}")
+    format!(
+        "{}-gen-{generation}-{kind}",
+        samurai_prompts::epic_slug(epic)
+    )
 }
 
 /// Whether one pending ritual has waited too long for its successor to
@@ -1090,7 +1113,7 @@ impl SamuraiReplicator {
         // successor is handed a one-line pointer at it.
         let instruction = brief_or_inline(
             &working_dir,
-            ritual_brief_name(generation, recovery),
+            ritual_brief_name(&snapshot.epic, generation, recovery),
             instruction,
         )
         .await;
@@ -1278,7 +1301,7 @@ impl SamuraiReplicator {
             if still_pending {
                 let instruction = brief_or_inline(
                     &working_dir,
-                    ritual_brief_name(generation, true),
+                    ritual_brief_name(&snapshot.epic, generation, true),
                     instruction,
                 )
                 .await;
@@ -1552,7 +1575,7 @@ impl SamuraiReplicator {
             // plus a pointer — the same treatment `replicate` gives its own.
             let instruction = brief_or_inline(
                 &working_dir,
-                ritual_brief_name(generation, recovery),
+                ritual_brief_name(&epic, generation, recovery),
                 instruction,
             )
             .await;
@@ -1628,10 +1651,15 @@ impl SamuraiReplicator {
         // to a file in the worktree and gen-1 is handed a pointer at it. One
         // small write, on the launch command's own async path (which already
         // wrote the run config synchronously); a failure keeps today's
-        // inline delivery.
+        // inline delivery. Issue #152: epic-scoped like every other brief
+        // stem — a launch is ALWAYS gen-1, so two epics opened against one
+        // working directory collided on `gen-1-launch` every single time.
         let instruction = samurai_brief::deliverable_instruction(
             Path::new(&working_dir),
-            &format!("gen-{generation}-launch"),
+            &format!(
+                "{}-gen-{generation}-launch",
+                samurai_prompts::epic_slug(epic)
+            ),
             instruction,
         );
         let spawn = SuccessorSpawn {
@@ -3356,8 +3384,9 @@ mod tests {
         assert_eq!(
             typed_text,
             samurai_brief::pointer_instruction(&format!(
-                "{}/gen-1-handoff.md",
-                samurai_brief::BRIEF_DIR
+                "{}/{}-gen-1-handoff.md",
+                samurai_brief::BRIEF_DIR,
+                samurai_prompts::epic_slug(epic)
             )),
             "the injected text must be the pointer at gen-1's handoff brief: {typed_text}"
         );
@@ -5221,6 +5250,70 @@ mod tests {
 
     // --- issue #137: long briefs are delivered as FILES, not typed ---
 
+    #[test]
+    fn test_ritual_brief_name_shape() {
+        assert_eq!(ritual_brief_name("#38", 3, false), "38-gen-3-ritual");
+        assert_eq!(ritual_brief_name("#38", 3, true), "38-gen-3-recovery");
+    }
+
+    /// Issue #152: `generation` is per-session, so two epics sharing one
+    /// working directory both reach gen-1 — an unscoped stem had them
+    /// overwrite each other's ritual brief.
+    #[test]
+    fn test_ritual_brief_names_are_epic_scoped_so_two_epics_never_share_a_brief() {
+        for recovery in [false, true] {
+            assert_ne!(
+                ritual_brief_name("#38", 1, recovery),
+                ritual_brief_name("#41", 1, recovery),
+                "two epics at gen-1 must not share one ritual brief (recovery={recovery})"
+            );
+        }
+        // Two spellings of ONE epic still name one brief.
+        assert_eq!(
+            ritual_brief_name("#38", 1, false),
+            ritual_brief_name("38", 1, false)
+        );
+    }
+
+    /// Issue #152: an empty or unusable epic keeps `epic_slug`'s `epic`
+    /// fallback, so the stem is a valid name and never a bare `-gen-1`.
+    #[test]
+    fn test_ritual_brief_name_falls_back_for_an_unknown_epic() {
+        assert_eq!(ritual_brief_name("", 1, false), "epic-gen-1-ritual");
+        assert_eq!(ritual_brief_name("###", 1, true), "epic-gen-1-recovery");
+    }
+
+    /// Issue #152: the launch stem shares `.maestro/briefs/` with the ritual
+    /// and injector stems and is ALWAYS gen-1, so it is the most collision-
+    /// prone of the three — it carries the epic too.
+    #[tokio::test]
+    async fn test_two_epics_launching_in_one_working_dir_keep_separate_briefs() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-two-epic-launch";
+        let worktree = tempdir().unwrap();
+        let working_dir = worktree.path().to_string_lossy().into_owned();
+        let brief_38 = "x".repeat(samurai_brief::INLINE_MAX_BYTES + 1);
+        let brief_41 = "y".repeat(samurai_brief::INLINE_MAX_BYTES + 1);
+
+        h.replicator
+            .spawn_first_generation(project, "#38", &working_dir, brief_38.clone());
+        h.replicator
+            .spawn_first_generation(project, "#41", &working_dir, brief_41.clone());
+
+        assert_eq!(
+            std::fs::read_to_string(worktree.path().join(".maestro/briefs/38-gen-1-launch.md"))
+                .unwrap(),
+            brief_38,
+            "epic #38's launch brief must survive epic #41's launch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.path().join(".maestro/briefs/41-gen-1-launch.md"))
+                .unwrap(),
+            brief_41
+        );
+    }
+
     #[tokio::test]
     async fn test_gen_1_launch_stages_a_pointer_at_a_launch_brief_file() {
         // The gen-1 brief is the longest payload Maestro types, and the one
@@ -5243,10 +5336,10 @@ mod tests {
         let (_, staged) = h.replicator.pending_view(1).unwrap();
         assert_eq!(
             staged,
-            samurai_brief::pointer_instruction(".maestro/briefs/gen-1-launch.md")
+            samurai_brief::pointer_instruction(".maestro/briefs/38-gen-1-launch.md")
         );
         assert_eq!(
-            std::fs::read_to_string(worktree.path().join(".maestro/briefs/gen-1-launch.md"))
+            std::fs::read_to_string(worktree.path().join(".maestro/briefs/38-gen-1-launch.md"))
                 .unwrap(),
             brief,
             "the brief on disk is what the caller composed, byte for byte"
@@ -5291,7 +5384,7 @@ mod tests {
         let (_, staged) = h.replicator.pending_view(3).unwrap();
         assert_eq!(
             staged,
-            samurai_brief::pointer_instruction(".maestro/briefs/gen-3-ritual.md")
+            samurai_brief::pointer_instruction(".maestro/briefs/epic-9-gen-3-ritual.md")
         );
         // The ritual itself is intact in the file the pointer names.
         let brief = brief_text(repo.path(), &staged);
@@ -5321,7 +5414,7 @@ mod tests {
         let (_, staged) = h.replicator.pending_view(3).unwrap();
         assert_eq!(
             staged,
-            samurai_brief::pointer_instruction(".maestro/briefs/gen-3-recovery.md")
+            samurai_brief::pointer_instruction(".maestro/briefs/epic-9-gen-3-recovery.md")
         );
         let brief = brief_text(repo.path(), &staged);
         assert!(brief.contains("RECOVERY MODE"), "{brief}");
@@ -5352,7 +5445,7 @@ mod tests {
         assert!(
             !repo
                 .path()
-                .join(".maestro/briefs/gen-3-recovery.md")
+                .join(".maestro/briefs/epic-9-gen-3-recovery.md")
                 .exists(),
             "the brief of a cancelled recovery must never reach the worktree"
         );
