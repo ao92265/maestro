@@ -245,16 +245,40 @@ pub fn pointer_instruction(relpath: &str) -> String {
 /// A failed write falls back to the full text — the pre-#137 behaviour — so
 /// the brief file can only ever improve delivery, never break it.
 pub fn deliverable_instruction(worktree: &Path, name: &str, instruction: String) -> String {
-    if instruction.len() <= INLINE_MAX_BYTES {
-        return instruction;
-    }
-    match write_brief(worktree, name, &instruction) {
-        Ok(relpath) => pointer_instruction(&relpath),
+    match try_deliverable_instruction(worktree, name, &instruction) {
+        Ok(Some(pointer)) => pointer,
+        Ok(None) => instruction,
         Err(e) => {
             log::warn!("samurai brief: {e} — typing the full instruction inline instead");
             instruction
         }
     }
+}
+
+/// [`deliverable_instruction`] without the swallowed failure: the same
+/// routing — the instruction inline under [`INLINE_MAX_BYTES`], a pointer at
+/// a written brief over it — but a failed write comes back as `Err` instead
+/// of silently becoming "type the whole thing".
+///
+/// `Ok(None)` means keep `instruction` exactly as it is, nothing was
+/// written; `Ok(Some(pointer))` means the brief is on disk and `pointer` is
+/// what to type; `Err` means the file route was taken and FAILED.
+///
+/// Added for issue #154. `commands::harvest` sizes the payload it assembles
+/// to the route it is about to take, so its file-route payload is far too
+/// large to blind-type as a fallback — it has to learn the write failed,
+/// re-render smaller, and type that instead. Callers with nothing to
+/// re-render keep using [`deliverable_instruction`], whose infallible
+/// fallback is the right answer when the alternative is delivering nothing.
+pub fn try_deliverable_instruction(
+    worktree: &Path,
+    name: &str,
+    instruction: &str,
+) -> Result<Option<String>, String> {
+    if instruction.len() <= INLINE_MAX_BYTES {
+        return Ok(None);
+    }
+    write_brief(worktree, name, instruction).map(|relpath| Some(pointer_instruction(&relpath)))
 }
 
 #[cfg(test)]
@@ -560,6 +584,40 @@ mod tests {
             std::fs::read_to_string(dir.path().join(".maestro/briefs/gen-1-launch.md")).unwrap(),
             instruction,
             "the brief on disk is the instruction, byte for byte"
+        );
+    }
+
+    #[test]
+    fn test_try_deliverable_instruction_reports_each_route_distinctly() {
+        // Issue #154: a caller that sized its payload for the FILE route
+        // must be able to tell "written, here is the pointer" from "the
+        // write failed" — the infallible wrapper collapses both into a
+        // string it would then type.
+        let short_dir = tempdir().unwrap();
+        let short = "[Maestro Samurai] ".to_string() + &"x".repeat(INLINE_MAX_BYTES - 18);
+        assert_eq!(short.len(), INLINE_MAX_BYTES);
+        assert_eq!(
+            try_deliverable_instruction(short_dir.path(), "gen-1-launch", &short).unwrap(),
+            None,
+            "under the budget: nothing to write, keep the instruction"
+        );
+        assert!(
+            !short_dir.path().join(BRIEF_DIR).exists(),
+            "no brief written"
+        );
+
+        let written_dir = tempdir().unwrap();
+        let instruction = long_instruction();
+        assert_eq!(
+            try_deliverable_instruction(written_dir.path(), "gen-1-launch", &instruction).unwrap(),
+            Some(pointer_instruction(".maestro/briefs/gen-1-launch.md"))
+        );
+
+        let failing_dir = tempdir().unwrap();
+        std::fs::write(failing_dir.path().join(".maestro"), "not a directory").unwrap();
+        assert!(
+            try_deliverable_instruction(failing_dir.path(), "gen-1-launch", &instruction).is_err(),
+            "a failed write is an Err here, never the full text"
         );
     }
 
