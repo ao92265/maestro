@@ -3894,8 +3894,8 @@ mod tests {
         // The delivery outcome fires, but `record_delivery_outcome` reads the
         // entry back and finds it gone, so it writes no row — its own
         // pre-existing "a raced removal simply skips the rows" rule, which
-        // this fix deliberately leaves alone. Pinned so a later change to it
-        // is a decision, not a drift.
+        // this fix deliberately leaves alone — tracked as #162. Pinned so a
+        // later change to it is a decision, not a drift.
         let rows = audit.read(project, None, None).await.unwrap().events;
         assert!(
             !rows
