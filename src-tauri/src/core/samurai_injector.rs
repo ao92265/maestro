@@ -1740,12 +1740,31 @@ impl SamuraiInjector {
     ///
     /// The lock is acquired and released *before* any I/O —
     /// `deliverable_instruction` never runs under `self.pending`'s mutex.
+    ///
+    /// Test-only since issue #153: production reaches the same body through
+    /// [`Self::stage_deliverable`] from inside `spawn_write`'s blocking task,
+    /// which has no `&self` to call this on.
+    #[cfg(test)]
     fn deliverable(&self, session_id: u32, data: String) -> String {
-        let name = self
-            .lock_pending()
+        Self::stage_deliverable(&self.pending, &self.session_dirs, session_id, data)
+    }
+
+    /// [`Self::deliverable`]'s body over borrowed state instead of `&self`,
+    /// so [`Self::spawn_write`] can run it inside a `spawn_blocking` closure
+    /// (issue #153) — `&self` cannot cross onto the blocking pool, the two
+    /// `Arc` handles can.
+    fn stage_deliverable(
+        pending: &Mutex<HashMap<u32, PendingInstruction>>,
+        session_dirs: &SessionDirResolver,
+        session_id: u32,
+        data: String,
+    ) -> String {
+        let name = pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&session_id)
             .map(|p| injector_brief_name(&p.epic, p.kind, p.generation, p.corrective, p.episode));
-        match (name, (self.session_dirs)(session_id)) {
+        match (name, session_dirs(session_id)) {
             (Some(name), Some(dir)) => {
                 samurai_brief::deliverable_instruction(&PathBuf::from(dir), &name, data)
             }
@@ -1766,6 +1785,22 @@ impl SamuraiInjector {
     /// stays the RAW `data`, taken before that conversion, so
     /// `record_delivery_outcome`'s excerpt/`total_chars` keep describing the
     /// real instruction, never the pointer.
+    ///
+    /// Issue #153: staging a brief is `create_dir_all` + write + rename, and
+    /// this runs on the tokio worker carrying the hook/bus tee for EVERY
+    /// session — a slow or cold worktree would stall every other session's
+    /// events behind one file write. So the staging *and* the writer call
+    /// move onto the blocking pool, the same policy
+    /// [`SamuraiReplicator::brief_or_inline`](super::samurai_replicator) and
+    /// [`Self::spawn_validation`] already follow. At or under
+    /// [`samurai_brief::INLINE_MAX_BYTES`] there is provably no filesystem
+    /// call at all (`deliverable_instruction` returns the text untouched), so
+    /// that path stays fully synchronous — no runtime hop bought for nothing,
+    /// and short instructions keep landing before this call returns.
+    ///
+    /// Every decision the ACK ladder reads — the `pending` bookkeeping
+    /// `arm_injection_on_idle` just wrote and the `idle_now` clear — already
+    /// happened in `on_idle` before this call; only the write travels.
     fn spawn_write(&self, session_id: u32, gate: &'static str, data: String) {
         let pending = self.pending.clone();
         let audit = self.audit.clone();
@@ -1782,8 +1817,30 @@ impl SamuraiInjector {
                 result,
             );
         });
-        let to_type = self.deliverable(session_id, data);
-        (self.deliver)(session_id, to_type, outcome);
+        if data.len() <= samurai_brief::INLINE_MAX_BYTES {
+            (self.deliver)(session_id, data, outcome);
+            return;
+        }
+        let deliver = self.deliver.clone();
+        let staging_pending = self.pending.clone();
+        let session_dirs = self.session_dirs.clone();
+        let inline = data.clone();
+        tauri::async_runtime::spawn(async move {
+            let to_type = tokio::task::spawn_blocking(move || {
+                Self::stage_deliverable(&staging_pending, &session_dirs, session_id, data)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                // Never drop the delivery: fall back to the full text, the
+                // pre-#143 behaviour and the same "a brief can only improve
+                // delivery" rule a failed write itself follows.
+                log::warn!(
+                    "samurai injector: the brief write task failed ({e}) — typing the full instruction inline instead"
+                );
+                inline
+            });
+            deliver(session_id, to_type, outcome);
+        });
     }
 
     /// ACK scan for one assistant reply. Only the session's own expected
@@ -1957,7 +2014,8 @@ impl SamuraiInjector {
 
     /// Run the two checks off the runtime: `git status` has no bounded
     /// completion time (repo size, cold FS caches), so it goes through
-    /// `spawn_blocking` — same policy as [`spawn_write`](Self::spawn_write).
+    /// `spawn_blocking` — the same policy [`spawn_write`](Self::spawn_write)
+    /// applies to a brief write since issue #153.
     fn spawn_validation(&self, session_id: u32, working_dir: String, relpath: String) {
         let pending = self.pending.clone();
         let supervisor = self.supervisor.clone();
@@ -3284,9 +3342,21 @@ mod tests {
         injector.tick(); // WORKING → HANDOFF_REQUESTED, instruction pending
 
         // The Stop hook gates the injection → one INJECT phase=delivered row
-        // with the kind, attempt, gate and a bounded excerpt.
+        // with the kind, attempt, gate and a bounded excerpt. Issue #153: an
+        // over-gate instruction is delivered from the blocking pool, so the
+        // row lands after `observe_hook` returns — poll rather than read once.
         injector.observe_hook(&stop_event(1));
-        let rows = audit.read(project, None, None).await.unwrap().events;
+        let mut rows = Vec::new();
+        for _ in 0..200 {
+            rows = audit.read(project, None, None).await.unwrap().events;
+            if rows
+                .iter()
+                .any(|r| r.event == AuditEventKind::Inject && r.details["phase"] == "delivered")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let delivered: Vec<_> = rows
             .iter()
             .filter(|r| r.event == AuditEventKind::Inject && r.details["phase"] == "delivered")
@@ -3636,8 +3706,11 @@ mod tests {
         assert_eq!(staged, instruction);
     }
 
-    /// The last `data` the injected writer was asked to type.
-    type DeliveryCapture = Arc<Mutex<Option<String>>>;
+    /// The last delivery the injected writer was asked to type: the `data`
+    /// itself and the thread it was typed from. Issue #153 needs the thread
+    /// too — "the brief write left the caller's worker" is only observable
+    /// from where the write ends up running.
+    type DeliveryCapture = Arc<Mutex<Option<(String, std::thread::ThreadId)>>>;
 
     /// Same wiring as [`harness`], but the injected writer also records the
     /// last `data` it was asked to type — issue #143's end-to-end check needs
@@ -3665,7 +3738,7 @@ mod tests {
         let captured: DeliveryCapture = Arc::new(Mutex::new(None));
         let captured_for_deliver = captured.clone();
         let deliver: StdinWriter = Arc::new(move |_, data, outcome: DeliveryOutcome| {
-            *captured_for_deliver.lock().unwrap() = Some(data);
+            *captured_for_deliver.lock().unwrap() = Some((data, std::thread::current().id()));
             outcome(Ok(()))
         });
         let injector = SamuraiInjector::new(
@@ -3698,7 +3771,10 @@ mod tests {
 
         injector.observe_hook(&stop_event(1));
 
-        let typed = captured.lock().unwrap().clone().expect("delivery captured");
+        // Issue #153: the brief write runs on the blocking pool, so the
+        // delivery lands after `observe_hook` returns — poll for it.
+        wait_until(|| captured.lock().unwrap().is_some()).await;
+        let (typed, _) = captured.lock().unwrap().clone().expect("delivery captured");
         let full = samurai_prompts::handoff_instruction("epic-7", 3);
         let relpath = format!("{}/epic-7-gen-3-handoff.md", samurai_brief::BRIEF_DIR);
         assert_eq!(typed, samurai_brief::pointer_instruction(&relpath));
@@ -3706,6 +3782,50 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(repo.path().join(&relpath)).unwrap(),
             full
+        );
+    }
+
+    /// Issue #153: staging a brief is `create_dir_all` + write + rename —
+    /// filesystem I/O with no bounded completion time (cold caches, a slow
+    /// or networked worktree), and `on_idle` runs on the tokio worker that
+    /// carries the hook/bus tee for EVERY session. So an over-gate
+    /// instruction must reach the writer from the blocking pool, never from
+    /// the thread that observed the idle signal. Content is
+    /// [`test_handoff_trigger_delivers_a_pointer_through_the_full_harness`]'s
+    /// job; this pins only WHERE the write ran.
+    #[tokio::test]
+    async fn test_a_long_instruction_is_staged_off_the_callers_worker_thread() {
+        let dir = tempdir().unwrap();
+        let (injector, _audit, supervisor, context, dirs, captured) =
+            harness_capturing_delivery(dir.path());
+        let repo = tempdir().unwrap();
+        dirs.lock()
+            .unwrap()
+            .insert(1, repo.path().to_string_lossy().into_owned());
+        supervisor
+            .register_session(
+                1,
+                "C:/git/proj-inj-brief-offthread".into(),
+                "epic-7".into(),
+                3,
+            )
+            .unwrap();
+        context.observe(&context_event(1, 50.0));
+        injector.tick();
+        assert!(
+            samurai_prompts::handoff_instruction("epic-7", 3).len()
+                > samurai_brief::INLINE_MAX_BYTES,
+            "fixture assumption: the staged instruction is over the brief gate"
+        );
+
+        let caller = std::thread::current().id();
+        injector.observe_hook(&stop_event(1));
+
+        wait_until(|| captured.lock().unwrap().is_some()).await;
+        let (_, wrote_from) = captured.lock().unwrap().clone().expect("delivery captured");
+        assert_ne!(
+            wrote_from, caller,
+            "the brief write blocked the caller's worker thread"
         );
     }
 
