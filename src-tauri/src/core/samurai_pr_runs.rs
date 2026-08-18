@@ -32,6 +32,8 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
+use super::samurai_brief::StagedBrief;
+
 /// Directory name, inside the `runs` root, holding PR-review records.
 pub const PR_RUNS_DIR: &str = "pr";
 
@@ -107,11 +109,25 @@ pub struct PrReviewRun {
     pub repo: String,
     pub project_path: String,
     pub steps: Vec<String>,
-    /// Worktree-relative path of the brief the prompt was staged as
-    /// (`samurai_brief`), or `None` when the prompt was short enough to type
-    /// inline — a review is not required to have a brief.
+    /// Path of the brief the prompt was staged as (`samurai_brief`),
+    /// RELATIVE to [`Self::brief_root`], or `None` when the prompt was short
+    /// enough to type inline — a review is not required to have a brief.
     #[serde(default)]
     pub brief: Option<String>,
+    /// The directory that relative path resolves against: the checkout the
+    /// brief was actually written into (the arm call's `brief_dir`, which is
+    /// the TAB's project). This is NOT [`Self::project_path`] — in a
+    /// multi-repo workspace the tab's project and the PR's own checkout are
+    /// different trees on purpose (`PrActionsMenu`, review finding C10), so
+    /// resolving the brief against `project_path` looks for it in the wrong
+    /// tree and, worse, can name a same-titled file that belongs to the user
+    /// (issue #145).
+    ///
+    /// `None` on records written before this field existed. Such a record
+    /// carries no evidence of where its brief landed, so the retention sweep
+    /// skips it entirely rather than guess — missing evidence never deletes.
+    #[serde(default)]
+    pub brief_root: Option<String>,
     /// The Maestro terminal session the review opened in. Its liveness is what
     /// makes the group live — but only together with [`Self::launch_id`], see
     /// [`is_live`].
@@ -128,7 +144,14 @@ pub struct PrReviewRun {
 impl PrReviewRun {
     /// Builds a record from a launch plus the two delivery facts, stamped with
     /// the current UTC time and this app launch's id.
-    pub fn now(launch: PrReviewLaunch, session_id: u32, brief: Option<String>) -> Self {
+    pub fn now(launch: PrReviewLaunch, session_id: u32, brief: Option<StagedBrief>) -> Self {
+        let (brief, brief_root) = match brief {
+            Some(staged) => (
+                Some(staged.relpath),
+                Some(normalize_project(&staged.root.to_string_lossy())),
+            ),
+            None => (None, None),
+        };
         Self {
             kind: PrRunKind::PrReview,
             pr: launch.pr,
@@ -137,6 +160,7 @@ impl PrReviewRun {
             project_path: normalize_project(&launch.project_path),
             steps: launch.steps,
             brief,
+            brief_root,
             session_id,
             launch_id: launch_id().to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
@@ -275,11 +299,39 @@ fn sanitize(value: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-/// Path of the brief a PR review was staged as, when it has one: the record's
-/// worktree-relative `brief` resolved against its checkout.
+/// Path of the brief a PR review was staged as, for LISTING: the record's
+/// relative `brief` resolved against the root it was actually staged under,
+/// falling back to the checkout for records written before
+/// [`PrReviewRun::brief_root`] existed. The fallback is a best-effort guess —
+/// right whenever the tab's project and the PR's checkout coincide, which is
+/// the single-repo case — and a wrong guess here only costs a row that does
+/// not stat, never a file.
+///
+/// Anything DESTRUCTIVE must use [`staged_brief_path`] instead, which refuses
+/// to guess at all.
 pub fn brief_path(run: &PrReviewRun) -> Option<PathBuf> {
     let brief = run.brief.as_deref()?;
-    Some(Path::new(&run.project_path).join(brief))
+    let root = run.brief_root.as_deref().unwrap_or(&run.project_path);
+    Some(Path::new(root).join(brief))
+}
+
+/// Where the brief PROVABLY landed: `Some` only when the record carries both
+/// halves ([`PrReviewRun::brief`] and [`PrReviewRun::brief_root`]) and the
+/// root is ABSOLUTE. Anything else is `None`.
+///
+/// The absoluteness check is not pedantry: a relative root resolves against
+/// the PROCESS's working directory, so a record carrying one would point the
+/// #145 retention sweep at `<cwd>/.maestro/briefs/` — a directory belonging to
+/// whatever the app happened to be started from. A record written before
+/// `brief_root` existed has no evidence at all and is `None` for the same
+/// reason: missing evidence never deletes.
+pub fn staged_brief_path(run: &PrReviewRun) -> Option<PathBuf> {
+    let (brief, root) = (run.brief.as_deref()?, run.brief_root.as_deref()?);
+    let root = Path::new(root);
+    if !root.is_absolute() {
+        return None;
+    }
+    Some(root.join(brief))
 }
 
 #[cfg(test)]
@@ -295,6 +347,16 @@ mod tests {
             project_path: r"\\?\C:\git\maestro".to_string(),
             ..launch()
         }
+    }
+
+    /// A brief staged under the tab's project — a DIFFERENT tree from the
+    /// `launch()` checkout on purpose (issue #145), so any test that resolves
+    /// a brief proves which root it used.
+    fn staged(relpath: &str) -> Option<StagedBrief> {
+        Some(StagedBrief {
+            root: PathBuf::from(r"C:\git\workspace"),
+            relpath: relpath.to_string(),
+        })
     }
 
     fn launch() -> PrReviewLaunch {
@@ -314,7 +376,7 @@ mod tests {
         let run = PrReviewRun::now(
             launch(),
             7,
-            Some(".maestro/briefs/pr-142-check-review.md".to_string()),
+            staged(".maestro/briefs/pr-142-check-review.md"),
         );
 
         let path = store.record(&run).unwrap();
@@ -332,6 +394,7 @@ mod tests {
             "project_path",
             "steps",
             "brief",
+            "brief_root",
             "session_id",
             "launch_id",
             "created_at",
@@ -385,7 +448,7 @@ mod tests {
 
         let mut first = PrReviewRun::now(launch(), 7, None);
         first.created_at = "2026-08-17T12:00:00+00:00".to_string();
-        let mut rearmed = PrReviewRun::now(launch(), 7, Some("b.md".to_string()));
+        let mut rearmed = PrReviewRun::now(launch(), 7, staged("b.md"));
         rearmed.created_at = "2026-08-17T12:00:00+00:00".to_string();
         let mut other_session = PrReviewRun::now(launch(), 8, None);
         other_session.created_at = "2026-08-17T12:00:00+00:00".to_string();
@@ -500,8 +563,17 @@ mod tests {
             run.project_path,
             PrReviewRun::now(launch(), 7, None).project_path
         );
-        // And the brief resolves against the normalized checkout.
-        let run = PrReviewRun::now(verbatim_launch(), 7, Some("a.md".to_string()));
+        // And a brief staged in the checkout ITSELF resolves against the
+        // normalized spelling, never the verbatim one.
+        let run = PrReviewRun::now(
+            verbatim_launch(),
+            7,
+            Some(StagedBrief {
+                root: PathBuf::from(r"\\?\C:\git\maestro"),
+                relpath: "a.md".to_string(),
+            }),
+        );
+        assert_eq!(run.brief_root.as_deref(), Some(r"C:\git\maestro"));
         assert_eq!(
             brief_path(&run).unwrap(),
             Path::new(r"C:\git\maestro").join("a.md")
@@ -509,16 +581,51 @@ mod tests {
     }
 
     #[test]
-    fn test_brief_path_resolves_against_the_checkout() {
-        let run = PrReviewRun::now(
-            launch(),
-            7,
-            Some(".maestro/briefs/pr-142-check-review.md".to_string()),
-        );
+    fn test_brief_path_resolves_against_the_tree_the_brief_was_staged_in() {
+        // Issue #145: the brief lands in the TAB's project, which in a
+        // multi-repo workspace is not the PR's own checkout.
+        let relpath = ".maestro/briefs/pr-142-check-review.md";
+        let run = PrReviewRun::now(launch(), 7, staged(relpath));
         assert_eq!(
             brief_path(&run).unwrap(),
-            Path::new(r"C:\git\maestro").join(".maestro/briefs/pr-142-check-review.md")
+            Path::new(r"C:\git\workspace").join(relpath)
         );
         assert!(brief_path(&PrReviewRun::now(launch(), 7, None)).is_none());
+
+        // A pre-#145 record knows only the relative half. LISTING falls back
+        // to the checkout — a guess that is right in the single-repo case and
+        // costs only a row that does not stat when it is wrong.
+        let mut legacy = run.clone();
+        legacy.brief_root = None;
+        assert_eq!(
+            brief_path(&legacy).unwrap(),
+            Path::new(r"C:\git\maestro").join(relpath)
+        );
+    }
+
+    #[test]
+    fn test_staged_brief_path_refuses_to_guess() {
+        // The DESTRUCTIVE resolution never falls back and never resolves
+        // against the process cwd: without both halves, and without an
+        // absolute root, there is no evidence and the answer is `None`.
+        let relpath = ".maestro/briefs/pr-142-check-review.md";
+        let run = PrReviewRun::now(launch(), 7, staged(relpath));
+        let absolute = std::env::temp_dir();
+        let mut here = run.clone();
+        here.brief_root = Some(absolute.to_string_lossy().into_owned());
+        assert_eq!(staged_brief_path(&here).unwrap(), absolute.join(relpath));
+
+        let mut legacy = run.clone();
+        legacy.brief_root = None;
+        assert!(staged_brief_path(&legacy).is_none(), "no staging evidence");
+
+        let mut relative = run.clone();
+        relative.brief_root = Some("..".to_string());
+        assert!(
+            staged_brief_path(&relative).is_none(),
+            "a relative root would resolve against the process cwd"
+        );
+
+        assert!(staged_brief_path(&PrReviewRun::now(launch(), 7, None)).is_none());
     }
 }

@@ -221,9 +221,14 @@ pub struct SamuraiFilesRoots {
 
 /// The handoff directory inside an epic worktree (PRD §6:
 /// `.maestro/handoffs/`). Input may carry the `\\?\` prefix; the result is
-/// stripped.
+/// stripped — through [`strip_extended_length`], so the `\\?\UNC\` spelling
+/// strips back to `\\server\share\…` instead of to a RELATIVE `UNC\…`, which
+/// resolves against the process cwd and therefore canonicalizes to nothing.
+/// A share-hosted checkout otherwise had its retention silently never run
+/// (issue #145 review); `test_canonical_stripped_keeps_unc_paths_absolute`
+/// pins the same rule one layer down.
 pub fn handoff_dir(worktree_path: &str) -> PathBuf {
-    PathBuf::from(strip_prefix_str(worktree_path))
+    PathBuf::from(strip_extended_length(worktree_path))
         .join(".maestro")
         .join("handoffs")
 }
@@ -233,7 +238,7 @@ pub fn handoff_dir(worktree_path: &str) -> PathBuf {
 /// [`handoff_dir`], and a managed delete root for the same reason: briefs are
 /// Maestro-written artifacts the Second Brain lists.
 pub fn brief_dir(dir: &str) -> PathBuf {
-    PathBuf::from(strip_prefix_str(dir)).join(BRIEF_DIR)
+    PathBuf::from(strip_extended_length(dir)).join(BRIEF_DIR)
 }
 
 /// PRD §8 row 1: a completed epic's `.maestro/` artifacts auto-clean
@@ -324,13 +329,29 @@ const SECS_PER_RETENTION_DAY: u64 = 24 * 60 * 60;
 /// protects a live review, not the terminal signal: a review still running
 /// two weeks after the app last started is not a thing.
 ///
+/// **Called at STARTUP only** (lib.rs), where no terminal exists yet and
+/// `open_session_ids` is therefore empty — the liveness parameter is honest
+/// there rather than load-bearing. A future mid-session caller would be the
+/// first to lean on it, and inherits the restart caveat above.
+///
 /// **This is the user's working tree, not a throwaway worktree** — a wrong
-/// delete destroys real work. So the record's `brief` field, which is data
-/// read back off disk, is never trusted as a path: the file must canonicalize
-/// INSIDE [`brief_dir`] of that record's own checkout and end in `.md`, which
-/// refuses a `..` spelling and an absolute path alike. Missing evidence never
-/// deletes, exactly as in the sibling: an unreadable mtime, an absent file or
-/// an unresolvable brief directory is skipped.
+/// delete destroys real work, so nothing the record says is taken on trust:
+///
+/// * The brief resolves against [`PrReviewRun::brief_root`], the directory it
+///   was actually staged under, NEVER against `project_path`. Those are
+///   different trees in a multi-repo workspace (`PrActionsMenu`, review
+///   finding C10), so `project_path` would both miss the real brief and name
+///   a same-titled file in the PR's checkout that belongs to the user.
+/// * A record with no `brief_root`, or a relative one, is skipped —
+///   [`samurai_pr_runs::staged_brief_path`] refuses to guess, and a relative
+///   root would resolve against the process cwd.
+/// * The resolved file must canonicalize INSIDE [`brief_dir`] of that staging
+///   root and end in `.md`, which refuses a `..` spelling and an absolute
+///   path alike, and it must be a regular file — a directory named `x.md`
+///   otherwise reached `remove_file` and was refused only by the OS.
+///
+/// Missing evidence never deletes, exactly as in the sibling: an unreadable
+/// mtime, an absent file or an unresolvable brief directory is skipped.
 pub fn sweep_pr_review_briefs(
     runs: &[(PathBuf, PrReviewRun)],
     open_session_ids: &HashSet<u32>,
@@ -341,32 +362,48 @@ pub fn sweep_pr_review_briefs(
     // name, so a DEAD record can point at the very brief a live relaunch is
     // reading. Skipping live records one by one would not catch that; the
     // paths the live ones hold are collected up front and never touched.
-    let live_briefs: HashSet<PathBuf> = runs
+    // BOTH spellings go in — a live brief that is momentarily unresolvable
+    // (transient IO, or `write_brief`'s temp-then-rename window) would drop
+    // out of a canonicalized-only allow-list exactly when it matters most.
+    let mut live_briefs: HashSet<PathBuf> = HashSet::new();
+    for (_, run) in runs
         .iter()
         .filter(|(_, run)| samurai_pr_runs::is_live(run, open_session_ids))
-        .filter_map(|(_, run)| samurai_pr_runs::brief_path(run))
-        .filter_map(|brief| canonical_stripped(&brief))
-        .collect();
+    {
+        let Some(brief) = samurai_pr_runs::staged_brief_path(run) else {
+            continue;
+        };
+        live_briefs.extend(canonical_stripped(&brief));
+        live_briefs.insert(brief);
+    }
     let mut removed: Vec<PathBuf> = Vec::new();
     for (_, run) in runs {
         if samurai_pr_runs::is_live(run, open_session_ids) {
             continue;
         }
-        // No brief (a short prompt typed inline), or one that is already gone
-        // — a record outlives the file it points at, and a second record
-        // sharing the name finds nothing to resolve.
-        let Some(target) = samurai_pr_runs::brief_path(run)
-            .as_deref()
-            .and_then(canonical_stripped)
-        else {
+        // No staging evidence (no brief at all, a pre-#145 record, or a root
+        // that is not absolute) — nothing this sweep may act on.
+        let Some(staged) = samurai_pr_runs::staged_brief_path(run) else {
+            continue;
+        };
+        // Already gone: a record outlives the file it points at, and a second
+        // record sharing the name finds nothing left to resolve.
+        let Some(target) = canonical_stripped(&staged) else {
             continue;
         };
         if target.extension().and_then(|e| e.to_str()) != Some("md")
             || live_briefs.contains(&target)
+            || live_briefs.contains(&staged)
         {
             continue;
         }
-        let Some(root) = canonical_stripped(&brief_dir(&run.project_path)) else {
+        let Some(root) = run
+            .brief_root
+            .as_deref()
+            .map(brief_dir)
+            .as_deref()
+            .and_then(canonical_stripped)
+        else {
             continue;
         };
         if target == root || !target.starts_with(&root) {
@@ -378,8 +415,9 @@ pub fn sweep_pr_review_briefs(
             continue;
         }
         let expired = std::fs::metadata(&target)
-            .and_then(|m| m.modified())
             .ok()
+            .filter(|m| m.is_file())
+            .and_then(|m| m.modified().ok())
             .and_then(|m| m.elapsed().ok())
             .is_some_and(|age| age >= max_age);
         if !expired {
@@ -1401,6 +1439,7 @@ fn path_key(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::core::allowance_watcher::{ACCOUNT_PROJECT, ACCOUNT_RUN};
+    use crate::core::samurai_brief::StagedBrief;
     use crate::core::samurai_pr_runs::PrReviewLaunch;
     use crate::core::samurai_run_config::RunConfigStore;
     use crate::core::supervisor::SupervisorState;
@@ -1580,7 +1619,10 @@ mod tests {
                 steps: vec!["check".to_string(), "review".to_string()],
             },
             7,
-            Some(pr_relpath),
+            Some(StagedBrief {
+                root: project_dir.clone(),
+                relpath: pr_relpath,
+            }),
         );
         let pr_record_path = roots.runs_dir.join("pr").join("record.json");
         std::fs::create_dir_all(pr_record_path.parent().unwrap()).unwrap();
@@ -2205,7 +2247,10 @@ mod tests {
                 steps: vec!["check".to_string()],
             },
             3,
-            Some(format!("{BRIEF_DIR}/pr-142-check.md")),
+            Some(StagedBrief {
+                root: project.clone(),
+                relpath: format!("{BRIEF_DIR}/pr-142-check.md"),
+            }),
         );
 
         let (_, entries) = list_files(
@@ -2658,6 +2703,20 @@ mod tests {
             brief_dir(r"\\?\C:\wt\epic-9"),
             PathBuf::from(r"C:\wt\epic-9").join(BRIEF_DIR)
         );
+        // A share-hosted checkout arrives as `\\?\UNC\…`. Stripping only
+        // `\\?\` left a RELATIVE `UNC\…`, which canonicalizes against the
+        // process cwd and matches nothing — so its retention silently never
+        // ran (issue #145 review).
+        assert_eq!(
+            handoff_dir(r"\\?\UNC\nas\team\wt\epic-9"),
+            PathBuf::from(r"\\nas\team\wt\epic-9")
+                .join(".maestro")
+                .join("handoffs")
+        );
+        assert_eq!(
+            brief_dir(r"\\?\UNC\nas\team\wt\epic-9"),
+            PathBuf::from(r"\\nas\team\wt\epic-9").join(BRIEF_DIR)
+        );
     }
 
     #[test]
@@ -2732,21 +2791,36 @@ mod tests {
         assert!(sweep_handoff_retention(&configs, 0).is_empty());
     }
 
-    /// A PR-review record rooted at `checkout`, staged as `brief` (the
-    /// worktree-relative spelling `samurai_brief::write_brief` returns) when
-    /// it has one.
-    fn pr_review(checkout: &Path, session: u32, brief: Option<String>) -> PrReviewRun {
+    /// A PR-review record that groups under `about` (the PR's own checkout,
+    /// the record's `project_path`) while its brief was staged under
+    /// `staged_in` (the arm call's `brief_dir`, i.e. the TAB's project).
+    /// `brief` is the relative spelling `samurai_brief::write_brief` returns.
+    fn pr_review_staged_in(
+        about: &Path,
+        staged_in: &Path,
+        session: u32,
+        brief: Option<String>,
+    ) -> PrReviewRun {
         PrReviewRun::now(
             PrReviewLaunch {
                 pr: 145,
                 title: "sweep pr briefs".to_string(),
                 repo: "nachogl1/maestro".to_string(),
-                project_path: checkout.to_string_lossy().to_string(),
+                project_path: about.to_string_lossy().to_string(),
                 steps: vec!["review".to_string()],
             },
             session,
-            brief,
+            brief.map(|relpath| StagedBrief {
+                root: staged_in.to_path_buf(),
+                relpath,
+            }),
         )
+    }
+
+    /// The single-repo case: the tab's project and the PR's checkout are the
+    /// same tree.
+    fn pr_review(checkout: &Path, session: u32, brief: Option<String>) -> PrReviewRun {
+        pr_review_staged_in(checkout, checkout, session, brief)
     }
 
     /// Writes `<checkout>/.maestro/briefs/<name>` and returns its path.
@@ -2795,6 +2869,57 @@ mod tests {
 
         // Idempotent: the record outlives the brief it points at.
         assert!(sweep_pr_review_briefs(&runs, &none_open, 0).is_empty());
+    }
+
+    #[test]
+    fn test_pr_brief_sweep_uses_the_tree_the_brief_was_staged_in() {
+        // Review finding C10 / issue #145: `briefDir` is the TAB's project —
+        // the terminal's working directory, where the pointer's relative path
+        // resolves — while the record's `project_path` is the PR's OWN
+        // checkout. In a multi-repo workspace those are different trees, and
+        // both can hold a `pr-<n>-<steps>.md`. Resolving against
+        // `project_path` therefore misses the real brief AND deletes the
+        // user's same-named file in the other tree.
+        let root = tempdir().unwrap();
+        let tab_project = root.path().join("workspace");
+        let pr_checkout = root.path().join("the-pr-repo");
+        let staged = staged_brief(&tab_project, "pr-145-review.md");
+        let decoy = staged_brief(&pr_checkout, "pr-145-review.md");
+
+        let runs = pr_runs(vec![pr_review_staged_in(
+            &pr_checkout,
+            &tab_project,
+            7,
+            Some(format!("{BRIEF_DIR}/pr-145-review.md")),
+        )]);
+        let removed = sweep_pr_review_briefs(&runs, &HashSet::new(), 0);
+
+        assert_eq!(removed.len(), 1, "removed: {removed:?}");
+        assert!(!staged.exists(), "the brief actually staged is swept");
+        assert!(
+            decoy.exists(),
+            "a same-named file in the PR's own checkout is NOT this review's brief"
+        );
+    }
+
+    #[test]
+    fn test_pr_brief_sweep_skips_a_record_with_no_staging_evidence() {
+        // A record written before `brief_root` existed knows only a relative
+        // path, and a relative root would resolve against the process cwd.
+        // Neither is evidence, so neither deletes.
+        let checkout = tempdir().unwrap();
+        let brief = staged_brief(checkout.path(), "pr-145-review.md");
+        let relpath = format!("{BRIEF_DIR}/pr-145-review.md");
+
+        let mut legacy = pr_review(checkout.path(), 7, Some(relpath.clone()));
+        legacy.brief_root = None;
+        let mut relative = pr_review(checkout.path(), 8, Some(relpath));
+        relative.brief_root = Some(".".to_string());
+
+        assert!(
+            sweep_pr_review_briefs(&pr_runs(vec![legacy, relative]), &HashSet::new(), 0).is_empty()
+        );
+        assert!(brief.exists());
     }
 
     #[test]
@@ -2883,6 +3008,10 @@ mod tests {
         let checkout = tempdir().unwrap();
         std::fs::create_dir_all(checkout.path().join(BRIEF_DIR)).unwrap();
         let not_markdown = staged_brief(checkout.path(), "pr-145-review.txt");
+        // A DIRECTORY whose name ends in `.md` passes the extension gate and
+        // reached `remove_file`, where only the OS refused it.
+        let dir_named_md = checkout.path().join(BRIEF_DIR).join("pr-145-dir.md");
+        std::fs::create_dir_all(&dir_named_md).unwrap();
         let runs = pr_runs(vec![
             pr_review(
                 checkout.path(),
@@ -2894,9 +3023,15 @@ mod tests {
                 8,
                 Some(format!("{BRIEF_DIR}/pr-145-review.txt")),
             ),
+            pr_review(
+                checkout.path(),
+                9,
+                Some(format!("{BRIEF_DIR}/pr-145-dir.md")),
+            ),
         ]);
         assert!(sweep_pr_review_briefs(&runs, &HashSet::new(), 0).is_empty());
         assert!(not_markdown.exists());
+        assert!(dir_named_md.is_dir());
 
         let gone = tempdir().unwrap();
         let vanished = gone.path().to_path_buf();
