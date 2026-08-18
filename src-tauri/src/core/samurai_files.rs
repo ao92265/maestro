@@ -1083,6 +1083,16 @@ fn agent_matches(agent: &str, key: &str) -> bool {
 ///
 /// Never silent: a missing/unresolvable target, a directory, or a failed
 /// remove all return the error (PRD §5.11 — delete is explicit and visible).
+///
+/// # What the root guard does NOT cover (issue #156)
+///
+/// A **hardlink** planted inside a managed root is deletable. Canonicalizing
+/// cannot defeat it, by design: a hardlink is a second name for the same
+/// inode, not a redirection, so the resolved path genuinely IS inside the
+/// root. What is removed is only that directory entry — the outside target
+/// keeps its own name and survives. Documented rather than blocked; the same
+/// limitation and the reasoning behind accepting it are written up on
+/// `commands::harvest::read_report`.
 pub fn delete_file(
     roots: &SamuraiFilesRoots,
     configs: &[(PathBuf, SamuraiRunConfig)],

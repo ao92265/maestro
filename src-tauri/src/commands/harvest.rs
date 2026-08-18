@@ -538,6 +538,25 @@ fn canonical_stripped(path: &Path) -> Option<PathBuf> {
 /// traversal, symlinks and Windows `\\?\`/short-name spellings cannot slip
 /// a foreign path past the guard: only a regular file DIRECTLY under the
 /// harvest dir is readable.
+///
+/// # What this guard does NOT cover (issue #156)
+///
+/// A **hardlink** planted inside the harvest dir is readable here, and
+/// deletable through `core::samurai_files::delete_file`. This is by design,
+/// not an oversight: a hardlink is not a redirection, it is a second name
+/// for the same inode, so `fs::canonicalize` resolves it to a path that
+/// genuinely IS directly under the harvest dir — there is nothing for a
+/// containment check to reject. Deleting one removes only that directory
+/// entry; the outside target survives.
+///
+/// Accepted rather than blocked because it needs an attacker who already
+/// has local write access to the harvest directory, at which point they can
+/// simply copy the file in. Rejecting multi-link files (`nlink > 1`) would
+/// also refuse legitimately hardlinked reports and is a no-op on Windows
+/// without extra platform API work. Verified against a hostile harvest dir
+/// during the #142 review: `..` traversal, Windows junctions and
+/// sibling-prefix paths (`harvestX/`) are all REFUSED — only the hardlink
+/// case passes.
 fn read_report(harvest_dir: &Path, path: &str) -> Result<String, String> {
     let requested = canonical_stripped(Path::new(path))
         .ok_or_else(|| format!("harvest report not found: {path}"))?;
