@@ -211,6 +211,44 @@ describe("HarvestReportsSection (issue #142)", () => {
     await waitFor(() => expect(screen.queryByText("a.md")).toBeNull());
   });
 
+  it("keeps every View enabled while a delete is in flight, disabling only that row's Delete", async () => {
+    // Issue #155: a delete never blocks reading. Hold `samurai_file_delete`
+    // open so the assertions run mid-flight.
+    const reports = [
+      report({ path: "C:\\data\\harvest\\a.md" }),
+      report({ path: "C:\\data\\harvest\\b.md" }),
+    ];
+    let releaseDelete: () => void = () => {};
+    const deleteInFlight = new Promise<void>((resolve) => {
+      releaseDelete = resolve;
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "samurai_harvest_list") return reports;
+      if (cmd === "samurai_file_delete") {
+        await deleteInFlight;
+        return undefined;
+      }
+      return undefined;
+    });
+    render(<HarvestReportsSection />);
+    expect(await screen.findByText("a.md")).toBeInTheDocument();
+
+    askMock.mockResolvedValueOnce(true);
+    fireEvent.click(screen.getByRole("button", { name: "Delete harvest report: a.md" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Delete harvest report: a.md" })).toBeDisabled(),
+    );
+    expect(screen.getByRole("button", { name: "View harvest report: a.md" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "View harvest report: b.md" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Delete harvest report: b.md" })).toBeEnabled();
+
+    releaseDelete();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Delete harvest report: a.md" })).toBeEnabled(),
+    );
+  });
+
   it("surfaces a failed delete and keeps the row", async () => {
     mockInvoke([report({ path: "C:\\data\\harvest\\a.md" })], {
       deleteRejections: { "C:\\data\\harvest\\a.md": "failed to delete a.md: access denied" },

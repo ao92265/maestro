@@ -121,7 +121,9 @@ export function HarvestReportsSection() {
   const [reports, setReports] = useState<SamuraiHarvestReport[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  // Path of the row whose delete is in flight — per row, never section-wide:
+  // a delete must not gate the read-only View of any row (issue #155).
+  const [deletingPath, setDeletingPath] = useState<string | null>(null);
   const [openPath, setOpenPath] = useState<string | null>(null);
 
   const refresh = useCallback(async (isCancelled: () => boolean = () => false) => {
@@ -160,7 +162,7 @@ export function HarvestReportsSection() {
       kind: "warning",
     }).catch(() => false);
     if (!confirmed) return;
-    setBusy(true);
+    setDeletingPath(report.path);
     setError(null);
     setNotice(null);
     try {
@@ -170,7 +172,7 @@ export function HarvestReportsSection() {
     } catch (err) {
       setError(String(err));
     } finally {
-      setBusy(false);
+      setDeletingPath(null);
     }
   };
 
@@ -203,7 +205,6 @@ export function HarvestReportsSection() {
             <button
               type="button"
               onClick={() => setOpenPath(report.path)}
-              disabled={busy}
               className="rounded p-1 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-text disabled:opacity-40"
               aria-label={`View harvest report: ${name}`}
               title="View this report (read-only)"
@@ -213,7 +214,7 @@ export function HarvestReportsSection() {
             <button
               type="button"
               onClick={() => handleDelete(report)}
-              disabled={busy}
+              disabled={deletingPath === report.path}
               className="rounded p-1 text-maestro-muted transition-colors hover:bg-maestro-surface hover:text-maestro-red disabled:opacity-40"
               aria-label={`Delete harvest report: ${name}`}
               title="Delete this report (asks first)"
