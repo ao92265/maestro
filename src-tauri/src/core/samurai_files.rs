@@ -246,7 +246,8 @@ pub fn brief_dir(dir: &str) -> PathBuf {
 /// so every staged ritual and every relaunch accumulated one more file in the
 /// worktree with nothing to ever remove it. (A PR review's brief lands in the
 /// user's own checkout, which belongs to no archivable run and so is not
-/// swept here — that half needs its own policy, tracked in #145.)
+/// swept here — [`sweep_pr_review_briefs`] carries that half, on the same
+/// window and the same mtime basis, issue #145.)
 ///
 /// The age signal is the file's mtime: a handoff or brief is written once and
 /// never touched again, so its mtime IS that generation's end. Missing
@@ -295,6 +296,101 @@ pub fn sweep_handoff_retention(
                     ),
                 }
             }
+        }
+    }
+    removed
+}
+
+/// Seconds in one retention day. Named because the retention window is the
+/// one place a bare `24 * 60 * 60` would read as arithmetic rather than as
+/// the unit `handoff_retention_days` is expressed in.
+const SECS_PER_RETENTION_DAY: u64 = 24 * 60 * 60;
+
+/// The other half of PRD §8 row 1 (issue #145): the brief a PR review is
+/// staged as (`commands::initial_prompt`, issue #138) is written into the
+/// user's OWN checkout, which belongs to no run config and so can never reach
+/// [`RunConfigStatus::Archived`]. [`sweep_handoff_retention`] therefore never
+/// looked at it, and every review left one more `.maestro/briefs/pr-*.md`
+/// behind, forever. Returns the removed paths for the caller's log, like its
+/// sibling.
+///
+/// A PR review has no completion signal to age from, so the policy is the
+/// sibling's and nothing more: the same `handoff_retention_days` window on
+/// the same mtime basis (a brief is written once and never touched again, so
+/// its mtime IS that review's start). A brief is swept only once no terminal
+/// this launch opened still holds it ([`samurai_pr_runs::is_live`]) — and
+/// that signal cannot survive a restart, because PTY session ids restart at
+/// 1, so an unknown terminal after one counts as CLOSED. The AGE gate is what
+/// protects a live review, not the terminal signal: a review still running
+/// two weeks after the app last started is not a thing.
+///
+/// **This is the user's working tree, not a throwaway worktree** — a wrong
+/// delete destroys real work. So the record's `brief` field, which is data
+/// read back off disk, is never trusted as a path: the file must canonicalize
+/// INSIDE [`brief_dir`] of that record's own checkout and end in `.md`, which
+/// refuses a `..` spelling and an absolute path alike. Missing evidence never
+/// deletes, exactly as in the sibling: an unreadable mtime, an absent file or
+/// an unresolvable brief directory is skipped.
+pub fn sweep_pr_review_briefs(
+    runs: &[(PathBuf, PrReviewRun)],
+    open_session_ids: &HashSet<u32>,
+    retention_days: u32,
+) -> Vec<PathBuf> {
+    let max_age = Duration::from_secs(u64::from(retention_days) * SECS_PER_RETENTION_DAY);
+    // Two reviews of the same PR with the same steps stage the same file
+    // name, so a DEAD record can point at the very brief a live relaunch is
+    // reading. Skipping live records one by one would not catch that; the
+    // paths the live ones hold are collected up front and never touched.
+    let live_briefs: HashSet<PathBuf> = runs
+        .iter()
+        .filter(|(_, run)| samurai_pr_runs::is_live(run, open_session_ids))
+        .filter_map(|(_, run)| samurai_pr_runs::brief_path(run))
+        .filter_map(|brief| canonical_stripped(&brief))
+        .collect();
+    let mut removed: Vec<PathBuf> = Vec::new();
+    for (_, run) in runs {
+        if samurai_pr_runs::is_live(run, open_session_ids) {
+            continue;
+        }
+        // No brief (a short prompt typed inline), or one that is already gone
+        // — a record outlives the file it points at, and a second record
+        // sharing the name finds nothing to resolve.
+        let Some(target) = samurai_pr_runs::brief_path(run)
+            .as_deref()
+            .and_then(canonical_stripped)
+        else {
+            continue;
+        };
+        if target.extension().and_then(|e| e.to_str()) != Some("md")
+            || live_briefs.contains(&target)
+        {
+            continue;
+        }
+        let Some(root) = canonical_stripped(&brief_dir(&run.project_path)) else {
+            continue;
+        };
+        if target == root || !target.starts_with(&root) {
+            log::warn!(
+                "samurai retention: PR review brief {} resolves outside {} — refusing to sweep it",
+                target.display(),
+                root.display()
+            );
+            continue;
+        }
+        let expired = std::fs::metadata(&target)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age >= max_age);
+        if !expired {
+            continue;
+        }
+        match std::fs::remove_file(&target) {
+            Ok(()) => removed.push(target),
+            Err(e) => log::warn!(
+                "samurai retention: failed to delete expired PR review brief {}: {e}",
+                target.display()
+            ),
         }
     }
     removed
@@ -2634,6 +2730,183 @@ mod tests {
         // Idempotent; an already-empty (or missing) handoff dir is not an
         // error.
         assert!(sweep_handoff_retention(&configs, 0).is_empty());
+    }
+
+    /// A PR-review record rooted at `checkout`, staged as `brief` (the
+    /// worktree-relative spelling `samurai_brief::write_brief` returns) when
+    /// it has one.
+    fn pr_review(checkout: &Path, session: u32, brief: Option<String>) -> PrReviewRun {
+        PrReviewRun::now(
+            PrReviewLaunch {
+                pr: 145,
+                title: "sweep pr briefs".to_string(),
+                repo: "nachogl1/maestro".to_string(),
+                project_path: checkout.to_string_lossy().to_string(),
+                steps: vec!["review".to_string()],
+            },
+            session,
+            brief,
+        )
+    }
+
+    /// Writes `<checkout>/.maestro/briefs/<name>` and returns its path.
+    fn staged_brief(checkout: &Path, name: &str) -> PathBuf {
+        let dir = checkout.join(BRIEF_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, "# pr review brief\n").unwrap();
+        path
+    }
+
+    /// The store hands the sweep `(path, record)` pairs; the record path is
+    /// never the thing being swept, so any spelling does.
+    fn pr_runs(runs: Vec<PrReviewRun>) -> Vec<(PathBuf, PrReviewRun)> {
+        runs.into_iter()
+            .enumerate()
+            .map(|(i, run)| (PathBuf::from(format!("pr-{i}.json")), run))
+            .collect()
+    }
+
+    #[test]
+    fn test_pr_brief_sweep_removes_an_expired_closed_reviews_brief() {
+        // Issue #145: a PR review's brief lands in the user's own checkout,
+        // which no run config archives — nothing ever swept it.
+        let checkout = tempdir().unwrap();
+        let brief = staged_brief(checkout.path(), "pr-145-review.md");
+        let stray = checkout.path().join(BRIEF_DIR).join("notes.txt");
+        std::fs::write(&stray, "not a brief").unwrap();
+        let runs = pr_runs(vec![pr_review(
+            checkout.path(),
+            7,
+            Some(format!("{BRIEF_DIR}/pr-145-review.md")),
+        )]);
+        let none_open = HashSet::new();
+
+        // Inside the shipped 14-day window: nothing goes.
+        assert!(sweep_pr_review_briefs(&runs, &none_open, 14).is_empty());
+        assert!(brief.exists());
+
+        // Expired. `0` is the age boundary this test can reach without a fake
+        // clock, exactly as in the archived-epic sweep above.
+        let removed = sweep_pr_review_briefs(&runs, &none_open, 0);
+        assert_eq!(removed.len(), 1, "removed: {removed:?}");
+        assert!(!brief.exists());
+        assert!(stray.exists(), "only .md briefs are swept");
+
+        // Idempotent: the record outlives the brief it points at.
+        assert!(sweep_pr_review_briefs(&runs, &none_open, 0).is_empty());
+    }
+
+    #[test]
+    fn test_pr_brief_sweep_keeps_a_live_reviews_brief() {
+        let checkout = tempdir().unwrap();
+        let brief = staged_brief(checkout.path(), "pr-145-review.md");
+        let live = pr_review(
+            checkout.path(),
+            7,
+            Some(format!("{BRIEF_DIR}/pr-145-review.md")),
+        );
+        let open: HashSet<u32> = HashSet::from([7]);
+        let runs = pr_runs(vec![live.clone()]);
+
+        assert!(sweep_pr_review_briefs(&runs, &open, 0).is_empty());
+        assert!(brief.exists(), "the terminal reading it is still open");
+
+        // Two reviews of the same PR with the same steps stage the SAME file
+        // name, so a dead record can point at the brief a live relaunch is
+        // reading — the dead one must not delete it either.
+        let stale = PrReviewRun {
+            launch_id: "20200101000000-1".to_string(),
+            ..live.clone()
+        };
+        let shared = pr_runs(vec![live, stale]);
+        assert!(sweep_pr_review_briefs(&shared, &open, 0).is_empty());
+        assert!(brief.exists());
+
+        // Closing the terminal (or a restart, which can never prove liveness)
+        // releases it.
+        assert_eq!(sweep_pr_review_briefs(&shared, &HashSet::new(), 0).len(), 1);
+        assert!(!brief.exists());
+    }
+
+    #[test]
+    fn test_pr_brief_sweep_ignores_a_review_with_no_brief() {
+        // A short prompt is typed inline — the record carries `brief: None`
+        // and there is nothing to sweep.
+        let checkout = tempdir().unwrap();
+        let kept = staged_brief(checkout.path(), "pr-145-review.md");
+        let runs = pr_runs(vec![pr_review(checkout.path(), 7, None)]);
+
+        assert!(sweep_pr_review_briefs(&runs, &HashSet::new(), 0).is_empty());
+        assert!(
+            kept.exists(),
+            "a record with no brief must not sweep the directory"
+        );
+    }
+
+    #[test]
+    fn test_pr_brief_sweep_refuses_a_brief_that_escapes_the_checkout() {
+        // The `brief` field is data read back off disk, and this is the
+        // user's OWN working tree — a `..` spelling or an absolute path must
+        // never resolve into a delete.
+        let root = tempdir().unwrap();
+        let checkout = root.path().join("checkout");
+        std::fs::create_dir_all(checkout.join(BRIEF_DIR)).unwrap();
+        let outside = root.path().join("real-work.md");
+        std::fs::write(&outside, "# the user's own file\n").unwrap();
+
+        let runs = pr_runs(vec![
+            pr_review(
+                &checkout,
+                7,
+                Some(format!("{BRIEF_DIR}/../../../real-work.md")),
+            ),
+            pr_review(
+                &checkout,
+                8,
+                Some(outside.to_string_lossy().replace('\\', "/")),
+            ),
+        ]);
+
+        assert!(sweep_pr_review_briefs(&runs, &HashSet::new(), 0).is_empty());
+        assert!(
+            outside.exists(),
+            "a brief value must never escape .maestro/briefs"
+        );
+    }
+
+    #[test]
+    fn test_pr_brief_sweep_skips_missing_evidence() {
+        // Missing evidence never deletes, matching the archived-epic sweep: a
+        // brief that is not on disk, a checkout that is gone, and a non-`.md`
+        // value are all skipped, never errors.
+        let checkout = tempdir().unwrap();
+        std::fs::create_dir_all(checkout.path().join(BRIEF_DIR)).unwrap();
+        let not_markdown = staged_brief(checkout.path(), "pr-145-review.txt");
+        let runs = pr_runs(vec![
+            pr_review(
+                checkout.path(),
+                7,
+                Some(format!("{BRIEF_DIR}/never-written.md")),
+            ),
+            pr_review(
+                checkout.path(),
+                8,
+                Some(format!("{BRIEF_DIR}/pr-145-review.txt")),
+            ),
+        ]);
+        assert!(sweep_pr_review_briefs(&runs, &HashSet::new(), 0).is_empty());
+        assert!(not_markdown.exists());
+
+        let gone = tempdir().unwrap();
+        let vanished = gone.path().to_path_buf();
+        drop(gone);
+        let runs = pr_runs(vec![pr_review(
+            &vanished,
+            9,
+            Some(format!("{BRIEF_DIR}/pr-145-review.md")),
+        )]);
+        assert!(sweep_pr_review_briefs(&runs, &HashSet::new(), 0).is_empty());
     }
 
     #[cfg(windows)]
