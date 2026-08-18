@@ -108,7 +108,18 @@ vi.mock("@/lib/samurai", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/samurai")>();
   return {
     ...actual,
-    samuraiRegisterSession: vi.fn(async () => ({})),
+    // Issue #158: the real command answers with the route it ARMED. The
+    // default models a backend that honours the claim; refusal tests
+    // override it.
+    samuraiRegisterSession: vi.fn(
+      async (
+        _sessionId: number,
+        _projectPath: string,
+        _epic: string,
+        _generation: number,
+        launchLinePrompt = false,
+      ) => ({ session: {}, launch_line_prompt: launchLinePrompt }),
+    ),
     samuraiHarvestArm: vi.fn(async () => {}),
     samuraiRevertLaunchLinePrompt: vi.fn(async () => true),
   };
@@ -186,6 +197,8 @@ describe("TerminalGrid pending samurai launch", () => {
     registerMock.mockClear();
     harvestArmMock.mockClear();
     initialPromptArmMock.mockClear();
+    revertMock.mockClear();
+    shellFamilyMock.mockClear();
     useSessionStore.setState({ sessions: [], samuraiBySessionId: {}, parkedSessionIds: [] });
     usePendingLaunchStore.setState({ pending: [] });
   });
@@ -325,7 +338,12 @@ describe("TerminalGrid pending samurai launch", () => {
     // the revert a later SessionStarted consumes the entry, types nothing,
     // and audits `delivered` — zero delivery behind a false trail.
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    writeStdinMock.mockRejectedValueOnce(new Error("PTY closed"));
+    // SessionNotFound is raised before a single byte is written — the one
+    // rejection that PROVES the line never landed.
+    writeStdinMock.mockRejectedValueOnce({
+      code: "SessionNotFound",
+      message: "Session 1 not found",
+    });
     const pointer = "[Maestro Samurai] Read `.maestro/briefs/epic-77-78-gen-1-launch.md` in FULL";
     queueLaunchWithPointer(pointer);
 
@@ -334,6 +352,43 @@ describe("TerminalGrid pending samurai launch", () => {
     await waitFor(() => expect(revertMock).toHaveBeenCalledTimes(1));
     expect(revertMock).toHaveBeenCalledWith(expect.any(Number));
     errorSpy.mockRestore();
+  });
+
+  it("leaves the claim standing when the write fails AFTER the bytes landed (#158)", async () => {
+    // `write_stdin` also rejects when `write_all` succeeded and `flush` did
+    // not: the whole line plus the CR is already in the PTY and claude
+    // launches with the pointer. Reverting there would type it a second time
+    // on SessionStarted — a double paste, which is worse than the ALERT the
+    // activity watch raises if the launch really did fail.
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    writeStdinMock.mockRejectedValueOnce({ code: "WriteFailed", message: "Flush failed: EPIPE" });
+    const pointer = "[Maestro Samurai] Read `.maestro/briefs/epic-77-78-gen-1-launch.md` in FULL";
+    queueLaunchWithPointer(pointer);
+
+    render(<TerminalGrid projectPath="C:/proj" tabId="tab-1" isActive />);
+
+    await waitFor(() => expect(writeStdinMock).toHaveBeenCalled());
+    await waitFor(() => expect(errorSpy).toHaveBeenCalled());
+    expect(revertMock).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  it("types the pointer when the backend REFUSES the launch-line claim (#158)", async () => {
+    // The refusal resolves like a success — the replicator only logs that it
+    // was never offered this route and keeps `Typed`. Reading "no exception"
+    // as acceptance writes a line carrying a pointer that is then typed too.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    registerMock.mockResolvedValueOnce({ session: {}, launch_line_prompt: false } as never);
+    const pointer = "[Maestro Samurai] Read `.maestro/briefs/epic-77-78-gen-1-launch.md` in FULL";
+    queueLaunchWithPointer(pointer);
+
+    render(<TerminalGrid projectPath="C:/proj" tabId="tab-1" isActive />);
+
+    await waitFor(() => expect(writeStdinMock).toHaveBeenCalled());
+    const cli = writeStdinMock.mock.calls.map((c) => String(c[1])).join("\n");
+    expect(cli).toContain("claude --dangerously-skip-permissions");
+    expect(cli).not.toContain("Maestro Samurai");
+    warnSpy.mockRestore();
   });
 
   // Issue #98: a "Harvest now" launch rides the same pending-launch flow —

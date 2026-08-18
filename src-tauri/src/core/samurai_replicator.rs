@@ -431,8 +431,9 @@ struct DeliveredWatch {
     /// so re-send it before giving up. `LaunchLine` has no unsubmitted Enter
     /// to re-send — the shell submitted the whole command — so the watch is
     /// ACTIVITY-ONLY: it exists purely so a launch whose positional prompt
-    /// the CLI ignored or mangled still raises `submit_unconfirmed` instead
-    /// of failing silently behind a `delivered` audit row.
+    /// the CLI IGNORED still raises `submit_unconfirmed` instead of failing
+    /// silently behind a `delivered` audit row. A prompt that arrived mangled
+    /// is out of its reach — see [`SamuraiReplicator::audit_launch_line_delivery`].
     route: DeliveryRoute,
 }
 
@@ -1954,7 +1955,7 @@ impl SamuraiReplicator {
     /// for that session id and starts the no-start clock; everything else is
     /// a no-op.
     pub fn on_registered(&self, snapshot: &SessionSnapshot) {
-        self.on_registered_with_route(snapshot, DeliveryRoute::Typed);
+        let _ = self.on_registered_with_route(snapshot, DeliveryRoute::Typed);
     }
 
     /// [`Self::on_registered`] plus the route the frontend actually used
@@ -1970,53 +1971,66 @@ impl SamuraiReplicator {
     /// spawn event actually offered a `launch_prompt`. That check is what
     /// makes double delivery structurally impossible rather than a
     /// convention: a claim the backend never made — a successor ritual, or a
-    /// gen-1 whose brief write failed and is staged as full text — is logged
-    /// and dropped, and the instruction is typed exactly as before.
-    pub fn on_registered_with_route(&self, snapshot: &SessionSnapshot, route: DeliveryRoute) {
+    /// gen-1 whose brief write failed and is staged as full text — is dropped
+    /// and the instruction is typed exactly as before.
+    ///
+    /// Returns the route now IN EFFECT, which is not always the one asked
+    /// for. The caller must branch on the answer, never on "the call did not
+    /// fail": a dropped claim still resolves, and a frontend that reads that
+    /// as acceptance writes a launch line carrying a pointer this entry is
+    /// still going to type — the double delivery, through the back door.
+    /// `Typed` is also the answer when no staged entry matched at all.
+    pub fn on_registered_with_route(
+        &self,
+        snapshot: &SessionSnapshot,
+        route: DeliveryRoute,
+    ) -> DeliveryRoute {
         let mut pending = self.lock_pending();
-        if let Some(p) = pending.iter_mut().find(|p| {
+        let Some(p) = pending.iter_mut().find(|p| {
             p.registered.is_none()
                 && p.generation == snapshot.generation
                 && p.epic == snapshot.epic
                 && p.project == snapshot.project
-        }) {
-            p.registered = Some((snapshot.session_id, AgeableInstant::now()));
-            match route {
-                DeliveryRoute::LaunchLine if p.launch_prompt_offered => {
-                    log::info!(
-                        "samurai replicator: gen-{} for epic {} rode the launch line (session {}) — nothing will be typed",
-                        p.generation,
-                        p.epic,
-                        snapshot.session_id
-                    );
-                    p.route = DeliveryRoute::LaunchLine;
-                }
-                DeliveryRoute::LaunchLine => log::warn!(
-                    "samurai replicator: session {} claims a launch-line delivery for epic {} gen-{}, which was never offered one — typing the instruction as usual",
-                    snapshot.session_id,
+        }) else {
+            return DeliveryRoute::Typed;
+        };
+        p.registered = Some((snapshot.session_id, AgeableInstant::now()));
+        match route {
+            DeliveryRoute::LaunchLine if p.launch_prompt_offered => {
+                log::info!(
+                    "samurai replicator: gen-{} for epic {} rode the launch line (session {}) — nothing will be typed",
+                    p.generation,
                     p.epic,
-                    p.generation
-                ),
-                DeliveryRoute::Typed => {}
-            }
-            if p.alerted {
-                // Finding G: the successor_no_start ALERT already fired, but
-                // the entry was latched — a late registration still gets the
-                // ritual. The alert stands as history; this recovers it.
-                log::warn!(
-                    "samurai replicator: LATE successor registration for epic {} gen-{} (session {}) after its successor_no_start ALERT — ritual re-armed, the stall recovered",
-                    snapshot.epic,
-                    snapshot.generation,
-                    snapshot.session_id,
+                    snapshot.session_id
                 );
+                p.route = DeliveryRoute::LaunchLine;
             }
-            log::info!(
-                "samurai replicator: successor session {} registered for epic {} gen-{} — ritual armed for its first SessionStarted",
+            DeliveryRoute::LaunchLine => log::warn!(
+                "samurai replicator: session {} claims a launch-line delivery for epic {} gen-{}, which was never offered one — typing the instruction as usual",
                 snapshot.session_id,
+                p.epic,
+                p.generation
+            ),
+            DeliveryRoute::Typed => {}
+        }
+        if p.alerted {
+            // Finding G: the successor_no_start ALERT already fired, but
+            // the entry was latched — a late registration still gets the
+            // ritual. The alert stands as history; this recovers it.
+            log::warn!(
+                "samurai replicator: LATE successor registration for epic {} gen-{} (session {}) after its successor_no_start ALERT — ritual re-armed, the stall recovered",
                 snapshot.epic,
-                snapshot.generation
+                snapshot.generation,
+                snapshot.session_id,
             );
         }
+        log::info!(
+            "samurai replicator: successor session {} registered for epic {} gen-{} — ritual armed for its first SessionStarted",
+            snapshot.session_id,
+            snapshot.epic,
+            snapshot.generation
+        );
+        p.route
     }
 
     /// Hook-chain tap (forwarded by the injector's `observe_hook`, pre-dedup
@@ -2172,12 +2186,20 @@ impl SamuraiReplicator {
     /// the launch command the frontend typed into a fresh shell, and it
     /// succeeded or the session would not have started.
     ///
-    /// It DOES arm an activity-only [`DeliveredWatch`]. The `delivered` row
-    /// above says the pointer went out, not that the CLI acted on it — a
-    /// positional prompt the CLI ignores or mangles would otherwise leave a
-    /// run silently parked behind a row claiming success. The watch keeps the
-    /// existing `submit_unconfirmed` ALERT as the backstop; what it drops is
-    /// the Enter resend, which has nothing to re-submit here.
+    /// It DOES arm an activity-only [`DeliveredWatch`], with a deliberately
+    /// narrow job: it catches a session that never STARTS A TURN — a CLI that
+    /// ignored the positional prompt entirely, leaving a run parked behind a
+    /// row claiming success. It keeps the existing `submit_unconfirmed` ALERT
+    /// as that backstop and drops the Enter resend, which has nothing to
+    /// re-submit here.
+    ///
+    /// What it does NOT catch: a prompt that arrived MANGLED. Any turn
+    /// activity releases the watch, so an agent that starts a turn on a
+    /// truncated pointer looks identical to a healthy one. Nothing downstream
+    /// can see it either — the launch line bypasses `samurai_pty`'s chunked
+    /// writer, which is where the #137 splice was observable at all. Detecting
+    /// that would mean gating release on evidence the brief was actually READ,
+    /// which is a larger change than this route warrants.
     fn audit_launch_line_delivery(&self, p: &PendingRitual, session_id: u32) {
         log::info!(
             "samurai replicator: session {session_id} started with the gen-{} launch brief already on its command line — nothing typed",
@@ -4723,8 +4745,12 @@ mod tests {
             .supervisor
             .register_session_with_details(5, project.into(), "#38".into(), 1, details)
             .unwrap();
-        h.replicator
-            .on_registered_with_route(&snapshot, DeliveryRoute::LaunchLine);
+        assert_eq!(
+            h.replicator
+                .on_registered_with_route(&snapshot, DeliveryRoute::LaunchLine),
+            DeliveryRoute::LaunchLine,
+            "an offered claim is honoured, and says so"
+        );
 
         h.replicator.observe_hook(&session_started(5));
         assert!(
@@ -4786,8 +4812,15 @@ mod tests {
             .supervisor
             .register_session_with_details(5, project.into(), "#38".into(), 1, details)
             .unwrap();
-        h.replicator
-            .on_registered_with_route(&snapshot, DeliveryRoute::LaunchLine);
+        // The refusal is REPORTED, not just logged: the caller has a pointer
+        // on a command line it is about to write and has to take it off
+        // again. A dropped claim that answered `LaunchLine` — or answered
+        // nothing at all — would be read as acceptance and deliver twice.
+        assert_eq!(
+            h.replicator
+                .on_registered_with_route(&snapshot, DeliveryRoute::LaunchLine),
+            DeliveryRoute::Typed
+        );
 
         h.replicator.observe_hook(&session_started(5));
         assert_eq!(h.writes.lock().unwrap().clone(), vec![(5, brief)]);
@@ -4809,8 +4842,12 @@ mod tests {
             .supervisor
             .register_session_with_details(2, project.into(), "epic-9".into(), 3, details)
             .unwrap();
-        h.replicator
-            .on_registered_with_route(&snapshot, DeliveryRoute::LaunchLine);
+        assert_eq!(
+            h.replicator
+                .on_registered_with_route(&snapshot, DeliveryRoute::LaunchLine),
+            DeliveryRoute::Typed,
+            "a successor is never offered the route, so the claim is refused"
+        );
 
         h.replicator.observe_hook(&session_started(2));
         let writes = h.writes.lock().unwrap().clone();

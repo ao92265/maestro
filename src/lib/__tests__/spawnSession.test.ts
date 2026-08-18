@@ -198,6 +198,8 @@ describe("samurai successor spawn listener (issue #55)", () => {
   });
 
   it("registerSamuraiSuccessor invokes samurai_register_session with the event's identity", async () => {
+    invokeMock.mockResolvedValueOnce({ session: {}, launch_line_prompt: false });
+
     await registerSamuraiSuccessor(42, { project: "C:\\git\\proj", epic: "#37", generation: 3 });
 
     expect(invokeMock).toHaveBeenCalledWith("samurai_register_session", {
@@ -212,7 +214,9 @@ describe("samurai successor spawn listener (issue #55)", () => {
   });
 
   it("registerSamuraiSuccessor reports a launch-line delivery so nothing is typed (#158)", async () => {
-    await registerSamuraiSuccessor(
+    invokeMock.mockResolvedValueOnce({ session: {}, launch_line_prompt: true });
+
+    const armed = await registerSamuraiSuccessor(
       42,
       { project: "C:\\git\\proj", epic: "#37", generation: 1 },
       true,
@@ -225,6 +229,22 @@ describe("samurai successor spawn listener (issue #55)", () => {
       generation: 1,
       launchLinePrompt: true,
     });
+    expect(armed).toBe(true);
+  });
+
+  it("registerSamuraiSuccessor reports a REFUSED claim, which resolves like a success (#158)", async () => {
+    // The replicator drops a launch-line claim it never offered and keeps
+    // `Typed` — without failing the call. A caller that reads "no exception"
+    // as acceptance writes a line carrying a pointer that is then typed too.
+    invokeMock.mockResolvedValueOnce({ session: {}, launch_line_prompt: false });
+
+    const armed = await registerSamuraiSuccessor(
+      42,
+      { project: "C:\\git\\proj", epic: "#37", generation: 1 },
+      true,
+    );
+
+    expect(armed).toBe(false);
   });
 
   it("samuraiSuccessorCliFlags forces skip-permissions and keeps custom flags", () => {

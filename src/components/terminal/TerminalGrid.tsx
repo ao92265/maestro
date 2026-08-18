@@ -174,6 +174,39 @@ const EMPTY_PLUGINS: PluginConfig[] = [];
  * Without worktrees, sessions can overwrite each other's MCP config before Claude CLI reads it.
  */
 /**
+ * Whether a `writeStdin` rejection PROVES nothing reached the PTY (issue
+ * #158). Only `SessionNotFound` does: it is raised before any byte is
+ * written. `WriteFailed` covers a failed `flush` as well as a failed
+ * `write_all` (`process_manager::write_stdin`), so it cannot rule out a line
+ * that already landed, and a non-`PtyError` rejection rules out nothing at
+ * all. Anything unproven leaves the launch-line claim standing.
+ */
+function writeReachedNothing(err: unknown): boolean {
+  if (!err || typeof err !== "object" || !("code" in err)) return false;
+  return (err as { code?: unknown }).code === "SessionNotFound";
+}
+
+/**
+ * Hands a launch-line claim back to the typed route, reporting both ways it
+ * can fail to take effect (issue #158). A `false` answer is NOT "nothing to
+ * do": it also covers the entry having already been consumed by
+ * `SessionStarted` on the launch-line route — audited as delivered, with
+ * nothing actually typed — which only the 45s activity watch would otherwise
+ * surface.
+ */
+async function revertLaunchLineClaim(sessionId: number): Promise<void> {
+  try {
+    if (!(await samuraiRevertLaunchLinePrompt(sessionId))) {
+      console.warn(
+        `[Samurai] No launch-line claim was reverted for session ${sessionId} — it may already have been consumed as delivered`,
+      );
+    }
+  } catch (err) {
+    console.error("[Samurai] Failed to revert the launch-line claim:", err);
+  }
+}
+
+/**
  * The spawned shell's quoting family (issue #158), or `null` when the backend
  * cannot name it — including when the call itself fails. `null` is a refusal,
  * not an error: the caller keeps a route that needs no quoting.
@@ -1192,26 +1225,36 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
               // strictly ahead of claude's SessionStart hook. Registration
               // failure is logged, not fatal — the session still launches and
               // the backend's successor_no_start ALERT surfaces the gap.
-              // The route reported here is what stops the backend typing a
-              // pointer this line already carries (issue #158) — so a failed
-              // registration must also take the pointer BACK OFF the line.
-              // Writing a line the backend does not know about would deliver
-              // the brief TWICE: once as argv, once typed on SessionStarted.
+              //
+              // Issue #158: the pointer may only stay on the line if the
+              // backend says it ARMED the launch-line route. A refusal
+              // resolves normally (it refuses a claim it never offered), and a
+              // throw says nothing either way — read as acceptance, both write
+              // a line carrying a pointer the backend is still going to type,
+              // delivering the brief TWICE. Either answer takes it back off.
               if (slot.samurai) {
+                let armed = false;
                 try {
-                  await registerSamuraiSuccessor(sessionId, slot.samurai, launchPromptOnLine);
+                  armed = await registerSamuraiSuccessor(
+                    sessionId,
+                    slot.samurai,
+                    launchPromptOnLine,
+                  );
                 } catch (err) {
                   console.error("[Samurai] Failed to register successor session:", err);
-                  if (launchPromptOnLine) {
-                    launchLine = buildCliLaunchLine(
-                      slot.mode,
-                      effectiveFlags,
-                      slot.resumeSessionId ?? undefined,
-                      null,
-                      shellFamily,
-                    );
-                    launchPromptOnLine = false;
-                  }
+                }
+                if (launchPromptOnLine && !armed) {
+                  console.warn(
+                    "[Samurai] The backend did not arm the launch-line route — typing the pointer instead",
+                  );
+                  launchLine = buildCliLaunchLine(
+                    slot.mode,
+                    effectiveFlags,
+                    slot.resumeSessionId ?? undefined,
+                    null,
+                    shellFamily,
+                  );
+                  launchPromptOnLine = false;
                 }
               }
               const cliCommand = launchLine?.command ?? null;
@@ -1262,14 +1305,15 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
                 await writeStdin(sessionId, `${cliCommand}\r`);
               } catch (err) {
                 // Issue #158: the claim above told the backend the pointer
-                // went out on this line. It did not, so hand the typed
-                // delivery back before rethrowing — otherwise a session that
-                // starts anyway consumes the staged entry, types nothing, and
-                // audits a delivery that never happened.
-                if (launchPromptOnLine) {
-                  await samuraiRevertLaunchLinePrompt(sessionId).catch((revertErr) => {
-                    console.error("[Samurai] Failed to revert the launch-line claim:", revertErr);
-                  });
+                // went out on this line. Hand the typed delivery back — but
+                // ONLY when the error proves nothing reached the shell.
+                // `writeStdin` also rejects after `write_all` succeeded (a
+                // failing `flush`, a join error), and there the whole line is
+                // already in the PTY: reverting would type the pointer a
+                // second time on SessionStarted. An unnecessary ALERT on a
+                // delivered run is cheap; a double paste corrupts it.
+                if (launchPromptOnLine && writeReachedNothing(err)) {
+                  await revertLaunchLineClaim(sessionId);
                 }
                 throw err;
               }

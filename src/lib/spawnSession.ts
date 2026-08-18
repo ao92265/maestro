@@ -173,24 +173,31 @@ export function successorLaunchImminent(
  * right before the CLI command is typed, so the backend's ritual delivery is
  * armed strictly before claude's SessionStart hook can fire.
  *
- * `launchLinePrompt` is the grid's report of which route the instruction took
- * (issue #158): `true` only when the pointer is already ON the launch command
- * about to be typed, which is what tells the backend not to type it a second
- * time. Defaults to `false` — the typed delivery is what happens unless the
- * launch line demonstrably carried it.
+ * `launchLinePrompt` is the grid's CLAIM that the pointer is already on the
+ * launch command about to be typed (issue #158), which is what tells the
+ * backend not to type it a second time. Defaults to `false` — the typed
+ * delivery is what happens unless the launch line demonstrably carried it.
+ *
+ * Returns whether the backend HONOURED that claim. It refuses one it never
+ * offered — a successor ritual, or a gen-1 re-staged with a failed brief
+ * write while a stale queued launch still holds the old pointer — and the
+ * refusal does not fail the call. A caller that reads "no exception" as
+ * acceptance writes a launch line carrying a pointer the backend is still
+ * going to type: the same double delivery, through a different door.
  */
 export async function registerSamuraiSuccessor(
   sessionId: number,
   samurai: SamuraiSuccessorInfo,
   launchLinePrompt = false,
-): Promise<void> {
-  await samuraiRegisterSession(
+): Promise<boolean> {
+  const result = await samuraiRegisterSession(
     sessionId,
     samurai.project,
     samurai.epic,
     samurai.generation,
     launchLinePrompt,
   );
+  return result.launch_line_prompt;
 }
 
 // Same StrictMode-safe init/stop shape as the samurai supervisor listener in
