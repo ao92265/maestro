@@ -72,6 +72,10 @@ const MAX_ENTRIES_CHARS_INLINE: usize = 12_000;
 /// It is also 10x the inline cap, so a realistically sized backlog drains
 /// in ONE pass; the entry-granularity cap machinery below stays in place
 /// unchanged for the journal that somehow exceeds even this.
+///
+/// Raising this raises the blast radius of a brief the agent never reads by
+/// the same factor, since consumption keys on the write succeeding and not
+/// on the read happening (issue #159).
 const MAX_ENTRIES_CHARS_BRIEF: usize = 120_000;
 /// Chars held back from [`MAX_ENTRIES_CHARS_INLINE`] for everything
 /// [`render_entry`] wraps around an entry's TEXT, so a split part always
@@ -207,19 +211,28 @@ fn truncate_chars_inline(s: &str, max_chars: usize) -> String {
 /// [`HarvestTriage::stage_triage`] is what decides which.
 fn render_entries_capped(entries: &[JournalEntry], max_entries_chars: usize) -> (String, usize) {
     let mut block = String::new();
+    // The block length is TRACKED, not rescanned: `block.chars().count()`
+    // per entry walks the whole block again and makes this O(n²) in block
+    // size. Tolerable at 12,000; at [`MAX_ENTRIES_CHARS_BRIEF`] the worst
+    // case is ~100x costlier, and this runs on the hook chain's blocking
+    // thread. Chars, not bytes — the cap is a char budget.
+    let mut block_chars = 0usize;
     let mut rendered = 0usize;
     for entry in entries {
         let line = render_entry(entry);
         if rendered == 0 {
             block = truncate_chars_inline(&line, max_entries_chars);
+            block_chars = block.chars().count();
             rendered = 1;
             continue;
         }
-        if block.chars().count() + 1 + line.chars().count() > max_entries_chars {
+        let line_chars = line.chars().count();
+        if block_chars + 1 + line_chars > max_entries_chars {
             break;
         }
         block.push(' ');
         block.push_str(&line);
+        block_chars += 1 + line_chars;
         rendered += 1;
     }
     let withheld = entries.len().saturating_sub(rendered);
@@ -284,6 +297,18 @@ pub struct HarvestInjectionOutcome {
     pub injected: usize,
     /// `None` on success.
     pub error: Option<String>,
+    /// Set only when the brief route was available and its WRITE failed, so
+    /// the prompt was typed at the smaller inline cap instead (issue #154).
+    /// The harvest still succeeded — this is why fewer entries came through
+    /// than the brief route would have carried, which the `injected` count
+    /// alone cannot say. `None` on every other path, including a successful
+    /// brief delivery and the plain no-resolver route, neither of which is a
+    /// downgrade.
+    ///
+    /// Additive on the wire: omitted from the JSON when `None`, so the shape
+    /// existing consumers already parse is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brief_downgrade: Option<String>,
 }
 
 /// Reports an injection attempt to the frontend. Production wires a Tauri
@@ -321,6 +346,12 @@ struct StagedTriage {
     prompt: String,
     /// Entries actually carried — [`JournalStore::commit_harvest`]'s cut.
     snapshot_len: usize,
+    /// Set only when this render is the inline-cap FALLBACK taken because a
+    /// resolved brief route failed its write — the user-facing half of that
+    /// downgrade, carried into [`HarvestInjectionOutcome::brief_downgrade`]
+    /// so the held-back entries have a stated reason instead of only a
+    /// `log::warn!` nobody reads.
+    brief_downgrade: Option<String>,
 }
 
 /// The interactive-harvest state machine: `arm` stages a just-launched
@@ -409,6 +440,7 @@ impl HarvestTriage {
         StagedTriage {
             prompt: build_triage_prompt(date, &entries_block, &self.downloads_dir),
             snapshot_len,
+            brief_downgrade: None,
         }
     }
 
@@ -448,6 +480,7 @@ impl HarvestTriage {
             Ok(Some(pointer)) => StagedTriage {
                 prompt: pointer,
                 snapshot_len: staged.snapshot_len,
+                brief_downgrade: None,
             },
             // Under `samurai_brief::INLINE_MAX_BYTES` — nothing was written
             // and the render is small enough to type as it stands.
@@ -456,7 +489,12 @@ impl HarvestTriage {
                 log::warn!(
                     "samurai harvest: {e} — re-rendering the entries at the inline cap and typing the prompt instead"
                 );
-                self.render_triage(date, entries, MAX_ENTRIES_CHARS_INLINE)
+                StagedTriage {
+                    brief_downgrade: Some(format!(
+                        "the triage brief file could not be written ({e}) — the prompt was typed at the smaller inline budget instead, so fewer entries came through this harvest"
+                    )),
+                    ..self.render_triage(date, entries, MAX_ENTRIES_CHARS_INLINE)
+                }
             }
         }
     }
@@ -522,6 +560,7 @@ impl HarvestTriage {
                     session_id,
                     injected: 0,
                     error: Some(format!("the journal could not be read: {e}")),
+                    brief_downgrade: None,
                 });
                 return;
             }
@@ -537,6 +576,7 @@ impl HarvestTriage {
                 error: Some(
                     "no unconsumed journal entries remained by the time the session started — nothing was injected".to_string(),
                 ),
+                brief_downgrade: None,
             });
             return;
         }
@@ -550,6 +590,7 @@ impl HarvestTriage {
         let StagedTriage {
             prompt,
             snapshot_len,
+            brief_downgrade,
         } = self.stage_triage(session_id, &today, &entries);
         // THE injection: the prompt is handed to the session's PTY here. A
         // failed write means nothing was injected — entries stay unconsumed
@@ -565,6 +606,7 @@ impl HarvestTriage {
                 error: Some(format!(
                     "the triage prompt never reached the terminal ({e}) — the entries stay unconsumed, click Harvest now again to retry"
                 )),
+                brief_downgrade,
             });
             return;
         }
@@ -596,6 +638,7 @@ impl HarvestTriage {
                 error: Some(format!(
                     "the entries were injected but not marked consumed ({e}) — they will be offered again next harvest"
                 )),
+                brief_downgrade,
             });
         } else {
             log::info!(
@@ -605,6 +648,7 @@ impl HarvestTriage {
                 session_id,
                 injected: snapshot_len,
                 error: None,
+                brief_downgrade,
             });
         }
     }
@@ -1322,6 +1366,10 @@ mod tests {
         assert_eq!(reported.len(), 2);
         assert_eq!(reported[1].injected, 1);
         assert_eq!(reported[1].error, None);
+        assert_eq!(
+            reported[1].brief_downgrade, None,
+            "a plain success is not a downgrade"
+        );
 
         // 3. Nothing left to inject: also reported, not just logged.
         triage.arm(8).unwrap_err();
@@ -1693,13 +1741,18 @@ mod tests {
 
     #[test]
     fn test_an_assembled_triage_prompt_is_always_over_the_inline_brief_gate() {
-        // The template alone dwarfs `samurai_brief`'s inline budget, so a
-        // RESOLVED brief route always writes a file: the stays-inline arm of
-        // `try_deliverable_instruction` is unreachable from the harvest, and
-        // a resolved route therefore always renders at the brief cap. The
-        // under-the-gate route itself is pinned in `samurai_brief`'s own
+        // A RESOLVED brief route always writes a file: the stays-inline arm
+        // of `try_deliverable_instruction` is unreachable from the harvest,
+        // and a resolved route therefore always renders at the brief cap.
+        // The under-the-gate route itself is pinned in `samurai_brief`'s own
         // tests, which is where that rule lives.
-        assert!(TRIAGE_PROMPT_TEMPLATE.len() > samurai_brief::INLINE_MAX_BYTES);
+        //
+        // Measured on the ASSEMBLED prompt, not on the raw template:
+        // interpolation REMOVES the placeholders, so a template that shrank
+        // toward the budget could slide under the gate while a raw-template
+        // assertion still passed. Empty substitutions are the smallest
+        // prompt that can ever be built.
+        assert!(build_triage_prompt("", "", "").len() > samurai_brief::INLINE_MAX_BYTES);
     }
 
     #[test]
@@ -1926,6 +1979,55 @@ mod tests {
             2,
             "consumption follows the render that was actually delivered"
         );
+    }
+
+    #[test]
+    fn test_a_failed_brief_write_is_reported_as_a_downgrade_not_only_logged() {
+        // Issue #154 review: the harvest SUCCEEDS on this path, just with
+        // fewer entries than the brief route would have carried. Without a
+        // signal in the outcome the user reads "injected 2" and has no way
+        // to know why the other three were held back.
+        let worktree = tempdir().unwrap();
+        std::fs::write(worktree.path().join(".maestro"), "not a directory").unwrap();
+        let journal_dir = tempdir().unwrap();
+        let journal = journal_of_five_big_entries(journal_dir.path());
+        let outcomes: Arc<Mutex<Vec<HarvestInjectionOutcome>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = outcomes.clone();
+        let notify: HarvestNotifyFn = Arc::new(move |o| sink.lock().unwrap().push(o));
+        let (triage, _delivered) = triage_with_journal(journal.clone(), "/downloads");
+        let triage = triage
+            .with_session_dirs(resolver_for(worktree.path()))
+            .with_notify(notify);
+
+        triage.arm(7).unwrap();
+        triage.on_session_started(7);
+
+        let reported = outcomes.lock().unwrap().clone();
+        assert_eq!(reported.len(), 1);
+        // Not an error: the triage prompt did land.
+        assert_eq!(reported[0].error, None);
+        assert_eq!(reported[0].injected, 2);
+        let downgrade = reported[0].brief_downgrade.clone().unwrap_or_default();
+        assert!(
+            downgrade.contains("brief file could not be written")
+                && downgrade.contains("inline budget"),
+            "{downgrade}"
+        );
+        // Additive on the wire: absent when there is no downgrade, present
+        // when there is — the shape existing consumers parse is unchanged.
+        let with_downgrade = serde_json::to_string(&reported[0]).unwrap();
+        assert!(
+            with_downgrade.contains("briefDowngrade"),
+            "{with_downgrade}"
+        );
+        let clean = serde_json::to_string(&HarvestInjectionOutcome {
+            session_id: 7,
+            injected: 2,
+            error: None,
+            brief_downgrade: None,
+        })
+        .unwrap();
+        assert!(!clean.contains("briefDowngrade"), "{clean}");
     }
 
     #[test]

@@ -35,6 +35,13 @@ interface HarvestInjectionOutcome {
   sessionId: number;
   injected: number;
   error: string | null;
+  /**
+   * Present only when the triage brief file could not be written and the
+   * prompt was typed at the smaller inline budget instead (issue #154) —
+   * the reason fewer entries came through than the brief route would have
+   * carried. Omitted from the payload on every other path.
+   */
+  briefDowngrade?: string;
 }
 
 /** How many rows to show — the newest slice, same no-virtualization bar as the audit list. */
@@ -204,14 +211,16 @@ export function JournalSection() {
     let disposed = false;
     let unlisten: UnlistenFn | null = null;
     listen<HarvestInjectionOutcome>("samurai-harvest-event", (e) => {
-      const { injected, error: failure } = e.payload;
+      const { injected, error: failure, briefDowngrade } = e.payload;
       if (failure) {
         setNotice(null);
         setError(failure);
       } else {
         setError(null);
+        // The downgrade is not a failure — the harvest worked — so it rides
+        // on the success notice rather than the error slot (issue #154).
         setNotice(
-          `Triage prompt injected — ${injected} ${injected === 1 ? "entry" : "entries"} handed to the session`,
+          `Triage prompt injected — ${injected} ${injected === 1 ? "entry" : "entries"} handed to the session${briefDowngrade ? ` (${briefDowngrade})` : ""}`,
         );
       }
       void refresh();
