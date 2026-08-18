@@ -748,9 +748,10 @@ pub fn run() {
             app.manage(run_configs.clone());
             // Issue #139: PR-review run records, inside the same `runs` root
             // so they fall under the existing managed-delete guard.
-            app.manage(Arc::new(core::samurai_pr_runs::PrRunStore::new(
+            let pr_runs = Arc::new(core::samurai_pr_runs::PrRunStore::new(
                 commands::ai_runner::artifact_base_dir("runs"),
-            )));
+            ));
+            app.manage(pr_runs.clone());
             // PRD §8 row 1 (issue #45's `handoff_retention_days`): handoff
             // files auto-clean once their epic has completed — i.e. its run
             // config is ARCHIVED. One sweep per app start: it is the only
@@ -769,6 +770,23 @@ pub fn run() {
                     log::info!(
                         "samurai retention: removed {} handoff file(s) older than {retention_days} days from archived epics",
                         swept.len()
+                    );
+                }
+                // Issue #145: the same window, same mtime basis, for the
+                // briefs PR reviews leave in the user's own checkout — no run
+                // config ever archives those, so nothing swept them. Startup
+                // is before any terminal exists, so NO session is open: that
+                // is the honest input here, and the age gate is what protects
+                // a review that is genuinely still running.
+                let swept_briefs = core::samurai_files::sweep_pr_review_briefs(
+                    &pr_runs.list_with_paths(),
+                    &std::collections::HashSet::new(),
+                    retention_days,
+                );
+                if !swept_briefs.is_empty() {
+                    log::info!(
+                        "samurai retention: removed {} PR review brief(s) older than {retention_days} days",
+                        swept_briefs.len()
                     );
                 }
             }

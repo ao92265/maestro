@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tauri::State;
 
 use super::harvest::DeliverFn;
-use crate::core::samurai_brief;
+use crate::core::samurai_brief::{self, StagedBrief};
 use crate::core::samurai_pr_runs::{PrReviewLaunch, PrReviewRun, PrRunStore};
 
 /// The all-whitespace refusal — pinned by test, surfaced to the caller.
@@ -117,10 +117,13 @@ impl InitialPromptInjector {
     /// sees a single short line. Without a target — or when the write fails —
     /// the flattened prompt is armed exactly as before.
     ///
-    /// Returns the worktree-relative path of the brief it staged, or `None`
-    /// when the prompt was typed inline — the PR-review record (issue #139)
-    /// names the brief its review was actually delivered as, and this hop is
-    /// the only place that knows which it was.
+    /// Returns the brief it staged — BOTH the directory it landed under and
+    /// the relative path inside it ([`StagedBrief`]) — or `None` when the
+    /// prompt was typed inline. The PR-review record (issue #139) names the
+    /// brief its review was actually delivered as, and this hop is the only
+    /// place that knows which it was; it must carry the root too, because the
+    /// record's own `project_path` is a DIFFERENT tree in a multi-repo
+    /// workspace (issue #145).
     ///
     /// Does a blocking file write when it stages a brief, which is why the
     /// command below is `#[tauri::command(async)]` — Tauri then runs it off
@@ -130,12 +133,12 @@ impl InitialPromptInjector {
         session_id: u32,
         prompt: &str,
         brief: Option<BriefTarget>,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<StagedBrief>, String> {
         let normalized = normalize_prompt(prompt);
         if normalized.is_empty() {
             return Err(EMPTY_PROMPT.to_string());
         }
-        let mut staged: Option<String> = None;
+        let mut staged: Option<StagedBrief> = None;
         let armed = brief
             .filter(|_| normalized.len() > samurai_brief::INLINE_MAX_BYTES)
             .and_then(|target| {
@@ -143,7 +146,10 @@ impl InitialPromptInjector {
                     Ok(relpath) => {
                         let pointer =
                             normalize_prompt(&samurai_brief::pointer_instruction(&relpath));
-                        staged = Some(relpath);
+                        staged = Some(StagedBrief {
+                            root: target.dir,
+                            relpath,
+                        });
                         Some(pointer)
                     }
                     Err(e) => {
@@ -237,7 +243,7 @@ fn record_pr_review(
     store: &PrRunStore,
     launch: PrReviewLaunch,
     session_id: u32,
-    brief: Option<String>,
+    brief: Option<StagedBrief>,
 ) {
     let run = PrReviewRun::now(launch, session_id, brief);
     match store.record(&run) {
@@ -257,6 +263,7 @@ fn record_pr_review(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::samurai_pr_runs::staged_brief_path;
     use tempfile::tempdir;
 
     /// Captured `(session_id, prompt)` pairs handed to a stubbed [`DeliverFn`].
@@ -575,10 +582,9 @@ mod tests {
         let brief = injector
             .arm(5, &prompt, Some(target(dir.path(), "pr-142-check-review")))
             .unwrap();
-        assert_eq!(
-            brief.as_deref(),
-            Some(".maestro/briefs/pr-142-check-review.md")
-        );
+        let staged = brief.clone().expect("the long prompt is staged as a brief");
+        assert_eq!(staged.relpath, ".maestro/briefs/pr-142-check-review.md");
+        assert_eq!(staged.root, dir.path());
         record_pr_review(&store, launch(), 5, brief);
 
         let recorded = store.list_with_paths();
@@ -593,6 +599,18 @@ mod tests {
             run.brief.as_deref(),
             Some(".maestro/briefs/pr-142-check-review.md"),
             "the record points at the brief that was really written"
+        );
+        // Issue #145: and at the tree it was really written INTO — which is
+        // the arm call's `brief_dir`, not the review's `project_path`.
+        assert_eq!(
+            run.brief_root.as_deref(),
+            Some(dir.path().to_string_lossy().as_ref()),
+            "the record names the tree the brief was staged in"
+        );
+        assert_ne!(run.brief_root.as_deref(), Some(run.project_path.as_str()));
+        assert_eq!(
+            staged_brief_path(run).unwrap(),
+            dir.path().join(".maestro/briefs/pr-142-check-review.md")
         );
         assert_eq!(run.group_id(), "pr:nachogl1/maestro#142");
     }

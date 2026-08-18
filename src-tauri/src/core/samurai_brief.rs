@@ -42,7 +42,7 @@
 //! full text is typed exactly as it is today — a warning, never a new failure
 //! mode.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -73,6 +73,28 @@ const STEM_HASH_CHARS: usize = 8;
 /// the whole Maestro tree, not just the one brief — briefs, handoffs and
 /// anything else the run drops there are equally not the user's work.
 const MAESTRO_EXCLUDE_LINE: &str = ".maestro/";
+
+/// A brief that actually landed on disk: the directory it was staged UNDER
+/// (the `worktree` argument to [`write_brief`]) plus the worktree-relative
+/// path inside it that the agent was pointed at.
+///
+/// The two halves travel together on purpose. The relative path alone is what
+/// the pointer instruction carries, and it is the only half worth showing a
+/// human — but it is meaningless without the root it resolves against. For a
+/// PR review those are genuinely different directories: the brief is staged in
+/// the TAB's project (the terminal's working directory, so the pointer
+/// resolves), while the review's record groups under the PR's OWN checkout
+/// (`PrActionsMenu`, review finding C10). Anything that has to find the file
+/// again later — the #145 retention sweep above all — needs both halves, and
+/// guessing the root from the other one deletes the wrong tree's file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedBrief {
+    /// The directory [`BRIEF_DIR`] was created under.
+    pub root: PathBuf,
+    /// Path of the brief RELATIVE to [`Self::root`], forward-slashed, exactly
+    /// as [`write_brief`] returned it.
+    pub relpath: String,
+}
 
 /// Writes `body` to `<worktree>/.maestro/briefs/<name>.md`, creating the
 /// directory. Returns the WORKTREE-RELATIVE path — that is what the agent is
