@@ -20,6 +20,15 @@ export interface SamuraiSuccessorInfo {
    * appends `--model <value>` to the CLI launch. Absent/null = default.
    */
   model?: string | null;
+  /**
+   * The gen-1 brief POINTER the backend offered for the `claude` launch line
+   * (issue #158): the grid appends it as a quoted positional initial prompt
+   * so it is submitted WITH the launch instead of typed into the REPL
+   * afterwards. Only a gen-1 launch ever carries one; absent/null means the
+   * backend types the instruction on the session's first SessionStarted, as
+   * it always has.
+   */
+  launchPrompt?: string | null;
 }
 
 /**

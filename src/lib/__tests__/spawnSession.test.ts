@@ -96,7 +96,13 @@ describe("samurai successor spawn listener (issue #55)", () => {
         workingDirOverride: "C:\\git\\proj-worktrees\\epic-37",
         branch: null,
         customName: "samurai gen-3 37",
-        samurai: { project: "C:\\git\\proj", epic: "#37", generation: 3, model: null },
+        samurai: {
+          project: "C:\\git\\proj",
+          epic: "#37",
+          generation: 3,
+          model: null,
+          launchPrompt: null,
+        },
       },
     ]);
   });
@@ -111,7 +117,19 @@ describe("samurai successor spawn listener (issue #55)", () => {
       epic: "#37",
       generation: 3,
       model: "opus",
+      launchPrompt: null,
     });
+  });
+
+  // --- issue #158: the gen-1 pointer offered for the launch line ---
+
+  it("carries the backend's launch-line prompt offer into the queued samurai info", () => {
+    useWorkspaceStore.setState({ tabs: [tab("tab-proj", "C:\\git\\proj")] });
+    const pointer = "[Maestro Samurai] Read `.maestro/briefs/epic-37-gen-1-launch.md` in FULL";
+
+    emitSpawnEvent(spawnEvent({ generation: 1, launch_prompt: pointer }));
+
+    expect(usePendingLaunchStore.getState().pending[0]?.samurai?.launchPrompt).toBe(pointer);
   });
 
   it("drops a re-emitted spawn event for an already-queued successor (review F6)", () => {
@@ -180,6 +198,8 @@ describe("samurai successor spawn listener (issue #55)", () => {
   });
 
   it("registerSamuraiSuccessor invokes samurai_register_session with the event's identity", async () => {
+    invokeMock.mockResolvedValueOnce({ session: {}, launch_line_prompt: false });
+
     await registerSamuraiSuccessor(42, { project: "C:\\git\\proj", epic: "#37", generation: 3 });
 
     expect(invokeMock).toHaveBeenCalledWith("samurai_register_session", {
@@ -187,7 +207,44 @@ describe("samurai successor spawn listener (issue #55)", () => {
       projectPath: "C:\\git\\proj",
       epic: "#37",
       generation: 3,
+      // Issue #158: the default is today's typed delivery — a caller that
+      // says nothing must never suppress it.
+      launchLinePrompt: false,
     });
+  });
+
+  it("registerSamuraiSuccessor reports a launch-line delivery so nothing is typed (#158)", async () => {
+    invokeMock.mockResolvedValueOnce({ session: {}, launch_line_prompt: true });
+
+    const armed = await registerSamuraiSuccessor(
+      42,
+      { project: "C:\\git\\proj", epic: "#37", generation: 1 },
+      true,
+    );
+
+    expect(invokeMock).toHaveBeenCalledWith("samurai_register_session", {
+      sessionId: 42,
+      projectPath: "C:\\git\\proj",
+      epic: "#37",
+      generation: 1,
+      launchLinePrompt: true,
+    });
+    expect(armed).toBe(true);
+  });
+
+  it("registerSamuraiSuccessor reports a REFUSED claim, which resolves like a success (#158)", async () => {
+    // The replicator drops a launch-line claim it never offered and keeps
+    // `Typed` — without failing the call. A caller that reads "no exception"
+    // as acceptance writes a line carrying a pointer that is then typed too.
+    invokeMock.mockResolvedValueOnce({ session: {}, launch_line_prompt: false });
+
+    const armed = await registerSamuraiSuccessor(
+      42,
+      { project: "C:\\git\\proj", epic: "#37", generation: 1 },
+      true,
+    );
+
+    expect(armed).toBe(false);
   });
 
   it("samuraiSuccessorCliFlags forces skip-permissions and keeps custom flags", () => {

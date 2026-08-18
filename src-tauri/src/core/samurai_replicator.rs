@@ -148,6 +148,9 @@ pub type HandoffAbsorber = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 /// carry the ritual prompt: frontend write-timing is unreliable (claude may
 /// not be up yet), so the prompt stays queued here and is delivered on the
 /// successor's first `SessionStarted` hook signal.
+///
+/// Issue #158 carves out the one exception the timing argument does not
+/// cover — see [`Self::launch_prompt`].
 #[derive(Debug, Clone, Serialize)]
 pub struct SuccessorSpawn {
     /// Canonical project path (`\\?\` prefix stripped).
@@ -165,6 +168,30 @@ pub struct SuccessorSpawn {
     /// `None` = the spawn flow's default model. Resolved at emit time via
     /// [`SamuraiReplicator::set_run_configs`].
     pub model: Option<String>,
+    /// Issue #158: the gen-1 brief POINTER, offered to the frontend to append
+    /// to the `claude` launch command as a positional initial-prompt
+    /// argument. Set by [`SamuraiReplicator::spawn_first_generation`] only,
+    /// and only for a payload [`samurai_brief::launch_line_safe`] clears —
+    /// every other ritual goes into an already-running PTY and has no launch
+    /// command left to ride.
+    ///
+    /// An OFFER, not an instruction: the frontend refuses it whenever the
+    /// prompt cannot be quoted for the machine's shell (`lib/shellEscape`),
+    /// and says so at registration. Whatever it decides, the entry keeps its
+    /// own copy of the instruction, so a refused offer is delivered exactly
+    /// as it is today.
+    pub launch_prompt: Option<String>,
+}
+
+/// How a staged ritual reaches its agent (issue #158).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryRoute {
+    /// Typed into the running CLI's PTY on its first `SessionStarted` — what
+    /// every ritual has always done, and still the fallback for all of them.
+    Typed,
+    /// Submitted WITH the `claude` launch command, as a positional
+    /// initial-prompt argument. Nothing is typed at all.
+    LaunchLine,
 }
 
 /// How many times a fresh-spawn ([`Self::spawn_generation`] /
@@ -233,6 +260,17 @@ struct PendingRitual {
     /// heuristic would delete them instantly; they are pruned on delivery
     /// instead (bounded: one per (project, epic, generation)).
     respawn: Option<RespawnState>,
+    /// Issue #158: whether this entry's spawn event OFFERED its instruction
+    /// as a launch-line prompt ([`SuccessorSpawn::launch_prompt`]). Only a
+    /// gen-1 launch ever sets it, and only the offer makes
+    /// [`DeliveryRoute::LaunchLine`] acceptable at registration — the backend
+    /// honours no route it did not itself put on the wire.
+    launch_prompt_offered: bool,
+    /// Issue #158: which route the instruction actually took. Decided by the
+    /// frontend at registration (it is the side that knows whether the prompt
+    /// survived quoting) and read on `SessionStarted`: `LaunchLine` means the
+    /// agent already has it and typing it again would deliver it TWICE.
+    route: DeliveryRoute,
 }
 
 /// HEAD gate (PRD §5.4/§5.6): verify is skippable only when both the
@@ -388,6 +426,15 @@ struct DeliveredWatch {
     /// full window.
     delivered_at: AgeableInstant,
     resends: u32,
+    /// How the watched instruction was delivered (issue #158). `Typed` is the
+    /// #103 behaviour: the Enter may have been swallowed by the paste burst,
+    /// so re-send it before giving up. `LaunchLine` has no unsubmitted Enter
+    /// to re-send — the shell submitted the whole command — so the watch is
+    /// ACTIVITY-ONLY: it exists purely so a launch whose positional prompt
+    /// the CLI IGNORED still raises `submit_unconfirmed` instead of failing
+    /// silently behind a `delivered` audit row. A prompt that arrived mangled
+    /// is out of its reach — see [`SamuraiReplicator::audit_launch_line_delivery`].
+    route: DeliveryRoute,
 }
 
 /// What the tick concluded about one delivered-but-unconfirmed instruction.
@@ -408,6 +455,27 @@ fn enter_resend_verdict(elapsed: Duration, resends: u32) -> EnterResendVerdict {
         EnterResendVerdict::Keep
     } else if resends < MAX_ENTER_RESENDS {
         EnterResendVerdict::Resend
+    } else {
+        EnterResendVerdict::GiveUp
+    }
+}
+
+/// Audit spelling of a [`DeliveryRoute`] (issue #158).
+fn route_label(route: DeliveryRoute) -> &'static str {
+    match route {
+        DeliveryRoute::Typed => "typed",
+        DeliveryRoute::LaunchLine => "launch_line",
+    }
+}
+
+/// The same decision for a watch that must never write (issue #158): a
+/// launch-line delivery was submitted by the SHELL, so there is no Enter
+/// sitting unsubmitted and a resend would inject a stray blank prompt into a
+/// working session. One window of silence is all the evidence there is —
+/// ALERT and stop.
+fn activity_only_verdict(elapsed: Duration) -> EnterResendVerdict {
+    if elapsed <= ENTER_RESEND_WINDOW {
+        EnterResendVerdict::Keep
     } else {
         EnterResendVerdict::GiveUp
     }
@@ -1124,6 +1192,9 @@ impl SamuraiReplicator {
             working_dir,
             session_name: samurai_prompts::successor_session_name(&snapshot.epic, generation),
             model: self.model_for(&snapshot.project, &snapshot.epic),
+            // A successor is typed into a PTY that is already running claude
+            // — no launch command exists to carry it (issue #158).
+            launch_prompt: None,
         };
         self.lock_pending().push(PendingRitual {
             project: snapshot.project.clone(),
@@ -1139,6 +1210,8 @@ impl SamuraiReplicator {
             registered: None,
             alerted: false,
             respawn: None,
+            launch_prompt_offered: false,
+            route: DeliveryRoute::Typed,
         });
         (self.emit_spawn)(&spawn);
     }
@@ -1247,6 +1320,8 @@ impl SamuraiReplicator {
                 registered: None,
                 alerted: false,
                 respawn: None,
+                launch_prompt_offered: false,
+                route: DeliveryRoute::Typed,
             });
         }
         let spawn = SuccessorSpawn {
@@ -1256,6 +1331,9 @@ impl SamuraiReplicator {
             working_dir: working_dir.clone(),
             session_name: samurai_prompts::successor_session_name(&snapshot.epic, generation),
             model: self.model_for(&snapshot.project, &snapshot.epic),
+            // A successor is typed into a PTY that is already running claude
+            // — no launch command exists to carry it (issue #158).
+            launch_prompt: None,
         };
         let this = self.clone();
         let snapshot = snapshot.clone();
@@ -1401,6 +1479,8 @@ impl SamuraiReplicator {
             working_dir: working_dir.clone(),
             session_name: samurai_prompts::successor_session_name(epic, generation),
             model: self.model_for(project, epic),
+            // Same as every other successor: nothing to ride (issue #158).
+            launch_prompt: None,
         };
         // Stage synchronously, under the one lock, so a repeated fire (the
         // schedule re-fires after a crash mid-callback) can never
@@ -1482,6 +1562,8 @@ impl SamuraiReplicator {
                     spawn: spawn.clone(),
                     attempts: 1,
                 }),
+                launch_prompt_offered: false,
+                route: DeliveryRoute::Typed,
             });
         }
         let this = self.clone();
@@ -1662,6 +1744,17 @@ impl SamuraiReplicator {
             ),
             instruction,
         );
+        // Issue #158: gen-1 is the ONE ritual Maestro can hand over without
+        // typing. Everything else is injected into a PTY already running
+        // claude; a launch still has a launch command being composed, so the
+        // pointer can travel as `claude … '<pointer>'` — argv, not a typed
+        // frame, which is the last part of the gen-1 handover that still
+        // depended on the CLI's input handling after #137. Offered only, and
+        // only for a payload that fits a command line: the frontend decides,
+        // and the entry below keeps the instruction either way.
+        let launch_prompt =
+            samurai_brief::launch_line_safe(&instruction).then(|| instruction.clone());
+        let launch_prompt_offered = launch_prompt.is_some();
         let spawn = SuccessorSpawn {
             project: project.to_string(),
             epic: epic.to_string(),
@@ -1669,6 +1762,7 @@ impl SamuraiReplicator {
             working_dir,
             session_name: samurai_prompts::successor_session_name(epic, generation),
             model: self.model_for(project, epic),
+            launch_prompt,
         };
         {
             let mut pending = self.lock_pending();
@@ -1716,6 +1810,11 @@ impl SamuraiReplicator {
                     spawn: spawn.clone(),
                     attempts: 1,
                 }),
+                launch_prompt_offered,
+                // Typed until the frontend reports otherwise (issue #158):
+                // the offer above may be refused, and the fallback must be
+                // what happens when nothing says it was taken.
+                route: DeliveryRoute::Typed,
             });
         }
         (self.emit_spawn)(&spawn);
@@ -1856,32 +1955,82 @@ impl SamuraiReplicator {
     /// for that session id and starts the no-start clock; everything else is
     /// a no-op.
     pub fn on_registered(&self, snapshot: &SessionSnapshot) {
+        let _ = self.on_registered_with_route(snapshot, DeliveryRoute::Typed);
+    }
+
+    /// [`Self::on_registered`] plus the route the frontend actually used
+    /// (issue #158).
+    ///
+    /// The frontend is the only side that knows: it composes the launch
+    /// command, and it is the one that refuses when the prompt cannot be
+    /// quoted for the machine's shell. It reports the verdict here, strictly
+    /// BEFORE the CLI is typed in, so the decision is recorded before any
+    /// `SessionStarted` can arrive.
+    ///
+    /// [`DeliveryRoute::LaunchLine`] is accepted only for an entry whose
+    /// spawn event actually offered a `launch_prompt`. That check is what
+    /// makes double delivery structurally impossible rather than a
+    /// convention: a claim the backend never made — a successor ritual, or a
+    /// gen-1 whose brief write failed and is staged as full text — is dropped
+    /// and the instruction is typed exactly as before.
+    ///
+    /// Returns the route now IN EFFECT, which is not always the one asked
+    /// for. The caller must branch on the answer, never on "the call did not
+    /// fail": a dropped claim still resolves, and a frontend that reads that
+    /// as acceptance writes a launch line carrying a pointer this entry is
+    /// still going to type — the double delivery, through the back door.
+    /// `Typed` is also the answer when no staged entry matched at all.
+    pub fn on_registered_with_route(
+        &self,
+        snapshot: &SessionSnapshot,
+        route: DeliveryRoute,
+    ) -> DeliveryRoute {
         let mut pending = self.lock_pending();
-        if let Some(p) = pending.iter_mut().find(|p| {
+        let Some(p) = pending.iter_mut().find(|p| {
             p.registered.is_none()
                 && p.generation == snapshot.generation
                 && p.epic == snapshot.epic
                 && p.project == snapshot.project
-        }) {
-            p.registered = Some((snapshot.session_id, AgeableInstant::now()));
-            if p.alerted {
-                // Finding G: the successor_no_start ALERT already fired, but
-                // the entry was latched — a late registration still gets the
-                // ritual. The alert stands as history; this recovers it.
-                log::warn!(
-                    "samurai replicator: LATE successor registration for epic {} gen-{} (session {}) after its successor_no_start ALERT — ritual re-armed, the stall recovered",
-                    snapshot.epic,
-                    snapshot.generation,
-                    snapshot.session_id,
+        }) else {
+            return DeliveryRoute::Typed;
+        };
+        p.registered = Some((snapshot.session_id, AgeableInstant::now()));
+        match route {
+            DeliveryRoute::LaunchLine if p.launch_prompt_offered => {
+                log::info!(
+                    "samurai replicator: gen-{} for epic {} rode the launch line (session {}) — nothing will be typed",
+                    p.generation,
+                    p.epic,
+                    snapshot.session_id
                 );
+                p.route = DeliveryRoute::LaunchLine;
             }
-            log::info!(
-                "samurai replicator: successor session {} registered for epic {} gen-{} — ritual armed for its first SessionStarted",
+            DeliveryRoute::LaunchLine => log::warn!(
+                "samurai replicator: session {} claims a launch-line delivery for epic {} gen-{}, which was never offered one — typing the instruction as usual",
                 snapshot.session_id,
+                p.epic,
+                p.generation
+            ),
+            DeliveryRoute::Typed => {}
+        }
+        if p.alerted {
+            // Finding G: the successor_no_start ALERT already fired, but
+            // the entry was latched — a late registration still gets the
+            // ritual. The alert stands as history; this recovers it.
+            log::warn!(
+                "samurai replicator: LATE successor registration for epic {} gen-{} (session {}) after its successor_no_start ALERT — ritual re-armed, the stall recovered",
                 snapshot.epic,
-                snapshot.generation
+                snapshot.generation,
+                snapshot.session_id,
             );
         }
+        log::info!(
+            "samurai replicator: successor session {} registered for epic {} gen-{} — ritual armed for its first SessionStarted",
+            snapshot.session_id,
+            snapshot.epic,
+            snapshot.generation
+        );
+        p.route
     }
 
     /// Hook-chain tap (forwarded by the injector's `observe_hook`, pre-dedup
@@ -1894,6 +2043,12 @@ impl SamuraiReplicator {
     /// Enter can be swallowed when the CLI is still consuming the paste
     /// burst, and no ACK ladder covers these instructions. Hook-side
     /// activity (PreToolUse above all) releases the watch here too.
+    ///
+    /// Issue #158: an entry marked [`DeliveryRoute::LaunchLine`] is claimed
+    /// and audited here but NOT written. The agent got the pointer as argv
+    /// when it launched; typing it again would deliver the same instruction
+    /// twice, and no watch belongs on it either — there is no Enter to
+    /// re-send, the run is already in its first turn.
     pub fn observe_hook(&self, event: &ClaudeEvent) {
         self.note_turn_activity(event);
         let ClaudeEvent::SessionStarted { session_id, .. } = event else {
@@ -1907,6 +2062,10 @@ impl SamuraiReplicator {
             index.map(|i| pending.remove(i))
         };
         if let Some(p) = ritual {
+            if p.route == DeliveryRoute::LaunchLine {
+                self.audit_launch_line_delivery(&p, *session_id);
+                return;
+            }
             log::info!(
                 "samurai replicator: successor session {session_id} started — delivering the gen-{} verify ritual",
                 p.generation
@@ -1977,6 +2136,7 @@ impl SamuraiReplicator {
                                 source: "replicator",
                                 delivered_at: AgeableInstant::now(),
                                 resends: 0,
+                                route: DeliveryRoute::Typed,
                             });
                     }
                     Err(error) => {
@@ -2016,6 +2176,99 @@ impl SamuraiReplicator {
         }
     }
 
+    /// Records the INJECT row for a gen-1 pointer that rode the `claude`
+    /// launch line (issue #158). Same shape and same `phase: "delivered"` as
+    /// the typed path — the instruction DID reach the agent — with the gate
+    /// naming the route that carried it, so the audit trail stays readable
+    /// when a run shows no typed frame at all.
+    ///
+    /// No delivery-outcome callback: the write already happened, as part of
+    /// the launch command the frontend typed into a fresh shell, and it
+    /// succeeded or the session would not have started.
+    ///
+    /// It DOES arm an activity-only [`DeliveredWatch`], with a deliberately
+    /// narrow job: it catches a session that never STARTS A TURN — a CLI that
+    /// ignored the positional prompt entirely, leaving a run parked behind a
+    /// row claiming success. It keeps the existing `submit_unconfirmed` ALERT
+    /// as that backstop and drops the Enter resend, which has nothing to
+    /// re-submit here.
+    ///
+    /// What it does NOT catch: a prompt that arrived MANGLED. Any turn
+    /// activity releases the watch, so an agent that starts a turn on a
+    /// truncated pointer looks identical to a healthy one. Nothing downstream
+    /// can see it either — the launch line bypasses `samurai_pty`'s chunked
+    /// writer, which is where the #137 splice was observable at all. Detecting
+    /// that would mean gating release on evidence the brief was actually READ,
+    /// which is a larger change than this route warrants.
+    fn audit_launch_line_delivery(&self, p: &PendingRitual, session_id: u32) {
+        log::info!(
+            "samurai replicator: session {session_id} started with the gen-{} launch brief already on its command line — nothing typed",
+            p.generation
+        );
+        let (excerpt, total_chars) = super::samurai_audit::instruction_excerpt(&p.instruction);
+        self.audit.append(
+            &p.project,
+            AuditEvent::now(
+                p.epic.clone(),
+                AuditEventKind::Inject,
+                p.generation,
+                session_id,
+                json!({
+                    "phase": "delivered",
+                    "instruction": "launch_brief",
+                    "gate": "launch_line",
+                    "excerpt": excerpt,
+                    "total_chars": total_chars,
+                }),
+            ),
+        );
+        self.lock_delivered().push(DeliveredWatch {
+            project: p.project.clone(),
+            epic: p.epic.clone(),
+            generation: p.generation,
+            session_id,
+            launch: true,
+            source: "replicator",
+            delivered_at: AgeableInstant::now(),
+            resends: 0,
+            route: DeliveryRoute::LaunchLine,
+        });
+    }
+
+    /// Puts a launch-line claim back on the typed route (issue #158).
+    ///
+    /// The frontend claims the route at registration — BEFORE the launch line
+    /// is written, so the claim is recorded ahead of any `SessionStarted`
+    /// hook — which leaves exactly one hole: the write itself failing after
+    /// the claim landed. This is the compensating step for that, called from
+    /// the grid's write-failure path. Returns whether a claim was actually
+    /// reverted.
+    ///
+    /// Best effort by design: if the write failed, the shell is usually
+    /// unusable and no `SessionStarted` will arrive at all, so the entry ends
+    /// on the ordinary `successor_no_start` ALERT. The revert simply makes the
+    /// recoverable case — a session that starts anyway — deliver the pointer
+    /// the way it always did.
+    pub fn revert_launch_line_route(&self, session_id: u32) -> bool {
+        let mut pending = self.lock_pending();
+        let Some(p) = pending
+            .iter_mut()
+            .find(|p| p.registered.map(|(id, _)| id) == Some(session_id))
+        else {
+            return false;
+        };
+        if p.route != DeliveryRoute::LaunchLine {
+            return false;
+        }
+        log::warn!(
+            "samurai replicator: the launch line for epic {} gen-{} (session {session_id}) was never written — reverting to the typed delivery",
+            p.epic,
+            p.generation
+        );
+        p.route = DeliveryRoute::Typed;
+        true
+    }
+
     /// Arms the issue-#103 Enter-resend watch for an instruction the
     /// INJECTOR just delivered (issue #109: handoff/park/wind-down used to
     /// have no watch at all, so a swallowed Enter degraded to an ack_timeout
@@ -2033,6 +2286,8 @@ impl SamuraiReplicator {
             source: "injector",
             delivered_at: AgeableInstant::now(),
             resends: 0,
+            // The injector always types into a running PTY (issue #158).
+            route: DeliveryRoute::Typed,
         });
     }
 
@@ -2242,7 +2497,13 @@ impl SamuraiReplicator {
                     // never write into a session that is no longer ours.
                     return false;
                 }
-                match enter_resend_verdict(d.delivered_at.elapsed(), d.resends) {
+                let verdict = match d.route {
+                    DeliveryRoute::Typed => {
+                        enter_resend_verdict(d.delivered_at.elapsed(), d.resends)
+                    }
+                    DeliveryRoute::LaunchLine => activity_only_verdict(d.delivered_at.elapsed()),
+                };
+                match verdict {
                     EnterResendVerdict::Keep => true,
                     EnterResendVerdict::Resend => {
                         d.resends += 1;
@@ -2275,6 +2536,7 @@ impl SamuraiReplicator {
                                     "attempt": d.resends,
                                     "launch": d.launch,
                                     "source": d.source,
+                                    "route": route_label(d.route),
                                 }),
                             ),
                         ));
@@ -2293,6 +2555,11 @@ impl SamuraiReplicator {
                                     "resends": d.resends,
                                     "launch": d.launch,
                                     "source": d.source,
+                                    // Issue #158: which delivery this ALERT
+                                    // is about — a launch-line prompt the CLI
+                                    // may have ignored reads very differently
+                                    // from an Enter that never landed.
+                                    "route": route_label(d.route),
                                 }),
                             ),
                         ));
@@ -4431,6 +4698,300 @@ mod tests {
         assert_eq!(h.spawns.lock().unwrap().len(), 2, "dropped launch re-emits");
     }
 
+    // --- issue #158: the gen-1 pointer on the `claude` launch line ---
+
+    /// Stages a gen-1 launch in a REAL worktree, so the brief goes to a file
+    /// and what the entry holds is the short pointer (issue #137) — the only
+    /// payload the launch line is ever offered.
+    fn stage_launch_with_pointer(h: &Harness, project: &str, worktree: &Path) -> String {
+        let brief = samurai_prompts::launch_instruction(
+            &samurai_prompts::RunRefs::epics_only("#38"),
+            Some("nachogl1/maestro"),
+            &samurai_workflow::compiled_for_run(None),
+        );
+        h.replicator.spawn_first_generation(
+            project,
+            "#38",
+            &worktree.to_string_lossy(),
+            brief.clone(),
+        );
+        let (_, staged) = h.replicator.pending_view(1).unwrap();
+        assert_ne!(staged, brief, "a real worktree takes the brief-file route");
+        staged
+    }
+
+    #[tokio::test]
+    async fn test_gen1_launch_offers_the_pointer_on_the_launch_line() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let worktree = tempdir().unwrap();
+        let pointer = stage_launch_with_pointer(&h, "C:/git/proj-158-offer", worktree.path());
+
+        // The spawn event carries the pointer so the frontend can put it on
+        // the launch line as a positional initial prompt.
+        let spawns = h.spawns.lock().unwrap().clone();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].launch_prompt.as_deref(), Some(pointer.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_a_launch_line_delivery_is_never_typed_again() {
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-158-once";
+        let worktree = tempdir().unwrap();
+        let pointer = stage_launch_with_pointer(&h, project, worktree.path());
+
+        // The frontend reports it put the pointer on the launch line.
+        let details = h.replicator.spawn_details(project, "#38", 1).unwrap();
+        let snapshot = h
+            .supervisor
+            .register_session_with_details(5, project.into(), "#38".into(), 1, details)
+            .unwrap();
+        assert_eq!(
+            h.replicator
+                .on_registered_with_route(&snapshot, DeliveryRoute::LaunchLine),
+            DeliveryRoute::LaunchLine,
+            "an offered claim is honoured, and says so"
+        );
+
+        h.replicator.observe_hook(&session_started(5));
+        assert!(
+            h.writes.lock().unwrap().is_empty(),
+            "double delivery: the pointer already went out with the launch command"
+        );
+        assert!(h.replicator.pending_view(1).is_none(), "claimed = pruned");
+        // A watch IS armed — the pointer went out, but nothing yet proves
+        // the CLI acted on it. It is activity-only: no Enter is ever
+        // re-sent (see the dedicated test below).
+        assert_eq!(h.replicator.delivered_count(), 1);
+
+        // The delivery is still audited, naming the route that carried it.
+        let mut rows = Vec::new();
+        for _ in 0..200 {
+            rows = h
+                .audit
+                .read(project, None, None)
+                .await
+                .unwrap()
+                .events
+                .into_iter()
+                .filter(|r| r.event == AuditEventKind::Inject)
+                .collect();
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].details["gate"], "launch_line");
+        assert_eq!(rows[0].details["instruction"], "launch_brief");
+        assert!(rows[0].details["excerpt"]
+            .as_str()
+            .unwrap()
+            .starts_with(&pointer[..20]));
+    }
+
+    #[tokio::test]
+    async fn test_a_launch_line_claim_the_backend_never_offered_is_refused() {
+        // The route is only honoured for an entry whose spawn event actually
+        // carried a launch prompt. Here the worktree does not exist, the
+        // brief write fails, and the full text was staged for TYPING — a
+        // frontend claiming otherwise must not cost the run its brief.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-158-unoffered";
+        let brief = samurai_prompts::launch_instruction(
+            &samurai_prompts::RunRefs::epics_only("#38"),
+            None,
+            &samurai_workflow::compiled_for_run(None),
+        );
+        h.replicator
+            .spawn_first_generation(project, "#38", "C:/tmp/wt-158-nope", brief.clone());
+        assert_eq!(h.spawns.lock().unwrap()[0].launch_prompt, None);
+
+        let details = h.replicator.spawn_details(project, "#38", 1).unwrap();
+        let snapshot = h
+            .supervisor
+            .register_session_with_details(5, project.into(), "#38".into(), 1, details)
+            .unwrap();
+        // The refusal is REPORTED, not just logged: the caller has a pointer
+        // on a command line it is about to write and has to take it off
+        // again. A dropped claim that answered `LaunchLine` — or answered
+        // nothing at all — would be read as acceptance and deliver twice.
+        assert_eq!(
+            h.replicator
+                .on_registered_with_route(&snapshot, DeliveryRoute::LaunchLine),
+            DeliveryRoute::Typed
+        );
+
+        h.replicator.observe_hook(&session_started(5));
+        assert_eq!(h.writes.lock().unwrap().clone(), vec![(5, brief)]);
+    }
+
+    #[tokio::test]
+    async fn test_successor_rituals_never_ride_the_launch_line() {
+        // Successor, recovery and injector instructions go into an ALREADY
+        // RUNNING PTY — there is no launch command left to carry them, so
+        // they are never offered the route and never suppressed by it.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-158-successor";
+        let _repo = stage_successor(&h, project).await;
+        assert_eq!(h.spawns.lock().unwrap()[0].launch_prompt, None);
+
+        let details = h.replicator.spawn_details(project, "epic-9", 3).unwrap();
+        let snapshot = h
+            .supervisor
+            .register_session_with_details(2, project.into(), "epic-9".into(), 3, details)
+            .unwrap();
+        assert_eq!(
+            h.replicator
+                .on_registered_with_route(&snapshot, DeliveryRoute::LaunchLine),
+            DeliveryRoute::Typed,
+            "a successor is never offered the route, so the claim is refused"
+        );
+
+        h.replicator.observe_hook(&session_started(2));
+        let writes = h.writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 1, "the successor ritual is still typed in");
+        assert_eq!(writes[0].0, 2);
+        assert_eq!(h.replicator.delivered_count(), 1, "and still watched");
+    }
+
+    #[tokio::test]
+    async fn test_the_default_registration_route_stays_typed() {
+        // The fallback #137 mandates: nothing about `on_registered` changes,
+        // so a frontend that never learned about the launch line (or that
+        // refused the quoting) gets exactly today's typed delivery.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-158-fallback";
+        let worktree = tempdir().unwrap();
+        let pointer = stage_launch_with_pointer(&h, project, worktree.path());
+
+        let details = h.replicator.spawn_details(project, "#38", 1).unwrap();
+        let snapshot = h
+            .supervisor
+            .register_session_with_details(5, project.into(), "#38".into(), 1, details)
+            .unwrap();
+        h.replicator.on_registered(&snapshot);
+
+        h.replicator.observe_hook(&session_started(5));
+        assert_eq!(h.writes.lock().unwrap().clone(), vec![(5, pointer)]);
+        assert_eq!(h.replicator.delivered_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_a_claimed_launch_line_that_was_never_written_reverts_to_typing() {
+        // The claim has to be made BEFORE the line is written (it must beat
+        // the SessionStarted hook), which leaves exactly one hole: the write
+        // failing afterwards. Without the revert, a session that starts
+        // anyway consumes the entry, types nothing, and audits a delivery
+        // that never happened.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-158-revert";
+        let worktree = tempdir().unwrap();
+        let pointer = stage_launch_with_pointer(&h, project, worktree.path());
+
+        let details = h.replicator.spawn_details(project, "#38", 1).unwrap();
+        let snapshot = h
+            .supervisor
+            .register_session_with_details(5, project.into(), "#38".into(), 1, details)
+            .unwrap();
+        h.replicator
+            .on_registered_with_route(&snapshot, DeliveryRoute::LaunchLine);
+
+        assert!(h.replicator.revert_launch_line_route(5));
+        // Idempotent, and silent about sessions it knows nothing of.
+        assert!(!h.replicator.revert_launch_line_route(5));
+        assert!(!h.replicator.revert_launch_line_route(99));
+
+        h.replicator.observe_hook(&session_started(5));
+        assert_eq!(h.writes.lock().unwrap().clone(), vec![(5, pointer)]);
+        assert_eq!(h.replicator.delivered_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_a_launch_line_delivery_alerts_when_no_turn_ever_starts() {
+        // The `delivered` row says the pointer went OUT, not that the CLI
+        // acted on it. A positional prompt claude ignored or mangled has to
+        // surface as an ALERT instead of a run parked behind a row claiming
+        // success — and the ALERT must arrive WITHOUT an Enter resend, which
+        // would inject a stray blank prompt into a working session.
+        let dir = tempdir().unwrap();
+        let h = harness(dir.path());
+        let project = "C:/git/proj-158-watch";
+        let worktree = tempdir().unwrap();
+        stage_launch_with_pointer(&h, project, worktree.path());
+
+        let details = h.replicator.spawn_details(project, "#38", 1).unwrap();
+        let snapshot = h
+            .supervisor
+            .register_session_with_details(5, project.into(), "#38".into(), 1, details)
+            .unwrap();
+        h.replicator
+            .on_registered_with_route(&snapshot, DeliveryRoute::LaunchLine);
+        h.replicator.observe_hook(&session_started(5));
+        assert_eq!(
+            h.replicator.delivered_count(),
+            1,
+            "a launch-line delivery is still watched for turn activity"
+        );
+
+        // Inside the window: quiet.
+        h.replicator.tick();
+        assert!(h.resends.lock().unwrap().is_empty());
+        assert_eq!(h.replicator.delivered_count(), 1);
+
+        // First expiry: ALERT and stop — no resend ladder, nothing typed.
+        h.replicator
+            .backdate_delivered(5, ENTER_RESEND_WINDOW + Duration::from_secs(1));
+        h.replicator.tick();
+        assert!(
+            h.resends.lock().unwrap().is_empty(),
+            "the shell already submitted the command — there is no Enter to re-send"
+        );
+        assert!(h.writes.lock().unwrap().is_empty(), "and nothing is typed");
+        assert_eq!(h.replicator.delivered_count(), 0);
+
+        let mut alerts = Vec::new();
+        for _ in 0..200 {
+            alerts = h
+                .audit
+                .read(project, None, None)
+                .await
+                .unwrap()
+                .events
+                .into_iter()
+                .filter(|r| r.details["kind"] == "submit_unconfirmed")
+                .collect();
+            if !alerts.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].details["route"], "launch_line");
+        assert_eq!(alerts[0].details["resends"], 0);
+
+        // Turn activity releases it exactly like a typed delivery.
+        let h2 = harness(dir.path());
+        let worktree2 = tempdir().unwrap();
+        stage_launch_with_pointer(&h2, project, worktree2.path());
+        let details = h2.replicator.spawn_details(project, "#38", 1).unwrap();
+        let snapshot = h2
+            .supervisor
+            .register_session_with_details(6, project.into(), "#38".into(), 1, details)
+            .unwrap();
+        h2.replicator
+            .on_registered_with_route(&snapshot, DeliveryRoute::LaunchLine);
+        h2.replicator.observe_hook(&session_started(6));
+        h2.replicator.observe(&user_message(6));
+        assert_eq!(h2.replicator.delivered_count(), 0);
+    }
+
     // --- issue #103: post-delivery watch (swallowed-Enter recovery) ---
 
     #[test]
@@ -4797,6 +5358,7 @@ mod tests {
             working_dir: project.to_string(),
             session_name: "samurai gen-3 9".to_string(),
             model: None,
+            launch_prompt: None,
         };
 
         // Nothing staged (the cleanup cancelled it while the decision ran):

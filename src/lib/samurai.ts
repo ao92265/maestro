@@ -150,14 +150,42 @@ export function samuraiListSessions(): Promise<SamuraiSessionSnapshot[]> {
  * (project, epic, generation) the `samurai-spawn-successor` event named arms
  * the backend's verify-ritual delivery for this session's first
  * SessionStarted hook signal.
+ *
+ * `launchLinePrompt` (issue #158) claims that a gen-1 launch prompt is on the
+ * `claude` command line about to be typed, so the backend must not type it in
+ * as well. The claim can be REFUSED without failing the call, so the answer
+ * comes back in `launch_line_prompt` — read it, never infer acceptance from
+ * the call resolving.
  */
+export interface SamuraiRegisterResult {
+  session: SamuraiSessionSnapshot;
+  /** Whether the backend actually armed the launch-line route. */
+  launch_line_prompt: boolean;
+}
+
 export function samuraiRegisterSession(
   sessionId: number,
   projectPath: string,
   epic: string,
   generation: number,
-): Promise<SamuraiSessionSnapshot> {
-  return invoke("samurai_register_session", { sessionId, projectPath, epic, generation });
+  launchLinePrompt = false,
+): Promise<SamuraiRegisterResult> {
+  return invoke("samurai_register_session", {
+    sessionId,
+    projectPath,
+    epic,
+    generation,
+    launchLinePrompt,
+  });
+}
+
+/**
+ * Undoes a `launchLinePrompt` claim when the launch line it described never
+ * reached the PTY (issue #158). Best effort: `false` just means there was
+ * nothing to undo.
+ */
+export function samuraiRevertLaunchLinePrompt(sessionId: number): Promise<boolean> {
+  return invoke("samurai_revert_launch_line_prompt", { sessionId });
 }
 
 /**

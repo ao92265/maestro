@@ -14,6 +14,13 @@
  * signal, when claude is actually up. This module only has to get a Claude
  * session running in the right directory and register it under supervision
  * (which is what arms that delivery).
+ *
+ * One exception (issue #158): a gen-1 LAUNCH is the only spawn where the CLI
+ * command itself is still being composed, so its short brief POINTER rides
+ * along in `launch_prompt` and goes out as a positional argument on that
+ * command — no typed frame at all. It stays an OFFER: whatever cannot be
+ * quoted for the local shell is handed back to the queued-and-typed route
+ * above, and registration reports which of the two actually happened.
  */
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -43,6 +50,13 @@ export interface SamuraiSpawnSuccessorEvent {
    * `--model <value>` to the successor's CLI launch. Absent/null = default.
    */
   model?: string | null;
+  /**
+   * Issue #158: the gen-1 brief pointer, offered for the `claude` launch
+   * line as a positional initial prompt. Present only for a gen-1 launch
+   * whose payload fits a command line; absent/null everywhere else, which
+   * leaves the backend typing the instruction as it always has.
+   */
+  launch_prompt?: string | null;
 }
 
 /**
@@ -97,6 +111,7 @@ export function queueSamuraiSuccessorLaunch(event: SamuraiSpawnSuccessorEvent): 
       epic: event.epic,
       generation: event.generation,
       model: event.model ?? null,
+      launchPrompt: event.launch_prompt ?? null,
     },
   });
   // Same as the History tab: make sure the grid is mounted to consume the
@@ -157,12 +172,32 @@ export function successorLaunchImminent(
  * Registers a just-launched successor under supervision. Called by the grid
  * right before the CLI command is typed, so the backend's ritual delivery is
  * armed strictly before claude's SessionStart hook can fire.
+ *
+ * `launchLinePrompt` is the grid's CLAIM that the pointer is already on the
+ * launch command about to be typed (issue #158), which is what tells the
+ * backend not to type it a second time. Defaults to `false` — the typed
+ * delivery is what happens unless the launch line demonstrably carried it.
+ *
+ * Returns whether the backend HONOURED that claim. It refuses one it never
+ * offered — a successor ritual, or a gen-1 re-staged with a failed brief
+ * write while a stale queued launch still holds the old pointer — and the
+ * refusal does not fail the call. A caller that reads "no exception" as
+ * acceptance writes a launch line carrying a pointer the backend is still
+ * going to type: the same double delivery, through a different door.
  */
 export async function registerSamuraiSuccessor(
   sessionId: number,
   samurai: SamuraiSuccessorInfo,
-): Promise<void> {
-  await samuraiRegisterSession(sessionId, samurai.project, samurai.epic, samurai.generation);
+  launchLinePrompt = false,
+): Promise<boolean> {
+  const result = await samuraiRegisterSession(
+    sessionId,
+    samurai.project,
+    samurai.epic,
+    samurai.generation,
+    launchLinePrompt,
+  );
+  return result.launch_line_prompt;
 }
 
 // Same StrictMode-safe init/stop shape as the samurai supervisor listener in

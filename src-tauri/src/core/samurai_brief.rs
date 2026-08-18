@@ -272,6 +272,36 @@ pub fn is_inline(instruction: &str) -> bool {
     instruction.len() <= INLINE_MAX_BYTES
 }
 
+/// Longest payload allowed onto a `claude` LAUNCH LINE (issue #158).
+///
+/// Deliberately its own constant rather than a reuse of [`INLINE_MAX_BYTES`],
+/// which it happens to equal: the two gates measure different things. The
+/// inline gate is about ONE PTY FRAME (`samurai_pty::CHUNK_BYTES`, 256 bytes,
+/// chunked); a launch line bypasses that transport entirely — it is one
+/// argument on a command line the shell parses, so the real ceiling is the
+/// shell's (cmd.exe's is 8191 characters, and quoting only adds two). 500 is a
+/// deliberately conservative fraction of that: comfortably above the ~250-byte
+/// pointer this exists for, and far below anything that could crowd a command
+/// line, so a FULL brief (multi-KB, staged only when the file write failed)
+/// can never take this route by accident.
+pub const LAUNCH_LINE_MAX_BYTES: usize = 500;
+
+/// Whether `instruction` may ride the `claude` LAUNCH LINE as a positional
+/// initial-prompt argument instead of being typed into the running REPL
+/// (issue #158).
+///
+/// Two conditions, both about the SHELL the launch command is typed into:
+/// - Single line. A CR or LF inside a command line submits it half-written —
+///   the very failure #137 exists to stop, and the reason
+///   [`pointer_instruction`] normalizes whitespace.
+/// - No bigger than [`LAUNCH_LINE_MAX_BYTES`].
+///
+/// Refusal is not a failure — the caller keeps the typed delivery it already
+/// had.
+pub fn launch_line_safe(instruction: &str) -> bool {
+    instruction.len() <= LAUNCH_LINE_MAX_BYTES && !instruction.contains(['\n', '\r'])
+}
+
 /// What is actually typed into the PTY for `instruction`: the instruction
 /// itself when it fits the inline budget, otherwise a pointer at a brief file
 /// written into `worktree` under `name`.
@@ -675,5 +705,28 @@ mod tests {
         let staged = deliverable_instruction(dir.path(), "gen-1-launch", instruction.clone());
 
         assert_eq!(staged, instruction);
+    }
+
+    #[test]
+    fn test_launch_line_safe_accepts_a_pointer_and_refuses_what_must_stay_typed() {
+        // Issue #158: only a payload that fits one shell command line may
+        // ride the `claude` launch line.
+        let dir = tempdir().unwrap();
+        let relpath = write_brief(dir.path(), "epic-38-gen-1-launch", "body").unwrap();
+        let pointer = pointer_instruction(&relpath);
+        assert!(
+            launch_line_safe(&pointer),
+            "the pointer is what this is for"
+        );
+
+        // A brief-write failure falls back to the FULL instruction — multi-KB
+        // and exactly the payload #137 took off the wire. It must not silently
+        // become a launch-line argument.
+        assert!(!launch_line_safe(&long_instruction()));
+        // A newline would submit the command half-typed.
+        assert!(!launch_line_safe("[Maestro Samurai] Read this\nand that"));
+        assert!(!launch_line_safe("[Maestro Samurai] Read this\rand that"));
+        // A short single-line instruction is fine — it is one frame either way.
+        assert!(launch_line_safe("[Maestro Samurai] Hand off now."));
     }
 }

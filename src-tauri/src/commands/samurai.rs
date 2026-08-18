@@ -30,7 +30,7 @@ use crate::core::samurai_journal::{
 use crate::core::samurai_parker::SamuraiParker;
 use crate::core::samurai_pr_runs::PrRunStore;
 use crate::core::samurai_prompts::{self, epic_slug, ref_slug, LaunchInput};
-use crate::core::samurai_replicator::{derive_repo_pin, SamuraiReplicator};
+use crate::core::samurai_replicator::{derive_repo_pin, DeliveryRoute, SamuraiReplicator};
 use crate::core::samurai_resumer::latest_handoff_generation;
 use crate::core::samurai_run_config::{
     RefTitle, RunConfigStatus, RunConfigStore, SamuraiRunConfig,
@@ -118,6 +118,20 @@ pub fn samurai_set_config(
 /// (same project, epic and generation) gets its SPAWN row linked to the
 /// predecessor, and arms the verify-ritual delivery for the new session's
 /// first `SessionStarted` hook signal.
+///
+/// Issue #158: `launch_line_prompt` is the frontend's report of HOW it INTENDS
+/// to deliver a gen-1 launch prompt the spawn event offered — `true` when the
+/// pointer is on the `claude` command line about to be typed, so nothing may
+/// be typed for it afterwards. Absent/`false` (every successor, and any
+/// launch whose prompt could not be quoted for the local shell) keeps the
+/// typed delivery.
+///
+/// The claim can be REFUSED: the replicator honours it only for an entry it
+/// actually offered a launch prompt. A refusal is not an error and does not
+/// fail this call, so the answer travels in
+/// [`SamuraiRegisterResult::launch_line_prompt`] — the caller must read it
+/// and take the pointer back off the line, because "the call succeeded" says
+/// nothing about which route is armed.
 #[tauri::command]
 pub fn samurai_register_session(
     supervisor: State<'_, Arc<Supervisor>>,
@@ -126,16 +140,54 @@ pub fn samurai_register_session(
     project_path: String,
     epic: String,
     generation: Option<u32>,
-) -> Result<SessionSnapshot, String> {
+    launch_line_prompt: Option<bool>,
+) -> Result<SamuraiRegisterResult, String> {
     let project = canonical_project_path(&project_path);
     let generation = generation.unwrap_or(1);
-    let snapshot = match replicator.spawn_details(&project, &epic, generation) {
+    let session = match replicator.spawn_details(&project, &epic, generation) {
         Some(details) => supervisor
             .register_session_with_details(session_id, project, epic, generation, details)?,
         None => supervisor.register_session(session_id, project, epic, generation)?,
     };
-    replicator.on_registered(&snapshot);
-    Ok(snapshot)
+    let armed = if launch_line_prompt.unwrap_or(false) {
+        replicator.on_registered_with_route(&session, DeliveryRoute::LaunchLine)
+    } else {
+        replicator.on_registered(&session);
+        DeliveryRoute::Typed
+    };
+    Ok(SamuraiRegisterResult {
+        session,
+        launch_line_prompt: armed == DeliveryRoute::LaunchLine,
+    })
+}
+
+/// What [`samurai_register_session`] answers: the registered session, plus
+/// the delivery route the replicator actually armed for it (issue #158).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SamuraiRegisterResult {
+    /// The registered session — the whole of what this command used to
+    /// return.
+    pub session: SessionSnapshot,
+    /// Whether the launch-line claim was HONOURED. `false` means the pointer
+    /// will be typed on the session's first `SessionStarted`, so a caller
+    /// that put it on the launch line must take it off again before writing.
+    pub launch_line_prompt: bool,
+}
+
+/// Undoes the `launch_line_prompt` claim made by
+/// [`samurai_register_session`] when the launch line it described never
+/// reached the PTY (issue #158).
+///
+/// The claim has to be made BEFORE the line is written — it must beat the
+/// `SessionStarted` hook — so this is the compensating step for the one
+/// window that ordering leaves open. Returns whether a claim was reverted;
+/// `false` simply means there was nothing to undo.
+#[tauri::command]
+pub fn samurai_revert_launch_line_prompt(
+    replicator: State<'_, Arc<SamuraiReplicator>>,
+    session_id: u32,
+) -> bool {
+    replicator.revert_launch_line_route(session_id)
 }
 
 /// Snapshots of every supervised session, ordered by session id.
