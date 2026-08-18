@@ -1255,6 +1255,19 @@ pub fn delete_file(
     managed.extend(configs.iter().map(|(_, c)| handoff_dir(&c.worktree_path)));
     managed.extend(configs.iter().map(|(_, c)| brief_dir(&c.worktree_path)));
     managed.extend(pr_runs.iter().map(|(_, r)| brief_dir(&r.project_path)));
+    // Issue #145: a review's brief lives in the tree it was STAGED in, which
+    // in a multi-repo workspace is not its `project_path`. The listing
+    // resolves it that way, so the delete must authorise that root too — or
+    // the panel offers a Delete on a row that can only ever answer "outside
+    // every Samurai-managed root". The `project_path` roots above stay:
+    // pre-`brief_root` records are still listed from there and must stay
+    // deletable.
+    managed.extend(
+        pr_runs
+            .iter()
+            .filter_map(|(_, r)| r.brief_root.as_deref())
+            .map(brief_dir),
+    );
 
     // A root that fails to canonicalize does not exist, and an existing
     // target cannot live under a non-existent root — skipping it is sound.
@@ -2599,6 +2612,52 @@ mod tests {
             delete_file(&f.roots, &configs, &f.pr_runs, &entries, &entry.path, false).unwrap();
             assert!(!Path::new(&entry.path).exists());
         }
+    }
+
+    #[test]
+    fn test_a_brief_staged_outside_the_pr_checkout_is_still_deletable() {
+        // Issue #145: the listing resolves a review's brief against the tree
+        // it was staged in. If the delete guard only authorised
+        // `project_path`, every multi-repo review's brief row would be listed
+        // and then refused as "outside every Samurai-managed root".
+        let f = fixture();
+        let root = tempdir().unwrap();
+        let tab_project = root.path().join("workspace");
+        let brief = staged_brief(&tab_project, "pr-145-review.md");
+        let mut pr_runs = f.pr_runs.clone();
+        pr_runs.push((
+            f.roots.runs_dir.join("pr").join("elsewhere.json"),
+            pr_review_staged_in(
+                Path::new(&f.project),
+                &tab_project,
+                11,
+                Some(format!("{BRIEF_DIR}/pr-145-review.md")),
+            ),
+        ));
+
+        let (_, entries) = list_files(
+            &f.roots,
+            &f.store.list_with_paths(),
+            &[],
+            &[],
+            &pr_runs,
+            &[],
+        );
+        let listed = entries
+            .iter()
+            .find(|e| path_key(Path::new(&e.path)) == path_key(&brief))
+            .expect("the brief is listed from the tree it was staged in");
+
+        delete_file(
+            &f.roots,
+            &f.store.list_with_paths(),
+            &pr_runs,
+            &entries,
+            &listed.path,
+            false,
+        )
+        .unwrap();
+        assert!(!brief.exists());
     }
 
     #[test]
