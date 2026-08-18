@@ -272,6 +272,9 @@ fn record_file_name(run: &PrReviewRun) -> String {
 /// construction so a record's checkout hashes to the same audit file, and
 /// keys the same Second Brain project, as every other samurai surface.
 fn normalize_project(project: &str) -> String {
+    // Strips `\\?\` only, so a `\\?\UNC\` checkout is left RELATIVE and its
+    // brief is skipped rather than swept — safe, but retention then silently
+    // never runs for a share-hosted tree. Tracked in #161.
     project.strip_prefix(r"\\?\").unwrap_or(project).to_string()
 }
 
@@ -299,20 +302,29 @@ fn sanitize(value: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-/// Path of the brief a PR review was staged as, for LISTING: the record's
-/// relative `brief` resolved against the root it was actually staged under,
-/// falling back to the checkout for records written before
-/// [`PrReviewRun::brief_root`] existed. The fallback is a best-effort guess —
-/// right whenever the tab's project and the PR's checkout coincide, which is
-/// the single-repo case — and a wrong guess here only costs a row that does
-/// not stat, never a file.
+/// Path of the brief a PR review was staged as, for LISTING. Whenever the
+/// record carries a staging root this is exactly [`staged_brief_path`] — the
+/// listed row and the deletable path are then the same file by construction,
+/// which is what keeps the Second Brain from offering a Delete the guard must
+/// refuse.
 ///
-/// Anything DESTRUCTIVE must use [`staged_brief_path`] instead, which refuses
-/// to guess at all.
+/// Only a record written BEFORE [`PrReviewRun::brief_root`] existed falls back
+/// to the checkout, and that fallback is explicitly best-effort ATTRIBUTION:
+/// it is right whenever the tab's project and the PR's checkout coincide (the
+/// single-repo case) and, when they do not, it can name a same-titled brief in
+/// the PR's checkout that belongs to a DIFFERENT review of the same PR. Both
+/// trees' `.maestro/briefs/` are Maestro-owned, so the cost is a misattributed
+/// row, never a file outside Maestro — and it applies to legacy records only,
+/// which stop being written the moment this version runs.
+///
+/// A record whose root is present but unusable (not absolute) resolves to
+/// `None` rather than to a guess: there is nothing honest to list.
 pub fn brief_path(run: &PrReviewRun) -> Option<PathBuf> {
+    if run.brief_root.is_some() {
+        return staged_brief_path(run);
+    }
     let brief = run.brief.as_deref()?;
-    let root = run.brief_root.as_deref().unwrap_or(&run.project_path);
-    Some(Path::new(root).join(brief))
+    Some(Path::new(&run.project_path).join(brief))
 }
 
 /// Where the brief PROVABLY landed: `Some` only when the record carries both
@@ -349,12 +361,19 @@ mod tests {
         }
     }
 
+    /// The tab's project: an ABSOLUTE directory in the host's own spelling.
+    /// [`staged_brief_path`] requires absoluteness, and a `C:\…` literal is
+    /// not absolute on the Linux CI runner.
+    fn workspace() -> PathBuf {
+        std::env::temp_dir().join("maestro-tab-project")
+    }
+
     /// A brief staged under the tab's project — a DIFFERENT tree from the
     /// `launch()` checkout on purpose (issue #145), so any test that resolves
     /// a brief proves which root it used.
     fn staged(relpath: &str) -> Option<StagedBrief> {
         Some(StagedBrief {
-            root: PathBuf::from(r"C:\git\workspace"),
+            root: workspace(),
             relpath: relpath.to_string(),
         })
     }
@@ -563,8 +582,8 @@ mod tests {
             run.project_path,
             PrReviewRun::now(launch(), 7, None).project_path
         );
-        // And a brief staged in the checkout ITSELF resolves against the
-        // normalized spelling, never the verbatim one.
+        // The staging root normalizes on the same rule — it is a checkout
+        // spelling too, and a verbatim one keys a different tree.
         let run = PrReviewRun::now(
             verbatim_launch(),
             7,
@@ -574,10 +593,6 @@ mod tests {
             }),
         );
         assert_eq!(run.brief_root.as_deref(), Some(r"C:\git\maestro"));
-        assert_eq!(
-            brief_path(&run).unwrap(),
-            Path::new(r"C:\git\maestro").join("a.md")
-        );
     }
 
     #[test]
@@ -586,10 +601,7 @@ mod tests {
         // multi-repo workspace is not the PR's own checkout.
         let relpath = ".maestro/briefs/pr-142-check-review.md";
         let run = PrReviewRun::now(launch(), 7, staged(relpath));
-        assert_eq!(
-            brief_path(&run).unwrap(),
-            Path::new(r"C:\git\workspace").join(relpath)
-        );
+        assert_eq!(brief_path(&run).unwrap(), workspace().join(relpath));
         assert!(brief_path(&PrReviewRun::now(launch(), 7, None)).is_none());
 
         // A pre-#145 record knows only the relative half. LISTING falls back
@@ -601,6 +613,13 @@ mod tests {
             brief_path(&legacy).unwrap(),
             Path::new(r"C:\git\maestro").join(relpath)
         );
+
+        // A root that IS recorded but cannot be used is not an invitation to
+        // fall back — the listing would then show a row the delete guard has
+        // to refuse.
+        let mut relative = run.clone();
+        relative.brief_root = Some("..".to_string());
+        assert!(brief_path(&relative).is_none());
     }
 
     #[test]
