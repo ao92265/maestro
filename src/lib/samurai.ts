@@ -172,6 +172,15 @@ export function samuraiRegisterSession(
 }
 
 /**
+ * Undoes a `launchLinePrompt` claim when the launch line it described never
+ * reached the PTY (issue #158). Best effort: `false` just means there was
+ * nothing to undo.
+ */
+export function samuraiRevertLaunchLinePrompt(sessionId: number): Promise<boolean> {
+  return invoke("samurai_revert_launch_line_prompt", { sessionId });
+}
+
+/**
  * Reads a project's audit rows (optionally only the last `tail`, optionally
  * only rows strictly after `sinceTs`) plus the current file size in bytes.
  */

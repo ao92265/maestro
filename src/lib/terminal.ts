@@ -7,7 +7,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { currentShellFamily, quoteShellArgument, type ShellFamily } from "@/lib/shellEscape";
+import { quoteShellArgument, type ShellFamily } from "@/lib/shellEscape";
 import type { BackendCapabilities, BackendType } from "./terminalTheme";
 
 /**
@@ -494,30 +494,73 @@ export interface CliLaunchLine {
  * argv, so the pointer is submitted WITH the launch instead — one frame, no
  * chunking, no submit-delay guesswork.
  *
- * Two refusals, both reported as `launchPromptDelivered: false` so the caller
- * falls back to today's typed delivery rather than degrading:
+ * Four refusals, every one reported as `launchPromptDelivered: false` so the
+ * caller falls back to today's typed delivery rather than degrading:
  * 1. Non-Claude modes. Only `claude` is known to read a bare positional as
  *    its initial prompt.
- * 2. A prompt that [`quoteShellArgument`] cannot quote for `shell`. Emitting
+ * 2. An unknown `shell` (`null`). The family comes from the backend, which
+ *    answers `null` for any shell without a verified quoter; guessing there
+ *    is how a PowerShell `COMSPEC` would receive cmd.exe quoting.
+ * 3. A prompt that [`quoteShellArgument`] cannot quote for `shell`. Emitting
  *    a half-escaped line would be far worse than typing: the pointer carries
  *    BACKTICKS, which a posix shell would run as command substitution.
+ * 4. Custom flags beyond a plain `--model <token>`. `customFlags` is free
+ *    text the user typed, appended immediately before the positional, so a
+ *    trailing value-taking flag would swallow the prompt as its VALUE — the
+ *    brief would never reach the agent while this still reported success and
+ *    suppressed the typed fallback. The one exception is the exact shape
+ *    `samuraiSuccessorCliFlags` generates for the run config's model, which
+ *    is token-restricted at its source and always carries its own value.
+ *    An allowlist, never a parse of user flags.
  */
 export function buildCliLaunchLine(
   mode: AiMode,
-  flags?: CliFlags,
-  resumeSessionId?: string,
-  launchPrompt?: string | null,
-  shell: ShellFamily = currentShellFamily(),
+  flags: CliFlags | undefined,
+  resumeSessionId: string | undefined,
+  launchPrompt: string | null | undefined,
+  shell: ShellFamily | null,
 ): CliLaunchLine | null {
   const command = buildCliCommand(mode, flags, resumeSessionId);
   if (command === null) return null;
-  if (!launchPrompt || mode !== "Claude") return { command, launchPromptDelivered: false };
+  const refused = { command, launchPromptDelivered: false };
+  if (!launchPrompt || mode !== "Claude") return refused;
+  if (shell === null) {
+    console.warn("[Samurai] Unknown shell family — the launch prompt will be typed instead");
+    return refused;
+  }
+  if (!launchPromptSurvivesFlags(flags)) {
+    console.warn("[Samurai] Custom CLI flags could swallow the launch prompt — typing it instead");
+    return refused;
+  }
   const quoted = quoteShellArgument(launchPrompt, shell);
   if (quoted === null) {
     console.warn(
       "[Samurai] The launch prompt cannot be quoted for this shell — falling back to typing it",
     );
-    return { command, launchPromptDelivered: false };
+    return refused;
   }
   return { command: `${command} ${quoted}`, launchPromptDelivered: true };
+}
+
+/**
+ * The one custom-flag shape allowed in front of a positional prompt: the
+ * model preference `samuraiSuccessorCliFlags` appends, whose value is
+ * token-restricted where it is built. Anything else is user free text and
+ * refuses the launch line (see [`buildCliLaunchLine`] refusal 4).
+ */
+const TRUSTED_CUSTOM_FLAGS = /^--model [A-Za-z0-9._-]+$/;
+
+function launchPromptSurvivesFlags(flags?: CliFlags): boolean {
+  const custom = flags?.customFlags.trim() ?? "";
+  return custom === "" || TRUSTED_CUSTOM_FLAGS.test(custom);
+}
+
+/**
+ * The quoting family of the shell the backend actually spawns for a session
+ * PTY (issue #158), or `null` when it has no verified quoter for it. Asked of
+ * the backend, never inferred here — see [`ShellFamily`].
+ */
+export async function terminalShellFamily(): Promise<ShellFamily | null> {
+  const family = await invoke<string | null>("terminal_shell_family");
+  return family === "posix" || family === "cmd" ? family : null;
 }

@@ -1,10 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  currentShellFamily,
-  quoteShellArgument,
-  shellEscapePath,
-  shellEscapePaths,
-} from "../shellEscape";
+import { quoteShellArgument, shellEscapePath, shellEscapePaths } from "../shellEscape";
 
 describe("shellEscapePath", () => {
   it("wraps a simple path in single quotes", () => {
@@ -128,21 +123,5 @@ describe("quoteShellArgument (cmd)", () => {
   it("refuses newlines and an empty payload", () => {
     expect(quote("a\nb")).toBeNull();
     expect(quote("")).toBeNull();
-  });
-});
-
-describe("currentShellFamily", () => {
-  it("reports cmd on Windows and posix elsewhere", () => {
-    // The PTY spawns COMSPEC on Windows and $SHELL everywhere else
-    // (`process_manager::spawn_shell`), so the quoting must follow the same
-    // split.
-    const original = Object.getOwnPropertyDescriptor(navigator, "platform");
-    Object.defineProperty(navigator, "platform", { value: "Win32", configurable: true });
-    expect(currentShellFamily()).toBe("cmd");
-    Object.defineProperty(navigator, "platform", { value: "MacIntel", configurable: true });
-    expect(currentShellFamily()).toBe("posix");
-    Object.defineProperty(navigator, "platform", { value: "Linux x86_64", configurable: true });
-    expect(currentShellFamily()).toBe("posix");
-    if (original) Object.defineProperty(navigator, "platform", original);
   });
 });

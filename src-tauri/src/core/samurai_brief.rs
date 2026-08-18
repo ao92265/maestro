@@ -238,6 +238,20 @@ pub fn pointer_instruction(relpath: &str) -> String {
     )
 }
 
+/// Longest payload allowed onto a `claude` LAUNCH LINE (issue #158).
+///
+/// Deliberately its own constant rather than a reuse of [`INLINE_MAX_BYTES`],
+/// which it happens to equal: the two gates measure different things. The
+/// inline gate is about ONE PTY FRAME (`samurai_pty::CHUNK_BYTES`, 256 bytes,
+/// chunked); a launch line bypasses that transport entirely — it is one
+/// argument on a command line the shell parses, so the real ceiling is the
+/// shell's (cmd.exe's is 8191 characters, and quoting only adds two). 500 is a
+/// deliberately conservative fraction of that: comfortably above the ~250-byte
+/// pointer this exists for, and far below anything that could crowd a command
+/// line, so a FULL brief (multi-KB, staged only when the file write failed)
+/// can never take this route by accident.
+pub const LAUNCH_LINE_MAX_BYTES: usize = 500;
+
 /// Whether `instruction` may ride the `claude` LAUNCH LINE as a positional
 /// initial-prompt argument instead of being typed into the running REPL
 /// (issue #158).
@@ -246,15 +260,12 @@ pub fn pointer_instruction(relpath: &str) -> String {
 /// - Single line. A CR or LF inside a command line submits it half-written —
 ///   the very failure #137 exists to stop, and the reason
 ///   [`pointer_instruction`] normalizes whitespace.
-/// - No bigger than [`INLINE_MAX_BYTES`]. The pointer is ~250 bytes; the only
-///   other thing that reaches here is a FULL brief, staged because the file
-///   write failed, and a multi-KB command line is exactly the payload that was
-///   observed arriving spliced. Same threshold as the inline gate: one frame.
+/// - No bigger than [`LAUNCH_LINE_MAX_BYTES`].
 ///
 /// Refusal is not a failure — the caller keeps the typed delivery it already
 /// had.
 pub fn launch_line_safe(instruction: &str) -> bool {
-    instruction.len() <= INLINE_MAX_BYTES && !instruction.contains(['\n', '\r'])
+    instruction.len() <= LAUNCH_LINE_MAX_BYTES && !instruction.contains(['\n', '\r'])
 }
 
 /// What is actually typed into the PTY for `instruction`: the instruction

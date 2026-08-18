@@ -5,8 +5,6 @@
  * as `'\''` (end quote, escaped quote, reopen quote).
  */
 
-import { isWindows } from "@/lib/platform";
-
 export function shellEscapePath(path: string): string {
   return `'${path.replace(/'/g, "'\\''")}'`;
 }
@@ -17,16 +15,22 @@ export function shellEscapePaths(paths: string[]): string {
 
 /**
  * Which quoting rules a command line typed into a session PTY must follow.
- * The backend spawns `COMSPEC` (cmd.exe) on Windows and `$SHELL` everywhere
- * else (`process_manager::spawn_shell`), so this is the only split that
- * matters — there is no PowerShell PTY to quote for.
+ *
+ * NEVER inferred from the operating system: the backend spawns whatever
+ * `COMSPEC`/`$SHELL` names (`process_manager::spawn_shell`), so a Windows box
+ * can be running PowerShell — where the backtick is the ESCAPE character and
+ * `$(...)` executes — and a unix box csh, which mis-parses the `'\''` splice.
+ * The family comes from `terminal_shell_family`, which classifies the shell
+ * actually configured and answers `null` for anything Maestro has no verified
+ * quoter for. `null` is not an error: it means refuse to build a quoted
+ * command line and use a route that needs no quoting.
+ *
+ * Verification caveat: the tests below assert the ESCAPED STRING only. No
+ * test parses the result back through a real shell — that would mean spawning
+ * bash/cmd in the unit suite — so the rules encoded here are reviewed
+ * reasoning, not a round trip.
  */
 export type ShellFamily = "posix" | "cmd";
-
-/** The family of the shell this machine's session PTYs actually run. */
-export function currentShellFamily(): ShellFamily {
-  return isWindows() ? "cmd" : "posix";
-}
 
 /**
  * Control characters are refused outright, on both families: the quoted
@@ -56,6 +60,12 @@ function hasControlCharacter(value: string): boolean {
  *   (`cmd /V:ON`, or the `DelayedExpansion` registry value).
  * Everything else cmd treats as special — `&`, `|`, `<`, `>`, `^`, `(`, `)` —
  * is inert inside double quotes, so wrapping is enough for those.
+ *
+ * This set also has to survive a SECOND batch pass: `claude` on Windows is an
+ * npm shim, `claude.cmd`, which forwards its arguments with `%*`. That pass
+ * re-expands `%…%` and (with delayed expansion on) `!…!`, which is safe here
+ * only because both are already refused above. Narrowing this set later must
+ * account for the shim, not just cmd.exe's own parsing.
  */
 const CMD_UNESCAPABLE = /["%!]/;
 

@@ -54,7 +54,8 @@ import {
   writeSessionPluginConfig,
 } from "@/lib/plugins";
 import { projectColorFor } from "@/lib/projectColor";
-import { samuraiHarvestArm } from "@/lib/samurai";
+import { samuraiHarvestArm, samuraiRevertLaunchLinePrompt } from "@/lib/samurai";
+import type { ShellFamily } from "@/lib/shellEscape";
 import { shellEscapePaths } from "@/lib/shellEscape";
 import {
   registerSamuraiSuccessor,
@@ -70,6 +71,7 @@ import {
   killSession,
   removeSessionHooksConfig,
   spawnShell,
+  terminalShellFamily,
   waitForTerminalReady,
   writeSessionHooksConfig,
   writeStdin,
@@ -171,6 +173,20 @@ const EMPTY_PLUGINS: PluginConfig[] = [];
  * This prevents race conditions where multiple sessions share the same .mcp.json file.
  * Without worktrees, sessions can overwrite each other's MCP config before Claude CLI reads it.
  */
+/**
+ * The spawned shell's quoting family (issue #158), or `null` when the backend
+ * cannot name it — including when the call itself fails. `null` is a refusal,
+ * not an error: the caller keeps a route that needs no quoting.
+ */
+async function shellFamilyOrNull(): Promise<ShellFamily | null> {
+  try {
+    return await terminalShellFamily();
+  } catch (err) {
+    console.error("[Samurai] Could not read the session shell family:", err);
+    return null;
+  }
+}
+
 const projectLaunchLocks = new Map<string, Promise<void>>();
 
 async function withProjectLock<T>(projectPath: string, fn: () => Promise<T>): Promise<T> {
@@ -1156,16 +1172,20 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
               // Issue #158: a gen-1 launch also carries its brief POINTER on
               // this very line, as a quoted positional initial prompt, so the
               // instruction that starts the run is submitted WITH the launch
-              // instead of typed into claude's REPL afterwards. The helper
-              // reports whether it managed to — a prompt it cannot quote for
-              // this machine's shell stays off the line and is typed as before.
-              const launchLine = buildCliLaunchLine(
+              // instead of typed into claude's REPL afterwards. The quoting
+              // family comes from the backend — the shell it actually spawns,
+              // not a guess from the OS — and an unavailable answer simply
+              // keeps the prompt off the line.
+              const launchPrompt = slot.samurai?.launchPrompt ?? null;
+              const shellFamily = launchPrompt ? await shellFamilyOrNull() : null;
+              let launchLine = buildCliLaunchLine(
                 slot.mode,
                 effectiveFlags,
                 slot.resumeSessionId ?? undefined,
-                slot.samurai?.launchPrompt,
+                launchPrompt,
+                shellFamily,
               );
-              const cliCommand = launchLine?.command ?? null;
+              let launchPromptOnLine = launchLine?.launchPromptDelivered ?? false;
 
               // Samurai successor: register under supervision BEFORE the CLI
               // launches, so the backend's verify-ritual delivery is armed
@@ -1173,18 +1193,28 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
               // failure is logged, not fatal — the session still launches and
               // the backend's successor_no_start ALERT surfaces the gap.
               // The route reported here is what stops the backend typing a
-              // pointer this line already carries (issue #158).
+              // pointer this line already carries (issue #158) — so a failed
+              // registration must also take the pointer BACK OFF the line.
+              // Writing a line the backend does not know about would deliver
+              // the brief TWICE: once as argv, once typed on SessionStarted.
               if (slot.samurai) {
                 try {
-                  await registerSamuraiSuccessor(
-                    sessionId,
-                    slot.samurai,
-                    launchLine?.launchPromptDelivered ?? false,
-                  );
+                  await registerSamuraiSuccessor(sessionId, slot.samurai, launchPromptOnLine);
                 } catch (err) {
                   console.error("[Samurai] Failed to register successor session:", err);
+                  if (launchPromptOnLine) {
+                    launchLine = buildCliLaunchLine(
+                      slot.mode,
+                      effectiveFlags,
+                      slot.resumeSessionId ?? undefined,
+                      null,
+                      shellFamily,
+                    );
+                    launchPromptOnLine = false;
+                  }
                 }
               }
+              const cliCommand = launchLine?.command ?? null;
 
               // Harvest triage launch (issue #98): arm the backend BEFORE
               // the CLI launches, so the journal-prompt injection gate is
@@ -1228,7 +1258,21 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
               }
 
               // Send CLI launch command
-              await writeStdin(sessionId, `${cliCommand}\r`);
+              try {
+                await writeStdin(sessionId, `${cliCommand}\r`);
+              } catch (err) {
+                // Issue #158: the claim above told the backend the pointer
+                // went out on this line. It did not, so hand the typed
+                // delivery back before rethrowing — otherwise a session that
+                // starts anyway consumes the staged entry, types nothing, and
+                // audits a delivery that never happened.
+                if (launchPromptOnLine) {
+                  await samuraiRevertLaunchLinePrompt(sessionId).catch((revertErr) => {
+                    console.error("[Samurai] Failed to revert the launch-line claim:", revertErr);
+                  });
+                }
+                throw err;
+              }
 
               // Brief delay for CLI initialization.
               // With session-specific MCP server names (maestro-1, maestro-2, etc.),

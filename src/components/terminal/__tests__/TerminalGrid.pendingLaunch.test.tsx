@@ -50,6 +50,9 @@ vi.mock("@/lib/terminal", async (importOriginal) => {
     writeSessionHooksConfig: vi.fn(async () => {}),
     removeSessionHooksConfig: vi.fn(async () => {}),
     renameSession: vi.fn(async () => {}),
+    // Issue #158: the quoting family comes from the backend, never from the
+    // OS. Default posix; the cmd-refusal test overrides it.
+    terminalShellFamily: vi.fn(async () => "posix"),
   };
 });
 
@@ -107,6 +110,7 @@ vi.mock("@/lib/samurai", async (importOriginal) => {
     ...actual,
     samuraiRegisterSession: vi.fn(async () => ({})),
     samuraiHarvestArm: vi.fn(async () => {}),
+    samuraiRevertLaunchLinePrompt: vi.fn(async () => true),
   };
 });
 
@@ -130,8 +134,12 @@ vi.mock("../splitTree", async (importOriginal) => {
 });
 
 import { invoke } from "@tauri-apps/api/core";
-import { samuraiHarvestArm, samuraiRegisterSession } from "@/lib/samurai";
-import { spawnShell, writeStdin } from "@/lib/terminal";
+import {
+  samuraiHarvestArm,
+  samuraiRegisterSession,
+  samuraiRevertLaunchLinePrompt,
+} from "@/lib/samurai";
+import { spawnShell, terminalShellFamily, writeStdin } from "@/lib/terminal";
 import { terminalArmInitialPrompt } from "@/lib/terminalPrompt";
 import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
 import { useSessionStore } from "@/stores/useSessionStore";
@@ -143,6 +151,8 @@ const spawnShellMock = vi.mocked(spawnShell);
 const writeStdinMock = vi.mocked(writeStdin);
 const registerMock = vi.mocked(samuraiRegisterSession);
 const harvestArmMock = vi.mocked(samuraiHarvestArm);
+const shellFamilyMock = vi.mocked(terminalShellFamily);
+const revertMock = vi.mocked(samuraiRevertLaunchLinePrompt);
 const initialPromptArmMock = vi.mocked(terminalArmInitialPrompt);
 
 const WORKTREE = "C:/wt/samurai-77-78";
@@ -255,10 +265,8 @@ describe("TerminalGrid pending samurai launch", () => {
     );
   });
 
-  it("falls back to the typed pointer when it cannot be quoted (#158)", async () => {
-    // A control character can be quoted for no shell; the launch line must
-    // come out WITHOUT it and the backend must be told to type it as before.
-    const unquotable = "[Maestro Samurai] Read this\nand that";
+  /** Queues the gen-1 launch every #158 test below drives. */
+  function queueLaunchWithPointer(pointer: string): void {
     usePendingLaunchStore.getState().request({
       tabId: "tab-1",
       mode: "Claude",
@@ -271,17 +279,61 @@ describe("TerminalGrid pending samurai launch", () => {
         epic: "77, 78",
         generation: 1,
         model: null,
-        launchPrompt: unquotable,
+        launchPrompt: pointer,
       },
     });
+  }
+
+  it("falls back to the typed pointer when cmd.exe cannot quote it (#158)", async () => {
+    // The refusal that can actually happen end to end: `launch_line_safe`
+    // already rejects newlines backend-side, but a `%` reaches the grid
+    // intact and cmd.exe has no escape for it.
+    shellFamilyMock.mockResolvedValueOnce("cmd");
+    const pointer = "[Maestro Samurai] Read `.maestro/briefs/100%-gen-1-launch.md` in FULL";
+    queueLaunchWithPointer(pointer);
 
     render(<TerminalGrid projectPath="C:/proj" tabId="tab-1" isActive />);
 
     await waitFor(() => expect(writeStdinMock).toHaveBeenCalled());
     const cli = writeStdinMock.mock.calls.map((c) => String(c[1])).join("\n");
     expect(cli).toContain("claude --dangerously-skip-permissions");
-    expect(cli).not.toContain("Read this");
+    expect(cli).not.toContain("Maestro Samurai");
     expect(registerMock).toHaveBeenCalledWith(expect.any(Number), "C:/proj", "77, 78", 1, false);
+  });
+
+  it("takes the pointer back off the line when registration fails (#158)", async () => {
+    // The backend never heard the claim, so it will type the pointer on
+    // SessionStarted. Writing a line that ALSO carries it delivers the brief
+    // twice — the failure this whole gate exists to prevent.
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    registerMock.mockRejectedValueOnce(new Error("supervisor unavailable"));
+    const pointer = "[Maestro Samurai] Read `.maestro/briefs/epic-77-78-gen-1-launch.md` in FULL";
+    queueLaunchWithPointer(pointer);
+
+    render(<TerminalGrid projectPath="C:/proj" tabId="tab-1" isActive />);
+
+    await waitFor(() => expect(writeStdinMock).toHaveBeenCalled());
+    const cli = writeStdinMock.mock.calls.map((c) => String(c[1])).join("\n");
+    expect(cli).toContain("claude --dangerously-skip-permissions");
+    expect(cli).not.toContain("Maestro Samurai");
+    errorSpy.mockRestore();
+  });
+
+  it("reverts the launch-line claim when the line never reaches the PTY (#158)", async () => {
+    // Claimed before the write (it has to beat the SessionStart hook), so a
+    // failed write leaves the backend believing a delivery happened. Without
+    // the revert a later SessionStarted consumes the entry, types nothing,
+    // and audits `delivered` — zero delivery behind a false trail.
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    writeStdinMock.mockRejectedValueOnce(new Error("PTY closed"));
+    const pointer = "[Maestro Samurai] Read `.maestro/briefs/epic-77-78-gen-1-launch.md` in FULL";
+    queueLaunchWithPointer(pointer);
+
+    render(<TerminalGrid projectPath="C:/proj" tabId="tab-1" isActive />);
+
+    await waitFor(() => expect(revertMock).toHaveBeenCalledTimes(1));
+    expect(revertMock).toHaveBeenCalledWith(expect.any(Number));
+    errorSpy.mockRestore();
   });
 
   // Issue #98: a "Harvest now" launch rides the same pending-launch flow —

@@ -90,4 +90,47 @@ describe("buildCliLaunchLine", () => {
   it("returns null for a mode with no CLI at all", () => {
     expect(buildCliLaunchLine("Plain", FLAGS, undefined, POINTER, "posix")).toBeNull();
   });
+
+  it("refuses when the shell family is unknown", () => {
+    // The backend answers null for any shell without a verified quoter
+    // (PowerShell as COMSPEC, csh as $SHELL). Guessing there is the bug.
+    expect(buildCliLaunchLine("Claude", FLAGS, undefined, POINTER, null)).toEqual({
+      command: "claude --dangerously-skip-permissions",
+      launchPromptDelivered: false,
+    });
+  });
+
+  it("refuses when user custom flags could swallow the prompt as their value", () => {
+    // `customFlags` is free text appended immediately before the positional:
+    // a trailing value-taking flag would eat the pointer, and reporting
+    // success would ALSO suppress the typed fallback — brief never delivered.
+    const line = buildCliLaunchLine(
+      "Claude",
+      { skipPermissions: true, customFlags: "--append-system-prompt" },
+      undefined,
+      POINTER,
+      "posix",
+    );
+    expect(line).toEqual({
+      command: "claude --dangerously-skip-permissions --append-system-prompt",
+      launchPromptDelivered: false,
+    });
+  });
+
+  it("still allows the trusted --model flag the samurai flow generates", () => {
+    // `samuraiSuccessorCliFlags` puts the run config's model on this channel
+    // with a token-restricted value, and it always carries its own value —
+    // refusing it would disable the launch line for most real runs.
+    const line = buildCliLaunchLine(
+      "Claude",
+      { skipPermissions: true, customFlags: "--model claude-opus-4-5" },
+      undefined,
+      POINTER,
+      "posix",
+    );
+    expect(line).toEqual({
+      command: `claude --dangerously-skip-permissions --model claude-opus-4-5 '${POINTER}'`,
+      launchPromptDelivered: true,
+    });
+  });
 });

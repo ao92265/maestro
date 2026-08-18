@@ -1297,6 +1297,7 @@ pub fn run() {
             commands::catalog::load_project_catalog,
             // Samurai supervisor + audit log (Phase 1)
             commands::samurai::samurai_register_session,
+            commands::samurai::samurai_revert_launch_line_prompt,
             commands::samurai::samurai_list_sessions,
             commands::samurai::samurai_audit_read,
             commands::samurai::samurai_audit_clear,
@@ -1331,6 +1332,7 @@ pub fn run() {
             commands::harvest::samurai_harvest_list,
             // Generic "launch a terminal with an initial prompt" injection
             commands::initial_prompt::terminal_arm_initial_prompt,
+            commands::terminal::terminal_shell_family,
             // CLI commands
             commands::cli::install_cli,
             commands::cli::uninstall_cli,

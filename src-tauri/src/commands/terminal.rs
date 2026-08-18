@@ -383,3 +383,18 @@ pub async fn check_cli_available(command: String) -> Result<bool, String> {
         Ok(output.status.success())
     }
 }
+
+/// The quoting family of the shell a session PTY actually runs — `"posix"`,
+/// `"cmd"`, or `null` (issue #158).
+///
+/// The frontend needs this before it can append a quoted argument to a CLI
+/// launch line. It must NOT infer the family from the operating system:
+/// `spawn_shell` reads `COMSPEC`/`$SHELL`, so a Windows box can be running
+/// PowerShell and a unix box csh — shells whose escaping rules would turn a
+/// correctly quoted string into something else entirely. `null` means Maestro
+/// has no verified quoter for the configured shell, and the caller must fall
+/// back to a route that needs no quoting.
+#[tauri::command]
+pub fn terminal_shell_family() -> Option<String> {
+    crate::core::process_manager::session_shell_family().map(str::to_string)
+}

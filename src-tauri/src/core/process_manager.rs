@@ -166,6 +166,54 @@ fn handle_dsr(inner: &Inner, id: u32, bytes: &[u8]) -> bool {
     true
 }
 
+/// The shell binary [`ProcessManager::spawn_shell`] launches for a session
+/// PTY: `$SHELL` on unix (`/bin/sh` when unset), `COMSPEC` on Windows
+/// (`cmd.exe` when unset). Read through one function so nothing can quote for
+/// a shell other than the one actually spawned (issue #158).
+pub fn session_shell() -> String {
+    #[cfg(unix)]
+    {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+    }
+    #[cfg(windows)]
+    {
+        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
+    }
+}
+
+/// Which quoting rules `shell` obeys — `"posix"`, `"cmd"`, or `None` when it
+/// is a shell Maestro has no VERIFIED quoter for (issue #158).
+///
+/// An allowlist on purpose, and `None` is a safe answer: a caller that cannot
+/// name the family must refuse to build a quoted command line and fall back
+/// to typing. Guessing from the operating system is what this replaces — a
+/// Windows box whose `COMSPEC` points at PowerShell would receive cmd.exe
+/// double quotes, in a shell where the backtick is the ESCAPE character and
+/// `$(...)` executes; a `$SHELL` of csh/tcsh mis-parses the `'\''` idiom the
+/// posix quoter relies on. Both are answered with `None`, not a guess.
+///
+/// Matched on the file stem, case-insensitively, so `/bin/bash`,
+/// `C:\WINDOWS\system32\cmd.exe` and a bare `zsh` all classify.
+pub fn shell_family_of(shell: &str) -> Option<&'static str> {
+    let name = shell.rsplit(['/', '\\']).next().unwrap_or(shell);
+    let stem = name
+        .rsplit_once('.')
+        .map_or(name, |(stem, _ext)| stem)
+        .to_ascii_lowercase();
+    match stem.as_str() {
+        // Bourne-family: `'…'` quotes everything literally and the `'\''`
+        // splice is the standard idiom.
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "mksh" | "ash" => Some("posix"),
+        "cmd" => Some("cmd"),
+        _ => None,
+    }
+}
+
+/// [`shell_family_of`] applied to the shell this machine actually spawns.
+pub fn session_shell_family() -> Option<&'static str> {
+    shell_family_of(&session_shell())
+}
+
 /// Owns and manages all PTY sessions for the application lifetime.
 ///
 /// Wraps an `Arc<Inner>` so it can be cheaply cloned into Tauri's managed state
@@ -260,10 +308,7 @@ impl ProcessManager {
             .map_err(|e| PtyError::spawn_failed(format!("Failed to open PTY: {e}")))?;
 
         // Determine the user's shell (platform-specific)
-        #[cfg(unix)]
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        #[cfg(windows)]
-        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        let shell = session_shell();
 
         let mut cmd = CommandBuilder::new(&shell);
         #[cfg(unix)]
@@ -819,6 +864,51 @@ mod tests {
                 "incomplete buffer must stay bounded, got {}",
                 d.incomplete.len()
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod shell_family_tests {
+    use super::shell_family_of;
+
+    #[test]
+    fn classifies_only_shells_with_a_verified_quoter() {
+        // Issue #158: the family drives which quoting rules a launch line is
+        // built with, so an unknown shell must answer None (refuse), never a
+        // plausible guess.
+        for posix in [
+            "/bin/sh",
+            "/bin/bash",
+            "/usr/bin/zsh",
+            "/bin/dash",
+            "ksh",
+            "/usr/local/bin/mksh",
+            "/bin/ash",
+        ] {
+            assert_eq!(shell_family_of(posix), Some("posix"), "{posix}");
+        }
+        for cmd in [
+            "cmd.exe",
+            "C:\\WINDOWS\\system32\\cmd.exe",
+            "C:/WINDOWS/system32/CMD.EXE",
+        ] {
+            assert_eq!(shell_family_of(cmd), Some("cmd"), "{cmd}");
+        }
+        // Shells whose escaping rules the quoters do NOT model: PowerShell
+        // treats the backtick as its escape character and runs `$(...)`;
+        // csh/tcsh mis-parse the `'\''` splice; fish and nushell are simply
+        // unverified.
+        for unknown in [
+            "powershell.exe",
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+            "/bin/csh",
+            "/bin/tcsh",
+            "/usr/bin/fish",
+            "/usr/bin/nu",
+            "",
+        ] {
+            assert_eq!(shell_family_of(unknown), None, "{unknown}");
         }
     }
 }

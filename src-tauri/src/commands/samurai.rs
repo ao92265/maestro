@@ -149,6 +149,22 @@ pub fn samurai_register_session(
     Ok(snapshot)
 }
 
+/// Undoes the `launch_line_prompt` claim made by
+/// [`samurai_register_session`] when the launch line it described never
+/// reached the PTY (issue #158).
+///
+/// The claim has to be made BEFORE the line is written — it must beat the
+/// `SessionStarted` hook — so this is the compensating step for the one
+/// window that ordering leaves open. Returns whether a claim was reverted;
+/// `false` simply means there was nothing to undo.
+#[tauri::command]
+pub fn samurai_revert_launch_line_prompt(
+    replicator: State<'_, Arc<SamuraiReplicator>>,
+    session_id: u32,
+) -> bool {
+    replicator.revert_launch_line_route(session_id)
+}
+
 /// Snapshots of every supervised session, ordered by session id.
 #[tauri::command]
 pub fn samurai_list_sessions(supervisor: State<'_, Arc<Supervisor>>) -> Vec<SessionSnapshot> {
