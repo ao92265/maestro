@@ -37,6 +37,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tauri::State;
 
 use super::ai_runner;
+use crate::core::samurai_brief;
+use crate::core::samurai_injector::SessionDirResolver;
 use crate::core::samurai_journal::{JournalEntry, JournalStore};
 
 /// Artifact kind — also the directory name under the app data dir. Must
@@ -88,6 +90,23 @@ pub const TRIAGE_PROMPT_TEMPLATE: &str = "[Maestro harvest] Interactive journal 
 /// the run date keeps one report per triage day.
 pub fn report_file_name(date: &str) -> String {
     format!("maestro-harvest-insights-{date}.md")
+}
+
+/// Brief-file stem for a triage prompt over the inline gate (issue #144):
+/// the `date` [`report_file_name`] already uses PLUS the triage session's
+/// own id.
+///
+/// The session id is what keeps two triage sessions apart. Entries are
+/// consumed the moment the prompt lands, so a second harvest later the same
+/// day is a normal thing to do — and with a date-only stem its brief would
+/// overwrite the first session's, handing an agent that had not read its
+/// brief yet somebody else's entries while its own stayed consumed and
+/// untriaged. Names disambiguate per delivery here exactly as
+/// `samurai_injector::injector_brief_name` (#143) and the #138 PR-review
+/// stem do. Stays inside `samurai_brief`'s stem bound: 15 + 10 + 2 + at most
+/// 10 digits = 37 characters.
+fn harvest_brief_name(date: &str, session_id: u32) -> String {
+    format!("harvest-triage-{date}-s{session_id}")
 }
 
 /// The user's Downloads directory, or `<home>/Downloads` when the OS lookup
@@ -267,6 +286,11 @@ pub struct HarvestTriage {
     notify: Option<HarvestNotifyFn>,
     /// Arms the post-delivery Enter-resend watch. `None` in tests.
     on_delivered: Option<HarvestDeliveredFn>,
+    /// Resolves a session id to the directory its terminal shell runs in —
+    /// where a triage brief file is written when the prompt is over the
+    /// inline gate (issue #144). `None` keeps every pre-#144 behaviour:
+    /// the raw prompt is always typed inline.
+    session_dirs: Option<SessionDirResolver>,
 }
 
 impl HarvestTriage {
@@ -278,6 +302,7 @@ impl HarvestTriage {
             armed: Mutex::new(HashSet::new()),
             notify: None,
             on_delivered: None,
+            session_dirs: None,
         }
     }
 
@@ -294,9 +319,41 @@ impl HarvestTriage {
         self
     }
 
+    /// [`Self::new`] plus the [`SessionDirResolver`] the delivery-time brief
+    /// gate resolves a session's worktree against (issue #144).
+    pub fn with_session_dirs(mut self, resolver: SessionDirResolver) -> Self {
+        self.session_dirs = Some(resolver);
+        self
+    }
+
     fn report(&self, outcome: HarvestInjectionOutcome) {
         if let Some(notify) = &self.notify {
             notify(outcome);
+        }
+    }
+
+    /// What is actually delivered to the PTY for the assembled triage
+    /// `prompt`, keyed by `session_id` and dated `date` (issue #144).
+    /// Mirrors `SamuraiInjector::deliverable` (#143): no `session_dirs`
+    /// resolver configured, or the resolver has no directory for this
+    /// session, types `prompt` unchanged — today's behaviour, and every
+    /// pre-#144 test's shape. Otherwise routes through
+    /// [`samurai_brief::deliverable_instruction`], which keeps `prompt`
+    /// inline at or under [`samurai_brief::INLINE_MAX_BYTES`] and otherwise
+    /// arms a POINTER at a brief file written verbatim into the resolved
+    /// directory under [`harvest_brief_name`] — falling back to `prompt`
+    /// unchanged if that write fails.
+    fn deliverable_prompt(&self, session_id: u32, date: &str, prompt: String) -> String {
+        let Some(session_dirs) = &self.session_dirs else {
+            return prompt;
+        };
+        match session_dirs(session_id) {
+            Some(dir) => samurai_brief::deliverable_instruction(
+                &PathBuf::from(dir),
+                &harvest_brief_name(date, session_id),
+                prompt,
+            ),
+            None => prompt,
         }
     }
 
@@ -383,6 +440,10 @@ impl HarvestTriage {
         let today = ai_runner::today_local();
         let (entries_block, snapshot_len) = render_entries_capped(&entries);
         let prompt = build_triage_prompt(&today, &entries_block, &self.downloads_dir);
+        // Delivery-time brief gate (issue #144): unchanged below the inline
+        // budget or with no session_dirs resolver configured; a pointer at a
+        // verbatim brief file otherwise.
+        let prompt = self.deliverable_prompt(session_id, &today, prompt);
         // THE injection: the prompt is handed to the session's PTY here. A
         // failed write means nothing was injected — entries stay unconsumed
         // (the session is already disarmed above, so a retry click re-arms
@@ -493,14 +554,81 @@ fn read_report(harvest_dir: &Path, path: &str) -> Result<String, String> {
     std::fs::read_to_string(&requested).map_err(|e| format!("Failed to read {}: {}", NOUN, e))
 }
 
-/// Reads one saved harvest report by absolute path — the Second Brain lists
-/// `HARVEST_REPORT` rows by path, this serves their content. New reports no
-/// longer land here (issue #98 moved harvest into an interactive session),
-/// but previously generated ones stay readable. Refuses anything that is
-/// not a regular file directly under the harvest dir.
+/// Reads one saved harvest report by absolute path — the Journal panel's
+/// legacy-reports section lists rows by path, this serves their content. New
+/// reports no longer land here (issue #98 moved harvest into an interactive
+/// session), but previously generated ones stay readable. Refuses anything
+/// that is not a regular file directly under the harvest dir.
 #[tauri::command]
 pub fn samurai_harvest_read(path: String) -> Result<String, String> {
     read_report(&harvest_dir(), &path)
+}
+
+/// One legacy harvest report on disk (issue #142) — the row the Journal
+/// panel's legacy-reports section lists. Deliberately NOT a
+/// `SamuraiFileEntry`: these files belong to no run and no PR review, so
+/// they carry no group, no epic and no project.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HarvestReportRow {
+    /// Absolute path — the identity `samurai_harvest_read` and
+    /// `samurai_file_delete` both take back.
+    pub path: String,
+    pub size_bytes: u64,
+    /// RFC 3339 modified time; `None` when the file's metadata could be read
+    /// but its modified time specifically could not.
+    pub modified_at: Option<String>,
+}
+
+/// Every legacy report directly under `dir`, newest first (tie-broken by
+/// path, descending — `read_dir` order is arbitrary, the precedent already
+/// noted at `core::samurai_files::Groups::upsert_pr` and
+/// `test_a_pr_title_fills_an_empty_label_whatever_the_record_order`). No
+/// extension filter: the retired `push_dir_files` lister listed every
+/// regular file and [`read_report`] accepts every regular file, so filtering
+/// here would hide a file the user can neither see nor remove. A
+/// subdirectory is skipped, matching `read_report`'s "regular file directly
+/// under the dir" rule. An absent or unreadable directory yields an empty
+/// list, never a panic or an error (Q4: this is the NORMAL state since #98).
+fn list_reports(dir: &Path) -> Vec<HarvestReportRow> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<HarvestReportRow> = read
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter_map(|path| {
+            // A file whose metadata cannot be read at all is skipped rather
+            // than emitted with a lying size (the `core::samurai_files::stat`
+            // precedent).
+            let meta = std::fs::metadata(&path).ok()?;
+            let modified_at = meta
+                .modified()
+                .ok()
+                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
+            Some(HarvestReportRow {
+                path: path.to_string_lossy().into_owned(),
+                size_bytes: meta.len(),
+                modified_at,
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.modified_at
+            .cmp(&a.modified_at)
+            .then_with(|| b.path.cmp(&a.path))
+    });
+    rows
+}
+
+/// Every legacy harvest report saved under `<app data>/harvest/` (issues
+/// #98/#142) — the Journal panel's legacy-reports section list. Never fails:
+/// an absent directory is the NORMAL state since #98 moved harvest into an
+/// interactive session whose `/insights` report goes to Downloads, so this
+/// answers with an empty list rather than an error.
+#[tauri::command]
+pub fn samurai_harvest_list() -> Vec<HarvestReportRow> {
+    list_reports(&harvest_dir())
 }
 
 #[cfg(test)]
@@ -1263,5 +1391,286 @@ mod tests {
         // A path that does not exist is refused before any compare.
         let err = read_report(&harvest, &harvest.join("nope.md").to_string_lossy()).unwrap_err();
         assert!(err.contains("harvest report not found"), "{err}");
+    }
+
+    #[test]
+    fn test_list_reports_lists_regular_files_newest_first() {
+        let dir = tempdir().unwrap();
+        let harvest = dir.path();
+
+        // Backdate each file so mtime ordering is deterministic — the
+        // `newest_jsonl_picks_latest_transcript` precedent
+        // (commands/claude_sessions.rs).
+        let write_at = |name: &str, content: &str, secs_ago: u64| -> PathBuf {
+            let path = harvest.join(name);
+            std::fs::write(&path, content).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago),
+                )
+                .unwrap();
+            path
+        };
+        let newest = write_at("newest.md", "AAA", 60);
+        // Extension irrelevant — the old lister filtered on none, and
+        // `read_report` accepts any regular file.
+        let middle = write_at("middle.log", "BBBBB", 600);
+        let oldest = write_at("oldest.md", "C", 3600);
+        // A subdirectory (even a "*.md"-suffixed one) is skipped.
+        std::fs::create_dir_all(harvest.join("sub.md")).unwrap();
+        std::fs::write(harvest.join("sub.md").join("nested.md"), "nested").unwrap();
+
+        let rows = list_reports(harvest);
+
+        assert_eq!(
+            rows.iter().map(|r| r.path.clone()).collect::<Vec<_>>(),
+            vec![
+                newest.to_string_lossy().into_owned(),
+                middle.to_string_lossy().into_owned(),
+                oldest.to_string_lossy().into_owned(),
+            ],
+            "newest first, subdirectory excluded, extension irrelevant"
+        );
+        assert_eq!(rows[0].size_bytes, 3);
+        assert_eq!(rows[1].size_bytes, 5);
+        assert_eq!(rows[2].size_bytes, 1);
+        for row in &rows {
+            let modified_at = row
+                .modified_at
+                .as_deref()
+                .unwrap_or_else(|| panic!("{row:?}"));
+            chrono::DateTime::parse_from_rfc3339(modified_at)
+                .unwrap_or_else(|e| panic!("not RFC 3339: {e}: {row:?}"));
+        }
+    }
+
+    #[test]
+    fn test_list_reports_on_absent_or_empty_dir_is_empty_not_an_error() {
+        let base = tempdir().unwrap();
+
+        let absent = base.path().join("does-not-exist");
+        assert!(list_reports(&absent).is_empty());
+
+        let empty = base.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(list_reports(&empty).is_empty());
+    }
+
+    #[test]
+    fn test_every_listed_report_passes_the_read_guard() {
+        let dir = tempdir().unwrap();
+        let harvest = dir.path();
+        std::fs::write(harvest.join("a.md"), "alpha").unwrap();
+        std::fs::write(harvest.join("b.txt"), "beta").unwrap();
+
+        let rows = list_reports(harvest);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        for row in &rows {
+            let content = read_report(harvest, &row.path)
+                .unwrap_or_else(|e| panic!("list emitted a path its own reader refuses: {e}"));
+            assert_eq!(content, std::fs::read_to_string(&row.path).unwrap());
+        }
+    }
+
+    /// A resolver that answers every session id with `dir`'s path — the
+    /// harvest terminal's own project checkout, per issue #144 §3.
+    fn resolver_for(dir: &Path) -> SessionDirResolver {
+        let dir = dir.to_string_lossy().into_owned();
+        Arc::new(move |_session_id| Some(dir.clone()))
+    }
+
+    #[test]
+    fn test_deliverable_prompt_over_the_gate_arms_a_pointer_and_writes_the_brief_verbatim() {
+        let worktree = tempdir().unwrap();
+        let journal_dir = tempdir().unwrap();
+        let journal = Arc::new(JournalStore::new(journal_dir.path().to_path_buf()));
+        let (triage, _delivered) = triage_with_journal(journal, "/downloads");
+        let triage = triage.with_session_dirs(resolver_for(worktree.path()));
+
+        let long_prompt = "x".repeat(samurai_brief::INLINE_MAX_BYTES + 1);
+        let staged = triage.deliverable_prompt(7, "2026-08-17", long_prompt.clone());
+
+        assert_ne!(staged, long_prompt, "over the gate: not typed inline");
+        assert!(
+            staged.contains(".maestro/briefs/harvest-triage-2026-08-17-s7.md"),
+            "{staged}"
+        );
+        let on_disk = std::fs::read_to_string(
+            worktree
+                .path()
+                .join(".maestro/briefs/harvest-triage-2026-08-17-s7.md"),
+        )
+        .unwrap();
+        assert_eq!(
+            on_disk, long_prompt,
+            "the on-disk brief is byte-identical to the original prompt"
+        );
+    }
+
+    #[test]
+    fn test_a_real_triage_session_delivers_a_pointer_when_session_dirs_is_configured() {
+        let worktree = tempdir().unwrap();
+        let journal_dir = tempdir().unwrap();
+        let journal = Arc::new(JournalStore::new(journal_dir.path().to_path_buf()));
+        journal
+            .append_entry(&JournalEntry::now(
+                JournalCategory::Error,
+                "boom",
+                None,
+                None,
+            ))
+            .unwrap();
+        let (triage, delivered) = triage_with_journal(journal.clone(), "/downloads");
+        let triage = triage.with_session_dirs(resolver_for(worktree.path()));
+
+        triage.arm(7).unwrap();
+        triage.on_session_started(7);
+
+        let staged = delivered.lock().unwrap()[0].1.clone();
+        assert!(
+            !staged.contains("boom"),
+            "the raw prompt must not reach the PTY: {staged}"
+        );
+        let today = ai_runner::today_local();
+        assert!(
+            staged.contains(&format!("harvest-triage-{today}-s7.md")),
+            "{staged}"
+        );
+        let on_disk = std::fs::read_to_string(
+            worktree
+                .path()
+                .join(format!(".maestro/briefs/harvest-triage-{today}-s7.md")),
+        )
+        .unwrap();
+        assert!(on_disk.contains("boom"), "{on_disk}");
+        assert!(on_disk.contains("/insights"), "{on_disk}");
+    }
+
+    #[test]
+    fn test_deliverable_prompt_under_the_gate_stays_inline_and_writes_no_file() {
+        let worktree = tempdir().unwrap();
+        let journal_dir = tempdir().unwrap();
+        let journal = Arc::new(JournalStore::new(journal_dir.path().to_path_buf()));
+        let (triage, _delivered) = triage_with_journal(journal, "/downloads");
+        let triage = triage.with_session_dirs(resolver_for(worktree.path()));
+
+        let short = "short synthetic triage prompt".to_string();
+        assert!(short.len() <= samurai_brief::INLINE_MAX_BYTES);
+        let staged = triage.deliverable_prompt(7, "2026-08-17", short.clone());
+
+        assert_eq!(staged, short);
+        assert!(
+            !worktree.path().join(".maestro/briefs").exists(),
+            "no brief written under the gate"
+        );
+    }
+
+    #[test]
+    fn test_two_same_day_triage_sessions_get_their_own_brief() {
+        // Entries are consumed at injection, so a second harvest later the
+        // same day is routine — and it must not overwrite the brief a first
+        // session may not have read yet.
+        let worktree = tempdir().unwrap();
+        let journal_dir = tempdir().unwrap();
+        let journal = Arc::new(JournalStore::new(journal_dir.path().to_path_buf()));
+        let (triage, _delivered) = triage_with_journal(journal, "/downloads");
+        let triage = triage.with_session_dirs(resolver_for(worktree.path()));
+
+        let first = "a".repeat(samurai_brief::INLINE_MAX_BYTES + 1);
+        let second = "b".repeat(samurai_brief::INLINE_MAX_BYTES + 1);
+        let staged_first = triage.deliverable_prompt(7, "2026-08-17", first.clone());
+        let staged_second = triage.deliverable_prompt(8, "2026-08-17", second.clone());
+
+        assert_ne!(staged_first, staged_second, "two pointers, two briefs");
+        let briefs = worktree.path().join(".maestro/briefs");
+        assert_eq!(
+            std::fs::read_to_string(briefs.join("harvest-triage-2026-08-17-s7.md")).unwrap(),
+            first,
+            "the first session's brief survives the second harvest"
+        );
+        assert_eq!(
+            std::fs::read_to_string(briefs.join("harvest-triage-2026-08-17-s8.md")).unwrap(),
+            second
+        );
+    }
+
+    #[test]
+    fn test_a_session_with_no_recorded_directory_stays_inline() {
+        // `SessionManager` has no record of the session (closed, or never
+        // registered): there is no checkout to write into, so nothing is
+        // written anywhere and the prompt is typed exactly as before #144.
+        let worktree = tempdir().unwrap();
+        let journal_dir = tempdir().unwrap();
+        let journal = Arc::new(JournalStore::new(journal_dir.path().to_path_buf()));
+        let (triage, _delivered) = triage_with_journal(journal, "/downloads");
+        let unknown_session: SessionDirResolver = Arc::new(|_session_id| None);
+        let triage = triage.with_session_dirs(unknown_session);
+
+        let long_prompt = "x".repeat(samurai_brief::INLINE_MAX_BYTES + 1);
+        let staged = triage.deliverable_prompt(7, "2026-08-17", long_prompt.clone());
+
+        assert_eq!(staged, long_prompt);
+        assert!(!worktree.path().join(".maestro").exists());
+    }
+
+    #[test]
+    fn test_no_session_dirs_configured_keeps_todays_inline_behaviour() {
+        let dir = tempdir().unwrap();
+        let journal = Arc::new(JournalStore::new(dir.path().to_path_buf()));
+        journal
+            .append_entry(&JournalEntry::now(
+                JournalCategory::Error,
+                "boom",
+                None,
+                None,
+            ))
+            .unwrap();
+        // Plain `new(...)` — no `with_session_dirs` — the shape of every
+        // pre-#144 test in this module.
+        let (triage, delivered) = triage_with_journal(journal.clone(), "/downloads");
+
+        triage.arm(7).unwrap();
+        triage.on_session_started(7);
+
+        let staged = delivered.lock().unwrap()[0].1.clone();
+        assert!(
+            staged.contains("boom"),
+            "no resolver configured: the raw prompt is typed exactly as before #144: {staged}"
+        );
+        assert!(staged.contains("/insights"));
+    }
+
+    #[test]
+    fn test_a_failed_brief_write_falls_back_to_the_full_prompt_with_a_warning() {
+        let worktree = tempdir().unwrap();
+        // `.maestro` occupied by a FILE: `write_brief` cannot create the
+        // briefs directory underneath it (the `samurai_brief.rs` /
+        // `initial_prompt.rs` fallback trick).
+        std::fs::write(worktree.path().join(".maestro"), "not a directory").unwrap();
+        let journal_dir = tempdir().unwrap();
+        let journal = Arc::new(JournalStore::new(journal_dir.path().to_path_buf()));
+        journal
+            .append_entry(&JournalEntry::now(
+                JournalCategory::Error,
+                "boom",
+                None,
+                None,
+            ))
+            .unwrap();
+        let (triage, delivered) = triage_with_journal(journal.clone(), "/downloads");
+        let triage = triage.with_session_dirs(resolver_for(worktree.path()));
+
+        triage.arm(7).unwrap();
+        triage.on_session_started(7);
+
+        let staged = delivered.lock().unwrap()[0].1.clone();
+        assert!(
+            staged.contains("boom"),
+            "a failed brief write falls back to the raw prompt: {staged}"
+        );
+        assert!(staged.contains("/insights"));
     }
 }

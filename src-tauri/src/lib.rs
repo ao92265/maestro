@@ -892,7 +892,8 @@ pub fn run() {
                     harvest_deliver,
                 )
                 .with_notify(harvest_notify)
-                .with_delivery_watch(harvest_watch),
+                .with_delivery_watch(harvest_watch)
+                .with_session_dirs(session_dirs.clone()),
             );
             app.manage(harvest_triage.clone());
             let _ = harvest_triage_slot.set(harvest_triage);
@@ -1322,9 +1323,12 @@ pub fn run() {
             // Per-entry journal delete (issue #100)
             commands::samurai::samurai_journal_delete,
             // Samurai harvest (issue #98: interactive triage session; the
-            // read command keeps serving previously generated reports)
+            // read command keeps serving previously generated reports, and
+            // samurai_harvest_list surfaces them to the Journal panel —
+            // issue #142)
             commands::harvest::samurai_harvest_arm,
             commands::harvest::samurai_harvest_read,
+            commands::harvest::samurai_harvest_list,
             // Generic "launch a terminal with an initial prompt" injection
             commands::initial_prompt::terminal_arm_initial_prompt,
             // CLI commands
