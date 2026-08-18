@@ -3379,7 +3379,10 @@ mod tests {
         // Something really was typed, and — the handoff instruction being far
         // over the brief-file gate (issue #143) — what reached the PTY is the
         // one-line POINTER at gen-1's handoff brief, not the instruction.
+        // Issue #153: staging that brief runs on the blocking pool, so the
+        // text arrives after `tick()` returns.
         use crate::core::samurai_injector::{ACK_TAG, WRITTEN_TAG};
+        wait_until(|| !typed.lock().unwrap().is_empty()).await;
         let typed_text = typed.lock().unwrap().join("");
         assert_eq!(
             typed_text,
@@ -4889,7 +4892,7 @@ mod tests {
     /// (gen-2, epic-9) through the idle-gated handoff injection — the state
     /// every injector-delivery watch test starts from. Returns the injector
     /// and the writes its own writer recorded.
-    fn inject_handoff_via_injector(
+    async fn inject_handoff_via_injector(
         h: &Harness,
         project: &str,
         writer: Option<StdinWriter>,
@@ -4900,11 +4903,23 @@ mod tests {
         let context = Arc::new(SamuraiContextStore::new());
         let writes: Arc<Mutex<Vec<(u32, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let writes_rec = writes.clone();
-        let deliver: StdinWriter = writer.unwrap_or_else(|| {
+        let inner: StdinWriter = writer.unwrap_or_else(|| {
             Arc::new(move |id, data, outcome| {
                 writes_rec.lock().unwrap().push((id, data));
                 outcome(Ok(()));
             })
+        });
+        // Issue #153: the handoff instruction is over the brief-file gate, so
+        // the injector stages it on the blocking pool and the write lands
+        // after `tick()` returns. Flag the delivery behind whatever writer the
+        // test injected — after its outcome ran, so the audit row and the
+        // Enter-resend watch are settled — and wait for it here, leaving every
+        // caller at the same "instruction delivered" start state as before.
+        let delivered = Arc::new(Mutex::new(false));
+        let delivered_flag = delivered.clone();
+        let deliver: StdinWriter = Arc::new(move |id, data, outcome| {
+            inner(id, data, outcome);
+            *delivered_flag.lock().unwrap() = true;
         });
         let injector = SamuraiInjector::new(
             h.supervisor.clone(),
@@ -4934,6 +4949,7 @@ mod tests {
             timestamp: "t".into(),
         });
         injector.tick();
+        wait_until(|| *delivered.lock().unwrap()).await;
         (injector, writes)
     }
 
@@ -4947,7 +4963,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         let project = "C:/git/proj-109-inj-resend";
-        let (_injector, writes) = inject_handoff_via_injector(&h, project, None);
+        let (_injector, writes) = inject_handoff_via_injector(&h, project, None).await;
 
         // Delivered once (no submit key in the body) and the watch is armed.
         assert_eq!(writes.lock().unwrap().len(), 1);
@@ -5019,7 +5035,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let h = harness(dir.path());
         let project = "C:/git/proj-109-inj-release";
-        inject_handoff_via_injector(&h, project, None);
+        inject_handoff_via_injector(&h, project, None).await;
         assert_eq!(h.replicator.delivered_count(), 1);
 
         h.replicator.observe(&user_message(1));
@@ -5037,7 +5053,7 @@ mod tests {
         let project = "C:/git/proj-109-inj-failed";
         let failing: StdinWriter =
             Arc::new(move |_id, _data, outcome| outcome(Err("pty gone".to_string())));
-        inject_handoff_via_injector(&h, project, Some(failing));
+        inject_handoff_via_injector(&h, project, Some(failing)).await;
 
         assert_eq!(
             h.replicator.delivered_count(),

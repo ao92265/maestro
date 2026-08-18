@@ -238,6 +238,18 @@ pub fn pointer_instruction(relpath: &str) -> String {
     )
 }
 
+/// Whether `instruction` is delivered as-is, small enough that
+/// [`deliverable_instruction`] makes no filesystem call for it at all.
+///
+/// The single definition of that rule. Callers who decide something else
+/// from it — the injector's issue-#153 gate, which only pays for a
+/// blocking-pool hop when a file might actually be written — ask here
+/// instead of re-comparing against [`INLINE_MAX_BYTES`], so the decision and
+/// the delivery can never drift apart.
+pub fn is_inline(instruction: &str) -> bool {
+    instruction.len() <= INLINE_MAX_BYTES
+}
+
 /// What is actually typed into the PTY for `instruction`: the instruction
 /// itself when it fits the inline budget, otherwise a pointer at a brief file
 /// written into `worktree` under `name`.
@@ -275,7 +287,7 @@ pub fn try_deliverable_instruction(
     name: &str,
     instruction: &str,
 ) -> Result<Option<String>, String> {
-    if instruction.len() <= INLINE_MAX_BYTES {
+    if is_inline(instruction) {
         return Ok(None);
     }
     write_brief(worktree, name, instruction).map(|relpath| Some(pointer_instruction(&relpath)))
@@ -561,6 +573,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let short = "[Maestro Samurai] ".to_string() + &"x".repeat(INLINE_MAX_BYTES - 18);
         assert_eq!(short.len(), INLINE_MAX_BYTES);
+        // The predicate callers gate on is the same rule this function
+        // applies — the boundary byte is inline for both or for neither.
+        assert!(is_inline(&short));
 
         let staged = deliverable_instruction(dir.path(), "gen-1-launch", short.clone());
 
@@ -573,6 +588,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let instruction = long_instruction();
         assert!(instruction.len() > INLINE_MAX_BYTES);
+        assert!(!is_inline(&instruction));
 
         let staged = deliverable_instruction(dir.path(), "gen-1-launch", instruction.clone());
 
