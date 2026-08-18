@@ -1741,34 +1741,45 @@ impl SamuraiInjector {
     /// The lock is acquired and released *before* any I/O —
     /// `deliverable_instruction` never runs under `self.pending`'s mutex.
     ///
-    /// Test-only since issue #153: production reaches the same body through
-    /// [`Self::stage_deliverable`] from inside `spawn_write`'s blocking task,
-    /// which has no `&self` to call this on.
+    /// Test-only since issue #153: production resolves the target and stages
+    /// it in two steps, [`Self::brief_target`] on the caller's thread and
+    /// [`Self::stage`] on the blocking pool.
     #[cfg(test)]
     fn deliverable(&self, session_id: u32, data: String) -> String {
-        Self::stage_deliverable(&self.pending, &self.session_dirs, session_id, data)
+        Self::stage(self.brief_target(session_id), data)
     }
 
-    /// [`Self::deliverable`]'s body over borrowed state instead of `&self`,
-    /// so [`Self::spawn_write`] can run it inside a `spawn_blocking` closure
-    /// (issue #153) — `&self` cannot cross onto the blocking pool, the two
-    /// `Arc` handles can.
-    fn stage_deliverable(
-        pending: &Mutex<HashMap<u32, PendingInstruction>>,
-        session_dirs: &SessionDirResolver,
-        session_id: u32,
-        data: String,
-    ) -> String {
-        let name = pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// Where `session_id`'s pending instruction would be staged: the brief's
+    /// name (issue #143's kind/generation/corrective/episode stem) and the
+    /// session's worktree. `None` at either half means the instruction is
+    /// typed exactly as before #143 — the "no new failure mode" fallback
+    /// #137 established.
+    ///
+    /// ALWAYS resolved on the caller's thread, never after a runtime hop
+    /// (issue #153): the pending entry is the only thing that knows the
+    /// brief's name, and a tick sweep or a `remove_session` can drop it while
+    /// the staging task is still queued. A `None` resolved on the far side
+    /// would paste the full multi-KB instruction into the PTY — undoing
+    /// #143 — and it would do so silently, since `record_delivery_outcome`
+    /// reads that same vanished entry and so raises nothing either.
+    fn brief_target(&self, session_id: u32) -> Option<(String, String)> {
+        let name = self
+            .lock_pending()
             .get(&session_id)
-            .map(|p| injector_brief_name(&p.epic, p.kind, p.generation, p.corrective, p.episode));
-        match (name, session_dirs(session_id)) {
-            (Some(name), Some(dir)) => {
+            .map(|p| injector_brief_name(&p.epic, p.kind, p.generation, p.corrective, p.episode))?;
+        Some((name, (self.session_dirs)(session_id)?))
+    }
+
+    /// Stage `data` at an already-resolved [`Self::brief_target`], yielding
+    /// the pointer that replaces it. Blocking (`create_dir_all` + write +
+    /// rename), so it only ever runs off the caller's worker — see
+    /// [`Self::spawn_write`].
+    fn stage(target: Option<(String, String)>, data: String) -> String {
+        match target {
+            Some((name, dir)) => {
                 samurai_brief::deliverable_instruction(&PathBuf::from(dir), &name, data)
             }
-            _ => data,
+            None => data,
         }
     }
 
@@ -1779,10 +1790,10 @@ impl SamuraiInjector {
     /// Enter-resend watch ride the writer's verdict callback (issue #109),
     /// never the mere attempt.
     ///
-    /// What is physically typed goes through [`Self::deliverable`] (issue
-    /// #143): an instruction over the brief-file gate is staged as a file and
-    /// a one-line pointer replaces it here. The audit's `instruction` clone
-    /// stays the RAW `data`, taken before that conversion, so
+    /// What is physically typed goes through the brief-file gate (issue
+    /// #143): an instruction over it is staged as a file and a one-line
+    /// pointer replaces it here. The audit's `instruction` handle stays the
+    /// RAW `data`, taken before that conversion, so
     /// `record_delivery_outcome`'s excerpt/`total_chars` keep describing the
     /// real instruction, never the pointer.
     ///
@@ -1792,20 +1803,32 @@ impl SamuraiInjector {
     /// events behind one file write. So the staging *and* the writer call
     /// move onto the blocking pool, the same policy
     /// [`SamuraiReplicator::brief_or_inline`](super::samurai_replicator) and
-    /// [`Self::spawn_validation`] already follow. At or under
-    /// [`samurai_brief::INLINE_MAX_BYTES`] there is provably no filesystem
-    /// call at all (`deliverable_instruction` returns the text untouched), so
-    /// that path stays fully synchronous — no runtime hop bought for nothing,
-    /// and short instructions keep landing before this call returns.
+    /// [`Self::spawn_validation`] already follow.
+    ///
+    /// The gate is [`samurai_brief::is_inline`] and nothing else: under it,
+    /// `deliverable_instruction` provably makes no filesystem call, so the
+    /// delivery stays fully synchronous and lands before this call returns.
+    /// Over it the hop is unconditional — including for a session whose
+    /// working directory is unknown, where the staging turns out to be a
+    /// no-op and the hop buys nothing. That spare hop is deliberate: gating
+    /// on the resolved target instead would put a check-then-stage race back
+    /// in, where a directory registered after the check drags a real file
+    /// write onto the worker anyway.
     ///
     /// Every decision the ACK ladder reads — the `pending` bookkeeping
     /// `arm_injection_on_idle` just wrote and the `idle_now` clear — already
-    /// happened in `on_idle` before this call; only the write travels.
+    /// happened in `on_idle` before this call, and [`Self::brief_target`] is
+    /// resolved here, synchronously. Only the write itself travels.
     fn spawn_write(&self, session_id: u32, gate: &'static str, data: String) {
         let pending = self.pending.clone();
         let audit = self.audit.clone();
         let replicator = self.replicator.clone();
-        let instruction = data.clone();
+        // One shared copy of the raw text: the audit excerpt reads it and so
+        // does the join-failure fallback below. `Arc` rather than a second
+        // `String`, so the over-gate path costs no more copies than the
+        // inline one for a payload that is multi-KB by definition.
+        let instruction: Arc<str> = Arc::from(data.as_str());
+        let audit_text = instruction.clone();
         let outcome: DeliveryOutcome = Box::new(move |result| {
             Self::record_delivery_outcome(
                 &pending,
@@ -1813,32 +1836,28 @@ impl SamuraiInjector {
                 replicator.as_ref(),
                 session_id,
                 gate,
-                &instruction,
+                &audit_text,
                 result,
             );
         });
-        if data.len() <= samurai_brief::INLINE_MAX_BYTES {
+        if samurai_brief::is_inline(&data) {
             (self.deliver)(session_id, data, outcome);
             return;
         }
+        let target = self.brief_target(session_id);
         let deliver = self.deliver.clone();
-        let staging_pending = self.pending.clone();
-        let session_dirs = self.session_dirs.clone();
-        let inline = data.clone();
         tauri::async_runtime::spawn(async move {
-            let to_type = tokio::task::spawn_blocking(move || {
-                Self::stage_deliverable(&staging_pending, &session_dirs, session_id, data)
-            })
-            .await
-            .unwrap_or_else(|e| {
-                // Never drop the delivery: fall back to the full text, the
-                // pre-#143 behaviour and the same "a brief can only improve
-                // delivery" rule a failed write itself follows.
-                log::warn!(
-                    "samurai injector: the brief write task failed ({e}) — typing the full instruction inline instead"
-                );
-                inline
-            });
+            let to_type = tokio::task::spawn_blocking(move || Self::stage(target, data))
+                .await
+                .unwrap_or_else(|e| {
+                    // Never drop the delivery: fall back to the full text, the
+                    // pre-#143 behaviour and the same "a brief can only improve
+                    // delivery" rule a failed write itself follows.
+                    log::warn!(
+                        "samurai injector: the brief write task failed ({e}) — typing the full instruction inline instead"
+                    );
+                    instruction.to_string()
+                });
             deliver(session_id, to_type, outcome);
         });
     }
@@ -3826,6 +3845,63 @@ mod tests {
         assert_ne!(
             wrote_from, caller,
             "the brief write blocked the caller's worker thread"
+        );
+    }
+
+    /// Issue #153 follow-up: the brief's identity comes from the pending
+    /// entry, and a tick sweep or a `remove_session` can drop that entry
+    /// while the staging task is still queued. Resolving the name on the far
+    /// side of the hop would find nothing and paste the full multi-KB
+    /// instruction into the PTY — silently undoing #143, because
+    /// `record_delivery_outcome` reads the same vanished entry and so raises
+    /// no ALERT either. The name and worktree are therefore resolved on the
+    /// caller's thread, before the hop: what lands is the POINTER the entry
+    /// described when it was still alive.
+    #[tokio::test]
+    async fn test_a_pending_entry_dropped_mid_staging_still_delivers_the_pointer() {
+        let dir = tempdir().unwrap();
+        let (injector, audit, supervisor, context, dirs, captured) =
+            harness_capturing_delivery(dir.path());
+        let project = "C:/git/proj-inj-brief-dropped";
+        let repo = tempdir().unwrap();
+        dirs.lock()
+            .unwrap()
+            .insert(1, repo.path().to_string_lossy().into_owned());
+        supervisor
+            .register_session(1, project.into(), "epic-7".into(), 3)
+            .unwrap();
+        context.observe(&context_event(1, 50.0));
+        injector.tick();
+
+        injector.observe_hook(&stop_event(1));
+        // The sweep wins the race with the staging task, every time: this
+        // runs on the caller's thread the instant `observe_hook` returns.
+        injector.remove_session(1);
+        assert!(injector.pending_view(1).is_none());
+
+        wait_until(|| captured.lock().unwrap().is_some()).await;
+        let (typed, _) = captured.lock().unwrap().clone().expect("delivery captured");
+        let relpath = format!("{}/epic-7-gen-3-handoff.md", samurai_brief::BRIEF_DIR);
+        let full = samurai_prompts::handoff_instruction("epic-7", 3);
+        assert_eq!(typed, samurai_brief::pointer_instruction(&relpath));
+        assert_ne!(typed, full, "the full instruction must never reach the PTY");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join(&relpath)).unwrap(),
+            full,
+            "the brief is still staged byte-identical"
+        );
+
+        // The delivery outcome fires, but `record_delivery_outcome` reads the
+        // entry back and finds it gone, so it writes no row — its own
+        // pre-existing "a raced removal simply skips the rows" rule, which
+        // this fix deliberately leaves alone. Pinned so a later change to it
+        // is a decision, not a drift.
+        let rows = audit.read(project, None, None).await.unwrap().events;
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.event == AuditEventKind::Inject && r.details["phase"] == "delivered"),
+            "no entry left to describe the delivery with"
         );
     }
 
