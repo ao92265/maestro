@@ -7,6 +7,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { currentShellFamily, quoteShellArgument, type ShellFamily } from "@/lib/shellEscape";
 import type { BackendCapabilities, BackendType } from "./terminalTheme";
 
 /**
@@ -469,4 +470,54 @@ export function buildCliCommand(
   }
 
   return parts.join(" ");
+}
+
+/** A CLI launch line plus whether it managed to carry the initial prompt. */
+export interface CliLaunchLine {
+  /** The exact string typed into the freshly spawned shell's PTY. */
+  command: string;
+  /**
+   * Whether `launchPrompt` actually made it onto the line. `false` means the
+   * caller must keep the delivery route it already had — see below.
+   */
+  launchPromptDelivered: boolean;
+}
+
+/**
+ * [`buildCliCommand`] plus an optional initial prompt appended as ONE
+ * positional argument (issue #158).
+ *
+ * WHY this exists: the gen-1 launch brief pointer used to be typed into
+ * claude's REPL as a second frame, after the launch command, which put the
+ * one instruction that starts a whole run at the mercy of the CLI's input
+ * handling (#137's remaining exposure). `claude <prompt>` takes the prompt as
+ * argv, so the pointer is submitted WITH the launch instead — one frame, no
+ * chunking, no submit-delay guesswork.
+ *
+ * Two refusals, both reported as `launchPromptDelivered: false` so the caller
+ * falls back to today's typed delivery rather than degrading:
+ * 1. Non-Claude modes. Only `claude` is known to read a bare positional as
+ *    its initial prompt.
+ * 2. A prompt that [`quoteShellArgument`] cannot quote for `shell`. Emitting
+ *    a half-escaped line would be far worse than typing: the pointer carries
+ *    BACKTICKS, which a posix shell would run as command substitution.
+ */
+export function buildCliLaunchLine(
+  mode: AiMode,
+  flags?: CliFlags,
+  resumeSessionId?: string,
+  launchPrompt?: string | null,
+  shell: ShellFamily = currentShellFamily(),
+): CliLaunchLine | null {
+  const command = buildCliCommand(mode, flags, resumeSessionId);
+  if (command === null) return null;
+  if (!launchPrompt || mode !== "Claude") return { command, launchPromptDelivered: false };
+  const quoted = quoteShellArgument(launchPrompt, shell);
+  if (quoted === null) {
+    console.warn(
+      "[Samurai] The launch prompt cannot be quoted for this shell — falling back to typing it",
+    );
+    return { command, launchPromptDelivered: false };
+  }
+  return { command: `${command} ${quoted}`, launchPromptDelivered: true };
 }

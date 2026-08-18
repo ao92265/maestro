@@ -96,7 +96,13 @@ describe("samurai successor spawn listener (issue #55)", () => {
         workingDirOverride: "C:\\git\\proj-worktrees\\epic-37",
         branch: null,
         customName: "samurai gen-3 37",
-        samurai: { project: "C:\\git\\proj", epic: "#37", generation: 3, model: null },
+        samurai: {
+          project: "C:\\git\\proj",
+          epic: "#37",
+          generation: 3,
+          model: null,
+          launchPrompt: null,
+        },
       },
     ]);
   });
@@ -111,7 +117,19 @@ describe("samurai successor spawn listener (issue #55)", () => {
       epic: "#37",
       generation: 3,
       model: "opus",
+      launchPrompt: null,
     });
+  });
+
+  // --- issue #158: the gen-1 pointer offered for the launch line ---
+
+  it("carries the backend's launch-line prompt offer into the queued samurai info", () => {
+    useWorkspaceStore.setState({ tabs: [tab("tab-proj", "C:\\git\\proj")] });
+    const pointer = "[Maestro Samurai] Read `.maestro/briefs/epic-37-gen-1-launch.md` in FULL";
+
+    emitSpawnEvent(spawnEvent({ generation: 1, launch_prompt: pointer }));
+
+    expect(usePendingLaunchStore.getState().pending[0]?.samurai?.launchPrompt).toBe(pointer);
   });
 
   it("drops a re-emitted spawn event for an already-queued successor (review F6)", () => {
@@ -187,6 +205,25 @@ describe("samurai successor spawn listener (issue #55)", () => {
       projectPath: "C:\\git\\proj",
       epic: "#37",
       generation: 3,
+      // Issue #158: the default is today's typed delivery — a caller that
+      // says nothing must never suppress it.
+      launchLinePrompt: false,
+    });
+  });
+
+  it("registerSamuraiSuccessor reports a launch-line delivery so nothing is typed (#158)", async () => {
+    await registerSamuraiSuccessor(
+      42,
+      { project: "C:\\git\\proj", epic: "#37", generation: 1 },
+      true,
+    );
+
+    expect(invokeMock).toHaveBeenCalledWith("samurai_register_session", {
+      sessionId: 42,
+      projectPath: "C:\\git\\proj",
+      epic: "#37",
+      generation: 1,
+      launchLinePrompt: true,
     });
   });
 

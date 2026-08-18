@@ -30,7 +30,7 @@ use crate::core::samurai_journal::{
 use crate::core::samurai_parker::SamuraiParker;
 use crate::core::samurai_pr_runs::PrRunStore;
 use crate::core::samurai_prompts::{self, epic_slug, ref_slug, LaunchInput};
-use crate::core::samurai_replicator::{derive_repo_pin, SamuraiReplicator};
+use crate::core::samurai_replicator::{derive_repo_pin, DeliveryRoute, SamuraiReplicator};
 use crate::core::samurai_resumer::latest_handoff_generation;
 use crate::core::samurai_run_config::{
     RefTitle, RunConfigStatus, RunConfigStore, SamuraiRunConfig,
@@ -118,6 +118,12 @@ pub fn samurai_set_config(
 /// (same project, epic and generation) gets its SPAWN row linked to the
 /// predecessor, and arms the verify-ritual delivery for the new session's
 /// first `SessionStarted` hook signal.
+///
+/// Issue #158: `launch_line_prompt` is the frontend's report of HOW it
+/// delivered a gen-1 launch prompt the spawn event offered — `true` when the
+/// pointer went out on the `claude` command line itself, so nothing may be
+/// typed for it. Absent/`false` (every successor, and any launch whose prompt
+/// could not be quoted for the local shell) keeps the typed delivery.
 #[tauri::command]
 pub fn samurai_register_session(
     supervisor: State<'_, Arc<Supervisor>>,
@@ -126,6 +132,7 @@ pub fn samurai_register_session(
     project_path: String,
     epic: String,
     generation: Option<u32>,
+    launch_line_prompt: Option<bool>,
 ) -> Result<SessionSnapshot, String> {
     let project = canonical_project_path(&project_path);
     let generation = generation.unwrap_or(1);
@@ -134,7 +141,11 @@ pub fn samurai_register_session(
             .register_session_with_details(session_id, project, epic, generation, details)?,
         None => supervisor.register_session(session_id, project, epic, generation)?,
     };
-    replicator.on_registered(&snapshot);
+    if launch_line_prompt.unwrap_or(false) {
+        replicator.on_registered_with_route(&snapshot, DeliveryRoute::LaunchLine);
+    } else {
+        replicator.on_registered(&snapshot);
+    }
     Ok(snapshot)
 }
 

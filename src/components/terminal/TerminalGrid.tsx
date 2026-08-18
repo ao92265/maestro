@@ -64,7 +64,7 @@ import {
 import {
   AI_CLI_CONFIG,
   assignSessionBranch,
-  buildCliCommand,
+  buildCliLaunchLine,
   checkCliAvailable,
   createSession,
   killSession,
@@ -1153,20 +1153,34 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
               const effectiveFlags = slot.samurai
                 ? samuraiSuccessorCliFlags(cliFlags, slot.samurai.model)
                 : cliFlags;
-              const cliCommand = buildCliCommand(
+              // Issue #158: a gen-1 launch also carries its brief POINTER on
+              // this very line, as a quoted positional initial prompt, so the
+              // instruction that starts the run is submitted WITH the launch
+              // instead of typed into claude's REPL afterwards. The helper
+              // reports whether it managed to — a prompt it cannot quote for
+              // this machine's shell stays off the line and is typed as before.
+              const launchLine = buildCliLaunchLine(
                 slot.mode,
                 effectiveFlags,
                 slot.resumeSessionId ?? undefined,
+                slot.samurai?.launchPrompt,
               );
+              const cliCommand = launchLine?.command ?? null;
 
               // Samurai successor: register under supervision BEFORE the CLI
               // launches, so the backend's verify-ritual delivery is armed
               // strictly ahead of claude's SessionStart hook. Registration
               // failure is logged, not fatal — the session still launches and
               // the backend's successor_no_start ALERT surfaces the gap.
+              // The route reported here is what stops the backend typing a
+              // pointer this line already carries (issue #158).
               if (slot.samurai) {
                 try {
-                  await registerSamuraiSuccessor(sessionId, slot.samurai);
+                  await registerSamuraiSuccessor(
+                    sessionId,
+                    slot.samurai,
+                    launchLine?.launchPromptDelivered ?? false,
+                  );
                 } catch (err) {
                   console.error("[Samurai] Failed to register successor session:", err);
                 }

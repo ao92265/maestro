@@ -150,14 +150,25 @@ export function samuraiListSessions(): Promise<SamuraiSessionSnapshot[]> {
  * (project, epic, generation) the `samurai-spawn-successor` event named arms
  * the backend's verify-ritual delivery for this session's first
  * SessionStarted hook signal.
+ *
+ * `launchLinePrompt` (issue #158) reports that a gen-1 launch prompt already
+ * went out ON the `claude` command line, so the backend must not type it in
+ * as well. Anything else keeps today's typed delivery.
  */
 export function samuraiRegisterSession(
   sessionId: number,
   projectPath: string,
   epic: string,
   generation: number,
+  launchLinePrompt = false,
 ): Promise<SamuraiSessionSnapshot> {
-  return invoke("samurai_register_session", { sessionId, projectPath, epic, generation });
+  return invoke("samurai_register_session", {
+    sessionId,
+    projectPath,
+    epic,
+    generation,
+    launchLinePrompt,
+  });
 }
 
 /**

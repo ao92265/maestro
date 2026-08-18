@@ -204,7 +204,8 @@ describe("TerminalGrid pending samurai launch", () => {
     // Registered under supervision — this is what arms the backend's brief
     // delivery and stops it re-emitting the spawn event.
     await waitFor(() => expect(registerMock).toHaveBeenCalledTimes(1));
-    expect(registerMock).toHaveBeenCalledWith(expect.any(Number), "C:/proj", "77, 78", 1);
+    // Issue #158: no launch prompt was offered, so the pointer stays typed.
+    expect(registerMock).toHaveBeenCalledWith(expect.any(Number), "C:/proj", "77, 78", 1, false);
 
     // …and the CLI carries the autonomy flags a samurai generation needs.
     await waitFor(() => expect(writeStdinMock).toHaveBeenCalled());
@@ -215,6 +216,72 @@ describe("TerminalGrid pending samurai launch", () => {
     // Exactly one terminal: the stray unsupervised one is the bug.
     expect(spawnShellMock).toHaveBeenCalledTimes(1);
     expect(useSessionStore.getState().sessions).toHaveLength(1);
+  });
+
+  // Issue #158: a gen-1 launch whose spawn event offered a brief POINTER
+  // carries it on the `claude` command line itself, and tells the backend so
+  // the same pointer is not typed into the REPL a second time.
+  it("puts the gen-1 brief pointer on the claude launch line, quoted, and says so", async () => {
+    const pointer = "[Maestro Samurai] Read `.maestro/briefs/epic-77-78-gen-1-launch.md` in FULL";
+    usePendingLaunchStore.getState().request({
+      tabId: "tab-1",
+      mode: "Claude",
+      resumeSessionId: null,
+      workingDirOverride: WORKTREE,
+      branch: null,
+      customName: "samurai gen-1 77-78",
+      samurai: {
+        project: "C:/proj",
+        epic: "77, 78",
+        generation: 1,
+        model: null,
+        launchPrompt: pointer,
+      },
+    });
+
+    render(<TerminalGrid projectPath="C:/proj" tabId="tab-1" isActive />);
+
+    await waitFor(() => expect(writeStdinMock).toHaveBeenCalled());
+    const cli = writeStdinMock.mock.calls.map((c) => String(c[1])).join("\n");
+    // ONE argument, quoted for the test environment's shell family (happy-dom
+    // reports a non-Windows platform, so posix single quotes) — and the
+    // backticks the pointer carries are inert inside them.
+    expect(cli).toContain(`--dangerously-skip-permissions '${pointer}'`);
+
+    // Registered as a launch-line delivery, strictly before the CLI line.
+    expect(registerMock).toHaveBeenCalledWith(expect.any(Number), "C:/proj", "77, 78", 1, true);
+    expect(registerMock.mock.invocationCallOrder[0]).toBeLessThan(
+      writeStdinMock.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("falls back to the typed pointer when it cannot be quoted (#158)", async () => {
+    // A control character can be quoted for no shell; the launch line must
+    // come out WITHOUT it and the backend must be told to type it as before.
+    const unquotable = "[Maestro Samurai] Read this\nand that";
+    usePendingLaunchStore.getState().request({
+      tabId: "tab-1",
+      mode: "Claude",
+      resumeSessionId: null,
+      workingDirOverride: WORKTREE,
+      branch: null,
+      customName: "samurai gen-1 77-78",
+      samurai: {
+        project: "C:/proj",
+        epic: "77, 78",
+        generation: 1,
+        model: null,
+        launchPrompt: unquotable,
+      },
+    });
+
+    render(<TerminalGrid projectPath="C:/proj" tabId="tab-1" isActive />);
+
+    await waitFor(() => expect(writeStdinMock).toHaveBeenCalled());
+    const cli = writeStdinMock.mock.calls.map((c) => String(c[1])).join("\n");
+    expect(cli).toContain("claude --dangerously-skip-permissions");
+    expect(cli).not.toContain("Read this");
+    expect(registerMock).toHaveBeenCalledWith(expect.any(Number), "C:/proj", "77, 78", 1, false);
   });
 
   // Issue #98: a "Harvest now" launch rides the same pending-launch flow —
