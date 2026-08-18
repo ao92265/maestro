@@ -367,8 +367,16 @@ describe("TerminalGrid pending samurai launch", () => {
 
     render(<TerminalGrid projectPath="C:/proj" tabId="tab-1" isActive />);
 
+    // Anchored on the write settling plus an explicit tick, NOT on the outer
+    // catch logging: that only happens to run after the revert decision
+    // because the revert is awaited before the rethrow. Draining the
+    // continuations the rejection scheduled is what makes "never called"
+    // mean it, whatever order the handlers take.
     await waitFor(() => expect(writeStdinMock).toHaveBeenCalled());
-    await waitFor(() => expect(errorSpy).toHaveBeenCalled());
+    await act(async () => {
+      await Promise.resolve();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
     expect(revertMock).not.toHaveBeenCalled();
     errorSpy.mockRestore();
   });

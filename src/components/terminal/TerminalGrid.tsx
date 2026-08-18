@@ -180,6 +180,14 @@ const EMPTY_PLUGINS: PluginConfig[] = [];
  * `write_all` (`process_manager::write_stdin`), so it cannot rule out a line
  * that already landed, and a non-`PtyError` rejection rules out nothing at
  * all. Anything unproven leaves the launch-line claim standing.
+ *
+ * `WriteFailed` is deliberately not split finer, even though one of its three
+ * causes — a poisoned writer lock — is strictly PRE-write and would be safe to
+ * revert on. It is indistinguishable from the other two at this boundary, and
+ * nothing is lost by treating it as unproven: with no bytes sent, claude never
+ * launches, `SessionStarted` never fires, and the entry ends on the ordinary
+ * `successor_no_start` ALERT. Letting the sweep report it beats widening a
+ * rule whose failure mode is a double paste.
  */
 function writeReachedNothing(err: unknown): boolean {
   if (!err || typeof err !== "object" || !("code" in err)) return false;
@@ -1232,6 +1240,15 @@ export const TerminalGrid = forwardRef<TerminalGridHandle, TerminalGridProps>(fu
               // throw says nothing either way — read as acceptance, both write
               // a line carrying a pointer the backend is still going to type,
               // delivering the brief TWICE. Either answer takes it back off.
+              //
+              // The mirror case is accepted, not unhandled: if the backend
+              // DID arm the route but the reply is lost, the pointer is
+              // stripped here and neither route delivers. That is exactly
+              // what the activity-only DeliveredWatch exists for — the
+              // session starts, no turn follows, and it raises
+              // `submit_unconfirmed`. A silent no-delivery is impossible; a
+              // double paste, had this branch guessed the other way, would
+              // not even be visible.
               if (slot.samurai) {
                 let armed = false;
                 try {
