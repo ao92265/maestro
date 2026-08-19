@@ -50,10 +50,13 @@ import {
 import { MAX_SESSIONS } from "./components/terminal/splitTree";
 import { UpdateNotification } from "./components/update/UpdateNotification";
 import { useAppKeyboard } from "./hooks/useAppKeyboard";
+import { useBandPolling } from "./hooks/useBandPolling";
 import { useSwipeNavigation } from "./hooks/useSwipeNavigation";
+import { useVanguardSnapshot } from "./hooks/useVanguardSnapshot";
 import { HEALTH_CHECK_INTERVAL_MS } from "./lib/healthRules";
 import { initActivityListener, stopActivityListener } from "./stores/useActivityStore";
 import { initAgentListener, stopAgentListener } from "./stores/useAgentStore";
+import { useFactoryViewStore } from "./stores/useFactoryViewStore";
 import { useGitHubStore } from "./stores/useGitHubStore";
 import {
   useGitHubWatchdogStore,
@@ -63,6 +66,7 @@ import {
 } from "./stores/useGitHubWatchdogStore";
 import { useGitStore } from "./stores/useGitStore";
 import { useHealthStore } from "./stores/useHealthStore";
+import { useHomeViewStore } from "./stores/useHomeViewStore";
 import { useTerminalSettingsStore } from "./stores/useTerminalSettingsStore";
 import { useUpdateStore } from "./stores/useUpdateStore";
 import { useWorkflowsViewStore } from "./stores/useWorkflowsViewStore";
@@ -84,6 +88,23 @@ const LandscapeView = lazy(() =>
  */
 const WorkflowsView = lazy(() =>
   import("./components/workflows/WorkflowsView").then((m) => ({ default: m.WorkflowsView })),
+);
+
+/**
+ * Home decision queue — the app's landing overlay (open by default). Lazy for
+ * symmetry with the other full-screen overlays; it is closed and reopened all
+ * day, so the chunk loads once at startup anyway.
+ */
+const HomeView = lazy(() =>
+  import("./components/home/HomeView").then((m) => ({ default: m.HomeView })),
+);
+
+/**
+ * Factory — the ACT lane: hand a spec over, watch runs, unblock gates. Same
+ * lazy overlay shell as the rest.
+ */
+const FactoryView = lazy(() =>
+  import("./components/factory/FactoryView").then((m) => ({ default: m.FactoryView })),
 );
 
 /** Header title for each git-panel tab. */
@@ -149,6 +170,13 @@ function App() {
   // inside the sidebar rather than a prop App can pass down.
   const workflowsViewOpen = useWorkflowsViewStore((s) => s.isOpen);
   const closeWorkflowsView = useWorkflowsViewStore((s) => s.close);
+  // Home decision queue overlay: open by default (the landing surface). The
+  // full-screen overlays assume they are never open together, so opening Home
+  // closes the other two and vice versa (see the toggle handlers below).
+  const homeViewOpen = useHomeViewStore((s) => s.isOpen);
+  const closeHomeView = useHomeViewStore((s) => s.close);
+  const factoryViewOpen = useFactoryViewStore((s) => s.isOpen);
+  const closeFactoryView = useFactoryViewStore((s) => s.close);
   // Marks the landscape button while a terminal anywhere is blocked on you.
   const needsInputAnywhere = useSessionStore((s) =>
     s.sessions.some((session) => session.status === "NeedsInput"),
@@ -675,6 +703,56 @@ function App() {
     [selectTab],
   );
 
+  // Home view: clicking a band row leaves the queue for that terminal — the
+  // same route the landscape takes, plus closing the Home overlay itself.
+  const handleHomeNavigate = useCallback(
+    (tabId: string, sessionId?: number) => {
+      closeHomeView();
+      setEagleView(false);
+      selectTab(tabId);
+      if (sessionId === undefined) return;
+      requestAnimationFrame(() => {
+        multiProjectRef.current?.zoomSessionInProject(tabId, sessionId);
+      });
+    },
+    [selectTab, closeHomeView],
+  );
+
+  // The full-screen overlays are never open together: opening Home or the
+  // Factory closes every other overlay, and opening the older two closes
+  // both of these (effect below).
+  const handleToggleHomeView = useCallback(() => {
+    const willOpen = !useHomeViewStore.getState().isOpen;
+    if (willOpen) {
+      setLandscapeView(false);
+      useWorkflowsViewStore.getState().close();
+      useFactoryViewStore.getState().close();
+    }
+    useHomeViewStore.getState().toggle();
+  }, []);
+
+  const handleToggleFactoryView = useCallback(() => {
+    const willOpen = !useFactoryViewStore.getState().isOpen;
+    if (willOpen) {
+      setLandscapeView(false);
+      useWorkflowsViewStore.getState().close();
+      useHomeViewStore.getState().close();
+    }
+    useFactoryViewStore.getState().toggle();
+  }, []);
+
+  useEffect(() => {
+    if (landscapeView || workflowsViewOpen) {
+      closeHomeView();
+      useFactoryViewStore.getState().close();
+    }
+  }, [landscapeView, workflowsViewOpen, closeHomeView]);
+
+  // Band data (handoffs, PR polls, ACT) refreshes app-wide, and every change
+  // mirrors to the Vanguard snapshot file the launchd digest reads.
+  useBandPolling();
+  useVanguardSnapshot();
+
   const handleSelectSidebarTab = useCallback((tab: SidebarTabId) => {
     setSidebarTab(tab);
     saveSidebarTab(tab);
@@ -775,6 +853,8 @@ function App() {
     onToggleUtilityPanel: handleToggleUtilityPanel,
     onToggleEagleView: useCallback(() => setEagleView((v) => !v), []),
     onToggleLandscapeView: useCallback(() => setLandscapeView((v) => !v), []),
+    onToggleHomeView: handleToggleHomeView,
+    onToggleFactoryView: handleToggleFactoryView,
     onNextProject: switchToNextTab,
     onPrevProject: switchToPrevTab,
   });
@@ -861,6 +941,11 @@ function App() {
               landscapeView={landscapeView}
               onToggleLandscapeView={() => setLandscapeView((v) => !v)}
               landscapeAttention={needsInputAnywhere}
+              homeViewOpen={homeViewOpen}
+              onToggleHomeView={handleToggleHomeView}
+              factoryViewOpen={factoryViewOpen}
+              onToggleFactoryView={handleToggleFactoryView}
+              homeAttention={needsInputAnywhere}
               memoryPanelOpen={utilityPanel === "memory"}
               onToggleMemoryPanel={() => handleToggleUtilityPanel("memory")}
               processesPanelOpen={utilityPanel === "processes"}
@@ -965,6 +1050,33 @@ function App() {
                   }
                 >
                   <WorkflowsView onClose={closeWorkflowsView} />
+                </Suspense>
+              )}
+
+              {/* Home decision queue — same overlay shell as the two above;
+                  open by default so the day starts on what is blocked on you. */}
+              {homeViewOpen && (
+                <Suspense
+                  fallback={
+                    <div className="absolute inset-0 z-50 flex items-center justify-center bg-maestro-bg text-xs text-maestro-muted">
+                      Loading…
+                    </div>
+                  }
+                >
+                  <HomeView onNavigate={handleHomeNavigate} onClose={closeHomeView} />
+                </Suspense>
+              )}
+
+              {/* Factory — the ACT lane, same overlay shell. */}
+              {factoryViewOpen && (
+                <Suspense
+                  fallback={
+                    <div className="absolute inset-0 z-50 flex items-center justify-center bg-maestro-bg text-xs text-maestro-muted">
+                      Loading…
+                    </div>
+                  }
+                >
+                  <FactoryView onClose={closeFactoryView} />
                 </Suspense>
               )}
             </main>

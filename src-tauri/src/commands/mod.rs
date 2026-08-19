@@ -1,3 +1,4 @@
+pub mod act;
 pub mod agents;
 pub mod ai_runner;
 pub mod catalog;
@@ -7,6 +8,7 @@ pub mod cli;
 pub mod fonts;
 pub mod git;
 pub mod github;
+pub mod handoffs;
 pub mod harvest;
 pub mod hooks;
 pub mod initial_prompt;
@@ -23,4 +25,5 @@ pub mod system;
 pub mod terminal;
 pub mod update;
 pub mod usage;
+pub mod vanguard;
 pub mod worktree;

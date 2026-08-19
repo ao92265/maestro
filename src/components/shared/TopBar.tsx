@@ -4,7 +4,9 @@ import {
   Bird,
   Brain,
   BrainCircuit,
+  Factory,
   GitMerge,
+  Home,
   Minus,
   Network,
   PanelLeft,
@@ -57,6 +59,14 @@ interface TopBarProps {
   onToggleLandscapeView?: () => void;
   /** A terminal somewhere is waiting for input — marks the landscape button. */
   landscapeAttention?: boolean;
+  /** Home decision queue: blocked on you / landed / running */
+  homeViewOpen?: boolean;
+  onToggleHomeView?: () => void;
+  /** A terminal somewhere is waiting for input — marks the Home button. */
+  homeAttention?: boolean;
+  /** Factory: the ACT lane (spec in, run stages, PR out) */
+  factoryViewOpen?: boolean;
+  onToggleFactoryView?: () => void;
   /** Right-side Memory panel */
   memoryPanelOpen?: boolean;
   onToggleMemoryPanel?: () => void;
@@ -97,6 +107,11 @@ export function TopBar({
   landscapeView = false,
   onToggleLandscapeView,
   landscapeAttention = false,
+  homeViewOpen = false,
+  onToggleHomeView,
+  homeAttention = false,
+  factoryViewOpen = false,
+  onToggleFactoryView,
   memoryPanelOpen = false,
   onToggleMemoryPanel,
   processesPanelOpen = false,
@@ -226,6 +241,50 @@ export function TopBar({
               </div>
             )}
           </div>
+        )}
+        {onToggleHomeView && (
+          <button
+            type="button"
+            onClick={onToggleHomeView}
+            className={`relative rounded p-1.5 transition-colors ${
+              homeViewOpen
+                ? "text-maestro-accent hover:bg-maestro-accent/10"
+                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
+            }`}
+            aria-label="Home"
+            title={titleWithShortcut(
+              "Home — blocked on you, landed since you looked, running",
+              modLabel(),
+              "1",
+            )}
+          >
+            <Home size={14} />
+            {homeAttention && !homeViewOpen && (
+              <span
+                aria-hidden="true"
+                className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-maestro-accent"
+              />
+            )}
+          </button>
+        )}
+        {onToggleFactoryView && (
+          <button
+            type="button"
+            onClick={onToggleFactoryView}
+            className={`relative rounded p-1.5 transition-colors ${
+              factoryViewOpen
+                ? "text-maestro-accent hover:bg-maestro-accent/10"
+                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
+            }`}
+            aria-label="Factory"
+            title={titleWithShortcut(
+              "Factory — hand ACT a spec, watch the run, get the PR",
+              modLabel(),
+              "7",
+            )}
+          >
+            <Factory size={14} />
+          </button>
         )}
         {onToggleEagleView && (
           <button
