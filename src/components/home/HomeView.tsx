@@ -257,11 +257,20 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
     [tabs],
   );
 
+  /* Keyed on a stable primitive, not the tabs array: tab objects are rebuilt
+     on every selection/session change, and each effect restart would fire an
+     immediate refresh AND reset the 5-minute timer (review fc0e6b9, #3).
+     `refresh` reads the live tab list itself from the workspace store. */
+  const repoKey = useMemo(
+    () => tabs.map((t) => t.selectedRepoPath ?? t.projectPath).join("|"),
+    [tabs],
+  );
+  // biome-ignore lint/correctness/useExhaustiveDependencies: repoKey is not read in the body but is the intended trigger — refresh() reads the live tab list from the workspace store, and this effect must re-fire (fetch now, restart the timer) exactly when the set of repos changes, not on every tab-object rebuild.
   useEffect(() => {
-    void refresh(bandTabs);
-    const timer = setInterval(() => void refresh(bandTabs), REFRESH_INTERVAL_MS);
+    void refresh();
+    const timer = setInterval(() => void refresh(), REFRESH_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [refresh, bandTabs]);
+  }, [refresh, repoKey]);
 
   const bands = useMemo(
     () => assembleBands({ sessions, tabs: bandTabs, handoffs, repoPrs, watermarkMs }),
@@ -311,11 +320,34 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
       <div className="flex h-10 shrink-0 items-center gap-1.5 overflow-x-auto border-b border-maestro-border px-3">
         <span className="mr-1 shrink-0 text-[12px] font-semibold text-maestro-text">Home</span>
 
-        {/* Fleet strip: one chip per status with a live count; click filters. */}
+        {/* Fleet strip: one chip per status with a live count; click filters.
+            Idle sessions live in no band, so that chip is a count, not a filter
+            (clicking it would blank all three bands — review fc0e6b9, LOW #2). */}
         {STRIP_ORDER.map((status) => {
           const count = bands.counts[status];
           const badge = SESSION_STATUS_BADGES[status];
           const active = statusFilter === status;
+          const countOnly = status === "Idle";
+          const chipContent = (
+            <>
+              <span className={`${badgeBaseClass} ${badge.cls}`}>{badge.label}</span>
+              <span>{count}</span>
+            </>
+          );
+          const chipTitle = `${badge.label}: ${count} session${count === 1 ? "" : "s"}`;
+          if (countOnly) {
+            return (
+              <span
+                key={status}
+                className={`flex shrink-0 items-center gap-1 rounded border border-maestro-border px-1.5 py-0.5 text-[10px] text-maestro-muted ${
+                  count === 0 ? "opacity-40" : ""
+                }`}
+                title={chipTitle}
+              >
+                {chipContent}
+              </span>
+            );
+          }
           return (
             <button
               key={status}
@@ -327,10 +359,9 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
                   ? "border-maestro-accent/60 text-maestro-text"
                   : "border-maestro-border text-maestro-muted hover:text-maestro-text"
               } ${count === 0 && !active ? "opacity-40" : ""}`}
-              title={`${badge.label}: ${count} session${count === 1 ? "" : "s"}`}
+              title={chipTitle}
             >
-              <span className={`${badgeBaseClass} ${badge.cls}`}>{badge.label}</span>
-              <span>{count}</span>
+              {chipContent}
             </button>
           );
         })}
@@ -338,7 +369,7 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
         <div className="flex-1" />
         <button
           type="button"
-          onClick={() => void refresh(bandTabs)}
+          onClick={() => void refresh()}
           disabled={isRefreshing}
           className="rounded p-1.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text disabled:opacity-50"
           aria-label="Refresh"
@@ -365,6 +396,16 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
             items={filtered(bands.blocked)}
             emptyText="Nothing is blocked on you."
             stale={handoffsError}
+            action={
+              bands.moreHandoffs > 0 ? (
+                <span
+                  className="text-[10px] text-maestro-muted/70"
+                  title="Older parked handoffs, one per directory, hidden to keep the queue short"
+                >
+                  +{bands.moreHandoffs} more parked
+                </span>
+              ) : undefined
+            }
             renderItem={(item, i) =>
               item.kind === "session" ? (
                 <SessionRow key={`s${item.session.id}`} item={item} onNavigate={onNavigate} />

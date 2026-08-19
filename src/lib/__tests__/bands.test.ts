@@ -159,6 +159,33 @@ describe("assembleBands", () => {
     expect(landedPrs).toEqual([11]);
   });
 
+  it("keeps only the newest handoff per path and caps the band at 10", () => {
+    const many = Array.from({ length: 14 }, (_, i) =>
+      handoff(`h${i}`, { lastActive: `2026-08-0${(i % 9) + 1}T08:00:00Z` }),
+    );
+    // Three snapshots of the same directory, different ages: newest wins.
+    const dupes = [
+      handoff("dupe-old", { path: "/repo/same", lastActive: "2026-08-01T08:00:00Z" }),
+      handoff("dupe-new", { path: "/repo/same", lastActive: "2026-08-18T08:00:00Z" }),
+      handoff("dupe-mid", { path: "/repo/same", lastActive: "2026-08-10T08:00:00Z" }),
+    ];
+    const bands = assembleBands({
+      sessions: [],
+      tabs: TABS,
+      handoffs: [...many, ...dupes],
+      repoPrs: [],
+      watermarkMs: 0,
+    });
+    const shown = bands.blocked.filter((i) => i.kind === "handoff");
+    expect(shown.length).toBe(10);
+    const slugs = shown.map((i) => (i.kind === "handoff" ? i.handoff.slug : ""));
+    expect(slugs).toContain("dupe-new");
+    expect(slugs).not.toContain("dupe-old");
+    expect(slugs).not.toContain("dupe-mid");
+    // 15 distinct paths survive dedup; 10 shown, 5 counted as hidden.
+    expect(bands.moreHandoffs).toBe(5);
+  });
+
   it("orders blocked: needs-input, then errors, then PRs, then handoffs", () => {
     const bands = assembleBands({
       sessions: [session(2, "Error"), session(1, "NeedsInput")],

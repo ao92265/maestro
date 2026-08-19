@@ -48,6 +48,8 @@ export interface RepoPrs {
   changesRequested: PullRequestInfo[];
   /** Recently merged PRs, any age — the watermark filters them here. */
   merged: PullRequestInfo[];
+  /** This repo's last poll failed; its lists above are the previous data. */
+  error?: string | null;
 }
 
 export type BandItem =
@@ -67,6 +69,8 @@ export interface Bands {
   running: BandItem[];
   /** Fleet strip: live count per session status, zero-filled. */
   counts: Record<BackendSessionStatus, number>;
+  /** Parked handoffs hidden by the display cap ("+N more"). */
+  moreHandoffs: number;
 }
 
 interface AssembleInput {
@@ -91,6 +95,13 @@ const ALL_STATUSES: BackendSessionStatus[] = [
 /** Blocked-band session statuses, in display order: questions first, then failures. */
 const BLOCKED_ORDER: BackendSessionStatus[] = ["NeedsInput", "Error", "Timeout"];
 const RUNNING_STATUSES: BackendSessionStatus[] = ["Working", "Starting"];
+
+/**
+ * Display cap on parked handoffs. The live directory holds hundreds of
+ * snapshots (many per repository); the band exists to surface the newest few,
+ * not to archive them (review fc0e6b9, HIGH #1).
+ */
+const MAX_HANDOFF_ROWS = 10;
 
 function sessionDir(s: SessionConfig): string {
   return s.working_directory ?? s.worktree_path ?? s.project_path;
@@ -135,10 +146,20 @@ export function assembleBands({
     }
   }
   const liveDirs = new Set(sessions.map(sessionDir));
-  const liveHandoffs = handoffs
+  const sortedHandoffs = handoffs
     .filter((h) => !h.stale && !h.orphan && !liveDirs.has(h.path))
     .sort((a, b) => Date.parse(b.lastActive) - Date.parse(a.lastActive));
-  for (const h of liveHandoffs) blocked.push({ kind: "handoff", handoff: h });
+  // One row per directory (newest snapshot wins), capped — the rest is a count.
+  const seenPaths = new Set<string>();
+  const dedupedHandoffs = sortedHandoffs.filter((h) => {
+    if (seenPaths.has(h.path)) return false;
+    seenPaths.add(h.path);
+    return true;
+  });
+  const moreHandoffs = Math.max(0, dedupedHandoffs.length - MAX_HANDOFF_ROWS);
+  for (const h of dedupedHandoffs.slice(0, MAX_HANDOFF_ROWS)) {
+    blocked.push({ kind: "handoff", handoff: h });
+  }
 
   /* Band 2 — landed since you looked. Done sessions are always shown (they
      clear themselves on the next turn); merged PRs honour the watermark. */
@@ -157,5 +178,5 @@ export function assembleBands({
     .filter((s) => RUNNING_STATUSES.includes(s.status))
     .map(toSessionItem);
 
-  return { blocked, landed, running, counts };
+  return { blocked, landed, running, counts, moreHandoffs };
 }

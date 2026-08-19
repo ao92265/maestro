@@ -136,6 +136,16 @@ fn fallback_path(slug: &str) -> String {
     )
 }
 
+/// A recorded path that is `/` or the home directory itself is a junk
+/// handoff: a session that ran outside any repo. Surfacing it would render an
+/// unidentifiable row, and resuming it would make `openProject` walk the
+/// whole filesystem looking for repositories (review fc0e6b9, HIGH #2) — so
+/// these are dropped at scan time, before the UI ever sees them.
+fn is_junk_path(recorded_path: &str, home: Option<&Path>) -> bool {
+    let path = Path::new(recorded_path);
+    path == Path::new("/") || home.is_some_and(|home| path == home)
+}
+
 fn parse_handoff(
     handoff_file: &Path,
     content: &str,
@@ -166,7 +176,12 @@ fn parse_handoff(
         uncommitted,
         last_commit: last_commit_value(content),
         asks,
-        waiting: last_action.trim().ends_with('?'),
+        // Reference regex: /\?\s*…?$|\?$/ — a trailing ellipsis after the
+        // question mark still counts as "stopped on an ask".
+        waiting: {
+            let trimmed = last_action.trim_end();
+            trimmed.ends_with('?') || trimmed.trim_end_matches('…').trim_end().ends_with('?')
+        },
         last_action,
         last_active: DateTime::<Utc>::from(modified).to_rfc3339(),
         stale: now
@@ -192,6 +207,7 @@ pub fn get_handoffs() -> Result<Vec<HandoffInfo>, String> {
         }
     };
     let now = SystemTime::now();
+    let home = BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
     let mut handoffs = Vec::new();
 
     for entry in entries.flatten() {
@@ -208,7 +224,11 @@ pub fn get_handoffs() -> Result<Vec<HandoffInfo>, String> {
         let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
             continue;
         };
-        handoffs.push((modified, parse_handoff(&path, &content, modified, now)));
+        let handoff = parse_handoff(&path, &content, modified, now);
+        if is_junk_path(&handoff.path, home.as_deref()) {
+            continue;
+        }
+        handoffs.push((modified, handoff));
     }
 
     handoffs.sort_by(|(modified_a, _), (modified_b, _)| modified_b.cmp(modified_a));
@@ -282,6 +302,29 @@ mod tests {
         );
         assert!(!handoff.stale);
         assert!(!handoff.orphan);
+    }
+
+    #[test]
+    fn drops_root_and_home_paths_as_junk() {
+        let home = Path::new("/Users/someone");
+        assert!(is_junk_path("/", Some(home)));
+        assert!(is_junk_path("/Users/someone", Some(home)));
+        assert!(is_junk_path("/Users/someone/", Some(home)));
+        assert!(!is_junk_path("/Users/someone/Repos/project", Some(home)));
+        assert!(!is_junk_path("/Users/someone", None));
+        assert!(is_junk_path("/", None));
+    }
+
+    #[test]
+    fn waiting_matches_question_followed_by_ellipsis() {
+        let content = "## State\n- Path: `/tmp/x`\n\n## Last action\n- Which option? …\n";
+        let handoff = parse_handoff(
+            Path::new("/tmp/handoffs/x.md"),
+            content,
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(handoff.waiting);
     }
 
     #[test]
