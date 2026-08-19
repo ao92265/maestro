@@ -29,9 +29,6 @@ interface HomeViewProps {
   onClose: () => void;
 }
 
-/** PR polls are `gh` subprocesses; five minutes matches the watchdog cadence. */
-const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
-
 /** Fleet strip display order: what needs you first, calmest last. */
 const STRIP_ORDER: BackendSessionStatus[] = [
   "NeedsInput",
@@ -287,25 +284,13 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
     [tabs],
   );
 
-  /* Keyed on a stable primitive, not the tabs array: tab objects are rebuilt
-     on every selection/session change, and each effect restart would fire an
-     immediate refresh AND reset the 5-minute timer (review fc0e6b9, #3).
-     `refresh` reads the live tab list itself from the workspace store. */
-  const repoKey = useMemo(
-    () => tabs.map((t) => t.selectedRepoPath ?? t.projectPath).join("|"),
-    [tabs],
-  );
-  // biome-ignore lint/correctness/useExhaustiveDependencies: repoKey is not read in the body but is the intended trigger — refresh() reads the live tab list from the workspace store, and this effect must re-fire (fetch now, restart the timer) exactly when the set of repos changes, not on every tab-object rebuild.
+  /* The 5-minute polling loop lives at App level (useBandPolling) so the
+     Vanguard snapshot stays fresh with Home closed; opening Home just tops
+     the data up once so the first paint isn't up to 5 minutes old. */
   useEffect(() => {
-    const tick = () => {
-      void refresh();
-      // ACT piggybacks on the same cadence; its failures are its own state.
-      void useActStore.getState().refresh();
-    };
-    tick();
-    const timer = setInterval(tick, REFRESH_INTERVAL_MS);
-    return () => clearInterval(timer);
-  }, [refresh, repoKey]);
+    void refresh();
+    void useActStore.getState().refresh();
+  }, [refresh]);
 
   const bands = useMemo(
     () => assembleBands({ sessions, tabs: bandTabs, handoffs, repoPrs, gatedRuns, watermarkMs }),

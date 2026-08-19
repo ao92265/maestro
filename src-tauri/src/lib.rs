@@ -1265,6 +1265,8 @@ pub fn run() {
             commands::act::act_set_task_status,
             commands::act::act_list_gates,
             commands::act::act_resolve_gate,
+            // Vanguard feed (band snapshot for the launchd digest script)
+            commands::vanguard::write_band_snapshot,
             // Claude auto-memory commands
             commands::memory::list_memory_projects,
             commands::memory::list_memory_files,

@@ -50,7 +50,9 @@ import {
 import { MAX_SESSIONS } from "./components/terminal/splitTree";
 import { UpdateNotification } from "./components/update/UpdateNotification";
 import { useAppKeyboard } from "./hooks/useAppKeyboard";
+import { useBandPolling } from "./hooks/useBandPolling";
 import { useSwipeNavigation } from "./hooks/useSwipeNavigation";
+import { useVanguardSnapshot } from "./hooks/useVanguardSnapshot";
 import { HEALTH_CHECK_INTERVAL_MS } from "./lib/healthRules";
 import { initActivityListener, stopActivityListener } from "./stores/useActivityStore";
 import { initAgentListener, stopAgentListener } from "./stores/useAgentStore";
@@ -745,6 +747,11 @@ function App() {
       useFactoryViewStore.getState().close();
     }
   }, [landscapeView, workflowsViewOpen, closeHomeView]);
+
+  // Band data (handoffs, PR polls, ACT) refreshes app-wide, and every change
+  // mirrors to the Vanguard snapshot file the launchd digest reads.
+  useBandPolling();
+  useVanguardSnapshot();
 
   const handleSelectSidebarTab = useCallback((tab: SidebarTabId) => {
     setSidebarTab(tab);

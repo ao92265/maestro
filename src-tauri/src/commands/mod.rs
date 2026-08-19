@@ -25,4 +25,5 @@ pub mod system;
 pub mod terminal;
 pub mod update;
 pub mod usage;
+pub mod vanguard;
 pub mod worktree;
