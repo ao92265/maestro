@@ -1262,6 +1262,7 @@ pub fn run() {
             commands::act::act_get_run,
             commands::act::act_submit_spec,
             commands::act::act_cancel_run,
+            commands::act::act_set_task_status,
             commands::act::act_list_gates,
             commands::act::act_resolve_gate,
             // Claude auto-memory commands

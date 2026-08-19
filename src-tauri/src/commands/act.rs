@@ -79,8 +79,13 @@ pub struct ActSubmitOutcome {
     pub complexity: Option<String>,
     pub http_status: u16,
     pub error: Option<String>,
+    /// 429 body: how full the in-flight window is.
     pub current_in_flight: Option<u64>,
     pub limit: Option<u64>,
+    /// 402 body: the token-budget numbers that make the rejection actionable.
+    pub used_tokens: Option<u64>,
+    pub cap_tokens: Option<u64>,
+    pub remaining_tokens: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -102,6 +107,33 @@ fn base_url() -> String {
         .unwrap_or_else(|_| DEFAULT_ACT_URL.to_string())
         .trim_end_matches('/')
         .to_string()
+}
+
+/// ACT gates every state-changing request behind a shared secret once
+/// `ACT_DASHBOARD_TOKEN` is set (its dashboard-auth middleware; GETs stay
+/// open). Attach it to every mutating relay call so those calls keep working
+/// the day the token is configured, instead of failing with an invisible 401.
+fn with_act_token(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match std::env::var("ACT_DASHBOARD_TOKEN") {
+        Ok(token) if !token.is_empty() => request.header("x-act-token", token),
+        _ => request,
+    }
+}
+
+/// Read the body of a failed mutating call so the error names what ACT said
+/// ("gate not found", "unauthorized…") instead of a bare status code.
+async fn failure_with_body(response: reqwest::Response) -> String {
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+    let detail = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|payload| truthy_string(payload.get("error")))
+        .unwrap_or_else(|| truncate_response(&body));
+    if detail.is_empty() {
+        response_error(status)
+    } else {
+        format!("{}: {detail}", response_error(status))
+    }
 }
 
 fn endpoint(segments: &[&str]) -> Result<Url, String> {
@@ -268,9 +300,7 @@ pub async fn act_get_run(run_id: String) -> Result<ActRunDetail, String> {
 #[tauri::command]
 pub async fn act_submit_spec(spec: ActSpecInput) -> Result<ActSubmitOutcome, String> {
     let url = endpoint(&["api", "portal", "specs"])?;
-    let response = client()?
-        .post(url)
-        .header("x-portal-user", PORTAL_USER)
+    let response = with_act_token(client()?.post(url).header("x-portal-user", PORTAL_USER))
         .json(&spec)
         .send()
         .await
@@ -316,6 +346,18 @@ pub async fn act_submit_spec(spec: ActSpecInput) -> Result<ActSubmitOutcome, Str
             .as_ref()
             .and_then(|payload| payload.get("limit"))
             .and_then(Value::as_u64),
+        used_tokens: payload
+            .as_ref()
+            .and_then(|payload| payload.get("usedTokens"))
+            .and_then(Value::as_u64),
+        cap_tokens: payload
+            .as_ref()
+            .and_then(|payload| payload.get("capTokens"))
+            .and_then(Value::as_u64),
+        remaining_tokens: payload
+            .as_ref()
+            .and_then(|payload| payload.get("remainingTokens"))
+            .and_then(Value::as_u64),
         http_status,
     })
 }
@@ -323,13 +365,37 @@ pub async fn act_submit_spec(spec: ActSpecInput) -> Result<ActSubmitOutcome, Str
 #[tauri::command]
 pub async fn act_cancel_run(run_id: String) -> Result<u16, String> {
     let url = endpoint(&["api", "portal", "runs", &run_id, "cancel"])?;
-    client()?
-        .post(url)
-        .header("x-portal-user", PORTAL_USER)
+    let response = with_act_token(client()?.post(url).header("x-portal-user", PORTAL_USER))
         .send()
         .await
-        .map(|response| response.status().as_u16())
-        .map_err(|error| format!("ACT request failed: {error}"))
+        .map_err(|error| format!("ACT request failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(failure_with_body(response).await);
+    }
+    Ok(response.status().as_u16())
+}
+
+/// Clear (or archive) a task blocked at ACT's confidence gate. Low-confidence
+/// blocks are written by the verification loop straight onto the TASK — no
+/// GateManager gate exists for them — so the only route that resolves one is
+/// the tasks route: `status: "pending"` releases the block and the run
+/// continues; `status: "archived"` drops the work.
+#[tauri::command]
+pub async fn act_set_task_status(task_id: String, status: String) -> Result<u16, String> {
+    const ALLOWED: [&str; 2] = ["pending", "archived"];
+    if !ALLOWED.contains(&status.as_str()) {
+        return Err(format!("Unsupported task status: {status}"));
+    }
+    let url = endpoint(&["api", "tasks", &task_id])?;
+    let response = with_act_token(client()?.put(url))
+        .json(&serde_json::json!({ "status": status }))
+        .send()
+        .await
+        .map_err(|error| format!("ACT request failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(failure_with_body(response).await);
+    }
+    Ok(response.status().as_u16())
 }
 
 #[tauri::command]
@@ -351,24 +417,33 @@ pub async fn act_list_gates(task_id: String) -> Result<Value, String> {
         .map_err(|error| format!("ACT returned malformed JSON: {error}"))
 }
 
+/// Resolve a GateManager gate (pipeline HITL pauses — a different subsystem
+/// from the low-confidence task blocks above). `gate_id` is the gate's OWN id
+/// from `act_list_gates`, never a task or run id.
 #[tauri::command]
 pub async fn act_resolve_gate(
     gate_id: String,
-    approve: bool,
-    note: Option<String>,
+    decision: String,
+    input: Option<String>,
 ) -> Result<u16, String> {
+    const VALID: [&str; 3] = ["approve", "revise", "skip"];
+    if !VALID.contains(&decision.as_str()) {
+        return Err(format!("Unsupported gate decision: {decision}"));
+    }
     let url = endpoint(&["api", "gates", &gate_id, "resolve"])?;
     let body = ResolveGateBody {
-        decision: if approve { "approve" } else { "revise" },
-        input: note.as_deref(),
+        decision: &decision,
+        input: input.as_deref(),
     };
-    client()?
-        .post(url)
+    let response = with_act_token(client()?.post(url))
         .json(&body)
         .send()
         .await
-        .map(|response| response.status().as_u16())
-        .map_err(|error| format!("ACT request failed: {error}"))
+        .map_err(|error| format!("ACT request failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(failure_with_body(response).await);
+    }
+    Ok(response.status().as_u16())
 }
 
 #[cfg(test)]

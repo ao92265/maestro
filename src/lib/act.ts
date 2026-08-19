@@ -52,11 +52,52 @@ export interface ActSubmitOutcome {
   accepted: boolean;
   runId: string | null;
   taskId: string | null;
+  /** Pipeline preview from a 200: the stage names the run will pass through. */
+  stages: string[] | null;
   complexity: string | null;
   httpStatus: number;
   error: string | null;
+  /** 429 body: how full the in-flight window is. */
   currentInFlight: number | null;
   limit: number | null;
+  /** 402 body: the token-budget numbers. */
+  usedTokens: number | null;
+  capTokens: number | null;
+  remainingTokens: number | null;
+}
+
+/**
+ * A pipeline HITL gate (ACT's GateManager) — a different pause from the
+ * low-confidence task block: gates have their own ids and a decision set,
+ * blocks live on the task and clear through the tasks route.
+ */
+export interface ActGate {
+  id: string;
+  title: string;
+  options: string[];
+  createdAt: string | null;
+}
+
+/** Best-effort parse of the gates payload; malformed entries are dropped. */
+export function parseGates(payload: unknown): ActGate[] {
+  if (typeof payload !== "object" || payload === null) return [];
+  const gates = (payload as { gates?: unknown }).gates;
+  if (!Array.isArray(gates)) return [];
+  return gates.flatMap((g) => {
+    if (typeof g !== "object" || g === null) return [];
+    const gate = g as Record<string, unknown>;
+    if (typeof gate.id !== "string" || gate.status === "resolved") return [];
+    return [
+      {
+        id: gate.id,
+        title: typeof gate.title === "string" ? gate.title : gate.id,
+        options: Array.isArray(gate.options)
+          ? gate.options.filter((o): o is string => typeof o === "string")
+          : ["approve", "revise", "skip"],
+        createdAt: typeof gate.createdAt === "string" ? gate.createdAt : null,
+      },
+    ];
+  });
 }
 
 /** Portal statuses that mean the run will not change again. */

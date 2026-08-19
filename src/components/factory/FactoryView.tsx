@@ -154,11 +154,13 @@ function SpecForm() {
           }`}
         >
           {submitOutcome.accepted
-            ? `Run queued (${submitOutcome.complexity ?? "complexity pending"}).`
+            ? `Run queued (${submitOutcome.complexity ?? "complexity pending"}${
+                submitOutcome.stages?.length ? `, stages: ${submitOutcome.stages.join(", ")}` : ""
+              }).`
             : submitOutcome.httpStatus === 429
               ? `ACT is at its in-flight limit (${submitOutcome.currentInFlight ?? "?"}/${submitOutcome.limit ?? "?"}). Try again when a run finishes.`
               : submitOutcome.httpStatus === 402
-                ? "ACT's token budget is exhausted for today."
+                ? `ACT's token budget is exhausted (${submitOutcome.usedTokens ?? "?"} of ${submitOutcome.capTokens ?? "?"} used, ${submitOutcome.remainingTokens ?? 0} left).`
                 : (submitOutcome.error ?? "ACT rejected the spec.")}
         </p>
       )}
@@ -195,7 +197,7 @@ function RunRow({ run, gated, onOpen }: { run: ActRun; gated: boolean; onOpen: (
 
 /** One run, opened: stages, the gate when there is one, the PR when done. */
 function RunDetail({ onBack }: { onBack: () => void }) {
-  const { detail, detailError, cancelRun, resolveGate } = useActStore();
+  const { detail, detailGates, detailError, cancelRun, unblockTask, resolveGate } = useActStore();
   if (!detail) return null;
   const gated = runNeedsYou(detail);
   return (
@@ -248,24 +250,57 @@ function RunDetail({ onBack }: { onBack: () => void }) {
       {gated && (
         <div className="flex flex-col gap-2 rounded border border-maestro-accent/40 p-3">
           <span className="text-[11px] font-semibold text-maestro-accent">
-            Stopped at a confidence gate — the run is waiting on you.
+            Stopped on low confidence: the run is waiting on you.
           </span>
           <div className="flex gap-2">
+            {/* Low-confidence blocks live on the TASK, not in the gates
+                subsystem — clearing one goes through the tasks route
+                (review b43c16d, HIGH #1). */}
             <button
               type="button"
-              onClick={() => detail.task?.id && void resolveGate(detail.task.id, true)}
+              onClick={() => detail.task?.id && void unblockTask(detail.task.id, true)}
               className="rounded border border-maestro-green/50 px-2 py-1 text-[11px] text-maestro-green transition-colors hover:bg-maestro-green/10"
             >
               Approve and continue
             </button>
             <button
               type="button"
-              onClick={() => detail.task?.id && void resolveGate(detail.task.id, false)}
+              onClick={() => detail.task?.id && void unblockTask(detail.task.id, false)}
               className="rounded border border-red-500/50 px-2 py-1 text-[11px] text-red-400 transition-colors hover:bg-red-500/10"
+              title="Archives the task; the run will not continue"
             >
-              Reject
+              Reject and archive
             </button>
           </div>
+        </div>
+      )}
+
+      {detailGates.length > 0 && (
+        <div className="flex flex-col gap-2 rounded border border-maestro-yellow/40 p-3">
+          <span className="text-[11px] font-semibold text-maestro-yellow">
+            Pipeline gate{detailGates.length === 1 ? "" : "s"} waiting for a decision.
+          </span>
+          {detailGates.map((gate) => (
+            <div key={gate.id} className="flex items-center gap-2">
+              <span className="min-w-0 flex-1 truncate text-[11px] text-maestro-text">
+                {gate.title}
+              </span>
+              {gate.options.map((option) => (
+                <button
+                  key={option}
+                  type="button"
+                  onClick={() => void resolveGate(gate.id, option)}
+                  className={`rounded border px-2 py-0.5 text-[11px] transition-colors ${
+                    option === "approve"
+                      ? "border-maestro-green/50 text-maestro-green hover:bg-maestro-green/10"
+                      : "border-maestro-border text-maestro-muted hover:text-maestro-text"
+                  }`}
+                >
+                  {option}
+                </button>
+              ))}
+            </div>
+          ))}
         </div>
       )}
 
@@ -308,7 +343,10 @@ export function FactoryView({ onClose }: FactoryViewProps) {
 
   const gatedIds = new Set(gatedRuns.map((r) => r.id));
   const offline = fetchedAt === 0;
-  const stale = !offline && (error !== null || Date.now() - fetchedAt > ACT_STALE_MS * 2);
+  /* fetchedAt changes on every successful poll, so this recomputes at least
+     once per interval; a stricter clock would need a render tick for no
+     user-visible gain (review b43c16d, LOW). */
+  const stale = !offline && (error !== null || Date.now() - fetchedAt > ACT_STALE_MS);
 
   return (
     /* z-50: same overlay shell as Home/Landscape (eagle zoom is z-40). */
