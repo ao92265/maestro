@@ -42,6 +42,10 @@ interface TourState {
  * Auto-open on first launch only; reopening later is always explicit. Pure
  * and exported so the rule is testable — the store initializer runs once at
  * module load, where a test cannot reach it.
+ *
+ * "First launch" means "no marker yet", so existing users upgrading into
+ * this build get the tour once too. Deliberate: they have never seen it
+ * either.
  */
 export function initialTourOpen(): boolean {
   return !hasSeenTour();
