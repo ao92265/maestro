@@ -521,8 +521,12 @@ enum TimeoutVerdict {
     /// The retry ran out of time too: ALERT once and stop tracking.
     Alert,
     /// Finding E: a waiting state aged out — the trigger fired but the Stop
-    /// hook never came (wedged turn), or the retry was armed and idle never
-    /// came. ALERT once (`never_idled` / `retry_never_injected`).
+    /// hook never came (wedged turn), the retry was armed and idle never
+    /// came, or the latest attempt's write never reported a verdict (issue
+    /// #160 — the stamp rides the delivery outcome, so a vanished callback
+    /// leaves the entry unstamped and the tick re-arms the retry). ALERT
+    /// once (`never_idled` / `retry_never_injected` /
+    /// `delivery_unresolved`).
     ///
     /// Unlike [`Alert`](Self::Alert) the entry is KEPT: "no idle yet" is not
     /// "cannot be instructed". A long turn — a subagent wave, a full
@@ -1313,18 +1317,32 @@ impl SamuraiInjector {
                         }
                         TimeoutVerdict::AlertStuck => {
                             // Finding E: no injection was possible yet —
-                            // either the trigger's Stop never came (a very
-                            // long turn) or the armed retry's idle never
-                            // came. One ack_timeout ALERT with the exact
-                            // flavor, then KEEP TRACKING: the turn ends
-                            // eventually and the instruction is still owed.
-                            // Latched so the ALERT stays one-shot.
+                            // the trigger's Stop never came (a very long
+                            // turn), the armed retry's idle never came, or
+                            // the latest attempt's write never resolved
+                            // (issue #160). One ack_timeout ALERT with the
+                            // exact flavor, then KEEP TRACKING: the turn
+                            // ends eventually and the instruction is still
+                            // owed. Latched so the ALERT stays one-shot.
                             if p.stuck_alerted {
                                 continue;
                             }
                             p.stuck_alerted = true;
                             let flag = if p.awaiting_retry {
                                 "retry_never_injected"
+                            } else if p.attempts > 0 {
+                                // Armed, delivered into the writer, and the
+                                // verdict callback never came back (issue
+                                // #160): without a stamp the ACK ladder
+                                // cannot run, and `should_inject_on_idle`
+                                // blocks a bare attempts=1 entry — so also
+                                // re-arm the retry here, or a vanished
+                                // verdict would wedge the entry forever.
+                                // The next idle re-injects, exactly as an
+                                // `ack_timeout` retry did before #160.
+                                p.awaiting_retry = true;
+                                p.waiting_since = AgeableInstant::now();
+                                "delivery_unresolved"
                             } else {
                                 "never_idled"
                             };
@@ -1655,8 +1673,15 @@ impl SamuraiInjector {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             pending.get_mut(&session_id).map(|p| {
                 // The delivery attempt just resolved: the ACK window starts
-                // NOW (issue #160).
-                p.injected_at = Some(AgeableInstant::now());
+                // NOW (issue #160). Only for an ARMED entry — arming always
+                // precedes the outcome, so an attempts=0 occupant is a
+                // DIFFERENT entry re-created after ours vanished (e.g. an
+                // all-clear superseding an armed wind-down), and a stale
+                // stamp on it would suppress the never-idled wait cap until
+                // its own first arm.
+                if p.attempts > 0 {
+                    p.injected_at = Some(AgeableInstant::now());
+                }
                 (
                     p.project.clone(),
                     p.epic.clone(),
@@ -4137,6 +4162,83 @@ mod tests {
         injector.backdate_injection(1, TIMEOUT + Duration::from_secs(1));
         injector.tick();
         assert!(injector.pending_view(1).is_none(), "final ALERT untracked");
+    }
+
+    #[tokio::test]
+    async fn test_stale_outcome_never_stamps_a_replacement_entry() {
+        let dir = tempdir().unwrap();
+        let (injector, _audit, supervisor, _context, outcomes) =
+            harness_deferred_delivery(dir.path());
+        let snapshot = supervisor
+            .register_session(1, "C:/git/proj-inj-staleout".into(), "epic-9".into(), 5)
+            .unwrap();
+
+        // A wind-down arms and its write goes in flight...
+        assert!(injector.begin_soft_winddown(&snapshot));
+        injector.observe_hook(&stop_event(1));
+        assert_eq!(injector.pending_view(1), Some((1, false, false)));
+        wait_until(|| !outcomes.lock().unwrap().is_empty()).await;
+
+        // ...and the all-clear supersedes it while the write is still out:
+        // the session slot now holds a DIFFERENT, never-armed entry.
+        assert!(injector.begin_winddown_allclear(&snapshot));
+        assert_eq!(injector.pending_view(1), Some((0, false, false)));
+
+        // The stale verdict resolves. It must not stamp the replacement —
+        // an attempts=0 entry with a stamp would sit on `timeout_verdict`'s
+        // defensive Keep arm forever, suppressing the never-idled wait cap.
+        resolve_delivery(&outcomes, Ok(()));
+        assert!(!injector.delivery_stamped(1), "replacement stays unstamped");
+
+        // The cap still governs the replacement: it can go stuck-ALERT.
+        injector.backdate_waiting(1, TURN_WAIT_OVER);
+        injector.tick();
+        assert_eq!(injector.pending_view(1), Some((0, false, false)), "kept");
+        assert!(!injector.has_pending(1), "stuck-alerted, not pending");
+    }
+
+    #[tokio::test]
+    async fn test_unresolved_delivery_alerts_and_rearms_the_retry() {
+        let dir = tempdir().unwrap();
+        let (injector, audit, supervisor, context, outcomes) =
+            harness_deferred_delivery(dir.path());
+        let project = "C:/git/proj-inj-noverdict";
+        supervisor
+            .register_session(1, project.into(), "epic".into(), 3)
+            .unwrap();
+        context.observe(&context_event(1, 50.0));
+        injector.tick();
+        injector.observe_hook(&stop_event(1));
+        wait_until(|| !outcomes.lock().unwrap().is_empty()).await;
+
+        // The write's verdict NEVER comes back (a wedged blocking write).
+        // Past the long-turn cap the tick alerts with the exact flavor and
+        // RE-ARMS the retry — an unstamped attempts=1 entry would otherwise
+        // never inject again.
+        injector.backdate_waiting(1, TURN_WAIT_OVER);
+        injector.tick();
+        assert_eq!(injector.pending_view(1), Some((1, false, true)), "re-armed");
+        assert!(!injector.has_pending(1), "stuck-alerted for the parker");
+
+        let mut found = false;
+        for _ in 0..200 {
+            let rows = audit.read(project, None, None).await.unwrap().events;
+            if rows.iter().any(|r| {
+                r.event == AuditEventKind::Alert
+                    && r.details["kind"] == "ack_timeout"
+                    && r.details["delivery_unresolved"] == true
+                    && r.details["still_tracked"] == true
+            }) {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(found, "the delivery_unresolved ALERT row landed");
+
+        // The next idle delivers attempt 2 — the ladder is running again.
+        injector.observe_hook(&stop_event(1));
+        assert_eq!(injector.pending_view(1), Some((2, false, false)));
     }
 
     // --- issue #54: written marker → validation → HANDOFF_WRITTEN ---
