@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { hasSeenTour, useTourStore } from "@/stores/useTourStore";
+import { hasSeenTour, initialTourOpen, TOUR_STEP_COUNT, useTourStore } from "@/stores/useTourStore";
 import { FirstRunTour, TOUR_STEPS } from "../FirstRunTour";
 
 describe("FirstRunTour", () => {
@@ -59,5 +59,34 @@ describe("FirstRunTour", () => {
     useTourStore.setState({ isOpen: false });
     render(<FirstRunTour />);
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("auto-opens on a fresh install only", () => {
+    // The store initializer runs at module load, so the rule is guarded via
+    // the pure function it delegates to: open with no marker, closed after
+    // any close (which writes the marker).
+    expect(initialTourOpen()).toBe(true);
+    useTourStore.getState().close();
+    expect(initialTourOpen()).toBe(false);
+  });
+
+  it("closes on Escape and counts that as seen", () => {
+    render(<FirstRunTour />);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(useTourStore.getState().isOpen).toBe(false);
+    expect(hasSeenTour()).toBe(true);
+  });
+
+  it("next clamps at the last step instead of walking past it", () => {
+    for (let i = 0; i < TOUR_STEPS.length + 3; i++) {
+      useTourStore.getState().next();
+    }
+    expect(useTourStore.getState().step).toBe(TOUR_STEPS.length - 1);
+  });
+
+  it("keeps the store's step count in sync with the cards", () => {
+    // The clamp lives in the store, the cards in the component; this is the
+    // tripwire for whoever adds a card without bumping the count.
+    expect(TOUR_STEPS.length).toBe(TOUR_STEP_COUNT);
   });
 });

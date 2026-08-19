@@ -1,7 +1,15 @@
 import { renderHook } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { useTourStore } from "@/stores/useTourStore";
 import { useAppKeyboard } from "../useAppKeyboard";
+
+// A fresh environment has no tour-seen marker, so the tour store starts
+// open and (correctly) mutes every app shortcut. Close it for the
+// shortcut tests; the mute itself is asserted in its own describe below.
+beforeEach(() => {
+  useTourStore.setState({ isOpen: false });
+});
 
 function dispatch(init: KeyboardEventInit): KeyboardEvent {
   const ev = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
@@ -145,5 +153,22 @@ describe("useAppKeyboard project cycling (Ctrl+Tab on all platforms)", () => {
     dispatch({ key: "Tab", code: "Tab" });
     dispatch({ key: "Tab", code: "Tab", metaKey: true });
     expect(onNextProject).not.toHaveBeenCalled();
+  });
+});
+
+describe("useAppKeyboard while the first-run tour is open", () => {
+  it("mutes every app shortcut so the tour's own hints cannot fire behind its modal", () => {
+    useTourStore.setState({ isOpen: true });
+    const handlers = renderAppKeyboard();
+
+    dispatch({ key: "1", code: "Digit1", altKey: true });
+    dispatch({ key: "2", code: "Digit2", ...MOD });
+    dispatch({ key: "t", code: "KeyT", ...MOD });
+    dispatch({ key: "g", code: "KeyG", ...MOD });
+    dispatch({ key: "Tab", code: "Tab", ctrlKey: true });
+
+    for (const handler of Object.values(handlers)) {
+      expect(handler).not.toHaveBeenCalled();
+    }
   });
 });

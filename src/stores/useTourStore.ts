@@ -8,6 +8,9 @@ import { create } from "zustand";
  */
 const TOUR_SEEN_KEY = "maestro-tour-seen";
 
+/** Kept in sync with TOUR_STEPS in FirstRunTour — a test asserts the match. */
+export const TOUR_STEP_COUNT = 5;
+
 export function hasSeenTour(): boolean {
   try {
     return localStorage.getItem(TOUR_SEEN_KEY) !== null;
@@ -35,9 +38,17 @@ interface TourState {
   back: () => void;
 }
 
+/**
+ * Auto-open on first launch only; reopening later is always explicit. Pure
+ * and exported so the rule is testable — the store initializer runs once at
+ * module load, where a test cannot reach it.
+ */
+export function initialTourOpen(): boolean {
+  return !hasSeenTour();
+}
+
 export const useTourStore = create<TourState>((set) => ({
-  // Auto-open on first launch only; reopening later is always explicit.
-  isOpen: !hasSeenTour(),
+  isOpen: initialTourOpen(),
   step: 0,
   open: () => set({ isOpen: true, step: 0 }),
   close: () => {
@@ -46,6 +57,6 @@ export const useTourStore = create<TourState>((set) => ({
     markTourSeen();
     set({ isOpen: false, step: 0 });
   },
-  next: () => set((s) => ({ step: s.step + 1 })),
+  next: () => set((s) => ({ step: Math.min(s.step + 1, TOUR_STEP_COUNT - 1) })),
   back: () => set((s) => ({ step: Math.max(0, s.step - 1) })),
 }));

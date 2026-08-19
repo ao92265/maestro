@@ -1080,11 +1080,6 @@ function App() {
                   <FactoryView onClose={closeFactoryView} />
                 </Suspense>
               )}
-
-              {/* First-run tour — sits above the full-screen overlays (z-60
-                  over their z-50) so it reads on top of the Home landing
-                  surface it introduces. */}
-              <FirstRunTour />
             </main>
 
             {/* Memory / Processes utility panel (optional right side) */}
@@ -1167,6 +1162,11 @@ function App() {
 
       <UpdateNotification />
       <NotificationToasts />
+
+      {/* First-run tour — at the root, not inside <main>, so its backdrop
+          dims the whole window (TopBar and sidebar included) and the dialog
+          is as modal as it claims to be. */}
+      <FirstRunTour />
     </div>
   );
 }

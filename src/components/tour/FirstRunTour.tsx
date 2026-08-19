@@ -1,4 +1,5 @@
 import { Factory, Home, Send, TerminalSquare, X } from "lucide-react";
+import { useEffect, useRef } from "react";
 import { useTourStore } from "@/stores/useTourStore";
 
 /**
@@ -51,6 +52,21 @@ export const TOUR_STEPS: TourStep[] = [
 
 export function FirstRunTour() {
   const { isOpen, step, close, next, back } = useTourStore();
+  const dialogRef = useRef<HTMLDivElement>(null);
+
+  // Focus the dialog when it appears (Tab starts inside it, screen readers
+  // announce it) and let Escape dismiss — the dialog opens unprompted on
+  // first launch, so it needs a keyboard-only way out.
+  useEffect(() => {
+    if (!isOpen) return;
+    dialogRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isOpen, close]);
+
   if (!isOpen) return null;
 
   const last = step >= TOUR_STEPS.length - 1;
@@ -58,12 +74,16 @@ export function FirstRunTour() {
   const Icon = current.icon;
 
   return (
-    <div className="absolute inset-0 z-[60] flex items-center justify-center bg-black/60">
+    /* fixed, not absolute: the backdrop must dim the whole window (TopBar,
+       sidebar, panels), matching the aria-modal claim. */
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60">
       <div
+        ref={dialogRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-label="Maestro tour"
-        className="w-[420px] rounded-lg border border-maestro-border bg-maestro-card p-5 shadow-xl"
+        className="w-[420px] rounded-lg border border-maestro-border bg-maestro-card p-5 shadow-xl outline-none"
       >
         <div className="flex items-start justify-between">
           <Icon size={20} className="text-maestro-accent" />

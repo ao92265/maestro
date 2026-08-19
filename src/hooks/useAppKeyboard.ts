@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { useTourStore } from "@/stores/useTourStore";
 
 /** Right-side utility panels reachable via Cmd/Ctrl+3-6. */
 export type UtilityPanelShortcut = "memory" | "processes" | "notes" | "ai";
@@ -72,6 +73,11 @@ export function useAppKeyboard({
 }: UseAppKeyboardOptions): void {
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
+      // The first-run tour quotes these shortcuts on its cards; firing them
+      // behind its modal would rearrange the app under a dialog the user
+      // cannot see past. Its own Escape handler still works.
+      if (useTourStore.getState().isOpen) return;
+
       // Alt-based shortcuts (no Cmd/Ctrl, no Shift)
       // Use event.code so the bindings are layout-independent (AZERTY etc.).
       if (event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey) {
