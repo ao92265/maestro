@@ -26,6 +26,8 @@ interface UseAppKeyboardOptions {
   onToggleEagleView?: () => void;
   /** Callback to toggle the landscape agent graph (Cmd/Ctrl+Shift+G) */
   onToggleLandscapeView?: () => void;
+  /** Callback to toggle the Home decision queue (Cmd/Ctrl+1) */
+  onToggleHomeView?: () => void;
   /** Ctrl+Tab (all platforms): switch to the next project tab */
   onNextProject?: () => void;
   /** Ctrl+Shift+Tab (all platforms): switch to the previous project tab */
@@ -44,6 +46,7 @@ function isMac(): boolean {
  *
  * Shortcuts:
  * - Alt+1-4: Toggle the left sidebar on tab N (General/History/Infra/Settings)
+ * - Cmd/Ctrl+1: Toggle the Home decision queue
  * - Cmd/Ctrl+2: Toggle the git panel
  * - Cmd/Ctrl+3-6: Toggle the Memory/Processes/Notes/AI panels
  * - Cmd/Ctrl+T: Add a new terminal (project picker in eagle view)
@@ -59,6 +62,7 @@ export function useAppKeyboard({
   onToggleUtilityPanel,
   onToggleEagleView,
   onToggleLandscapeView,
+  onToggleHomeView,
   onNextProject,
   onPrevProject,
 }: UseAppKeyboardOptions): void {
@@ -108,6 +112,15 @@ export function useAppKeyboard({
       // Don't interfere with other modifier combinations
       if (event.altKey || event.shiftKey) return;
 
+      // Cmd/Ctrl+1: toggle the Home decision queue — digit 1 because Home is
+      // the first thing in the day, and 2-6 are already panels.
+      if ((event.code === "Digit1" || event.code === "Numpad1") && onToggleHomeView) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        onToggleHomeView();
+        return;
+      }
+
       // Cmd/Ctrl+2: toggle the git panel.
       // Use event.code so this still triggers on layouts where Ctrl+2 produces a non-"2" event.key.
       if ((event.code === "Digit2" || event.code === "Numpad2") && onToggleGitPanel) {
@@ -156,6 +169,7 @@ export function useAppKeyboard({
     onToggleUtilityPanel,
     onToggleEagleView,
     onToggleLandscapeView,
+    onToggleHomeView,
     onNextProject,
     onPrevProject,
   ]);

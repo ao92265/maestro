@@ -1255,6 +1255,8 @@ pub fn run() {
             commands::claudemd::list_context_docs,
             commands::claudemd::read_context_doc,
             commands::claudemd::write_context_doc,
+            // Claude handoff files (Home view's parked-session triage)
+            commands::handoffs::get_handoffs,
             // Claude auto-memory commands
             commands::memory::list_memory_projects,
             commands::memory::list_memory_files,
