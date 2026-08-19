@@ -85,16 +85,18 @@ export function useVanguardSnapshot(): void {
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null;
     // The session store ticks on every status/output update, so without this
-    // the debounce floor becomes the ceiling: a rebuild + serialize + IPC hop
-    // every 2s for the app's whole life. Only writtenAt would differ in most
-    // of those writes, and the digest script doesn't need a fresher clock
-    // than the data it timestamps.
+    // the debounce floor becomes the ceiling: a serialize + IPC hop every 2s
+    // for the app's whole life. writtenAt and the sources timestamps are
+    // excluded from the comparison: the digest script reads neither sources
+    // nor a fresher clock than the data it timestamps, so only band content
+    // should trigger a write. buildSnapshot itself still runs on every
+    // debounced tick; accepted, it is sub-ms at real handoff counts.
     let lastWritten: string | null = null;
     const write = () => {
       timer = null;
       const snapshot = buildSnapshot();
       const comparable = JSON.stringify(snapshot, (key, value) =>
-        key === "writtenAt" ? undefined : value,
+        key === "writtenAt" || key === "sources" ? undefined : value,
       );
       if (comparable === lastWritten) return;
       invoke("write_band_snapshot", { snapshot })
