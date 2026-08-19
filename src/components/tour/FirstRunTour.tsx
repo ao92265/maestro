@@ -72,6 +72,10 @@ export function FirstRunTour() {
       if (event.key !== "Tab") return;
       const dialog = dialogRef.current;
       if (!dialog) return;
+      // Queried live on every Tab: the focusable set changes between steps
+      // (Back appears from step 1, Next becomes Done). NOTE: "button" is
+      // accurate for today's markup; a card that ever gains a link or input
+      // must widen this selector or the trap fails open (focus escapes).
       const focusables = dialog.querySelectorAll<HTMLElement>("button");
       if (focusables.length === 0) return;
       const first = focusables[0];
