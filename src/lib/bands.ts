@@ -1,3 +1,4 @@
+import type { ActRun } from "@/lib/act";
 import type { PullRequestInfo } from "@/stores/useGitHubStore";
 import type { BackendSessionStatus, SessionConfig } from "@/stores/useSessionStore";
 
@@ -61,7 +62,8 @@ export type BandItem =
       projectName: string;
     }
   | { kind: "handoff"; handoff: HandoffInfo }
-  | { kind: "pr"; pr: PullRequestInfo; repoPath: string; projectName: string };
+  | { kind: "pr"; pr: PullRequestInfo; repoPath: string; projectName: string }
+  | { kind: "run"; run: ActRun };
 
 export interface Bands {
   blocked: BandItem[];
@@ -78,6 +80,8 @@ interface AssembleInput {
   tabs: BandTab[];
   handoffs: HandoffInfo[];
   repoPrs: RepoPrs[];
+  /** ACT runs stopped at a confidence gate — waiting on the user. */
+  gatedRuns?: ActRun[];
   /** "Since you looked": merged PRs at or before this instant are old news. */
   watermarkMs: number;
 }
@@ -112,6 +116,7 @@ export function assembleBands({
   tabs,
   handoffs,
   repoPrs,
+  gatedRuns = [],
   watermarkMs,
 }: AssembleInput): Bands {
   const counts = Object.fromEntries(ALL_STATUSES.map((s) => [s, 0])) as Record<
@@ -140,6 +145,8 @@ export function assembleBands({
   for (const status of BLOCKED_ORDER) {
     for (const s of sessions.filter((x) => x.status === status)) blocked.push(toSessionItem(s));
   }
+  // ACT runs waiting at a confidence gate: the factory is blocked on a human.
+  for (const run of gatedRuns) blocked.push({ kind: "run", run });
   for (const repo of repoPrs) {
     for (const pr of repo.changesRequested) {
       blocked.push({ kind: "pr", pr, repoPath: repo.repoPath, projectName: repo.projectName });

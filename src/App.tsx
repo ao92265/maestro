@@ -54,6 +54,7 @@ import { useSwipeNavigation } from "./hooks/useSwipeNavigation";
 import { HEALTH_CHECK_INTERVAL_MS } from "./lib/healthRules";
 import { initActivityListener, stopActivityListener } from "./stores/useActivityStore";
 import { initAgentListener, stopAgentListener } from "./stores/useAgentStore";
+import { useFactoryViewStore } from "./stores/useFactoryViewStore";
 import { useGitHubStore } from "./stores/useGitHubStore";
 import {
   useGitHubWatchdogStore,
@@ -94,6 +95,14 @@ const WorkflowsView = lazy(() =>
  */
 const HomeView = lazy(() =>
   import("./components/home/HomeView").then((m) => ({ default: m.HomeView })),
+);
+
+/**
+ * Factory — the ACT lane: hand a spec over, watch runs, unblock gates. Same
+ * lazy overlay shell as the rest.
+ */
+const FactoryView = lazy(() =>
+  import("./components/factory/FactoryView").then((m) => ({ default: m.FactoryView })),
 );
 
 /** Header title for each git-panel tab. */
@@ -164,6 +173,8 @@ function App() {
   // closes the other two and vice versa (see the toggle handlers below).
   const homeViewOpen = useHomeViewStore((s) => s.isOpen);
   const closeHomeView = useHomeViewStore((s) => s.close);
+  const factoryViewOpen = useFactoryViewStore((s) => s.isOpen);
+  const closeFactoryView = useFactoryViewStore((s) => s.close);
   // Marks the landscape button while a terminal anywhere is blocked on you.
   const needsInputAnywhere = useSessionStore((s) =>
     s.sessions.some((session) => session.status === "NeedsInput"),
@@ -705,19 +716,34 @@ function App() {
     [selectTab, closeHomeView],
   );
 
-  // The full-screen overlays are never open together: opening Home closes the
-  // other two, and opening either of them closes Home (effect below).
+  // The full-screen overlays are never open together: opening Home or the
+  // Factory closes every other overlay, and opening the older two closes
+  // both of these (effect below).
   const handleToggleHomeView = useCallback(() => {
     const willOpen = !useHomeViewStore.getState().isOpen;
     if (willOpen) {
       setLandscapeView(false);
       useWorkflowsViewStore.getState().close();
+      useFactoryViewStore.getState().close();
     }
     useHomeViewStore.getState().toggle();
   }, []);
 
+  const handleToggleFactoryView = useCallback(() => {
+    const willOpen = !useFactoryViewStore.getState().isOpen;
+    if (willOpen) {
+      setLandscapeView(false);
+      useWorkflowsViewStore.getState().close();
+      useHomeViewStore.getState().close();
+    }
+    useFactoryViewStore.getState().toggle();
+  }, []);
+
   useEffect(() => {
-    if (landscapeView || workflowsViewOpen) closeHomeView();
+    if (landscapeView || workflowsViewOpen) {
+      closeHomeView();
+      useFactoryViewStore.getState().close();
+    }
   }, [landscapeView, workflowsViewOpen, closeHomeView]);
 
   const handleSelectSidebarTab = useCallback((tab: SidebarTabId) => {
@@ -821,6 +847,7 @@ function App() {
     onToggleEagleView: useCallback(() => setEagleView((v) => !v), []),
     onToggleLandscapeView: useCallback(() => setLandscapeView((v) => !v), []),
     onToggleHomeView: handleToggleHomeView,
+    onToggleFactoryView: handleToggleFactoryView,
     onNextProject: switchToNextTab,
     onPrevProject: switchToPrevTab,
   });
@@ -909,6 +936,8 @@ function App() {
               landscapeAttention={needsInputAnywhere}
               homeViewOpen={homeViewOpen}
               onToggleHomeView={handleToggleHomeView}
+              factoryViewOpen={factoryViewOpen}
+              onToggleFactoryView={handleToggleFactoryView}
               homeAttention={needsInputAnywhere}
               memoryPanelOpen={utilityPanel === "memory"}
               onToggleMemoryPanel={() => handleToggleUtilityPanel("memory")}
@@ -1028,6 +1057,19 @@ function App() {
                   }
                 >
                   <HomeView onNavigate={handleHomeNavigate} onClose={closeHomeView} />
+                </Suspense>
+              )}
+
+              {/* Factory — the ACT lane, same overlay shell. */}
+              {factoryViewOpen && (
+                <Suspense
+                  fallback={
+                    <div className="absolute inset-0 z-50 flex items-center justify-center bg-maestro-bg text-xs text-maestro-muted">
+                      Loading…
+                    </div>
+                  }
+                >
+                  <FactoryView onClose={closeFactoryView} />
                 </Suspense>
               )}
             </main>

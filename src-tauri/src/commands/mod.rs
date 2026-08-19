@@ -1,3 +1,4 @@
+pub mod act;
 pub mod agents;
 pub mod ai_runner;
 pub mod catalog;

@@ -1257,6 +1257,13 @@ pub fn run() {
             commands::claudemd::write_context_doc,
             // Claude handoff files (Home view's parked-session triage)
             commands::handoffs::get_handoffs,
+            // ACT relay (Factory view — CSP blocks direct local HTTP)
+            commands::act::act_list_runs,
+            commands::act::act_get_run,
+            commands::act::act_submit_spec,
+            commands::act::act_cancel_run,
+            commands::act::act_list_gates,
+            commands::act::act_resolve_gate,
             // Claude auto-memory commands
             commands::memory::list_memory_projects,
             commands::memory::list_memory_files,

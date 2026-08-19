@@ -13,8 +13,11 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { badgeBaseClass, SESSION_STATUS_BADGES } from "@/components/session/agentPresentation";
 import { assembleBands, type BandItem, type BandTab, type HandoffInfo } from "@/lib/bands";
+import { useActStore } from "@/stores/useActStore";
 import { useBandStore } from "@/stores/useBandStore";
+import { useFactoryViewStore } from "@/stores/useFactoryViewStore";
 import { useFDAStore } from "@/stores/useFDAStore";
+import { useHomeViewStore } from "@/stores/useHomeViewStore";
 import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
 import type { BackendSessionStatus } from "@/stores/useSessionStore";
 import { useSessionStore } from "@/stores/useSessionStore";
@@ -140,6 +143,32 @@ function PrRow({ item }: { item: BandItem }) {
   );
 }
 
+/** An ACT run stopped at a confidence gate; clicking opens it in the Factory. */
+function RunRow({ item }: { item: BandItem }) {
+  if (item.kind !== "run") return null;
+  const { run } = item;
+  return (
+    <button
+      type="button"
+      className={rowClass}
+      onClick={() => {
+        void useActStore.getState().openDetail(run.id);
+        useHomeViewStore.getState().close();
+        useFactoryViewStore.getState().open();
+      }}
+      title="Open this run in the Factory to approve or reject the gate"
+    >
+      <span className={`${badgeBaseClass} bg-maestro-accent/15 text-maestro-accent`}>
+        FACTORY GATE
+      </span>
+      <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-maestro-text">
+        {run.title}
+      </span>
+      {run.stage && <span className="shrink-0 text-[10px] text-maestro-muted">{run.stage}</span>}
+    </button>
+  );
+}
+
 function HandoffRow({ item, onLaunch }: { item: BandItem; onLaunch: (h: HandoffInfo) => void }) {
   if (item.kind !== "handoff") return null;
   const h = item.handoff;
@@ -244,6 +273,7 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
     markSeen,
   } = useBandStore();
   const requireAccess = useFDAStore((s) => s.requireAccess);
+  const gatedRuns = useActStore(useShallow((s) => s.gatedRuns));
   const [statusFilter, setStatusFilter] = useState<BackendSessionStatus | null>(null);
 
   const bandTabs: BandTab[] = useMemo(
@@ -267,14 +297,19 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
   );
   // biome-ignore lint/correctness/useExhaustiveDependencies: repoKey is not read in the body but is the intended trigger — refresh() reads the live tab list from the workspace store, and this effect must re-fire (fetch now, restart the timer) exactly when the set of repos changes, not on every tab-object rebuild.
   useEffect(() => {
-    void refresh();
-    const timer = setInterval(() => void refresh(), REFRESH_INTERVAL_MS);
+    const tick = () => {
+      void refresh();
+      // ACT piggybacks on the same cadence; its failures are its own state.
+      void useActStore.getState().refresh();
+    };
+    tick();
+    const timer = setInterval(tick, REFRESH_INTERVAL_MS);
     return () => clearInterval(timer);
   }, [refresh, repoKey]);
 
   const bands = useMemo(
-    () => assembleBands({ sessions, tabs: bandTabs, handoffs, repoPrs, watermarkMs }),
-    [sessions, bandTabs, handoffs, repoPrs, watermarkMs],
+    () => assembleBands({ sessions, tabs: bandTabs, handoffs, repoPrs, gatedRuns, watermarkMs }),
+    [sessions, bandTabs, handoffs, repoPrs, gatedRuns, watermarkMs],
   );
 
   /** The strip filter narrows session rows; other rows stay (they have no status). */
@@ -411,6 +446,8 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
                 <SessionRow key={`s${item.session.id}`} item={item} onNavigate={onNavigate} />
               ) : item.kind === "pr" ? (
                 <PrRow key={`p${item.pr.url}`} item={item} />
+              ) : item.kind === "run" ? (
+                <RunRow key={`r${item.run.id}`} item={item} />
               ) : (
                 <HandoffRow
                   key={`h${item.handoff.slug}-${i}`}

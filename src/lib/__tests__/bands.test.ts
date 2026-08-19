@@ -186,6 +186,40 @@ describe("assembleBands", () => {
     expect(bands.moreHandoffs).toBe(5);
   });
 
+  it("puts confidence-gated ACT runs in blocked, after sessions, before PRs", () => {
+    const gated = [
+      {
+        id: "run-1",
+        title: "Build the widget",
+        status: "running",
+        stage: "verify",
+        stages: [],
+        createdAt: null,
+        updatedAt: null,
+        repoUrl: null,
+        error: null,
+      },
+    ];
+    const bands = assembleBands({
+      sessions: [session(1, "NeedsInput")],
+      tabs: TABS,
+      handoffs: [handoff("h1")],
+      repoPrs: [
+        {
+          repoPath: "/repo/a",
+          projectName: "repo-a",
+          changesRequested: [pr(10, { reviewDecision: "CHANGES_REQUESTED" })],
+          merged: [],
+        },
+      ],
+      gatedRuns: gated,
+      watermarkMs: 0,
+    });
+    expect(bands.blocked.map((i) => i.kind)).toEqual(["session", "run", "pr", "handoff"]);
+    const runItem = bands.blocked[1];
+    expect(runItem.kind === "run" && runItem.run.id).toBe("run-1");
+  });
+
   it("orders blocked: needs-input, then errors, then PRs, then handoffs", () => {
     const bands = assembleBands({
       sessions: [session(2, "Error"), session(1, "NeedsInput")],
