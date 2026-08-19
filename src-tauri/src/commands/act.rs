@@ -113,6 +113,10 @@ fn base_url() -> String {
 /// `ACT_DASHBOARD_TOKEN` is set (its dashboard-auth middleware; GETs stay
 /// open). Attach it to every mutating relay call so those calls keep working
 /// the day the token is configured, instead of failing with an invisible 401.
+///
+/// Reads the Tauri process env: a token exported only in .zshrc is invisible
+/// to a packaged app launched from Finder. Launch from a shell or set it via
+/// launchd if the token is ever required.
 fn with_act_token(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     match std::env::var("ACT_DASHBOARD_TOKEN") {
         Ok(token) if !token.is_empty() => request.header("x-act-token", token),

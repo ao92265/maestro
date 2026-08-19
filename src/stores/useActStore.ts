@@ -20,7 +20,11 @@ import {
  * unreachable ACT is a NORMAL state — the factory is simply off.
  */
 
-/** How many non-terminal runs get a detail probe per poll (gate detection). */
+/**
+ * How many non-terminal runs get a detail probe per poll (gate detection).
+ * A gated run at position 11+ is missed until earlier runs finish; accepted
+ * trade-off to keep the poll cheap.
+ */
 const GATE_PROBE_LIMIT = 10;
 
 /** A successful fetch older than this reads as stale in the UI. */
@@ -146,7 +150,10 @@ export const useActStore = create<ActState>((set, get) => ({
     try {
       await invoke<number>("act_cancel_run", { runId });
     } catch (err) {
+      // Return early: openDetail's success path resets detailError, which
+      // would wipe this message one frame after we set it.
       set({ detailError: String(err) });
+      return;
     }
     void get().refresh();
     if (get().detail?.id === runId) void get().openDetail(runId);
@@ -159,7 +166,10 @@ export const useActStore = create<ActState>((set, get) => ({
         status: approve ? "pending" : "archived",
       });
     } catch (err) {
+      // Return early: openDetail's success path resets detailError, which
+      // would wipe this message one frame after we set it.
       set({ detailError: String(err) });
+      return;
     }
     const open = get().detail;
     if (open) void get().openDetail(open.id);
@@ -170,7 +180,10 @@ export const useActStore = create<ActState>((set, get) => ({
     try {
       await invoke<number>("act_resolve_gate", { gateId, decision, input: input ?? null });
     } catch (err) {
+      // Return early: openDetail's success path resets detailError, which
+      // would wipe this message one frame after we set it.
       set({ detailError: String(err) });
+      return;
     }
     const open = get().detail;
     if (open) void get().openDetail(open.id);
