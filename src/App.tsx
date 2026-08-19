@@ -48,6 +48,7 @@ import {
   sidebarTabShortcutTransition,
 } from "./components/sidebar/Sidebar";
 import { MAX_SESSIONS } from "./components/terminal/splitTree";
+import { FirstRunTour } from "./components/tour/FirstRunTour";
 import { UpdateNotification } from "./components/update/UpdateNotification";
 import { useAppKeyboard } from "./hooks/useAppKeyboard";
 import { useBandPolling } from "./hooks/useBandPolling";
@@ -1079,6 +1080,11 @@ function App() {
                   <FactoryView onClose={closeFactoryView} />
                 </Suspense>
               )}
+
+              {/* First-run tour — sits above the full-screen overlays (z-60
+                  over their z-50) so it reads on top of the Home landing
+                  surface it introduces. */}
+              <FirstRunTour />
             </main>
 
             {/* Memory / Processes utility panel (optional right side) */}
