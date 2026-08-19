@@ -31,8 +31,13 @@ const PR_LIMIT = 20;
  * First run has no watermark. Starting it at "now" means band 2 begins empty
  * and fills with merges that happen from here on — not with the last 20
  * merged PRs per repo regardless of age (review fc0e6b9, MEDIUM #5).
+ *
+ * Deliberately a writer despite running at store init: the first-ever launch
+ * IS the first "look", and persisting it immediately keeps the semantics
+ * stable across restarts (an unpersisted default would re-zero the band's
+ * meaning of "news" on every app start).
  */
-function loadWatermark(): number {
+function initWatermark(): number {
   const raw = localStorage.getItem(WATERMARK_KEY);
   const parsed = raw ? Number(raw) : NaN;
   if (Number.isFinite(parsed)) return parsed;
@@ -44,6 +49,9 @@ function loadWatermark(): number {
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+/** One queued re-run for a refresh that arrived while another was in flight. */
+let pendingRefresh = false;
 
 function bandTabsFromWorkspace(): BandTab[] {
   return useWorkspaceStore.getState().tabs.map((t) => ({
@@ -80,10 +88,16 @@ export const useBandStore = create<BandDataState>((set, get) => ({
   handoffsError: null,
   prsError: null,
   isRefreshing: false,
-  watermarkMs: loadWatermark(),
+  watermarkMs: initWatermark(),
 
   refresh: async () => {
-    if (get().isRefreshing) return;
+    /* A refresh requested mid-poll is queued, not dropped: opening project B
+       while A's multi-repo poll is in flight must not leave B's PRs missing
+       until the next 5-minute tick (re-review of 5fbaccc, LOW #1). */
+    if (get().isRefreshing) {
+      pendingRefresh = true;
+      return;
+    }
     set({ isRefreshing: true });
 
     try {
@@ -151,6 +165,10 @@ export const useBandStore = create<BandDataState>((set, get) => ({
       });
     } finally {
       set({ isRefreshing: false });
+      if (pendingRefresh) {
+        pendingRefresh = false;
+        void get().refresh();
+      }
     }
   },
 

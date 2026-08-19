@@ -425,7 +425,17 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
             icon={<CheckCircle2 size={12} className="text-maestro-green" />}
             items={filtered(bands.landed)}
             emptyText="Nothing new has landed."
-            stale={prsError}
+            /* A partially failed poll must not read as "nothing landed" —
+               that is silent under-reporting on a decision queue. */
+            stale={
+              prsError ??
+              (repoPrs.some((r) => r.error)
+                ? `Could not poll: ${repoPrs
+                    .filter((r) => r.error)
+                    .map((r) => r.projectName)
+                    .join(", ")}`
+                : null)
+            }
             action={
               <button
                 type="button"
