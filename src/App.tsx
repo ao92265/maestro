@@ -48,6 +48,7 @@ import {
   sidebarTabShortcutTransition,
 } from "./components/sidebar/Sidebar";
 import { MAX_SESSIONS } from "./components/terminal/splitTree";
+import { FirstRunTour } from "./components/tour/FirstRunTour";
 import { UpdateNotification } from "./components/update/UpdateNotification";
 import { useAppKeyboard } from "./hooks/useAppKeyboard";
 import { useBandPolling } from "./hooks/useBandPolling";
@@ -1161,6 +1162,11 @@ function App() {
 
       <UpdateNotification />
       <NotificationToasts />
+
+      {/* First-run tour — at the root, not inside <main>, so its backdrop
+          dims the whole window (TopBar and sidebar included) and the dialog
+          is as modal as it claims to be. */}
+      <FirstRunTour />
     </div>
   );
 }

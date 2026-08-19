@@ -4,6 +4,7 @@ import {
   CircleDot,
   GitMerge,
   GitPullRequest,
+  HelpCircle,
   Inbox,
   Play,
   RefreshCw,
@@ -21,6 +22,7 @@ import { useHomeViewStore } from "@/stores/useHomeViewStore";
 import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
 import type { BackendSessionStatus } from "@/stores/useSessionStore";
 import { useSessionStore } from "@/stores/useSessionStore";
+import { useTourStore } from "@/stores/useTourStore";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 
 interface HomeViewProps {
@@ -387,6 +389,15 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
         })}
 
         <div className="flex-1" />
+        <button
+          type="button"
+          onClick={() => useTourStore.getState().open()}
+          className="rounded p-1.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text"
+          aria-label="Show tour"
+          title="Show the app tour"
+        >
+          <HelpCircle size={13} />
+        </button>
         <button
           type="button"
           onClick={() => void refresh()}
