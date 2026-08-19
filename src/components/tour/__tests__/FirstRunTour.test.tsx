@@ -84,6 +84,43 @@ describe("FirstRunTour", () => {
     expect(useTourStore.getState().step).toBe(TOUR_STEPS.length - 1);
   });
 
+  it("keeps Tab cycling inside the dialog", () => {
+    render(<FirstRunTour />);
+    const skip = screen.getByLabelText("Skip tour");
+    const next = screen.getByText("Next");
+
+    // Forward from the last button wraps to the first.
+    next.focus();
+    fireEvent.keyDown(window, { key: "Tab" });
+    expect(document.activeElement).toBe(skip);
+
+    // Backward from the first button wraps to the last.
+    fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(next);
+
+    // Focus that escaped behind the backdrop gets pulled back in.
+    (document.activeElement as HTMLElement).blur();
+    fireEvent.keyDown(window, { key: "Tab" });
+    expect(document.activeElement).toBe(skip);
+  });
+
+  it("hands focus back to the opener on close", () => {
+    const opener = document.createElement("button");
+    document.body.appendChild(opener);
+    opener.focus();
+    useTourStore.setState({ isOpen: false });
+
+    const { unmount } = render(<FirstRunTour />);
+    act(() => useTourStore.getState().open());
+    expect(document.activeElement).not.toBe(opener);
+
+    act(() => useTourStore.getState().close());
+    expect(document.activeElement).toBe(opener);
+
+    unmount();
+    opener.remove();
+  });
+
   it("keeps the store's step count in sync with the cards", () => {
     // The clamp lives in the store, the cards in the component; this is the
     // tripwire for whoever adds a card without bumping the count.

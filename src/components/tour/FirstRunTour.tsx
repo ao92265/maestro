@@ -55,16 +55,45 @@ export function FirstRunTour() {
   const dialogRef = useRef<HTMLDivElement>(null);
 
   // Focus the dialog when it appears (Tab starts inside it, screen readers
-  // announce it) and let Escape dismiss — the dialog opens unprompted on
-  // first launch, so it needs a keyboard-only way out.
+  // announce it), keep Tab cycling inside it (everything behind the backdrop
+  // is focusable but invisible), let Escape dismiss, and hand focus back to
+  // whatever had it on close — the dialog opens unprompted on first launch,
+  // so the whole keyboard story has to work without a mouse.
   useEffect(() => {
     if (!isOpen) return;
+    const previouslyFocused =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
     dialogRef.current?.focus();
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") close();
+      if (event.key === "Escape") {
+        close();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const dialog = dialogRef.current;
+      if (!dialog) return;
+      const focusables = dialog.querySelectorAll<HTMLElement>("button");
+      if (focusables.length === 0) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey && (active === first || active === dialog)) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && active === last) {
+        event.preventDefault();
+        first.focus();
+      } else if (!dialog.contains(active)) {
+        // Focus escaped anyway (or never entered): pull it back in.
+        event.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      previouslyFocused?.focus();
+    };
   }, [isOpen, close]);
 
   if (!isOpen) return null;
