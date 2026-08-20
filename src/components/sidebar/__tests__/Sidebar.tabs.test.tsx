@@ -34,7 +34,7 @@ import {
 const invokeMock = vi.mocked(invoke);
 
 /**
- * The active tab is lifted to App (so Alt+1-4 shortcuts can drive it); this
+ * The active tab is lifted to App (so Alt+1-3 shortcuts can drive it); this
  * harness recreates App's side of the contract: state + persistence.
  */
 function ControlledSidebar(
@@ -226,17 +226,26 @@ describe("Sidebar tab bar", () => {
     expect(screen.getByText(/^parked/)).toBeInTheDocument();
   });
 
-  // Infra has no strip button any more — it is reached via the TopBar's
-  // More menu ("Extensions"), which drives activeTab the same way Alt+1-4
-  // used to. Sidebar itself just has to keep rendering the content when
-  // told to, so this drives activeTab directly instead of clicking a tab.
-  it("renders Infra content (MCP + skills + project context) when activeTab is set to it", () => {
+  // Infra has no permanent strip slot — it is reached via the TopBar's More
+  // menu ("Extensions"), which drives activeTab directly. SidebarTabBar
+  // still shows a transient "Extensions" pill for as long as infra stays
+  // active, so the state isn't invisible; this drives activeTab directly
+  // instead of clicking a tab, mirroring how the More menu enters it.
+  it("renders Infra content and a transient Extensions pill when activeTab is set to it", () => {
     render(<Sidebar activeTab="infra" onSelectTab={() => {}} />);
     expect(screen.getByText("MCP Servers")).toBeInTheDocument();
     expect(screen.getByText("Plugins & Skills")).toBeInTheDocument();
     expect(screen.getByText("Project Context")).toBeInTheDocument();
     expect(screen.queryByText("Agents")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Infra" })).not.toBeInTheDocument();
+    // The transient 4th pill — present only while infra is active, so the
+    // strip never sits with nothing lit.
+    expect(screen.getByRole("button", { name: "Extensions" })).toBeInTheDocument();
+  });
+
+  it("does not show the transient Extensions pill on any other tab", () => {
+    render(<ControlledSidebar />);
+    expect(screen.queryByRole("button", { name: "Extensions" })).not.toBeInTheDocument();
   });
 
   it("switches to Settings and persists the chosen tab", async () => {

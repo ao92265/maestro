@@ -21,6 +21,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { MAX_SESSIONS } from "@/components/terminal/splitTree";
 import { isMac } from "@/lib/platform";
 import { modLabel, titleWithShortcut } from "@/lib/shortcuts";
+import { countForArea, useHealthStore } from "@/stores/useHealthStore";
 import { GitHubWatchdogBadge } from "./GitHubWatchdogBadge";
 import { HealthAttentionBadge } from "./HealthAttentionBadge";
 
@@ -122,6 +123,11 @@ export function TopBar({
   onOpenWorkflows,
 }: TopBarProps) {
   const appWindow = useMemo(() => getCurrentWindow(), []);
+
+  // Memory's health flags lost their button when Memory moved into the More
+  // menu; this feeds the aggregated dot on the More button below (the
+  // per-item badge inside the menu still uses HealthAttentionBadge directly).
+  const memoryHealthCount = useHealthStore((s) => countForArea(s.flags, "memory"));
 
   // Eagle view add-terminal dropdown (pick which project gets the new terminal)
   const [addMenuOpen, setAddMenuOpen] = useState(false);
@@ -377,7 +383,7 @@ export function TopBar({
               title="More — Landscape, Memory, Workflows, Extensions"
             >
               <MoreHorizontal size={14} />
-              {landscapeAttention && !landscapeView && (
+              {((landscapeAttention && !landscapeView) || memoryHealthCount > 0) && (
                 <span
                   aria-hidden="true"
                   className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-maestro-accent"
@@ -406,10 +412,11 @@ export function TopBar({
                       setMoreMenuOpen(false);
                       onToggleMemoryPanel();
                     }}
-                    className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-maestro-text transition-colors hover:bg-maestro-card"
+                    className="relative flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-maestro-text transition-colors hover:bg-maestro-card"
                   >
                     <Brain size={13} className="shrink-0 text-maestro-muted" />
                     Memory
+                    <HealthAttentionBadge area="memory" />
                   </button>
                 )}
                 {onOpenWorkflows && (

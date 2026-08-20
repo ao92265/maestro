@@ -63,7 +63,7 @@ import { cardClass, divider, SectionHeader } from "./sectionChrome";
 interface SidebarProps {
   collapsed?: boolean;
   onCollapse?: () => void;
-  /** Active sidebar tab — lifted to App so Alt+1-4 shortcuts can drive it. */
+  /** Active sidebar tab — lifted to App so Alt+1-3 shortcuts can drive it. */
   activeTab: SidebarTabId;
   /** Select a sidebar tab (App persists the choice). */
   onSelectTab: (tab: SidebarTabId) => void;
@@ -259,7 +259,8 @@ export type SidebarTabId = "general" | "history" | "infra" | "settings";
 // "infra" stays a valid SidebarTabId and ConfigTab still renders its content
 // (MCP servers, plugins, skills) — it just no longer has its own strip
 // button. The TopBar More menu's "Extensions" item sets activeTab to it
-// directly, same as this array drove Alt+1-4 before the strip shrank.
+// directly instead; SidebarTabBar below renders a transient pill for it
+// while it's active, since it isn't in this array.
 export const SIDEBAR_TABS: { id: SidebarTabId; label: string; icon: React.ElementType }[] = [
   { id: "general", label: "General", icon: Home },
   { id: "history", label: "History", icon: History },
@@ -278,7 +279,7 @@ export function saveSidebarTab(tab: SidebarTabId): void {
 }
 
 /**
- * State transition for the Alt+1-4 sidebar shortcuts: closed → open on that
+ * State transition for the Alt+1-3 sidebar shortcuts: closed → open on that
  * tab; open on that tab already → close; open on another tab → switch.
  * Returns null when the index doesn't name a tab.
  */
@@ -301,17 +302,30 @@ function SidebarTabBar({
   active: SidebarTabId;
   onSelect: (tab: SidebarTabId) => void;
 }) {
+  // Extensions (infra) has no strip slot of its own — it's reached via the
+  // TopBar's More menu — but while it IS the active tab the strip must
+  // still show something lit, or the sidebar looks stateless with every
+  // pill unhighlighted. Render it as a transient 4th pill only for as long
+  // as it stays active; picking any of the three real tabs drops it again.
+  const tabs =
+    active === "infra"
+      ? [...SIDEBAR_TABS, { id: "infra" as const, label: "Extensions", icon: Package }]
+      : SIDEBAR_TABS;
   return (
     // Equal-width columns (auto-cols-fr): every tab gets the same width
     // regardless of its label, sized by the available space, with a small
     // gap between tab names.
     <div className="grid shrink-0 auto-cols-fr grid-flow-col gap-1 border-b border-maestro-border/60 px-1">
-      {SIDEBAR_TABS.map(({ id, label, icon: Icon }, index) => (
+      {tabs.map(({ id, label, icon: Icon }, index) => (
         <button
           key={id}
           type="button"
           onClick={() => onSelect(id)}
-          title={titleWithShortcut(label, altLabel(), String(index + 1))}
+          title={
+            id === "infra"
+              ? "Extensions — MCP servers, plugins, skills (opened from the More menu)"
+              : titleWithShortcut(label, altLabel(), String(index + 1))
+          }
           className={`flex min-w-0 flex-col items-center gap-0.5 border-b-2 px-0.5 py-1.5 text-[9px] font-semibold uppercase tracking-wide transition-colors ${
             active === id
               ? "border-maestro-accent text-maestro-accent"

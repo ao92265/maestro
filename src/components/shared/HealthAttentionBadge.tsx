@@ -2,11 +2,14 @@ import type { HealthArea } from "@/lib/healthRules";
 import { countForArea, useHealthStore } from "@/stores/useHealthStore";
 
 /**
- * Small count badge pinned to the corner of the top-bar Memory / Processes
- * buttons when the health checker has something worth a look. Renders nothing
- * when the area is clean, so a healthy setup stays visually silent.
+ * Small count badge pinned to the corner of its parent when the health
+ * checker has something worth a look. Sits directly on the top-bar
+ * Processes button; Memory moved into the TopBar's More menu, so its badge
+ * now sits on that dropdown row instead (the More button itself only gets
+ * a plain aggregated dot, not this count). Renders nothing when the area is
+ * clean, so a healthy setup stays visually silent.
  *
- * The parent button must be `relative` for the absolute positioning to bite.
+ * The parent element must be `relative` for the absolute positioning to bite.
  */
 export function HealthAttentionBadge({ area }: { area: HealthArea }) {
   const flags = useHealthStore((s) => s.flags);
