@@ -136,6 +136,33 @@ describe("inferActColumn", () => {
   it("matches case-insensitively", () => {
     expect(inferActColumn("PLAN")).toBe("planning");
   });
+
+  // Realistic stage names, hardcoded on purpose: this table must NOT import
+  // ACT_STAGE_KEYWORDS, so an edit that breaks the keyword map fails here
+  // instead of auto-passing (review finding #2 on commit 024c112).
+  it.each([
+    ["implementation", "building"],
+    ["code-review", "review"],
+    ["qa-verify", "checking"],
+    ["unit-tests", "checking"],
+    ["pr-merge", "review"],
+    ["PR", "review"],
+    ["architect-spec", "planning"],
+  ] as [string, BoardColumnKey][])("realistic stage %s -> %s", (stage, expected) => {
+    expect(inferActColumn(stage)).toBe(expected);
+  });
+
+  // Two-letter keywords ("pr", "qa") must match whole tokens only: a stage
+  // merely containing the letters inside a word is not that stage, and the
+  // honest answer is the Building fallback with the raw text on the card.
+  it.each([
+    ["prepare"],
+    ["preflight"],
+    ["process"],
+    ["quality"],
+  ])("within-word hit %s stays in the building fallback", (stage) => {
+    expect(inferActColumn(stage)).toBe("building");
+  });
 });
 
 describe("needsYou", () => {
@@ -430,6 +457,42 @@ describe("assembleBoard", () => {
     const reviewReq = columns.review.find((c) => c.kind === "pr" && c.pr.number === 20);
     expect(changesReq?.needsYou).toBe(true);
     expect(reviewReq?.needsYou).toBe(false);
+  });
+
+  it("renders one Review card when the same PR is both changes-requested and review-requested", () => {
+    // Both polls can surface the same PR (changesRequested is not
+    // author-filtered; the watchdog lists review-requested:@me). One PR,
+    // one card, and the needs-you version wins (review finding #1).
+    const repoPrs: RepoPrs[] = [
+      {
+        repoPath: "/tmp/proj-a",
+        projectName: "proj-a",
+        changesRequested: [pr(10, { reviewDecision: "CHANGES_REQUESTED" })],
+        merged: [],
+      },
+    ];
+    const reviewRequests: BoardReviewRequests[] = [
+      { repoPath: "/tmp/proj-a", projectName: "proj-a", reviewRequests: [pr(10)] },
+    ];
+    const columns = assembleBoard({ ...EMPTY, repoPrs, reviewRequests });
+    expect(columns.review.length).toBe(1);
+    expect(columns.review[0]?.needsYou).toBe(true);
+  });
+
+  it("keeps a same-numbered PR from a different repo as its own Review card", () => {
+    const repoPrs: RepoPrs[] = [
+      {
+        repoPath: "/tmp/proj-a",
+        projectName: "proj-a",
+        changesRequested: [pr(10, { reviewDecision: "CHANGES_REQUESTED" })],
+        merged: [],
+      },
+    ];
+    const reviewRequests: BoardReviewRequests[] = [
+      { repoPath: "/tmp/proj-b", projectName: "proj-b", reviewRequests: [pr(10)] },
+    ];
+    const columns = assembleBoard({ ...EMPTY, repoPrs, reviewRequests });
+    expect(columns.review.length).toBe(2);
   });
 
   it("puts merged PRs in Done only once they cross the watermark", () => {

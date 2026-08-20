@@ -10,7 +10,7 @@ import type { PullRequestInfo } from "@/stores/useGitHubStore";
 import type { BackendSessionStatus, SessionConfig } from "@/stores/useSessionStore";
 
 /**
- * Pure assembly of the Board view's columns — the kanban read of the same
+ * Pure assembly of the Board view's columns: the kanban read of the same
  * live state the Home bands read (`bands.ts`). Board answers a different
  * question than bands: not "what needs you first" but "what stage is each
  * piece of work in, honestly." Everything here is a pure function of
@@ -18,14 +18,14 @@ import type { BackendSessionStatus, SessionConfig } from "@/stores/useSessionSto
  * routing rules are unit-testable (`__tests__/board.test.ts`).
  *
  * Column contract: see the plan's "Column model (the kanban contract)"
- * table. A fallback must always show the truth — an unmapped ACT stage
+ * table. A fallback must always show the truth: an unmapped ACT stage
  * lands in Building carrying its own raw stage text, never a fabricated
  * label.
  */
 
 export type BoardColumnKey = "suggested" | "planning" | "building" | "checking" | "review" | "done";
 
-/** Display order, left to right — the spec's column list. */
+/** Display order, left to right: the spec's column list. */
 export const BOARD_COLUMN_ORDER: BoardColumnKey[] = [
   "suggested",
   "planning",
@@ -106,7 +106,7 @@ interface AssembleBoardInput {
   repoPrs: RepoPrs[];
   /** Every ACT run the factory currently knows about (not just gated ones). */
   runs: ActRun[];
-  /** ACT runs stopped at a confidence gate — waiting on the user. */
+  /** ACT runs stopped at a confidence gate: waiting on the user. */
   gatedRuns?: ActRun[];
   /** Watchdog "review requested" PRs, per repo. */
   reviewRequests?: BoardReviewRequests[];
@@ -151,9 +151,11 @@ export function inferSessionColumn(status: BackendSessionStatus): BoardColumnKey
 /**
  * ACT stage-name keyword table, as data (spec risk #2's "start coarse"
  * instruction made concrete). First matching bucket wins; order is
- * significant for stage names that could match more than one row — accepted
- * spec risk, not fixed here. Keywords are lowercase substrings matched
- * against the lowercased stage name.
+ * significant for stage names that could match more than one row (accepted
+ * spec risk, not fixed here). Keywords of three letters or more are lowercase
+ * substrings matched against the lowercased stage name; two-letter keywords
+ * ("pr", "qa") match whole tokens only, so "prepare" or "process" does not
+ * land in Review just for containing the letters.
  */
 export const ACT_STAGE_KEYWORDS: ReadonlyArray<{ column: BoardColumnKey; keywords: string[] }> = [
   { column: "planning", keywords: ["plan", "spec", "architect"] },
@@ -164,21 +166,23 @@ export const ACT_STAGE_KEYWORDS: ReadonlyArray<{ column: BoardColumnKey; keyword
 
 /**
  * Maps a raw ACT stage name to a board column. A null or unrecognized stage
- * falls back to Building — the fallback must show the truth (the raw stage
+ * falls back to Building: the fallback must show the truth (the raw stage
  * text stays on the card via `stageLabel`), never fake a stage.
  */
 export function inferActColumn(stage: string | null): BoardColumnKey {
   if (!stage) return "building";
   const lower = stage.toLowerCase();
+  const tokens = lower.split(/[^a-z0-9]+/).filter(Boolean);
   for (const { column, keywords } of ACT_STAGE_KEYWORDS) {
-    if (keywords.some((k) => lower.includes(k))) return column;
+    const hit = keywords.some((k) => (k.length <= 2 ? tokens.includes(k) : lower.includes(k)));
+    if (hit) return column;
   }
   return "building";
 }
 
 /**
  * "Needs you" flag predicate, one rule per card kind (spec's needs-you
- * column notes). Handoffs never need you — they are suggestions, not
+ * column notes). Handoffs never need you: they are suggestions, not
  * blockers, until a session picks one up.
  */
 export function needsYou(
@@ -260,7 +264,7 @@ export function assembleBoard({
 
   /* Suggested -> handoffs on disk. Dedupe/cap mirrors bands.ts exactly; a
      handoff covered by a live session (or, per activeDirs, an externally
-     running claude) is not "on disk waiting" — the running work IS it. */
+     running claude) is not "on disk waiting": the running work IS it. */
   const liveDirs = new Set(sessions.map(sessionDir));
   const sortedHandoffs = handoffs
     .filter(
@@ -290,7 +294,7 @@ export function assembleBoard({
 
   /* ACT runs -> stage-keyword column, or Done once terminal-success crosses
      the watermark. Terminal non-success runs (failed/cancelled) and
-     terminal-success runs older than the watermark get no card — the same
+     terminal-success runs older than the watermark get no card: the same
      "old news" treatment merged PRs get below. */
   const gatedIds = new Set(gatedRuns.map((r) => r.id));
   for (const run of runs) {
@@ -323,9 +327,13 @@ export function assembleBoard({
   }
 
   /* Review -> PRs with changes requested (needs-you) or a review requested
-     of the user (watchdog, no flag — a request is not yet a block). */
+     of the user (watchdog, no flag: a request is not yet a block). The two
+     polls can surface the same PR (changesRequested is not author-filtered),
+     so changes-requested wins and the watchdog copy is skipped by key. */
+  const reviewCardKeys = new Set<string>();
   for (const repo of repoPrs) {
     for (const pr of repo.changesRequested) {
+      reviewCardKeys.add(`${repo.repoPath}#${pr.number}`);
       columns.review.push({
         kind: "pr",
         pr,
@@ -355,6 +363,7 @@ export function assembleBoard({
   }
   for (const w of reviewRequests) {
     for (const pr of w.reviewRequests) {
+      if (reviewCardKeys.has(`${w.repoPath}#${pr.number}`)) continue;
       columns.review.push({
         kind: "pr",
         pr,
