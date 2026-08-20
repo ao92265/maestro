@@ -144,7 +144,7 @@ function App() {
   const retryAfterFDAGrant = useFDAStore((s) => s.retryAfterGrant);
   const multiProjectRef = useRef<MultiProjectViewHandle>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  // Active left-sidebar tab — lifted out of Sidebar so Alt+1-4 can drive it.
+  // Active left-sidebar tab — lifted out of Sidebar so Alt+1-3 can drive it.
   const [sidebarTab, setSidebarTab] = useState<SidebarTabId>(loadSavedSidebarTab);
   const [gitPanelOpen, setGitPanelOpen] = useState(false);
   // Git-panel tab (commits/branches/…) is deliberately a single app-level
@@ -756,10 +756,31 @@ function App() {
 
   const handleSelectSidebarTab = useCallback((tab: SidebarTabId) => {
     setSidebarTab(tab);
-    saveSidebarTab(tab);
+    // Extensions (infra) has no strip slot of its own — it's a transient
+    // surface reached via the TopBar's More menu (or the transient pill
+    // that appears while it's active), and "infra" no longer validates in
+    // loadSavedSidebarTab. Persisting it would silently reset to General on
+    // the next launch, so skip the write for it and keep it for real tabs.
+    if (tab !== "infra") saveSidebarTab(tab);
   }, []);
 
-  // Alt+1-4: open the sidebar on tab N; pressing the active tab's shortcut
+  // TopBar's More menu → Extensions: the Infra tab (MCP servers, plugins,
+  // skills) no longer has its own strip button, but its content still
+  // renders when selected — this is the fallback route to it.
+  const handleOpenExtensions = useCallback(() => {
+    setSidebarOpen(true);
+    handleSelectSidebarTab("infra");
+  }, [handleSelectSidebarTab]);
+
+  // TopBar's More menu → Workflows: the full-screen workflow editor is a
+  // standalone store-driven overlay (see useWorkflowsViewStore) — its only
+  // trigger used to be a button inside the now-cut Launch panel, but the
+  // overlay itself never depended on that panel being open.
+  const handleOpenWorkflows = useCallback(() => {
+    useWorkflowsViewStore.getState().open();
+  }, []);
+
+  // Alt+1-3: open the sidebar on tab N; pressing the active tab's shortcut
   // again closes the sidebar (per-tab toggle, no separate pane toggle).
   const handleSidebarTabShortcut = useCallback(
     (index: number) => {
@@ -947,19 +968,14 @@ function App() {
               factoryViewOpen={factoryViewOpen}
               onToggleFactoryView={handleToggleFactoryView}
               homeAttention={needsInputAnywhere}
-              memoryPanelOpen={utilityPanel === "memory"}
               onToggleMemoryPanel={() => handleToggleUtilityPanel("memory")}
               processesPanelOpen={utilityPanel === "processes"}
               onToggleProcessesPanel={() => handleToggleUtilityPanel("processes")}
-              notesPanelOpen={utilityPanel === "notes"}
-              onToggleNotesPanel={() => handleToggleUtilityPanel("notes")}
               aiPanelOpen={utilityPanel === "ai"}
               onToggleAiPanel={() => handleToggleUtilityPanel("ai")}
-              secondBrainPanelOpen={utilityPanel === "secondbrain"}
-              onToggleSecondBrainPanel={() => handleToggleUtilityPanel("secondbrain")}
-              launchPanelOpen={utilityPanel === "launch"}
-              onToggleLaunchPanel={() => handleToggleUtilityPanel("launch")}
               onWatchdogNavigate={handleWatchdogNavigate}
+              onOpenExtensions={handleOpenExtensions}
+              onOpenWorkflows={handleOpenWorkflows}
             />
 
             {/* Git panel header - inline at same level as TopBar.

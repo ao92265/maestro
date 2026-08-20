@@ -1,4 +1,4 @@
-import { Factory, Home, Send, TerminalSquare, X } from "lucide-react";
+import { Factory, Home, MoreHorizontal, Send, TerminalSquare, X } from "lucide-react";
 import { useEffect, useRef } from "react";
 import { useTourStore } from "@/stores/useTourStore";
 
@@ -43,9 +43,9 @@ export const TOUR_STEPS: TourStep[] = [
     body: "The feed watches the same board Home shows. It pings you when something sits blocked for ten minutes and sends one digest each morning. Nothing to configure in here.",
   },
   {
-    icon: X,
-    title: "Ignore the rest for now",
-    body: "Samurai, Harvest, Second Brain, Journal, Landscape, Marketplace: all inherited from upstream and not wired into your flow. Whatever stays untouched gets stripped later.",
+    icon: MoreHorizontal,
+    title: "Everything else lives behind More",
+    body: "Landscape and Memory are one click from the ⋯ menu at the top right, alongside Extensions (MCP servers, plugins, skills). Samurai, Harvest, Second Brain and Journal are still in the app, just off today's map.",
     hint: "Reopen this tour any time from the Home header",
   },
 ];

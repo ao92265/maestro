@@ -1,14 +1,14 @@
 import { useEffect } from "react";
 import { useTourStore } from "@/stores/useTourStore";
 
-/** Right-side utility panels reachable via Cmd/Ctrl+3-6. */
+/** Right-side utility panels reachable via Cmd/Ctrl+3, 4, 6. */
 export type UtilityPanelShortcut = "memory" | "processes" | "notes" | "ai";
 
-/** Cmd/Ctrl+digit → right-side utility panel (2 is the git panel, handled separately). */
+/** Cmd/Ctrl+digit → right-side utility panel (2 is the git panel, handled
+ *  separately). 5/Notes is cut from nav — the gap is deliberate. */
 const UTILITY_PANEL_BY_DIGIT: Record<string, UtilityPanelShortcut> = {
   "3": "memory",
   "4": "processes",
-  "5": "notes",
   "6": "ai",
 };
 
@@ -17,11 +17,11 @@ interface UseAppKeyboardOptions {
   onAddSession: () => void;
   /** Whether adding a session is currently allowed */
   canAddSession: boolean;
-  /** Alt+1-4: toggle the left sidebar on tab N (1-based tab index) */
+  /** Alt+1-3: toggle the left sidebar on tab N (1-based tab index) */
   onSidebarTab?: (index: number) => void;
   /** Callback to toggle the git panel (Cmd/Ctrl+2) */
   onToggleGitPanel?: () => void;
-  /** Cmd/Ctrl+3-6: toggle a right-side utility panel */
+  /** Cmd/Ctrl+3, 4, 6: toggle a right-side utility panel */
   onToggleUtilityPanel?: (panel: UtilityPanelShortcut) => void;
   /** Callback to toggle the eagle all-projects terminals view (Cmd/Ctrl+G) */
   onToggleEagleView?: () => void;
@@ -48,11 +48,11 @@ function isMac(): boolean {
  * App-level keyboard shortcut handler.
  *
  * Shortcuts:
- * - Alt+1-4: Toggle the left sidebar on tab N (General/History/Infra/Settings)
+ * - Alt+1-3: Toggle the left sidebar on tab N (General/History/Settings)
  * - Cmd/Ctrl+1: Toggle the Home decision queue
  * - Cmd/Ctrl+2: Toggle the git panel
  * - Cmd/Ctrl+7: Toggle the Factory (ACT lane)
- * - Cmd/Ctrl+3-6: Toggle the Memory/Processes/Notes/AI panels
+ * - Cmd/Ctrl+3, 4, 6: Toggle the Memory/Processes/AI panels (5/Notes cut from nav)
  * - Cmd/Ctrl+T: Add a new terminal (project picker in eagle view)
  * - Cmd/Ctrl+G: Toggle the eagle all-projects terminals view
  * - Cmd/Ctrl+Shift+G: Toggle the landscape agent graph
@@ -81,10 +81,10 @@ export function useAppKeyboard({
       // Alt-based shortcuts (no Cmd/Ctrl, no Shift)
       // Use event.code so the bindings are layout-independent (AZERTY etc.).
       if (event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey) {
-        // Alt+1-4: toggle the left sidebar on the given tab. Top-row digits
+        // Alt+1-3: toggle the left sidebar on the given tab. Top-row digits
         // only — Alt+numpad digits must stay free for Windows Alt-code entry
         // (e.g. Alt+164 → ñ typed into a terminal).
-        const sidebarDigit = /^Digit([1-4])$/.exec(event.code);
+        const sidebarDigit = /^Digit([1-3])$/.exec(event.code);
         if (sidebarDigit && onSidebarTab) {
           event.preventDefault();
           event.stopImmediatePropagation();
@@ -149,8 +149,9 @@ export function useAppKeyboard({
         return;
       }
 
-      // Cmd/Ctrl+3-6: toggle the right-side utility panels.
-      const utilityDigit = /^(?:Digit|Numpad)([3-6])$/.exec(event.code);
+      // Cmd/Ctrl+3, 4, 6: toggle the right-side utility panels. 5/Notes is
+      // cut from nav, so the digit gap is deliberate — not matched here.
+      const utilityDigit = /^(?:Digit|Numpad)([346])$/.exec(event.code);
       if (utilityDigit && onToggleUtilityPanel) {
         event.preventDefault();
         event.stopImmediatePropagation();
