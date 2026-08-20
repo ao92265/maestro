@@ -130,6 +130,64 @@ describe("assembleBands", () => {
     expect(slugs).toEqual(["fresh"]);
   });
 
+  it("excludes a handoff when an externally-running claude cwd sits at or under its path", () => {
+    const bands = assembleBands({
+      sessions: [],
+      tabs: TABS,
+      handoffs: [handoff("nested"), handoff("exact")],
+      repoPrs: [],
+      watermarkMs: 0,
+      activeDirs: new Set(["/repo/nested/subdir", "/repo/exact"]),
+    });
+    const slugs = bands.blocked
+      .filter((i) => i.kind === "handoff")
+      .map((i) => (i.kind === "handoff" ? i.handoff.slug : ""));
+    expect(slugs).toEqual([]);
+  });
+
+  it("does not exclude a handoff for an unrelated activeDirs cwd", () => {
+    const bands = assembleBands({
+      sessions: [],
+      tabs: TABS,
+      handoffs: [handoff("fresh")],
+      repoPrs: [],
+      watermarkMs: 0,
+      activeDirs: new Set(["/repo/unrelated"]),
+    });
+    const slugs = bands.blocked
+      .filter((i) => i.kind === "handoff")
+      .map((i) => (i.kind === "handoff" ? i.handoff.slug : ""));
+    expect(slugs).toEqual(["fresh"]);
+  });
+
+  it("ignores a null or empty cwd entry in activeDirs", () => {
+    const bands = assembleBands({
+      sessions: [],
+      tabs: TABS,
+      handoffs: [handoff("fresh")],
+      repoPrs: [],
+      watermarkMs: 0,
+      activeDirs: new Set([null as unknown as string, ""]),
+    });
+    const slugs = bands.blocked
+      .filter((i) => i.kind === "handoff")
+      .map((i) => (i.kind === "handoff" ? i.handoff.slug : ""));
+    expect(slugs).toEqual(["fresh"]);
+  });
+
+  it("preserves current behaviour with an empty activeDirs set (regression guard)", () => {
+    const input = {
+      sessions: [],
+      tabs: TABS,
+      handoffs: [handoff("fresh")],
+      repoPrs: [],
+      watermarkMs: 0,
+    };
+    const withoutField = assembleBands(input);
+    const withEmptySet = assembleBands({ ...input, activeDirs: new Set<string>() });
+    expect(withEmptySet).toEqual(withoutField);
+  });
+
   it("puts changes-requested PRs in blocked and fresh merges in landed, honouring the watermark", () => {
     const repoPrs: RepoPrs[] = [
       {

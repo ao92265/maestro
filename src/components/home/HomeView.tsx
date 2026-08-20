@@ -173,7 +173,7 @@ function HandoffRow({ item, onLaunch }: { item: BandItem; onLaunch: (h: HandoffI
   const h = item.handoff;
   return (
     <div className={rowClass}>
-      <span className={`${badgeBaseClass} bg-maestro-yellow/15 text-maestro-yellow`}>PARKED</span>
+      <span className={`${badgeBaseClass} bg-maestro-yellow/15 text-maestro-yellow`}>HANDOFF</span>
       <span className="shrink-0 text-[12px] font-medium text-maestro-text">{h.repo}</span>
       {h.branch && (
         <span className="shrink-0 rounded bg-maestro-muted/10 px-1 text-[10px] text-maestro-muted">
@@ -431,9 +431,9 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
               bands.moreHandoffs > 0 ? (
                 <span
                   className="text-[10px] text-maestro-muted/70"
-                  title="Older parked handoffs, one per directory, hidden to keep the queue short"
+                  title="Older handoffs on disk, one per directory, hidden to keep the queue short"
                 >
-                  +{bands.moreHandoffs} more parked
+                  +{bands.moreHandoffs} more handoffs on disk
                 </span>
               ) : undefined
             }

@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
 import type { BandTab, HandoffInfo, RepoPrs } from "@/lib/bands";
+import { listDevProcesses } from "@/lib/processes";
 import type { PullRequestInfo } from "@/stores/useGitHubStore";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 
@@ -74,6 +75,15 @@ interface BandDataState {
   prsError: string | null;
   isRefreshing: boolean;
   watermarkMs: number;
+  /**
+   * Cwds of claude processes seen running outside a live Maestro session
+   * (best-effort liveness detection, `list_dev_processes` watchlist
+   * "claude"). Feeds `activeDirs` into `assembleBands`/`assembleBoard`, whose
+   * job is additive-only: it can only remove a false "parked" label, never
+   * invent liveness. A scan failure leaves the previous set in place, so the
+   * unconditional handoff relabel stays the honesty floor.
+   */
+  externallyActiveDirs: Set<string>;
   /** Fetch everything once; callers drive the interval. Never rejects. */
   refresh: () => Promise<void>;
   /** "I have looked": merged PRs up to now stop counting as news. */
@@ -89,6 +99,7 @@ export const useBandStore = create<BandDataState>((set, get) => ({
   prsError: null,
   isRefreshing: false,
   watermarkMs: initWatermark(),
+  externallyActiveDirs: new Set(),
 
   refresh: async () => {
     /* A refresh requested mid-poll is queued, not dropped: opening project B
@@ -104,6 +115,22 @@ export const useBandStore = create<BandDataState>((set, get) => ({
       await invoke<HandoffInfo[]>("get_handoffs").then(
         (handoffs) => set({ handoffs, handoffsFetchedAt: Date.now(), handoffsError: null }),
         (err) => set({ handoffsError: String(err) }),
+      );
+
+      /* Best-effort liveness detection: a claude process running outside any
+         Maestro session still means the handoff's directory is live. Rides
+         this refresh cadence only, never a tighter poll loop. A scan failure
+         is silently swallowed, leaving the previous set (and the unconditional
+         relabel) as the honesty floor. */
+      await listDevProcesses(["claude"]).then(
+        (procs) => {
+          const dirs = new Set<string>();
+          for (const p of procs) {
+            if (p.cwd) dirs.add(p.cwd);
+          }
+          set({ externallyActiveDirs: dirs });
+        },
+        () => {},
       );
 
       /* One entry per distinct repo path; a workspace can point two tabs at

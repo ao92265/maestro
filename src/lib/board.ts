@@ -1,5 +1,11 @@
 import { type ActRun, isTerminal } from "@/lib/act";
-import type { BandTab, HandoffInfo, RepoPrs } from "@/lib/bands";
+import {
+  type BandTab,
+  type HandoffInfo,
+  isCoveredByActiveDir,
+  MAX_HANDOFF_ROWS,
+  type RepoPrs,
+} from "@/lib/bands";
 import type { PullRequestInfo } from "@/stores/useGitHubStore";
 import type { BackendSessionStatus, SessionConfig } from "@/stores/useSessionStore";
 
@@ -107,10 +113,10 @@ interface AssembleBoardInput {
   /** "Since you looked": merged PRs / completed runs at or before this instant are old news. */
   watermarkMs: number;
   /**
-   * External claude process cwds (WP2's process-scan detection). WP1 merges
-   * this by exact path match only; the ancestor/prefix matching promised by
-   * the plan (a session running in a subdirectory of a handoff's path) is
-   * WP2's job, once `staleProcess.ts`'s matcher is wired in.
+   * Cwds of claude processes seen running outside a live Maestro session
+   * (WP2's process-scan liveness detection). Additive-only: a handoff whose
+   * path equals, or is an ancestor of, one of these cwds is not shown in
+   * Suggested, since the running work IS it.
    */
   activeDirs?: Set<string>;
 }
@@ -124,13 +130,6 @@ const ALL_STATUSES: BackendSessionStatus[] = [
   "Error",
   "Timeout",
 ];
-
-/**
- * Display cap on handoffs shown in Suggested, mirroring bands.ts's
- * MAX_HANDOFF_ROWS (not exported there, so duplicated here — same value,
- * same rationale: surface the newest few, not archive them).
- */
-const MAX_HANDOFF_ROWS = 10;
 
 /** Session status -> board column. Idle produces no card (fleet-strip only). */
 export function inferSessionColumn(status: BackendSessionStatus): BoardColumnKey | null {
@@ -263,11 +262,11 @@ export function assembleBoard({
      handoff covered by a live session (or, per activeDirs, an externally
      running claude) is not "on disk waiting" — the running work IS it. */
   const liveDirs = new Set(sessions.map(sessionDir));
-  if (activeDirs) {
-    for (const dir of activeDirs) liveDirs.add(dir);
-  }
   const sortedHandoffs = handoffs
-    .filter((h) => !h.stale && !h.orphan && !liveDirs.has(h.path))
+    .filter(
+      (h) =>
+        !h.stale && !h.orphan && !liveDirs.has(h.path) && !isCoveredByActiveDir(h.path, activeDirs),
+    )
     .sort((a, b) => Date.parse(b.lastActive) - Date.parse(a.lastActive));
   const seenPaths = new Set<string>();
   const dedupedHandoffs = sortedHandoffs.filter((h) => {

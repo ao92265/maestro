@@ -274,6 +274,45 @@ describe("assembleBoard", () => {
     expect(slugs).toEqual(["fresh"]);
   });
 
+  it("excludes a handoff when an externally-running claude cwd sits at or under its path", () => {
+    const columns = assembleBoard({
+      ...EMPTY,
+      handoffs: [handoff("nested"), handoff("exact")],
+      tabs: TABS,
+      activeDirs: new Set(["/tmp/proj-nested/subdir", "/tmp/proj-exact"]),
+    });
+    expect(columns.suggested).toEqual([]);
+  });
+
+  it("does not exclude a handoff for an unrelated activeDirs cwd", () => {
+    const columns = assembleBoard({
+      ...EMPTY,
+      handoffs: [handoff("fresh")],
+      tabs: TABS,
+      activeDirs: new Set(["/tmp/proj-unrelated"]),
+    });
+    const slugs = columns.suggested.map((c) => (c.kind === "handoff" ? c.handoff.slug : ""));
+    expect(slugs).toEqual(["fresh"]);
+  });
+
+  it("ignores a null or empty cwd entry in activeDirs", () => {
+    const columns = assembleBoard({
+      ...EMPTY,
+      handoffs: [handoff("fresh")],
+      tabs: TABS,
+      activeDirs: new Set([null as unknown as string, ""]),
+    });
+    const slugs = columns.suggested.map((c) => (c.kind === "handoff" ? c.handoff.slug : ""));
+    expect(slugs).toEqual(["fresh"]);
+  });
+
+  it("preserves current behaviour with an empty activeDirs set (regression guard)", () => {
+    const input = { ...EMPTY, handoffs: [handoff("fresh")], tabs: TABS };
+    const withoutField = assembleBoard(input);
+    const withEmptySet = assembleBoard({ ...input, activeDirs: new Set<string>() });
+    expect(withEmptySet).toEqual(withoutField);
+  });
+
   it("keeps only the newest handoff per path and caps Suggested at 10", () => {
     const many = Array.from({ length: 14 }, (_, i) =>
       handoff(`h${i}`, {
