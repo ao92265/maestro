@@ -16,7 +16,7 @@ export function IdleLandingView({ onAdd }: IdleLandingViewProps) {
 
       {/* Prompt text */}
       <div className="flex flex-col items-center gap-1.5">
-        <p className="text-sm text-maestro-muted">Select branch and click Launch</p>
+        <p className="text-sm text-maestro-muted">Click + to add a session, then Launch</p>
         <p className="text-xs text-maestro-muted/50">Using current branch</p>
       </div>
 
