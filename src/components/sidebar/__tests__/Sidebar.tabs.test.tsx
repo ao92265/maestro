@@ -169,14 +169,16 @@ describe("Sidebar tab bar", () => {
     useSessionStore.setState({ sessions: [], samuraiSchedule: [] });
   });
 
-  it("renders the four tabs with General active by default", () => {
+  it("renders the three tabs with General active by default", () => {
     render(<ControlledSidebar />);
-    for (const label of ["General", "History", "Infra", "Settings"]) {
+    for (const label of ["General", "History", "Settings"]) {
       expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
     }
-    // Processes and Memory moved to the right-side utility panel
+    // Processes and Memory moved to the right-side utility panel; Infra
+    // moved to the TopBar's More menu (Extensions) — none get a strip button.
     expect(screen.queryByRole("button", { name: "Processes" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Memory" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Infra" })).not.toBeInTheDocument();
     // General tab content
     expect(screen.getByText("Agents")).toBeInTheDocument();
     expect(screen.getByText("Git Repository")).toBeInTheDocument();
@@ -224,13 +226,17 @@ describe("Sidebar tab bar", () => {
     expect(screen.getByText(/^parked/)).toBeInTheDocument();
   });
 
-  it("switches to Infra (MCP + skills + project context)", () => {
-    render(<ControlledSidebar />);
-    fireEvent.click(screen.getByRole("button", { name: "Infra" }));
+  // Infra has no strip button any more — it is reached via the TopBar's
+  // More menu ("Extensions"), which drives activeTab the same way Alt+1-4
+  // used to. Sidebar itself just has to keep rendering the content when
+  // told to, so this drives activeTab directly instead of clicking a tab.
+  it("renders Infra content (MCP + skills + project context) when activeTab is set to it", () => {
+    render(<Sidebar activeTab="infra" onSelectTab={() => {}} />);
     expect(screen.getByText("MCP Servers")).toBeInTheDocument();
     expect(screen.getByText("Plugins & Skills")).toBeInTheDocument();
     expect(screen.getByText("Project Context")).toBeInTheDocument();
     expect(screen.queryByText("Agents")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Infra" })).not.toBeInTheDocument();
   });
 
   it("switches to Settings and persists the chosen tab", async () => {
@@ -441,7 +447,7 @@ describe("Sidebar tab bar", () => {
   });
 });
 
-describe("sidebarTabShortcutTransition (Alt+1-4 toggle semantics)", () => {
+describe("sidebarTabShortcutTransition (Alt+1-3 toggle semantics)", () => {
   it("opens the sidebar on the requested tab when closed", () => {
     expect(sidebarTabShortcutTransition(false, "general", 2)).toEqual({
       open: true,
@@ -450,21 +456,21 @@ describe("sidebarTabShortcutTransition (Alt+1-4 toggle semantics)", () => {
   });
 
   it("closes the sidebar when the active tab's shortcut repeats", () => {
-    expect(sidebarTabShortcutTransition(true, "infra", 3)).toEqual({
+    expect(sidebarTabShortcutTransition(true, "settings", 3)).toEqual({
       open: false,
-      tab: "infra",
+      tab: "settings",
     });
   });
 
   it("switches tabs when the sidebar is open on another tab", () => {
-    expect(sidebarTabShortcutTransition(true, "general", 4)).toEqual({
+    expect(sidebarTabShortcutTransition(true, "general", 3)).toEqual({
       open: true,
       tab: "settings",
     });
   });
 
-  it("returns null for an index that names no tab", () => {
-    expect(sidebarTabShortcutTransition(true, "general", 5)).toBeNull();
+  it("returns null for an index that names no tab (Infra dropped from the strip, so 4 is out of range)", () => {
+    expect(sidebarTabShortcutTransition(true, "general", 4)).toBeNull();
     expect(sidebarTabShortcutTransition(false, "general", 0)).toBeNull();
   });
 });

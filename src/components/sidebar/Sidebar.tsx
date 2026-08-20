@@ -256,10 +256,13 @@ export function Sidebar({
 
 export type SidebarTabId = "general" | "history" | "infra" | "settings";
 
+// "infra" stays a valid SidebarTabId and ConfigTab still renders its content
+// (MCP servers, plugins, skills) — it just no longer has its own strip
+// button. The TopBar More menu's "Extensions" item sets activeTab to it
+// directly, same as this array drove Alt+1-4 before the strip shrank.
 export const SIDEBAR_TABS: { id: SidebarTabId; label: string; icon: React.ElementType }[] = [
   { id: "general", label: "General", icon: Home },
   { id: "history", label: "History", icon: History },
-  { id: "infra", label: "Infra", icon: Package },
   { id: "settings", label: "Settings", icon: Settings },
 ];
 

@@ -759,6 +759,14 @@ function App() {
     saveSidebarTab(tab);
   }, []);
 
+  // TopBar's More menu → Extensions: the Infra tab (MCP servers, plugins,
+  // skills) no longer has its own strip button, but its content still
+  // renders when selected — this is the fallback route to it.
+  const handleOpenExtensions = useCallback(() => {
+    setSidebarOpen(true);
+    handleSelectSidebarTab("infra");
+  }, [handleSelectSidebarTab]);
+
   // Alt+1-4: open the sidebar on tab N; pressing the active tab's shortcut
   // again closes the sidebar (per-tab toggle, no separate pane toggle).
   const handleSidebarTabShortcut = useCallback(
@@ -947,19 +955,13 @@ function App() {
               factoryViewOpen={factoryViewOpen}
               onToggleFactoryView={handleToggleFactoryView}
               homeAttention={needsInputAnywhere}
-              memoryPanelOpen={utilityPanel === "memory"}
               onToggleMemoryPanel={() => handleToggleUtilityPanel("memory")}
               processesPanelOpen={utilityPanel === "processes"}
               onToggleProcessesPanel={() => handleToggleUtilityPanel("processes")}
-              notesPanelOpen={utilityPanel === "notes"}
-              onToggleNotesPanel={() => handleToggleUtilityPanel("notes")}
               aiPanelOpen={utilityPanel === "ai"}
               onToggleAiPanel={() => handleToggleUtilityPanel("ai")}
-              secondBrainPanelOpen={utilityPanel === "secondbrain"}
-              onToggleSecondBrainPanel={() => handleToggleUtilityPanel("secondbrain")}
-              launchPanelOpen={utilityPanel === "launch"}
-              onToggleLaunchPanel={() => handleToggleUtilityPanel("launch")}
               onWatchdogNavigate={handleWatchdogNavigate}
+              onOpenExtensions={handleOpenExtensions}
             />
 
             {/* Git panel header - inline at same level as TopBar.
