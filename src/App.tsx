@@ -767,6 +767,14 @@ function App() {
     handleSelectSidebarTab("infra");
   }, [handleSelectSidebarTab]);
 
+  // TopBar's More menu → Workflows: the full-screen workflow editor is a
+  // standalone store-driven overlay (see useWorkflowsViewStore) — its only
+  // trigger used to be a button inside the now-cut Launch panel, but the
+  // overlay itself never depended on that panel being open.
+  const handleOpenWorkflows = useCallback(() => {
+    useWorkflowsViewStore.getState().open();
+  }, []);
+
   // Alt+1-4: open the sidebar on tab N; pressing the active tab's shortcut
   // again closes the sidebar (per-tab toggle, no separate pane toggle).
   const handleSidebarTabShortcut = useCallback(
@@ -962,6 +970,7 @@ function App() {
               onToggleAiPanel={() => handleToggleUtilityPanel("ai")}
               onWatchdogNavigate={handleWatchdogNavigate}
               onOpenExtensions={handleOpenExtensions}
+              onOpenWorkflows={handleOpenWorkflows}
             />
 
             {/* Git panel header - inline at same level as TopBar.

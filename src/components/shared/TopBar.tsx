@@ -14,6 +14,7 @@ import {
   Plus,
   Sparkles,
   Square,
+  Workflow,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -82,6 +83,11 @@ interface TopBarProps {
    *  servers, plugins, skills) — that tab no longer has its own strip
    *  button, but its content still renders when selected. */
   onOpenExtensions?: () => void;
+  /** More menu → Workflows: opens the full-screen workflow editor overlay.
+   *  Its only trigger used to live inside the (now cut) Launch panel, but
+   *  the overlay itself is a standalone store-driven view — reachable here
+   *  with no change to the editor. */
+  onOpenWorkflows?: () => void;
 }
 
 export function TopBar({
@@ -113,6 +119,7 @@ export function TopBar({
   onToggleAiPanel,
   onWatchdogNavigate,
   onOpenExtensions,
+  onOpenWorkflows,
 }: TopBarProps) {
   const appWindow = useMemo(() => getCurrentWindow(), []);
 
@@ -353,10 +360,10 @@ export function TopBar({
         >
           <GitMerge size={14} />
         </button>
-        {/* More menu — Landscape, Memory and Extensions moved here (issue
-            declutter): each keeps its keyboard shortcut and store wiring,
+        {/* More menu — Landscape, Memory, Workflows and Extensions moved here
+            (issue declutter): each keeps its keyboard shortcut/store wiring,
             just off the always-visible strip. */}
-        {(onToggleLandscapeView || onToggleMemoryPanel || onOpenExtensions) && (
+        {(onToggleLandscapeView || onToggleMemoryPanel || onOpenWorkflows || onOpenExtensions) && (
           <div className="relative" ref={moreMenuRef}>
             <button
               type="button"
@@ -367,7 +374,7 @@ export function TopBar({
                   : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
               }`}
               aria-label="More"
-              title="More — Landscape, Memory, Extensions"
+              title="More — Landscape, Memory, Workflows, Extensions"
             >
               <MoreHorizontal size={14} />
               {landscapeAttention && !landscapeView && (
@@ -403,6 +410,19 @@ export function TopBar({
                   >
                     <Brain size={13} className="shrink-0 text-maestro-muted" />
                     Memory
+                  </button>
+                )}
+                {onOpenWorkflows && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMoreMenuOpen(false);
+                      onOpenWorkflows();
+                    }}
+                    className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-maestro-text transition-colors hover:bg-maestro-card"
+                  >
+                    <Workflow size={13} className="shrink-0 text-maestro-muted" />
+                    Workflows
                   </button>
                 )}
                 {onOpenExtensions && (
