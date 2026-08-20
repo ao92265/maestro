@@ -6,8 +6,10 @@ import { create } from "zustand";
  * lives in the TopBar while band rows elsewhere (toasts, sidebar) may want to
  * open Home without prop-drilling.
  *
- * Starts OPEN: Home is the app's landing surface. The first thing the user
- * sees is what is blocked on them, not an empty grid.
+ * Starts CLOSED: the Board is the landing surface now (see
+ * `BOARD_DEFAULT_OPEN` in `useBoardViewStore`), and two full-screen surfaces
+ * cannot both greet you. Home stays one keystroke away on Cmd/Ctrl+1 until
+ * Phase 3 folds its bands into the Board's rail.
  */
 interface HomeViewState {
   isOpen: boolean;
@@ -17,7 +19,7 @@ interface HomeViewState {
 }
 
 export const useHomeViewStore = create<HomeViewState>((set) => ({
-  isOpen: true,
+  isOpen: false,
   open: () => set({ isOpen: true }),
   close: () => set({ isOpen: false }),
   toggle: () => set((s) => ({ isOpen: !s.isOpen })),

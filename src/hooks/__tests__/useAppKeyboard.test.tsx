@@ -24,6 +24,7 @@ function renderAppKeyboard(overrides: Partial<Parameters<typeof useAppKeyboard>[
     onToggleGitPanel: vi.fn(),
     onToggleUtilityPanel: vi.fn(),
     onToggleEagleView: vi.fn(),
+    onToggleBoardView: vi.fn(),
     onNextProject: vi.fn(),
     onPrevProject: vi.fn(),
   };
@@ -133,6 +134,35 @@ describe("useAppKeyboard eagle view (Cmd/Ctrl+G)", () => {
   });
 });
 
+describe("useAppKeyboard board layer (Cmd/Ctrl+E)", () => {
+  it("fires onToggleBoardView", () => {
+    const { onToggleBoardView } = renderAppKeyboard();
+
+    const ev = dispatch({ key: "e", code: "KeyE", ...MOD });
+
+    expect(onToggleBoardView).toHaveBeenCalledTimes(1);
+    expect(ev.defaultPrevented).toBe(true);
+  });
+
+  it("ignores KeyE with Alt or Shift held", () => {
+    const { onToggleBoardView } = renderAppKeyboard();
+
+    dispatch({ key: "e", code: "KeyE", ...MOD, altKey: true });
+    dispatch({ key: "e", code: "KeyE", ...MOD, shiftKey: true });
+
+    expect(onToggleBoardView).not.toHaveBeenCalled();
+  });
+
+  it("leaves a bare E alone so it still types into a terminal", () => {
+    const { onToggleBoardView } = renderAppKeyboard();
+
+    const ev = dispatch({ key: "e", code: "KeyE" });
+
+    expect(onToggleBoardView).not.toHaveBeenCalled();
+    expect(ev.defaultPrevented).toBe(false);
+  });
+});
+
 describe("useAppKeyboard project cycling (Ctrl+Tab on all platforms)", () => {
   it("fires onNextProject on Ctrl+Tab", () => {
     const { onNextProject, onPrevProject } = renderAppKeyboard();
@@ -170,6 +200,7 @@ describe("useAppKeyboard while the first-run tour is open", () => {
     dispatch({ key: "2", code: "Digit2", ...MOD });
     dispatch({ key: "t", code: "KeyT", ...MOD });
     dispatch({ key: "g", code: "KeyG", ...MOD });
+    dispatch({ key: "e", code: "KeyE", ...MOD });
     dispatch({ key: "Tab", code: "Tab", ctrlKey: true });
 
     for (const handler of Object.values(handlers)) {

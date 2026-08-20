@@ -3,9 +3,11 @@ import {
   Activity,
   Bird,
   Brain,
+  Columns,
   Factory,
   GitMerge,
   Home,
+  LayoutGrid,
   Minus,
   MoreHorizontal,
   Network,
@@ -60,6 +62,12 @@ interface TopBarProps {
   onToggleLandscapeView?: () => void;
   /** A terminal somewhere is waiting for input — marks the landscape button. */
   landscapeAttention?: boolean;
+  /** Board layer: every piece of live work, in the stage it is in */
+  boardViewOpen?: boolean;
+  /** Board/Grid segmented toggle. A two-position selector, not a toggle
+   *  button: clicking the segment you are already on is a no-op by design,
+   *  the way a radio group behaves. */
+  onSetBoardView?: (open: boolean) => void;
   /** Home decision queue: blocked on you / landed / running */
   homeViewOpen?: boolean;
   onToggleHomeView?: () => void;
@@ -108,6 +116,8 @@ export function TopBar({
   landscapeView = false,
   onToggleLandscapeView,
   landscapeAttention = false,
+  boardViewOpen = false,
+  onSetBoardView,
   homeViewOpen = false,
   onToggleHomeView,
   homeAttention = false,
@@ -197,6 +207,46 @@ export function TopBar({
 
       {/* Right: action icons */}
       <div className="flex items-center gap-0.5 mr-1">
+        {/* Shell mode. The Board is a layer over the permanently mounted
+            grid, so "Grid" closes the layer rather than unmounting anything. */}
+        {onSetBoardView && (
+          <div className="mr-1.5 flex items-center gap-0.5 rounded-md border border-maestro-border bg-maestro-card p-0.5">
+            <button
+              type="button"
+              onClick={() => onSetBoardView(true)}
+              aria-pressed={boardViewOpen}
+              className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] transition-colors ${
+                boardViewOpen
+                  ? "bg-maestro-surface text-maestro-text"
+                  : "text-maestro-muted hover:text-maestro-text"
+              }`}
+              aria-label="Board view"
+              title={titleWithShortcut(
+                "Board: every piece of work in the stage it is in",
+                modLabel(),
+                "E",
+              )}
+            >
+              <Columns size={12} />
+              Board
+            </button>
+            <button
+              type="button"
+              onClick={() => onSetBoardView(false)}
+              aria-pressed={!boardViewOpen}
+              className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] transition-colors ${
+                boardViewOpen
+                  ? "text-maestro-muted hover:text-maestro-text"
+                  : "bg-maestro-surface text-maestro-text"
+              }`}
+              aria-label="Grid view"
+              title={titleWithShortcut("Grid: the terminals themselves", modLabel(), "E")}
+            >
+              <LayoutGrid size={12} />
+              Grid
+            </button>
+          </div>
+        )}
         {/* GitHub watchdog totals (review requests / assigned issues) */}
         {onWatchdogNavigate && <GitHubWatchdogBadge onNavigate={onWatchdogNavigate} />}
         {/* Active project: adds a pre-launch slot to its grid. */}

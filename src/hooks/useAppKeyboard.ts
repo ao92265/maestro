@@ -25,6 +25,8 @@ interface UseAppKeyboardOptions {
   onToggleUtilityPanel?: (panel: UtilityPanelShortcut) => void;
   /** Callback to toggle the eagle all-projects terminals view (Cmd/Ctrl+G) */
   onToggleEagleView?: () => void;
+  /** Callback to toggle the Board layer, the default shell (Cmd/Ctrl+E) */
+  onToggleBoardView?: () => void;
   /** Callback to toggle the landscape agent graph (Cmd/Ctrl+Shift+G) */
   onToggleLandscapeView?: () => void;
   /** Callback to toggle the Home decision queue (Cmd/Ctrl+1) */
@@ -54,6 +56,7 @@ function isMac(): boolean {
  * - Cmd/Ctrl+7: Toggle the Factory (ACT lane)
  * - Cmd/Ctrl+3, 4, 6: Toggle the Memory/Processes/AI panels (5/Notes cut from nav)
  * - Cmd/Ctrl+T: Add a new terminal (project picker in eagle view)
+ * - Cmd/Ctrl+E: Toggle the Board layer (off reveals the terminal grid)
  * - Cmd/Ctrl+G: Toggle the eagle all-projects terminals view
  * - Cmd/Ctrl+Shift+G: Toggle the landscape agent graph
  * - Ctrl+Tab / Ctrl+Shift+Tab (all platforms): Next / previous project tab
@@ -65,6 +68,7 @@ export function useAppKeyboard({
   onToggleGitPanel,
   onToggleUtilityPanel,
   onToggleEagleView,
+  onToggleBoardView,
   onToggleLandscapeView,
   onToggleHomeView,
   onToggleFactoryView,
@@ -168,6 +172,16 @@ export function useAppKeyboard({
         return;
       }
 
+      // Cmd/Ctrl+E: toggle the Board layer, which is the shell the app opens
+      // on. A focused xterm loses Cmd+E to us here, the same trade Cmd+G
+      // already makes: leaving the Board is worth more than that keystroke.
+      if (event.code === "KeyE" && onToggleBoardView) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        onToggleBoardView();
+        return;
+      }
+
       // Cmd/Ctrl+G: toggle the eagle all-projects terminals view.
       if (event.code === "KeyG" && onToggleEagleView) {
         event.preventDefault();
@@ -188,6 +202,7 @@ export function useAppKeyboard({
     onToggleGitPanel,
     onToggleUtilityPanel,
     onToggleEagleView,
+    onToggleBoardView,
     onToggleLandscapeView,
     onToggleHomeView,
     onToggleFactoryView,

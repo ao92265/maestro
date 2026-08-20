@@ -13,13 +13,12 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { badgeBaseClass, SESSION_STATUS_BADGES } from "@/components/session/agentPresentation";
+import { useLaunchHandoff } from "@/hooks/useLaunchHandoff";
 import { assembleBands, type BandItem, type BandTab, type HandoffInfo } from "@/lib/bands";
 import { useActStore } from "@/stores/useActStore";
 import { useBandStore } from "@/stores/useBandStore";
 import { useFactoryViewStore } from "@/stores/useFactoryViewStore";
-import { useFDAStore } from "@/stores/useFDAStore";
 import { useHomeViewStore } from "@/stores/useHomeViewStore";
-import { usePendingLaunchStore } from "@/stores/usePendingLaunchStore";
 import type { BackendSessionStatus } from "@/stores/useSessionStore";
 import { useSessionStore } from "@/stores/useSessionStore";
 import { useTourStore } from "@/stores/useTourStore";
@@ -51,16 +50,6 @@ function relAgo(iso: string): string {
   const hours = Math.floor(mins / 60);
   if (hours < 48) return `${hours}h ago`;
   return `${Math.floor(hours / 24)}d ago`;
-}
-
-/**
- * The handover nudge typed into the fresh session. Deliberately short: the
- * SessionStart hook injects the full handoff body on its own (rohcna's
- * `handoverPrompt` convention, ported).
- */
-function handoverPrompt(h: HandoffInfo): string {
-  const where = h.branch ? `${h.repo} on ${h.branch}` : h.repo;
-  return `Resume from the injected handoff for ${where}. Confirm branch and working-tree state, then continue the next step.`;
 }
 
 const rowClass =
@@ -268,10 +257,10 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
     prsError,
     isRefreshing,
     watermarkMs,
+    externallyActiveDirs,
     refresh,
     markSeen,
   } = useBandStore();
-  const requireAccess = useFDAStore((s) => s.requireAccess);
   const gatedRuns = useActStore(useShallow((s) => s.gatedRuns));
   const [statusFilter, setStatusFilter] = useState<BackendSessionStatus | null>(null);
 
@@ -294,9 +283,22 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
     void useActStore.getState().refresh();
   }, [refresh]);
 
+  /* `activeDirs` is what keeps a handoff from being called blocked-on-you
+     while a claude session is already running in its directory outside
+     Maestro. The Board reads the same field; Home would otherwise keep
+     showing the row the Board has already dropped. */
   const bands = useMemo(
-    () => assembleBands({ sessions, tabs: bandTabs, handoffs, repoPrs, gatedRuns, watermarkMs }),
-    [sessions, bandTabs, handoffs, repoPrs, gatedRuns, watermarkMs],
+    () =>
+      assembleBands({
+        sessions,
+        tabs: bandTabs,
+        handoffs,
+        repoPrs,
+        gatedRuns,
+        watermarkMs,
+        activeDirs: externallyActiveDirs,
+      }),
+    [sessions, bandTabs, handoffs, repoPrs, gatedRuns, watermarkMs, externallyActiveDirs],
   );
 
   /** The strip filter narrows session rows; other rows stay (they have no status). */
@@ -308,32 +310,7 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
     [statusFilter],
   );
 
-  const launchHandoff = useCallback(
-    (h: HandoffInfo) => {
-      void requireAccess(h.path, async () => {
-        const ws = useWorkspaceStore.getState();
-        if (!ws.getTabByPath(h.path)) await ws.openProject(h.path);
-        const tab = useWorkspaceStore.getState().getTabByPath(h.path);
-        if (!tab) {
-          console.error("Handoff launch: no tab after openProject", h.path);
-          return;
-        }
-        usePendingLaunchStore.getState().request({
-          tabId: tab.id,
-          mode: "Claude",
-          resumeSessionId: null,
-          workingDirOverride: h.path,
-          branch: h.branch,
-          customName: h.slug,
-          initialPrompt: handoverPrompt(h),
-        });
-        // Grid must be mounted to consume the request (JournalSection convention).
-        useWorkspaceStore.getState().setSessionsLaunched(tab.id, true);
-        onNavigate(tab.id);
-      });
-    },
-    [requireAccess, onNavigate],
-  );
+  const launchHandoff = useLaunchHandoff(onNavigate);
 
   return (
     /* z-50 like the landscape overlay: the zoomed eagle pane sits at z-40. */

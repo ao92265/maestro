@@ -102,6 +102,54 @@ describe("TopBar", () => {
     expect(screen.queryByRole("button", { name: "Landscape" })).not.toBeInTheDocument();
   });
 
+  it("has no Board/Grid toggle when the shell does not offer one", () => {
+    renderTopBar();
+    expect(screen.queryByRole("button", { name: "Board view" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Grid view" })).not.toBeInTheDocument();
+  });
+
+  it("marks the Board segment as the active one while the Board is open", () => {
+    const onSetBoardView = vi.fn();
+    renderTopBar({ boardViewOpen: true, onSetBoardView });
+
+    expect(screen.getByRole("button", { name: "Board view" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(screen.getByRole("button", { name: "Grid view" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+  });
+
+  it("marks the Grid segment as the active one while the Board is closed", () => {
+    const onSetBoardView = vi.fn();
+    renderTopBar({ boardViewOpen: false, onSetBoardView });
+
+    expect(screen.getByRole("button", { name: "Grid view" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
+  it("asks for the grid when the Grid segment is clicked", () => {
+    const onSetBoardView = vi.fn();
+    renderTopBar({ boardViewOpen: true, onSetBoardView });
+
+    fireEvent.click(screen.getByRole("button", { name: "Grid view" }));
+
+    expect(onSetBoardView).toHaveBeenCalledWith(false);
+  });
+
+  it("asks for the board when the Board segment is clicked", () => {
+    const onSetBoardView = vi.fn();
+    renderTopBar({ boardViewOpen: false, onSetBoardView });
+
+    fireEvent.click(screen.getByRole("button", { name: "Board view" }));
+
+    expect(onSetBoardView).toHaveBeenCalledWith(true);
+  });
+
   it("shows an aggregated dot on the More button when Memory has a health flag", () => {
     useHealthStore.setState({
       flags: [
