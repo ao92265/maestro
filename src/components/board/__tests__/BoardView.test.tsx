@@ -14,6 +14,13 @@ vi.mock("@tauri-apps/plugin-store", () => ({
   })),
 }));
 
+/* The peek panel lists transcripts through lib/terminal's invoke wrapper;
+   stub the IPC layer so opening it resolves instead of throwing under
+   happy-dom. */
+const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => {}) }));
+
 import { BoardView } from "@/components/board/BoardView";
 import type { ActRun } from "@/lib/act";
 import type { HandoffInfo, RepoPrs } from "@/lib/bands";
@@ -107,6 +114,7 @@ function renderBoard(overrides: Record<string, unknown> = {}) {
     onLaunchHandoff: vi.fn(),
     onOpenPr: vi.fn(),
     onShowGrid: vi.fn(),
+    onOpenProject: vi.fn(),
   };
   render(<BoardView {...handlers} overlayOpen={false} {...overrides} />);
   return handlers;
@@ -296,7 +304,7 @@ describe("BoardView", () => {
     expect(selectedCard()?.textContent).not.toContain("doing step 1");
   });
 
-  it("shows work running outside Maestro as a Building card without button styling", () => {
+  it("shows work running outside Maestro as a Building card, out of Suggested", () => {
     useBandStore.setState({
       handoffs: [handoff()],
       externallyActiveDirs: new Set(["/tmp/proj-b"]),
@@ -306,10 +314,48 @@ describe("BoardView", () => {
 
     const building = column("Building");
     expect(building.getByText("left the migration half applied")).toBeInTheDocument();
-    expect(building.queryByRole("button")).not.toBeInTheDocument();
     expect(
       column("Suggested").queryByText("left the migration half applied"),
     ).not.toBeInTheDocument();
+  });
+
+  it("opens the peek on an outside-Maestro card and freezes board keys behind it", async () => {
+    invokeMock.mockResolvedValue({ sessions: [], total_found: 0, truncated: false, unreadable: 0 });
+    useBandStore.setState({
+      handoffs: [handoff()],
+      externallyActiveDirs: new Set(["/tmp/proj-b"]),
+    });
+
+    renderBoard();
+    const buildingCard = column("Building").getByRole("button");
+    fireEvent.click(buildingCard);
+
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(await screen.findByText(/No transcript found for this directory/)).toBeInTheDocument();
+
+    /* j must not move the selection behind the peek. */
+    fireEvent.keyDown(window, { key: "j" });
+    expect(selectedCard()).toBe(buildingCard);
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("opens the project from the peek and closes it", async () => {
+    invokeMock.mockResolvedValue({ sessions: [], total_found: 0, truncated: false, unreadable: 0 });
+    useBandStore.setState({
+      handoffs: [handoff()],
+      externallyActiveDirs: new Set(["/tmp/proj-b"]),
+    });
+
+    const handlers = renderBoard();
+    fireEvent.click(column("Building").getByRole("button"));
+    await screen.findByRole("dialog");
+
+    fireEvent.click(screen.getByRole("button", { name: "Open project in Maestro" }));
+
+    expect(handlers.onOpenProject).toHaveBeenCalledWith("/tmp/proj-b");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
   it("ignores j, k and Enter while the tour is open", () => {

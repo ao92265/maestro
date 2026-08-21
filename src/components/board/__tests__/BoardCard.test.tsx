@@ -106,10 +106,10 @@ describe("cardAction", () => {
     expect(action.title).toContain("not open in a tab");
   });
 
-  it("disables an outside-Maestro card and says why", () => {
+  it("enables an outside-Maestro card as a read-only peek", () => {
     const action = cardAction(externalCard());
-    expect(action.enabled).toBe(false);
-    expect(action.title).toContain("outside Maestro");
+    expect(action.enabled).toBe(true);
+    expect(action.title).toContain("Peek");
   });
 
   it("enables every other card kind", () => {
@@ -187,13 +187,14 @@ describe("BoardCard", () => {
     expect(screen.getByTitle(/not open in a tab/)).toBeInTheDocument();
   });
 
-  it("renders an outside-Maestro card without button styling, saying why", () => {
-    render(<BoardCard item={externalCard()} selected={false} onActivate={vi.fn()} />);
+  it("renders an outside-Maestro card as a button that offers the peek", () => {
+    const onActivate = vi.fn();
+    render(<BoardCard item={externalCard()} selected={false} onActivate={onActivate} />);
 
-    expect(screen.queryByRole("button")).not.toBeInTheDocument();
     expect(screen.getByText("left the migration half applied")).toBeInTheDocument();
     expect(screen.getByText("OUTSIDE MAESTRO")).toBeInTheDocument();
-    expect(screen.getByTitle(/outside Maestro/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(onActivate).toHaveBeenCalledTimes(1);
   });
 
   it("renders a live cwd with no handoff carrying only the directory truth", () => {

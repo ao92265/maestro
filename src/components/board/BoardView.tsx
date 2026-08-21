@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { BoardCard, boardCardKey, cardAction } from "@/components/board/BoardCard";
 import { BoardColumn } from "@/components/board/BoardColumn";
+import { BoardPeek } from "@/components/board/BoardPeek";
 import { badgeBaseClass, SESSION_STATUS_BADGES } from "@/components/session/agentPresentation";
 import type { BandTab, HandoffInfo } from "@/lib/bands";
 import {
@@ -45,6 +46,11 @@ interface BoardViewProps {
   /** Close the Board layer to reveal the terminal grid underneath. */
   onShowGrid: () => void;
   /**
+   * Open a directory as a Maestro tab without launching a session in it,
+   * for adopting the project an outside claude is working in.
+   */
+  onOpenProject: (dir: string) => void;
+  /**
    * A z-50 overlay (Home, Factory, Landscape, Workflows) is stacked over the
    * Board. They open without closing it, so while one is up the Board's keys
    * must go dead: j/k/Enter acting on cards nobody can see activated hidden
@@ -82,6 +88,7 @@ export function BoardView({
   onLaunchHandoff,
   onOpenPr,
   onShowGrid,
+  onOpenProject,
   overlayOpen,
 }: BoardViewProps) {
   const sessions = useSessionStore(useShallow((s) => s.sessions));
@@ -103,6 +110,9 @@ export function BoardView({
   const actError = useActStore((s) => s.error);
   const watchdogProjects = useGitHubWatchdogStore(useShallow((s) => s.projects));
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [peekItem, setPeekItem] = useState<Extract<BoardCardItem, { kind: "external" }> | null>(
+    null,
+  );
 
   const bandTabs: BandTab[] = useMemo(
     () =>
@@ -185,9 +195,9 @@ export function BoardView({
           onOpenPr(item.pr.url);
           return;
         case "external":
-          /* Not reachable from the keyboard (disabled cards are filtered out
-             of `flat`), kept for the switch's exhaustiveness: Maestro cannot
-             open or zoom a session it did not spawn. */
+          /* Maestro cannot open or zoom a session it did not spawn; the
+             honest action is the read-only peek at its transcript trail. */
+          setPeekItem(item);
           return;
       }
     },
@@ -211,6 +221,15 @@ export function BoardView({
          overlay covers the board: these keys would act on hidden cards. */
       if (overlayOpen) return;
       if (useTourStore.getState().isOpen) return;
+      /* The peek is modal over the board: Escape closes it, everything else
+         must not move or activate the cards hidden behind it. */
+      if (peekItem) {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          setPeekItem(null);
+        }
+        return;
+      }
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       const target = event.target as HTMLElement | null;
       if (
@@ -237,7 +256,7 @@ export function BoardView({
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [flat, selectedKey, activate, overlayOpen]);
+  }, [flat, selectedKey, activate, overlayOpen, peekItem]);
 
   /* A partially failed PR poll must not read as "nothing in review": naming
      the repos that failed is the difference between stale and wrong. */
@@ -397,6 +416,18 @@ export function BoardView({
           j and k move, Enter opens
         </span>
       </div>
+
+      {peekItem && (
+        <BoardPeek
+          dir={peekItem.dir}
+          projectName={peekItem.projectName}
+          onClose={() => setPeekItem(null)}
+          onOpenProject={(dir) => {
+            setPeekItem(null);
+            onOpenProject(dir);
+          }}
+        />
+      )}
     </div>
   );
 }

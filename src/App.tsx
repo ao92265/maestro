@@ -756,6 +756,26 @@ function App() {
     useFactoryViewStore.getState().open();
   }, []);
 
+  // Adopting an outside session's project from the Board peek: open the tab,
+  // never a second agent. Resuming the work itself stays with the Suggested
+  // handoff flow once the outside session stops. Same FDA gate and
+  // open-if-missing dance as useLaunchHandoff, minus the launch.
+  const handleBoardOpenProject = useCallback(
+    (dir: string) => {
+      void useFDAStore.getState().requireAccess(dir, async () => {
+        const ws = useWorkspaceStore.getState();
+        if (!ws.getTabByPath(dir)) await ws.openProject(dir);
+        const tab = useWorkspaceStore.getState().getTabByPath(dir);
+        if (!tab) {
+          console.error("Board open project: no tab after openProject", dir);
+          return;
+        }
+        handleBoardNavigate(tab.id);
+      });
+    },
+    [handleBoardNavigate],
+  );
+
   // Cmd/Ctrl+E and the TopBar segments both land here. The Board is a layer,
   // never a replacement: closing it reveals the grid that was mounted all
   // along, so there is nothing to tear down or rebuild either way.
@@ -1119,6 +1139,7 @@ function App() {
                     void openUrl(url).catch((err) => console.error("Failed to open PR:", err))
                   }
                   onShowGrid={closeBoardView}
+                  onOpenProject={handleBoardOpenProject}
                   overlayOpen={
                     landscapeView || workflowsViewOpen || homeViewOpen || factoryViewOpen
                   }

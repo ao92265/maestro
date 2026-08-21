@@ -75,8 +75,9 @@ export function cardAction(item: BoardCardItem): { enabled: boolean; title: stri
       return { enabled: true, title: "Open on GitHub" };
     case "external":
       return {
-        enabled: false,
-        title: "Running outside Maestro, so there is no terminal here to open or zoom",
+        enabled: true,
+        title:
+          "Peek at what this outside session is doing. Maestro cannot show its live terminal, only the transcript trail.",
       };
   }
 }
