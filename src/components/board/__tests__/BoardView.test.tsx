@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 /* The workspace and watchdog stores persist through the Tauri plugin-store,
@@ -133,6 +133,7 @@ describe("BoardView", () => {
       repoPrs: [],
       handoffsError: null,
       prsError: null,
+      processesError: null,
       isRefreshing: false,
       watermarkMs: 0,
       externallyActiveDirs: new Set<string>(),
@@ -330,6 +331,29 @@ describe("BoardView", () => {
 
     expect(column("Suggested").getByText("STALE")).toBeInTheDocument();
     expect(column("Building").queryByText("STALE")).not.toBeInTheDocument();
+  });
+
+  it("clears the selection when the selected card leaves the board", () => {
+    useBandStore.setState({ handoffs: [handoff()] });
+
+    renderBoard();
+    fireEvent.keyDown(window, { key: "j" });
+    expect(selectedCard()?.textContent).toContain("proj-b");
+
+    act(() => {
+      useBandStore.setState({ handoffs: [] });
+    });
+
+    expect(selectedCard()).toBeNull();
+  });
+
+  it("marks Building stale when the process scan failed", () => {
+    useBandStore.setState({ processesError: "list_dev_processes: scan failed" });
+
+    renderBoard();
+
+    expect(column("Building").getByText("STALE")).toBeInTheDocument();
+    expect(column("Suggested").queryByText("STALE")).not.toBeInTheDocument();
   });
 
   it("marks Review and Done stale, naming the repo, when a PR poll failed", () => {

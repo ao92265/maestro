@@ -26,11 +26,11 @@ import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 /* Fixtures are fully synthetic: this repo is public, so no real project
    paths appear here. */
 
-function proc(cwd: string | null, isMaestro: boolean): DevProcess {
+function proc(cwd: string | null, isMaestro: boolean, name = "claude"): DevProcess {
   return {
     pid: 1,
     parentPid: null,
-    name: "claude",
+    name,
     cmd: "claude",
     cwd,
     memoryBytes: 0,
@@ -48,7 +48,11 @@ describe("useBandStore externallyActiveDirs", () => {
     invokeMock.mockResolvedValue([]);
     listDevProcessesMock.mockReset();
     useWorkspaceStore.setState({ tabs: [] });
-    useBandStore.setState({ externallyActiveDirs: new Set<string>(), isRefreshing: false });
+    useBandStore.setState({
+      externallyActiveDirs: new Set<string>(),
+      processesError: null,
+      isRefreshing: false,
+    });
   });
 
   it("collects only cwds of claude processes Maestro did not spawn itself", async () => {
@@ -63,6 +67,21 @@ describe("useBandStore externallyActiveDirs", () => {
     expect([...useBandStore.getState().externallyActiveDirs]).toEqual(["/tmp/proj-outside"]);
   });
 
+  it("ignores processes that merely mention claude in their command line", async () => {
+    /* The Rust matcher also hits on a command-line substring, so an MCP
+       helper under node or a shell sourcing a ~/.claude snapshot matches
+       the watchlist. Only the claude executable itself is claude work. */
+    listDevProcessesMock.mockResolvedValue([
+      proc("/tmp/proj-helper", false, "node"),
+      proc("/tmp/proj-shell", false, "zsh"),
+      proc("/tmp/proj-real", false, "claude"),
+    ]);
+
+    await useBandStore.getState().refresh();
+
+    expect([...useBandStore.getState().externallyActiveDirs]).toEqual(["/tmp/proj-real"]);
+  });
+
   it("clears the set when the process scan fails instead of freezing stale liveness", async () => {
     listDevProcessesMock.mockResolvedValue([proc("/tmp/proj-outside", false)]);
     await useBandStore.getState().refresh();
@@ -72,5 +91,15 @@ describe("useBandStore externallyActiveDirs", () => {
     await useBandStore.getState().refresh();
 
     expect(useBandStore.getState().externallyActiveDirs.size).toBe(0);
+  });
+
+  it("records a scan failure and clears it on the next success", async () => {
+    listDevProcessesMock.mockRejectedValue(new Error("scan failed"));
+    await useBandStore.getState().refresh();
+    expect(useBandStore.getState().processesError).toContain("scan failed");
+
+    listDevProcessesMock.mockResolvedValue([]);
+    await useBandStore.getState().refresh();
+    expect(useBandStore.getState().processesError).toBeNull();
   });
 });

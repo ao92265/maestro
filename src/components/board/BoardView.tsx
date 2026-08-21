@@ -91,6 +91,7 @@ export function BoardView({
     repoPrs,
     handoffsError,
     prsError,
+    processesError,
     isRefreshing,
     watermarkMs,
     externallyActiveDirs,
@@ -193,6 +194,15 @@ export function BoardView({
     [onNavigateSession, onLaunchHandoff, onOpenRun, onOpenPr],
   );
 
+  /* Selection follows the card, so when the card itself leaves the board
+     (tab closed, handoff went live outside) the ring must go with it: a
+     ringed card j/k/Enter no longer see is a dead control wearing focus. */
+  useEffect(() => {
+    if (selectedKey && !flat.some((item) => boardCardKey(item) === selectedKey)) {
+      setSelectedKey(null);
+    }
+  }, [flat, selectedKey]);
+
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       /* The tour's focus trap only traps Tab, so every other key still
@@ -242,6 +252,9 @@ export function BoardView({
 
   function staleFor(key: BoardColumnKey): string | null {
     if (key === "suggested") return handoffsError;
+    /* A failed process scan empties the live outside-Maestro cards; saying
+       so beats letting real work silently read as not running. */
+    if (key === "building") return processesError;
     if (key === "review" || key === "done") return prsStale;
     return null;
   }

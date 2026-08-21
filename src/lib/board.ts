@@ -306,40 +306,52 @@ export function assembleBoard({
     });
   }
 
-  /* Building -> live claude work outside Maestro. A covered handoff becomes
-     a card carrying its own last words (the stop hook rewrites the handoff
-     file every turn, so lastAction is near-live). A live cwd with no handoff
-     still shows: directory name only, nothing invented. Maestro cannot see
-     an outside session asking for input, so needsYou stays false; claiming
-     otherwise would lie. */
-  for (const h of liveOutsideHandoffs) {
-    const lastAsk = h.asks[h.asks.length - 1];
-    columns.building.push({
-      kind: "external",
-      dir: h.path,
-      handoff: h,
-      projectName: h.repo,
-      objective: h.waiting && lastAsk ? lastAsk : h.lastAction,
-      stageLabel: "Live outside Maestro",
-      needsYou: false,
-      since: h.lastActive,
-    });
-  }
+  /* Building -> live claude work outside Maestro, one card per live cwd:
+     one process must never read as two pieces of work, so when handoff
+     paths nest the deepest covered one speaks for the cwd (a shallower
+     covered handoff stays off Suggested too; it is still not waiting). A
+     covered handoff card carries its own last words (the stop hook rewrites
+     the handoff file every turn, so lastAction is near-live). A live cwd
+     with no handoff still shows: directory name only, nothing invented.
+     Maestro cannot see an outside session asking for input, so needsYou
+     stays false; claiming otherwise would lie. */
   if (activeDirs) {
+    const liveCards = new Map<string, BoardCardItem>();
     for (const cwd of [...activeDirs].sort()) {
       if (!cwd) continue;
-      if (liveOutsideHandoffs.some((h) => isCoveredByActiveDir(h.path, new Set([cwd])))) continue;
-      columns.building.push({
-        kind: "external",
-        dir: cwd,
-        handoff: null,
-        projectName: cwd.split("/").pop() ?? cwd,
-        objective: "Working outside Maestro",
-        stageLabel: "Live outside Maestro",
-        needsYou: false,
-        since: null,
-      });
+      const single = new Set([cwd]);
+      let deepest: HandoffInfo | null = null;
+      for (const h of liveOutsideHandoffs) {
+        if (!isCoveredByActiveDir(h.path, single)) continue;
+        if (!deepest || h.path.length > deepest.path.length) deepest = h;
+      }
+      if (deepest) {
+        const lastAsk = deepest.asks[deepest.asks.length - 1];
+        liveCards.set(deepest.path, {
+          kind: "external",
+          dir: deepest.path,
+          handoff: deepest,
+          projectName: deepest.repo,
+          objective: deepest.waiting && lastAsk ? lastAsk : deepest.lastAction,
+          stageLabel: "Live outside Maestro",
+          needsYou: false,
+          since: deepest.lastActive,
+        });
+      } else {
+        liveCards.set(cwd, {
+          kind: "external",
+          dir: cwd,
+          handoff: null,
+          /* filter(Boolean) so a root cwd names itself rather than "". */
+          projectName: cwd.split("/").filter(Boolean).pop() ?? cwd,
+          objective: "Working outside Maestro",
+          stageLabel: "Live outside Maestro",
+          needsYou: false,
+          since: null,
+        });
+      }
     }
+    columns.building.push(...liveCards.values());
   }
 
   /* ACT runs -> stage-keyword column, or Done once terminal-success crosses

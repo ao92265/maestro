@@ -576,6 +576,38 @@ describe("assembleBoard live outside-Maestro cards (WP7)", () => {
     expect(card.dir).toBe("/tmp/mystery-dir");
   });
 
+  it("names a root-directory cwd by the directory itself, never blank", () => {
+    const columns = assembleBoard({
+      ...EMPTY,
+      tabs: TABS,
+      activeDirs: new Set(["/"]),
+    });
+    const card = columns.building[0];
+    expect(card.kind).toBe("external");
+    expect(card.projectName).toBe("/");
+  });
+
+  it("emits one card per live cwd when handoff paths nest, keeping the deepest", () => {
+    /* One live process must not read as two live pieces of work. */
+    const columns = assembleBoard({
+      ...EMPTY,
+      handoffs: [
+        handoff("parent", { path: "/tmp/proj-a" }),
+        handoff("child", { path: "/tmp/proj-a/sub" }),
+      ],
+      tabs: TABS,
+      activeDirs: new Set(["/tmp/proj-a/sub"]),
+    });
+    const externals = columns.building.filter((c) => c.kind === "external");
+    expect(externals.length).toBe(1);
+    const card = externals[0];
+    if (card.kind !== "external") return;
+    expect(card.dir).toBe("/tmp/proj-a/sub");
+    expect(card.handoff?.slug).toBe("child");
+    /* The parent handoff stays covered: not waiting in Suggested either. */
+    expect(columns.suggested).toEqual([]);
+  });
+
   it("emits one card per covered handoff even when the cwd sits deeper than its path", () => {
     const columns = assembleBoard({
       ...EMPTY,

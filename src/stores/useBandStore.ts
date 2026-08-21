@@ -84,6 +84,13 @@ interface BandDataState {
    * relabel stays the honesty floor.
    */
   externallyActiveDirs: Set<string>;
+  /**
+   * Last process-scan failure, cleared on the next success. While set,
+   * Building may be missing live outside-Maestro work and Suggested may hold
+   * handoffs that are actually being worked on; the view shows a stale
+   * badge, matching this store's failure convention above.
+   */
+  processesError: string | null;
   /** Fetch everything once; callers drive the interval. Never rejects. */
   refresh: () => Promise<void>;
   /** "I have looked": merged PRs up to now stop counting as news. */
@@ -100,6 +107,7 @@ export const useBandStore = create<BandDataState>((set, get) => ({
   isRefreshing: false,
   watermarkMs: initWatermark(),
   externallyActiveDirs: new Set(),
+  processesError: null,
 
   refresh: async () => {
     /* A refresh requested mid-poll is queued, not dropped: opening project B
@@ -122,17 +130,21 @@ export const useBandStore = create<BandDataState>((set, get) => ({
          this refresh cadence only, never a tighter poll loop. Maestro's own
          spawned sessions are excluded: they are already on the board as
          session cards, not "outside" anything (review finding 2 on 4f3f27a).
-         A failed scan clears the set instead of freezing stale liveness
-         (finding 3); the view degrades to the unconditional relabel floor. */
+         The name gate matters: the Rust matcher also hits on a command-line
+         substring, so MCP helpers under node and shells sourcing ~/.claude
+         snapshots all come back matched; only the claude executable itself
+         is claude work. A failed scan clears the set instead of freezing
+         stale liveness (finding 3) and records the error so Building can
+         wear a stale badge rather than silently un-living real work. */
       await listDevProcesses(["claude"]).then(
         (procs) => {
           const dirs = new Set<string>();
           for (const p of procs) {
-            if (p.cwd && !p.isMaestro) dirs.add(p.cwd);
+            if (p.cwd && !p.isMaestro && p.name === "claude") dirs.add(p.cwd);
           }
-          set({ externallyActiveDirs: dirs });
+          set({ externallyActiveDirs: dirs, processesError: null });
         },
-        () => set({ externallyActiveDirs: new Set<string>() }),
+        (err) => set({ externallyActiveDirs: new Set<string>(), processesError: String(err) }),
       );
 
       /* One entry per distinct repo path; a workspace can point two tabs at
