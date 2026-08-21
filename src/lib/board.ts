@@ -306,10 +306,12 @@ export function assembleBoard({
     });
   }
 
-  /* Building -> live claude work outside Maestro, one card per live cwd:
-     one process must never read as two pieces of work, so when handoff
-     paths nest the deepest covered one speaks for the cwd (a shallower
-     covered handoff stays off Suggested too; it is still not waiting). A
+  /* Building -> live claude work outside Maestro, one card per live piece
+     of work: when handoff paths nest, the deepest covered one speaks for
+     the cwd (a shallower covered handoff stays off Suggested too; it is
+     still not waiting), and several cwds under one handoff collapse to
+     that handoff's card (a session and its subagent are one piece of
+     work; the Suggested header note still counts directories). A
      covered handoff card carries its own last words (the stop hook rewrites
      the handoff file every turn, so lastAction is near-live). A live cwd
      with no handoff still shows: directory name only, nothing invented.

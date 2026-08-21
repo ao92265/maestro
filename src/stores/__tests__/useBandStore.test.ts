@@ -112,6 +112,37 @@ describe("useBandStore externallyActiveDirs", () => {
     ]);
   });
 
+  it("recognises Windows and node-shim launches of the CLI", async () => {
+    /* Windows cmd lines are backslashed and keep .exe; an npm-installed CLI
+       execs through env node with the claude script as argv[1]. */
+    listDevProcessesMock.mockResolvedValue([
+      proc(
+        "/tmp/proj-win",
+        false,
+        "claude",
+        "C:\\Users\\x\\AppData\\Local\\Programs\\claude\\claude.exe --resume",
+      ),
+      proc("/tmp/proj-shim", false, "node", "/usr/bin/node /x/.nvm/bin/claude --resume"),
+    ]);
+
+    await useBandStore.getState().refresh();
+
+    expect([...useBandStore.getState().externallyActiveDirs].sort()).toEqual([
+      "/tmp/proj-shim",
+      "/tmp/proj-win",
+    ]);
+  });
+
+  it("ignores claude mcp serve, plumbing is not a session", async () => {
+    listDevProcessesMock.mockResolvedValue([
+      proc("/tmp/proj-mcp", false, "2.1.228", "claude mcp serve"),
+    ]);
+
+    await useBandStore.getState().refresh();
+
+    expect(useBandStore.getState().externallyActiveDirs.size).toBe(0);
+  });
+
   it("ignores the Claude desktop app and its helpers", async () => {
     /* The GUI bundle's binary is also named claude once lowercased, but a
        .app bundle is not a coding session in a directory. */

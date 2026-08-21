@@ -251,9 +251,11 @@ export function BoardView({
       : null);
 
   function staleFor(key: BoardColumnKey): string | null {
-    if (key === "suggested") return handoffsError;
-    /* A failed process scan empties the live outside-Maestro cards; saying
-       so beats letting real work silently read as not running. */
+    /* A failed process scan empties the live outside-Maestro cards AND
+       drops their handoffs back into Suggested with a live Launch action;
+       both columns say so, since launching a second agent onto a directory
+       already being driven is the harmful direction. */
+    if (key === "suggested") return handoffsError ?? processesError;
     if (key === "building") return processesError;
     if (key === "review" || key === "done") return prsStale;
     return null;

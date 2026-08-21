@@ -608,6 +608,20 @@ describe("assembleBoard live outside-Maestro cards (WP7)", () => {
     expect(columns.suggested).toEqual([]);
   });
 
+  it("shows one card when two live cwds sit under the same handoff", () => {
+    /* Two processes in one project (a session and its subagent) are one
+       piece of work; the header note still counts directories. */
+    const columns = assembleBoard({
+      ...EMPTY,
+      handoffs: [handoff("shared", { path: "/tmp/proj-a" })],
+      tabs: TABS,
+      activeDirs: new Set(["/tmp/proj-a/x", "/tmp/proj-a/y"]),
+    });
+    const externals = columns.building.filter((c) => c.kind === "external");
+    expect(externals.length).toBe(1);
+    if (externals[0].kind === "external") expect(externals[0].handoff?.slug).toBe("shared");
+  });
+
   it("emits one card per covered handoff even when the cwd sits deeper than its path", () => {
     const columns = assembleBoard({
       ...EMPTY,

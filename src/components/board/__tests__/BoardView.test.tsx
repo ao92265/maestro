@@ -333,27 +333,34 @@ describe("BoardView", () => {
     expect(column("Building").queryByText("STALE")).not.toBeInTheDocument();
   });
 
-  it("clears the selection when the selected card leaves the board", () => {
-    useBandStore.setState({ handoffs: [handoff()] });
+  it("clears the selection when the selected card can no longer be activated", () => {
+    /* The card is still rendered, only disabled: a lingering ring on a card
+       j/k/Enter no longer see would be a dead control wearing focus. */
+    useSessionStore.setState({ sessions: [session(1, "Working")] });
+    useWorkspaceStore.setState({ tabs: [tab()] });
 
     renderBoard();
     fireEvent.keyDown(window, { key: "j" });
-    expect(selectedCard()?.textContent).toContain("proj-b");
+    expect(selectedCard()?.textContent).toContain("doing step 1");
 
     act(() => {
-      useBandStore.setState({ handoffs: [] });
+      useWorkspaceStore.setState({ tabs: [] });
     });
 
+    expect(screen.getByText("doing step 1")).toBeInTheDocument();
     expect(selectedCard()).toBeNull();
   });
 
-  it("marks Building stale when the process scan failed", () => {
+  it("marks Building and Suggested stale when the process scan failed", () => {
+    /* Building may be missing live cards, and Suggested may be re-offering
+       handoffs whose directories are actually being worked on. */
     useBandStore.setState({ processesError: "list_dev_processes: scan failed" });
 
     renderBoard();
 
     expect(column("Building").getByText("STALE")).toBeInTheDocument();
-    expect(column("Suggested").queryByText("STALE")).not.toBeInTheDocument();
+    expect(column("Suggested").getByText("STALE")).toBeInTheDocument();
+    expect(column("Review").queryByText("STALE")).not.toBeInTheDocument();
   });
 
   it("marks Review and Done stale, naming the repo, when a PR poll failed", () => {
