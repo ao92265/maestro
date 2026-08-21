@@ -341,6 +341,26 @@ describe("BoardView", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
+  it("closes the peek when its directory stops being live outside", async () => {
+    invokeMock.mockResolvedValue({ sessions: [], total_found: 0, truncated: false, unreadable: 0 });
+    useBandStore.setState({
+      handoffs: [handoff()],
+      externallyActiveDirs: new Set(["/tmp/proj-b"]),
+    });
+
+    renderBoard();
+    fireEvent.click(column("Building").getByRole("button"));
+    await screen.findByRole("dialog");
+
+    act(() => {
+      useBandStore.setState({ externallyActiveDirs: new Set<string>() });
+    });
+
+    /* The card moved back to Suggested; a panel still saying "working
+       outside Maestro" would be asserting a present tense nobody verified. */
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
   it("opens the project from the peek and closes it", async () => {
     invokeMock.mockResolvedValue({ sessions: [], total_found: 0, truncated: false, unreadable: 0 });
     useBandStore.setState({

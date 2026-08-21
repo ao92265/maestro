@@ -74,6 +74,7 @@ function externalCard(withHandoff = true): BoardCardItem {
   return {
     kind: "external",
     dir: "/tmp/proj-b",
+    cwds: ["/tmp/proj-b"],
     handoff: withHandoff
       ? ({ slug: "hand-1", path: "/tmp/proj-b", repo: "proj-b" } as HandoffInfo)
       : null,

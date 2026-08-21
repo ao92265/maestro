@@ -1,7 +1,8 @@
 import { X } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { relAgo } from "@/components/board/BoardCard";
 import { badgeBaseClass } from "@/components/session/agentPresentation";
+import { normalizePath } from "@/lib/staleProcess";
 import {
   type ClaudeSessionInfo,
   type ClaudeSessionListing,
@@ -26,6 +27,7 @@ const MAX_PEEK_SESSIONS = 3;
 
 export function BoardPeek({
   dir,
+  cwds,
   projectName,
   onClose,
   onOpenProject,
@@ -33,6 +35,8 @@ export function BoardPeek({
 }: {
   /** Directory the outside claude process is working in. */
   dir: string;
+  /** The live process cwds the card stands for; scopes the transcript list. */
+  cwds: string[];
   projectName: string;
   onClose: () => void;
   /** Open the directory as a Maestro tab (no session launch). */
@@ -40,20 +44,33 @@ export function BoardPeek({
   /** Injectable for tests; the real one lists Claude Code's transcripts. */
   loadSessions?: (dir: string) => Promise<ClaudeSessionListing>;
 }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
   const [sessions, setSessions] = useState<ClaudeSessionInfo[] | null>(null);
+  const [hiddenCount, setHiddenCount] = useState(0);
+  const [unreadable, setUnreadable] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     setSessions(null);
+    setHiddenCount(0);
+    setUnreadable(0);
     setError(null);
+    /* `cwds` rides on the peeked card, a state snapshot taken on click, so
+       its identity is stable for the panel's whole lifetime. */
+    const liveCwds = new Set(cwds.map(normalizePath));
     loadSessions(dir).then(
       (listing) => {
         if (cancelled) return;
-        const newest = [...listing.sessions].sort(
-          (a, b) => Date.parse(b.last_active) - Date.parse(a.last_active),
-        );
-        setSessions(newest.slice(0, MAX_PEEK_SESSIONS));
+        /* The listing sweeps the whole subtree, which includes transcripts
+           Maestro's own sessions wrote in an ancestor repo; only exact live
+           cwds are the outside work this panel claims to show. */
+        const matching = listing.sessions
+          .filter((s) => s.cwd && liveCwds.has(normalizePath(s.cwd)))
+          .sort((a, b) => (Date.parse(b.last_active) || 0) - (Date.parse(a.last_active) || 0));
+        setSessions(matching.slice(0, MAX_PEEK_SESSIONS));
+        setHiddenCount(Math.max(0, matching.length - MAX_PEEK_SESSIONS));
+        setUnreadable(listing.unreadable);
       },
       (err) => {
         if (!cancelled) setError(String(err));
@@ -62,7 +79,47 @@ export function BoardPeek({
     return () => {
       cancelled = true;
     };
-  }, [dir, loadSessions]);
+  }, [dir, cwds, loadSessions]);
+
+  /* Focus the dialog on open, keep Tab cycling inside it (every board card
+     behind the backdrop is a focusable button, and Enter on a Suggested
+     card would launch a second agent onto a live directory), close on
+     Escape, and hand focus back on close. Same trap as FirstRunTour. */
+  useEffect(() => {
+    const previouslyFocused =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    dialogRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const dialog = dialogRef.current;
+      if (!dialog) return;
+      const focusables = dialog.querySelectorAll<HTMLElement>("button");
+      if (focusables.length === 0) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey && (active === first || active === dialog)) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && active === last) {
+        event.preventDefault();
+        first.focus();
+      } else if (!dialog.contains(active)) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      previouslyFocused?.focus();
+    };
+  }, [onClose]);
 
   function rowText(s: ClaudeSessionInfo): string {
     return s.last_activity ?? s.last_prompt ?? s.first_prompt ?? "No readable messages yet";
@@ -74,9 +131,12 @@ export function BoardPeek({
        lives on Escape (BoardView's key handler) and the header button. */
     <div className="absolute inset-0 z-[46] flex items-center justify-center bg-black/50 p-6">
       <div
+        ref={dialogRef}
+        tabIndex={-1}
         role="dialog"
+        aria-modal="true"
         aria-label={`Outside session in ${projectName}`}
-        className="flex max-h-full w-[34rem] flex-col rounded-md border border-maestro-border bg-maestro-bg shadow-xl"
+        className="flex max-h-full w-[34rem] flex-col rounded-md border border-maestro-border bg-maestro-bg shadow-xl outline-none"
       >
         <div className="flex h-10 shrink-0 items-center gap-2 border-b border-maestro-border px-3">
           <span className="min-w-0 flex-1 truncate text-[12px] font-semibold text-maestro-text">
@@ -98,6 +158,10 @@ export function BoardPeek({
             <p className="text-[11px] text-maestro-yellow">Could not read transcripts: {error}</p>
           ) : sessions === null ? (
             <p className="text-[11px] text-maestro-muted">Reading transcripts…</p>
+          ) : sessions.length === 0 && unreadable > 0 ? (
+            <p className="text-[11px] text-maestro-yellow">
+              {unreadable} transcripts exist here but could not be read.
+            </p>
           ) : sessions.length === 0 ? (
             <p className="text-[11px] text-maestro-muted">
               No transcript found for this directory. The process is running, but no conversation
@@ -126,6 +190,16 @@ export function BoardPeek({
                 </li>
               ))}
             </ul>
+          )}
+          {hiddenCount > 0 && (
+            <p className="mt-1.5 text-[10px] text-maestro-muted/70">
+              +{hiddenCount} more conversations on disk
+            </p>
+          )}
+          {sessions !== null && sessions.length > 0 && unreadable > 0 && (
+            <p className="mt-1.5 text-[10px] text-maestro-yellow/80">
+              {unreadable} transcripts could not be read
+            </p>
           )}
           <p className="mt-2 text-[10px] text-maestro-muted/70">
             This work runs in another terminal. Maestro reads its transcript trail; the live view

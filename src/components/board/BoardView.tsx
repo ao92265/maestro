@@ -213,6 +213,18 @@ export function BoardView({
     }
   }, [flat, selectedKey]);
 
+  /* Same for the peek: when its directory stops being live outside (the
+     poll dropped it, or the session ended), a panel still saying "working
+     outside Maestro" would be asserting a present tense nobody verified. */
+  useEffect(() => {
+    if (
+      peekItem &&
+      !columns.building.some((c) => c.kind === "external" && c.dir === peekItem.dir)
+    ) {
+      setPeekItem(null);
+    }
+  }, [columns, peekItem]);
+
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       /* The tour's focus trap only traps Tab, so every other key still
@@ -221,15 +233,10 @@ export function BoardView({
          overlay covers the board: these keys would act on hidden cards. */
       if (overlayOpen) return;
       if (useTourStore.getState().isOpen) return;
-      /* The peek is modal over the board: Escape closes it, everything else
-         must not move or activate the cards hidden behind it. */
-      if (peekItem) {
-        if (event.key === "Escape") {
-          event.preventDefault();
-          setPeekItem(null);
-        }
-        return;
-      }
+      /* The peek is modal over the board: its own focus trap owns Escape
+         and Tab; everything here goes dead so j/k/Enter cannot act on the
+         cards hidden behind it. */
+      if (peekItem) return;
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       const target = event.target as HTMLElement | null;
       if (
@@ -420,6 +427,7 @@ export function BoardView({
       {peekItem && (
         <BoardPeek
           dir={peekItem.dir}
+          cwds={peekItem.cwds}
           projectName={peekItem.projectName}
           onClose={() => setPeekItem(null)}
           onOpenProject={(dir) => {

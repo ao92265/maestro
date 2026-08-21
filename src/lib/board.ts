@@ -81,6 +81,12 @@ export type BoardCardItem =
       kind: "external";
       /** Directory the live outside-Maestro claude process is working in. */
       dir: string;
+      /**
+       * The live cwds this card stands for (several processes in one
+       * project collapse to one card). Scopes the peek's transcript list to
+       * the outside work rather than the whole repo's history.
+       */
+      cwds: string[];
       /** Freshest handoff for that directory, when one exists on disk. */
       handoff: HandoffInfo | null;
       projectName: string;
@@ -328,10 +334,16 @@ export function assembleBoard({
         if (!deepest || h.path.length > deepest.path.length) deepest = h;
       }
       if (deepest) {
+        const existing = liveCards.get(deepest.path);
+        if (existing && existing.kind === "external") {
+          existing.cwds.push(cwd);
+          continue;
+        }
         const lastAsk = deepest.asks[deepest.asks.length - 1];
         liveCards.set(deepest.path, {
           kind: "external",
           dir: deepest.path,
+          cwds: [cwd],
           handoff: deepest,
           projectName: deepest.repo,
           objective: deepest.waiting && lastAsk ? lastAsk : deepest.lastAction,
@@ -343,6 +355,7 @@ export function assembleBoard({
         liveCards.set(cwd, {
           kind: "external",
           dir: cwd,
+          cwds: [cwd],
           handoff: null,
           /* filter(Boolean) so a root cwd names itself rather than "". */
           projectName: cwd.split("/").filter(Boolean).pop() ?? cwd,

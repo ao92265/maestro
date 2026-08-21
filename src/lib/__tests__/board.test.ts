@@ -619,7 +619,12 @@ describe("assembleBoard live outside-Maestro cards (WP7)", () => {
     });
     const externals = columns.building.filter((c) => c.kind === "external");
     expect(externals.length).toBe(1);
-    if (externals[0].kind === "external") expect(externals[0].handoff?.slug).toBe("shared");
+    if (externals[0].kind === "external") {
+      expect(externals[0].handoff?.slug).toBe("shared");
+      /* Both live cwds ride on the card so the peek can scope transcripts
+         to the outside work, not the whole repo's. */
+      expect(externals[0].cwds).toEqual(["/tmp/proj-a/x", "/tmp/proj-a/y"]);
+    }
   });
 
   it("emits one card per covered handoff even when the cwd sits deeper than its path", () => {

@@ -37,6 +37,7 @@ function renderPeek(overrides: Record<string, unknown> = {}) {
   render(
     <BoardPeek
       dir="/tmp/proj-b"
+      cwds={["/tmp/proj-b"]}
       projectName="proj-b"
       loadSessions={vi.fn().mockResolvedValue(listing([sessionInfo()]))}
       {...handlers}
@@ -101,6 +102,63 @@ describe("BoardPeek", () => {
     await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
+
+    expect(handlers.onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows only conversations from the live cwds, not the whole repo's", async () => {
+    /* The listing sweeps the subtree, so an ancestor repo's own Maestro
+       transcripts come back too; under the header "working outside Maestro"
+       they would be a lie. */
+    const sessions = [
+      sessionInfo({ session_id: "a1", cwd: "/tmp/proj-b", last_activity: "outside work" }),
+      sessionInfo({ session_id: "b2", cwd: "/tmp/proj-b/wt", last_activity: "someone else" }),
+      sessionInfo({ session_id: "c3", cwd: null, last_activity: "no cwd recorded" }),
+    ];
+    renderPeek({ loadSessions: vi.fn().mockResolvedValue(listing(sessions)) });
+
+    expect(await screen.findByText("outside work")).toBeInTheDocument();
+    expect(screen.queryByText("someone else")).not.toBeInTheDocument();
+    expect(screen.queryByText("no cwd recorded")).not.toBeInTheDocument();
+  });
+
+  it("counts what it is not showing instead of hiding it", async () => {
+    const sessions = ["a1", "b2", "c3", "d4", "e5"].map((id, i) =>
+      sessionInfo({ session_id: id, last_active: `2026-08-2${i}T10:00:00Z` }),
+    );
+    renderPeek({ loadSessions: vi.fn().mockResolvedValue(listing(sessions)) });
+
+    await waitFor(() => expect(screen.getAllByRole("listitem").length).toBe(3));
+    expect(screen.getByText(/2 more conversations on disk/)).toBeInTheDocument();
+  });
+
+  it("says transcripts could not be read rather than claiming none exist", async () => {
+    renderPeek({
+      loadSessions: vi
+        .fn()
+        .mockResolvedValue({ sessions: [], total_found: 0, truncated: false, unreadable: 2 }),
+    });
+
+    expect(await screen.findByText(/2 transcripts .*could not be read/)).toBeInTheDocument();
+    expect(screen.queryByText(/No transcript found/)).not.toBeInTheDocument();
+  });
+
+  it("takes focus on open and pulls a Tab that escaped back inside", async () => {
+    renderPeek();
+    const dialog = await screen.findByRole("dialog");
+
+    expect(document.activeElement).toBe(dialog);
+
+    (document.body as HTMLElement).focus();
+    fireEvent.keyDown(window, { key: "Tab" });
+    expect(dialog.contains(document.activeElement)).toBe(true);
+  });
+
+  it("closes on Escape from its own listener", async () => {
+    const handlers = renderPeek();
+    await screen.findByRole("dialog");
+
+    fireEvent.keyDown(window, { key: "Escape" });
 
     expect(handlers.onClose).toHaveBeenCalledTimes(1);
   });
