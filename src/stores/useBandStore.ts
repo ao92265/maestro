@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
 import type { BandTab, HandoffInfo, RepoPrs } from "@/lib/bands";
-import { listDevProcesses } from "@/lib/processes";
+import { isClaudeSession, listDevProcesses } from "@/lib/processes";
 import type { PullRequestInfo } from "@/stores/useGitHubStore";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 
@@ -130,17 +130,19 @@ export const useBandStore = create<BandDataState>((set, get) => ({
          this refresh cadence only, never a tighter poll loop. Maestro's own
          spawned sessions are excluded: they are already on the board as
          session cards, not "outside" anything (review finding 2 on 4f3f27a).
-         The name gate matters: the Rust matcher also hits on a command-line
-         substring, so MCP helpers under node and shells sourcing ~/.claude
-         snapshots all come back matched; only the claude executable itself
-         is claude work. A failed scan clears the set instead of freezing
-         stale liveness (finding 3) and records the error so Building can
-         wear a stale badge rather than silently un-living real work. */
+         The isClaudeSession gate matters: the Rust matcher also hits on a
+         command-line substring, so MCP helpers under node and shells
+         sourcing ~/.claude snapshots all come back matched; only the CLI
+         itself is claude work (see the predicate's doc for why the process
+         name alone cannot decide this). A failed scan clears the set
+         instead of freezing stale liveness (finding 3) and records the
+         error so Building can wear a stale badge rather than silently
+         un-living real work. */
       await listDevProcesses(["claude"]).then(
         (procs) => {
           const dirs = new Set<string>();
           for (const p of procs) {
-            if (p.cwd && !p.isMaestro && p.name === "claude") dirs.add(p.cwd);
+            if (p.cwd && !p.isMaestro && isClaudeSession(p)) dirs.add(p.cwd);
           }
           set({ externallyActiveDirs: dirs, processesError: null });
         },

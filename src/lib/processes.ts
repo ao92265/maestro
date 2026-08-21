@@ -42,6 +42,25 @@ export interface DockerPs {
   containers: DockerContainer[];
 }
 
+/**
+ * True when a watchlist-matched process is an actual claude CLI session.
+ *
+ * The Rust matcher also hits on command-line substrings, so MCP helpers
+ * under node, npm running one, and shells sourcing a ~/.claude snapshot all
+ * come back matched. The OS-reported name cannot carry the decision either:
+ * the CLI's executable image lives at ~/.local/share/claude/versions/<x.y.z>,
+ * so `name` is a bare version number (observed live, 2026-08-21). What does
+ * identify it is argv[0]: "claude" bare from a PATH launch or as the
+ * basename of a full-path launch (launchd jobs). A .app bundle path is the
+ * desktop app, not a coding session in a directory.
+ */
+export function isClaudeSession(p: DevProcess): boolean {
+  const argv0 = p.cmd.split(" ")[0] ?? "";
+  if (argv0.includes(".app/")) return false;
+  const base = argv0.split("/").filter(Boolean).pop() ?? "";
+  return base.toLowerCase() === "claude";
+}
+
 /** Scan all OS processes and return those matching the watchlist. */
 export function listDevProcesses(watchlist: string[]): Promise<DevProcess[]> {
   return invoke("list_dev_processes", { watchlist });

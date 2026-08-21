@@ -6,7 +6,12 @@ const { invokeMock, listDevProcessesMock } = vi.hoisted(() => ({
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
-vi.mock("@/lib/processes", () => ({ listDevProcesses: listDevProcessesMock }));
+/* Partial mock: the real isClaudeSession predicate is under test here, only
+   the Tauri-backed scan call is stubbed. */
+vi.mock("@/lib/processes", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/processes")>()),
+  listDevProcesses: listDevProcessesMock,
+}));
 
 /* The workspace store persists through the Tauri plugin-store, which has no
    window internals under vitest (same stub as BoardView.test.tsx). */
@@ -26,12 +31,17 @@ import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 /* Fixtures are fully synthetic: this repo is public, so no real project
    paths appear here. */
 
-function proc(cwd: string | null, isMaestro: boolean, name = "claude"): DevProcess {
+function proc(
+  cwd: string | null,
+  isMaestro: boolean,
+  name = "claude",
+  cmd = "claude --resume",
+): DevProcess {
   return {
     pid: 1,
     parentPid: null,
     name,
-    cmd: "claude",
+    cmd,
     cwd,
     memoryBytes: 0,
     cpuPercent: 0,
@@ -69,17 +79,50 @@ describe("useBandStore externallyActiveDirs", () => {
 
   it("ignores processes that merely mention claude in their command line", async () => {
     /* The Rust matcher also hits on a command-line substring, so an MCP
-       helper under node or a shell sourcing a ~/.claude snapshot matches
-       the watchlist. Only the claude executable itself is claude work. */
+       helper under node, npm running one, or a shell sourcing a ~/.claude
+       snapshot all come back matched. Only the claude CLI itself, invoked
+       as claude, is claude work. */
     listDevProcessesMock.mockResolvedValue([
-      proc("/tmp/proj-helper", false, "node"),
-      proc("/tmp/proj-shell", false, "zsh"),
+      proc("/tmp/proj-helper", false, "node", "node /x/node_modules/.bin/claude-historian-mcp"),
+      proc("/tmp/proj-npm", false, "npm", "npm exec claude-historian-mcp"),
+      proc("/tmp/proj-shell", false, "zsh", "/bin/zsh -c source /x/.claude/snap.sh && claude"),
       proc("/tmp/proj-real", false, "claude"),
     ]);
 
     await useBandStore.getState().refresh();
 
     expect([...useBandStore.getState().externallyActiveDirs]).toEqual(["/tmp/proj-real"]);
+  });
+
+  it("recognises the claude CLI when its process name is the version-directory basename", async () => {
+    /* Observed live: the CLI's executable image is
+       ~/.local/share/claude/versions/<x.y.z>, so the OS-reported process
+       name is a bare version number; argv[0] is what says claude. Covers
+       both a PATH launch and a launchd job's full-path launch. */
+    listDevProcessesMock.mockResolvedValue([
+      proc("/tmp/proj-path", false, "2.1.228", "claude --resume"),
+      proc("/tmp/proj-daemon", false, "2.1.228", "/x/.local/bin/claude -p tick"),
+    ]);
+
+    await useBandStore.getState().refresh();
+
+    expect([...useBandStore.getState().externallyActiveDirs].sort()).toEqual([
+      "/tmp/proj-daemon",
+      "/tmp/proj-path",
+    ]);
+  });
+
+  it("ignores the Claude desktop app and its helpers", async () => {
+    /* The GUI bundle's binary is also named claude once lowercased, but a
+       .app bundle is not a coding session in a directory. */
+    listDevProcessesMock.mockResolvedValue([
+      proc("/", false, "claude", "/Applications/Claude.app/Contents/MacOS/Claude"),
+      proc("/", false, "claude", "/Applications/Claude.app/Contents/MacOS/Claude --type=renderer"),
+    ]);
+
+    await useBandStore.getState().refresh();
+
+    expect(useBandStore.getState().externallyActiveDirs.size).toBe(0);
   });
 
   it("clears the set when the process scan fails instead of freezing stale liveness", async () => {
