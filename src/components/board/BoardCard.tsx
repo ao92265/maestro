@@ -48,6 +48,8 @@ export function boardCardKey(item: BoardCardItem): string {
       return `run:${item.run.id}`;
     case "pr":
       return `pr:${item.repoPath}#${item.pr.number}`;
+    case "external":
+      return `external:${item.dir}`;
   }
 }
 
@@ -71,6 +73,11 @@ export function cardAction(item: BoardCardItem): { enabled: boolean; title: stri
       return { enabled: true, title: "Open this run in the Factory" };
     case "pr":
       return { enabled: true, title: "Open on GitHub" };
+    case "external":
+      return {
+        enabled: false,
+        title: "Running outside Maestro, so there is no terminal here to open or zoom",
+      };
   }
 }
 
@@ -98,12 +105,17 @@ function stageChip(item: BoardCardItem): { label: string; cls: string; mono: boo
             : "bg-maestro-blue/15 text-maestro-blue",
         mono: false,
       };
+    case "external":
+      /* Blue means working, matching live sessions: this work IS live, it
+         just is not Maestro's to open. */
+      return { label: "OUTSIDE MAESTRO", cls: "bg-maestro-blue/15 text-maestro-blue", mono: false };
   }
 }
 
 function cardIcon(item: BoardCardItem) {
   switch (item.kind) {
     case "session":
+    case "external":
       return TerminalSquare;
     case "handoff":
       return Play;

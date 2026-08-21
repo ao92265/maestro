@@ -70,6 +70,21 @@ function prCard(stageLabel: string, mergedAt: string | null, needsYou: boolean):
   };
 }
 
+function externalCard(withHandoff = true): BoardCardItem {
+  return {
+    kind: "external",
+    dir: "/tmp/proj-b",
+    handoff: withHandoff
+      ? ({ slug: "hand-1", path: "/tmp/proj-b", repo: "proj-b" } as HandoffInfo)
+      : null,
+    projectName: "proj-b",
+    objective: withHandoff ? "left the migration half applied" : "Working outside Maestro",
+    stageLabel: "Live outside Maestro",
+    needsYou: false,
+    since: null,
+  };
+}
+
 describe("boardCardKey", () => {
   it("gives every card kind a distinct stable key", () => {
     const keys = [
@@ -77,8 +92,9 @@ describe("boardCardKey", () => {
       handoffCard(),
       runCard("build"),
       prCard("Merged", "2026-08-19T09:00:00Z", false),
+      externalCard(),
     ].map(boardCardKey);
-    expect(new Set(keys).size).toBe(4);
+    expect(new Set(keys).size).toBe(5);
     expect(boardCardKey(sessionCard("Working", "t1"))).toBe(keys[0]);
   });
 });
@@ -88,6 +104,12 @@ describe("cardAction", () => {
     const action = cardAction(sessionCard("Working", null));
     expect(action.enabled).toBe(false);
     expect(action.title).toContain("not open in a tab");
+  });
+
+  it("disables an outside-Maestro card and says why", () => {
+    const action = cardAction(externalCard());
+    expect(action.enabled).toBe(false);
+    expect(action.title).toContain("outside Maestro");
   });
 
   it("enables every other card kind", () => {
@@ -163,6 +185,22 @@ describe("BoardCard", () => {
 
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
     expect(screen.getByTitle(/not open in a tab/)).toBeInTheDocument();
+  });
+
+  it("renders an outside-Maestro card without button styling, saying why", () => {
+    render(<BoardCard item={externalCard()} selected={false} onActivate={vi.fn()} />);
+
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(screen.getByText("left the migration half applied")).toBeInTheDocument();
+    expect(screen.getByText("OUTSIDE MAESTRO")).toBeInTheDocument();
+    expect(screen.getByTitle(/outside Maestro/)).toBeInTheDocument();
+  });
+
+  it("renders a live cwd with no handoff carrying only the directory truth", () => {
+    render(<BoardCard item={externalCard(false)} selected={false} onActivate={vi.fn()} />);
+
+    expect(screen.getByText("proj-b")).toBeInTheDocument();
+    expect(screen.getByText("Working outside Maestro")).toBeInTheDocument();
   });
 
   it("marks the selected card and leaves an unselected one unmarked", () => {

@@ -76,6 +76,18 @@ export type BoardCardItem =
       stageLabel: string;
       needsYou: boolean;
       since: string | null;
+    }
+  | {
+      kind: "external";
+      /** Directory the live outside-Maestro claude process is working in. */
+      dir: string;
+      /** Freshest handoff for that directory, when one exists on disk. */
+      handoff: HandoffInfo | null;
+      projectName: string;
+      objective: string;
+      stageLabel: string;
+      needsYou: boolean;
+      since: string | null;
     };
 
 export interface BoardColumns {
@@ -263,14 +275,12 @@ export function assembleBoard({
   }
 
   /* Suggested -> handoffs on disk. Dedupe/cap mirrors bands.ts exactly; a
-     handoff covered by a live session (or, per activeDirs, an externally
-     running claude) is not "on disk waiting": the running work IS it. */
+     handoff covered by a live session is dropped, and one covered by an
+     externally running claude (activeDirs) is not "on disk waiting" either:
+     the running work IS it, so it shows in Building below instead. */
   const liveDirs = new Set(sessions.map(sessionDir));
   const sortedHandoffs = handoffs
-    .filter(
-      (h) =>
-        !h.stale && !h.orphan && !liveDirs.has(h.path) && !isCoveredByActiveDir(h.path, activeDirs),
-    )
+    .filter((h) => !h.stale && !h.orphan && !liveDirs.has(h.path))
     .sort((a, b) => Date.parse(b.lastActive) - Date.parse(a.lastActive));
   const seenPaths = new Set<string>();
   const dedupedHandoffs = sortedHandoffs.filter((h) => {
@@ -278,8 +288,12 @@ export function assembleBoard({
     seenPaths.add(h.path);
     return true;
   });
-  columns.moreHandoffs = Math.max(0, dedupedHandoffs.length - MAX_HANDOFF_ROWS);
-  for (const h of dedupedHandoffs.slice(0, MAX_HANDOFF_ROWS)) {
+  const waitingHandoffs = dedupedHandoffs.filter((h) => !isCoveredByActiveDir(h.path, activeDirs));
+  const liveOutsideHandoffs = dedupedHandoffs.filter((h) =>
+    isCoveredByActiveDir(h.path, activeDirs),
+  );
+  columns.moreHandoffs = Math.max(0, waitingHandoffs.length - MAX_HANDOFF_ROWS);
+  for (const h of waitingHandoffs.slice(0, MAX_HANDOFF_ROWS)) {
     const lastAsk = h.asks[h.asks.length - 1];
     columns.suggested.push({
       kind: "handoff",
@@ -290,6 +304,42 @@ export function assembleBoard({
       needsYou: false,
       since: h.lastActive,
     });
+  }
+
+  /* Building -> live claude work outside Maestro. A covered handoff becomes
+     a card carrying its own last words (the stop hook rewrites the handoff
+     file every turn, so lastAction is near-live). A live cwd with no handoff
+     still shows: directory name only, nothing invented. Maestro cannot see
+     an outside session asking for input, so needsYou stays false; claiming
+     otherwise would lie. */
+  for (const h of liveOutsideHandoffs) {
+    const lastAsk = h.asks[h.asks.length - 1];
+    columns.building.push({
+      kind: "external",
+      dir: h.path,
+      handoff: h,
+      projectName: h.repo,
+      objective: h.waiting && lastAsk ? lastAsk : h.lastAction,
+      stageLabel: "Live outside Maestro",
+      needsYou: false,
+      since: h.lastActive,
+    });
+  }
+  if (activeDirs) {
+    for (const cwd of [...activeDirs].sort()) {
+      if (!cwd) continue;
+      if (liveOutsideHandoffs.some((h) => isCoveredByActiveDir(h.path, new Set([cwd])))) continue;
+      columns.building.push({
+        kind: "external",
+        dir: cwd,
+        handoff: null,
+        projectName: cwd.split("/").pop() ?? cwd,
+        objective: "Working outside Maestro",
+        stageLabel: "Live outside Maestro",
+        needsYou: false,
+        since: null,
+      });
+    }
   }
 
   /* ACT runs -> stage-keyword column, or Done once terminal-success crosses

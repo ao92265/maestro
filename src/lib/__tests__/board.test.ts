@@ -301,7 +301,7 @@ describe("assembleBoard", () => {
     expect(slugs).toEqual(["fresh"]);
   });
 
-  it("excludes a handoff when an externally-running claude cwd sits at or under its path", () => {
+  it("moves a handoff out of Suggested when an externally-running claude cwd sits at or under its path", () => {
     const columns = assembleBoard({
       ...EMPTY,
       handoffs: [handoff("nested"), handoff("exact")],
@@ -309,6 +309,8 @@ describe("assembleBoard", () => {
       activeDirs: new Set(["/tmp/proj-nested/subdir", "/tmp/proj-exact"]),
     });
     expect(columns.suggested).toEqual([]);
+    // Not hidden: the running work shows as a live card in Building (WP7).
+    expect(columns.building.filter((c) => c.kind === "external").length).toBe(2);
   });
 
   it("does not exclude a handoff for an unrelated activeDirs cwd", () => {
@@ -513,5 +515,91 @@ describe("assembleBoard", () => {
       watermarkMs: Date.parse("2026-08-10T00:00:00Z"),
     });
     expect(columns.done.map((c) => (c.kind === "pr" ? c.pr.number : -1))).toEqual([11]);
+  });
+});
+
+describe("assembleBoard live outside-Maestro cards (WP7)", () => {
+  it("shows a covered handoff as a Building card carrying its own last action", () => {
+    const columns = assembleBoard({
+      ...EMPTY,
+      handoffs: [handoff("live", { lastAction: "rewiring the exporter" })],
+      tabs: TABS,
+      activeDirs: new Set(["/tmp/proj-live"]),
+    });
+    expect(columns.suggested).toEqual([]);
+    expect(columns.building.length).toBe(1);
+    const card = columns.building[0];
+    expect(card.kind).toBe("external");
+    if (card.kind !== "external") return;
+    expect(card.stageLabel).toBe("Live outside Maestro");
+    expect(card.objective).toBe("rewiring the exporter");
+    expect(card.projectName).toBe("live");
+    expect(card.needsYou).toBe(false);
+    expect(card.since).toBe("2026-08-19T08:00:00Z");
+    expect(card.dir).toBe("/tmp/proj-live");
+    expect(card.handoff?.slug).toBe("live");
+  });
+
+  it("uses the last ask as the objective when the covered handoff stopped on a question", () => {
+    const columns = assembleBoard({
+      ...EMPTY,
+      handoffs: [
+        handoff("live", {
+          waiting: true,
+          asks: ["first ask", "second ask"],
+          lastAction: "stopped mid-step",
+        }),
+      ],
+      tabs: TABS,
+      activeDirs: new Set(["/tmp/proj-live"]),
+    });
+    const card = columns.building[0];
+    expect(card.kind).toBe("external");
+    expect(card.objective).toBe("second ask");
+  });
+
+  it("shows a live cwd with no handoff as a minimal card inventing nothing", () => {
+    const columns = assembleBoard({
+      ...EMPTY,
+      tabs: TABS,
+      activeDirs: new Set(["/tmp/mystery-dir"]),
+    });
+    expect(columns.building.length).toBe(1);
+    const card = columns.building[0];
+    expect(card.kind).toBe("external");
+    if (card.kind !== "external") return;
+    expect(card.projectName).toBe("mystery-dir");
+    expect(card.objective).toBe("Working outside Maestro");
+    expect(card.stageLabel).toBe("Live outside Maestro");
+    expect(card.handoff).toBeNull();
+    expect(card.since).toBeNull();
+    expect(card.dir).toBe("/tmp/mystery-dir");
+  });
+
+  it("emits one card per covered handoff even when the cwd sits deeper than its path", () => {
+    const columns = assembleBoard({
+      ...EMPTY,
+      handoffs: [handoff("deep")],
+      tabs: TABS,
+      activeDirs: new Set(["/tmp/proj-deep/sub/dir"]),
+    });
+    const externals = columns.building.filter((c) => c.kind === "external");
+    expect(externals.length).toBe(1);
+    if (externals[0].kind === "external") expect(externals[0].dir).toBe("/tmp/proj-deep");
+  });
+
+  it("keeps moreHandoffs counting only handoffs actually waiting in Suggested", () => {
+    const waiting = Array.from({ length: 12 }, (_, i) =>
+      handoff(`w${i}`, { path: `/tmp/proj-w${i}` }),
+    );
+    const columns = assembleBoard({
+      ...EMPTY,
+      handoffs: [...waiting, handoff("live")],
+      tabs: TABS,
+      activeDirs: new Set(["/tmp/proj-live"]),
+    });
+    expect(columns.suggested.length).toBe(10);
+    expect(columns.moreHandoffs).toBe(2);
+    expect(columns.building.filter((c) => c.kind === "external").length).toBe(1);
   });
 });
