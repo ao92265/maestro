@@ -108,7 +108,7 @@ function renderBoard(overrides: Record<string, unknown> = {}) {
     onOpenPr: vi.fn(),
     onShowGrid: vi.fn(),
   };
-  render(<BoardView {...handlers} {...overrides} />);
+  render(<BoardView {...handlers} overlayOpen={false} {...overrides} />);
   return handlers;
 }
 
@@ -268,6 +268,47 @@ describe("BoardView", () => {
     fireEvent.click(column("Review").getByRole("button"));
 
     expect(handlers.onOpenPr).toHaveBeenCalledWith("https://example.test/pr/7");
+  });
+
+  it("ignores j, k and Enter while a full-screen overlay covers the board", () => {
+    useBandStore.setState({ handoffs: [handoff()] });
+
+    const handlers = renderBoard({ overlayOpen: true });
+    fireEvent.keyDown(window, { key: "j" });
+    fireEvent.keyDown(window, { key: "Enter" });
+
+    expect(selectedCard()).toBeNull();
+    expect(handlers.onLaunchHandoff).not.toHaveBeenCalled();
+  });
+
+  it("skips a card that cannot be activated when moving the selection", () => {
+    /* No tabs open: the session card has no terminal to jump to. j must land
+       on the handoff both times, never park on a card Enter cannot act on. */
+    useSessionStore.setState({ sessions: [session(1, "Working")] });
+    useBandStore.setState({ handoffs: [handoff()] });
+
+    renderBoard();
+    fireEvent.keyDown(window, { key: "j" });
+    expect(selectedCard()?.textContent).toContain("proj-b");
+    fireEvent.keyDown(window, { key: "j" });
+    expect(selectedCard()?.textContent).toContain("proj-b");
+    expect(selectedCard()?.textContent).not.toContain("doing step 1");
+  });
+
+  it("shows work running outside Maestro as a Building card without button styling", () => {
+    useBandStore.setState({
+      handoffs: [handoff()],
+      externallyActiveDirs: new Set(["/tmp/proj-b"]),
+    });
+
+    renderBoard();
+
+    const building = column("Building");
+    expect(building.getByText("left the migration half applied")).toBeInTheDocument();
+    expect(building.queryByRole("button")).not.toBeInTheDocument();
+    expect(
+      column("Suggested").queryByText("left the migration half applied"),
+    ).not.toBeInTheDocument();
   });
 
   it("ignores j, k and Enter while the tour is open", () => {

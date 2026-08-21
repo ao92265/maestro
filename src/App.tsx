@@ -765,8 +765,24 @@ function App() {
   }, []);
 
   const handleToggleBoardView = useCallback(() => {
+    /* Cmd+E under a z-50 overlay would toggle the Board invisibly beneath
+       it (review finding 5 on 4f3f27a). The visible meaning of the keystroke
+       is "show me the Board", so leave the overlay and open it. */
+    const overlayUp =
+      landscapeView ||
+      useWorkflowsViewStore.getState().isOpen ||
+      useHomeViewStore.getState().isOpen ||
+      useFactoryViewStore.getState().isOpen;
+    if (overlayUp) {
+      setLandscapeView(false);
+      useWorkflowsViewStore.getState().close();
+      useHomeViewStore.getState().close();
+      useFactoryViewStore.getState().close();
+      useBoardViewStore.getState().open();
+      return;
+    }
     useBoardViewStore.getState().toggle();
-  }, []);
+  }, [landscapeView]);
 
   // The full-screen overlays are never open together: opening Home or the
   // Factory closes every other overlay, and opening the older two closes
@@ -1103,6 +1119,9 @@ function App() {
                     void openUrl(url).catch((err) => console.error("Failed to open PR:", err))
                   }
                   onShowGrid={closeBoardView}
+                  overlayOpen={
+                    landscapeView || workflowsViewOpen || homeViewOpen || factoryViewOpen
+                  }
                 />
               )}
 

@@ -1,7 +1,7 @@
 import { HelpCircle, LayoutGrid, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
-import { BoardCard, boardCardKey } from "@/components/board/BoardCard";
+import { BoardCard, boardCardKey, cardAction } from "@/components/board/BoardCard";
 import { BoardColumn } from "@/components/board/BoardColumn";
 import { badgeBaseClass, SESSION_STATUS_BADGES } from "@/components/session/agentPresentation";
 import type { BandTab, HandoffInfo } from "@/lib/bands";
@@ -44,6 +44,13 @@ interface BoardViewProps {
   onOpenPr: (url: string) => void;
   /** Close the Board layer to reveal the terminal grid underneath. */
   onShowGrid: () => void;
+  /**
+   * A z-50 overlay (Home, Factory, Landscape, Workflows) is stacked over the
+   * Board. They open without closing it, so while one is up the Board's keys
+   * must go dead: j/k/Enter acting on cards nobody can see activated hidden
+   * work (review finding 1 on 4f3f27a).
+   */
+  overlayOpen: boolean;
 }
 
 const COLUMN_META: Record<BoardColumnKey, { title: string; emptyText: string }> = {
@@ -75,6 +82,7 @@ export function BoardView({
   onLaunchHandoff,
   onOpenPr,
   onShowGrid,
+  overlayOpen,
 }: BoardViewProps) {
   const sessions = useSessionStore(useShallow((s) => s.sessions));
   const tabs = useWorkspaceStore(useShallow((s) => s.tabs));
@@ -150,8 +158,15 @@ export function BoardView({
     ],
   );
 
-  /* Reading order for j/k: column by column, left to right, top to bottom. */
-  const flat = useMemo(() => BOARD_COLUMN_ORDER.flatMap((key) => columns[key]), [columns]);
+  /* Reading order for j/k: column by column, left to right, top to bottom.
+     Only cards Enter can act on: parking the selection on a card that
+     silently no-ops is a dead control by keyboard, and the why-disabled
+     explanation is hover-only (review finding 4 on 4f3f27a). */
+  const flat = useMemo(
+    () =>
+      BOARD_COLUMN_ORDER.flatMap((key) => columns[key]).filter((item) => cardAction(item).enabled),
+    [columns],
+  );
 
   const activate = useCallback(
     (item: BoardCardItem) => {
@@ -168,6 +183,11 @@ export function BoardView({
         case "pr":
           onOpenPr(item.pr.url);
           return;
+        case "external":
+          /* Not reachable from the keyboard (disabled cards are filtered out
+             of `flat`), kept for the switch's exhaustiveness: Maestro cannot
+             open or zoom a session it did not spawn. */
+          return;
       }
     },
     [onNavigateSession, onLaunchHandoff, onOpenRun, onOpenPr],
@@ -177,7 +197,9 @@ export function BoardView({
     function handleKeyDown(event: KeyboardEvent) {
       /* The tour's focus trap only traps Tab, so every other key still
          reaches this listener behind its modal (useAppKeyboard.ts makes the
-         same early return for the same reason). */
+         same early return for the same reason). Same guard while a z-50
+         overlay covers the board: these keys would act on hidden cards. */
+      if (overlayOpen) return;
       if (useTourStore.getState().isOpen) return;
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       const target = event.target as HTMLElement | null;
@@ -205,7 +227,7 @@ export function BoardView({
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [flat, selectedKey, activate]);
+  }, [flat, selectedKey, activate, overlayOpen]);
 
   /* A partially failed PR poll must not read as "nothing in review": naming
      the repos that failed is the difference between stale and wrong. */
