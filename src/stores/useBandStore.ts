@@ -78,10 +78,10 @@ interface BandDataState {
   /**
    * Cwds of claude processes seen running outside a live Maestro session
    * (best-effort liveness detection, `list_dev_processes` watchlist
-   * "claude"). Feeds `activeDirs` into `assembleBands`/`assembleBoard`, whose
-   * job is additive-only: it can only remove a false "parked" label, never
-   * invent liveness. A scan failure leaves the previous set in place, so the
-   * unconditional handoff relabel stays the honesty floor.
+   * "claude", Maestro-spawned processes excluded via `isMaestro`). Feeds
+   * `activeDirs` into `assembleBands`/`assembleBoard`. A scan failure clears
+   * the set rather than freezing stale liveness; the unconditional handoff
+   * relabel stays the honesty floor.
    */
   externallyActiveDirs: Set<string>;
   /** Fetch everything once; callers drive the interval. Never rejects. */
@@ -119,18 +119,20 @@ export const useBandStore = create<BandDataState>((set, get) => ({
 
       /* Best-effort liveness detection: a claude process running outside any
          Maestro session still means the handoff's directory is live. Rides
-         this refresh cadence only, never a tighter poll loop. A scan failure
-         is silently swallowed, leaving the previous set (and the unconditional
-         relabel) as the honesty floor. */
+         this refresh cadence only, never a tighter poll loop. Maestro's own
+         spawned sessions are excluded: they are already on the board as
+         session cards, not "outside" anything (review finding 2 on 4f3f27a).
+         A failed scan clears the set instead of freezing stale liveness
+         (finding 3); the view degrades to the unconditional relabel floor. */
       await listDevProcesses(["claude"]).then(
         (procs) => {
           const dirs = new Set<string>();
           for (const p of procs) {
-            if (p.cwd) dirs.add(p.cwd);
+            if (p.cwd && !p.isMaestro) dirs.add(p.cwd);
           }
           set({ externallyActiveDirs: dirs });
         },
-        () => {},
+        () => set({ externallyActiveDirs: new Set<string>() }),
       );
 
       /* One entry per distinct repo path; a workspace can point two tabs at
