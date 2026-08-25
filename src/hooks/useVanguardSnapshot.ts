@@ -46,7 +46,8 @@ function rowOf(item: BandItem): SnapshotRow {
       return {
         kind: item.kind,
         label: `Parked: ${item.handoff.repo}`,
-        detail: item.handoff.lastAction,
+        // The open ask is the decision; lastAction is only a fallback narration.
+        detail: item.handoff.asks[0] || item.handoff.lastAction,
       };
   }
 }
