@@ -33,6 +33,8 @@ interface UseAppKeyboardOptions {
   onToggleHomeView?: () => void;
   /** Callback to toggle the Factory ACT lane (Cmd/Ctrl+7) */
   onToggleFactoryView?: () => void;
+  /** Callback to toggle the quick-open palette (Cmd/Ctrl+P) */
+  onToggleQuickOpen?: () => void;
   /** Ctrl+Tab (all platforms): switch to the next project tab */
   onNextProject?: () => void;
   /** Ctrl+Shift+Tab (all platforms): switch to the previous project tab */
@@ -55,6 +57,7 @@ function isMac(): boolean {
  * - Cmd/Ctrl+2: Toggle the git panel
  * - Cmd/Ctrl+7: Toggle the Factory (ACT lane)
  * - Cmd/Ctrl+3, 4, 6: Toggle the Memory/Processes/AI panels (5/Notes cut from nav)
+ * - Cmd/Ctrl+P: Toggle the quick-open palette (sessions and worktrees)
  * - Cmd/Ctrl+T: Add a new terminal (project picker in eagle view)
  * - Cmd/Ctrl+E: Toggle the Board layer (off reveals the terminal grid)
  * - Cmd/Ctrl+G: Toggle the eagle all-projects terminals view
@@ -72,6 +75,7 @@ export function useAppKeyboard({
   onToggleLandscapeView,
   onToggleHomeView,
   onToggleFactoryView,
+  onToggleQuickOpen,
   onNextProject,
   onPrevProject,
 }: UseAppKeyboardOptions): void {
@@ -163,6 +167,17 @@ export function useAppKeyboard({
         return;
       }
 
+      // Cmd/Ctrl+P: quick-open palette. Not Cmd/Ctrl+K (the cmdk convention) —
+      // that is already "clear terminal scrollback" in TerminalView, so P it is,
+      // matching the editor quick-open convention. preventDefault regardless, to
+      // swallow the WebView's print dialog.
+      if (event.code === "KeyP" && onToggleQuickOpen) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        onToggleQuickOpen();
+        return;
+      }
+
       if (event.code === "KeyT") {
         // Always prevent default to block WebView's new-tab behavior
         event.preventDefault();
@@ -206,6 +221,7 @@ export function useAppKeyboard({
     onToggleLandscapeView,
     onToggleHomeView,
     onToggleFactoryView,
+    onToggleQuickOpen,
     onNextProject,
     onPrevProject,
   ]);
