@@ -1,18 +1,19 @@
-import { Factory, Home, MoreHorizontal, Send, TerminalSquare, X } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+import { Columns, Factory, MoreHorizontal, Send, TerminalSquare, X } from "lucide-react";
 import { useEffect, useRef } from "react";
 import { useTourStore } from "@/stores/useTourStore";
 
 /**
- * First-run tour: a five-card walkthrough of the mental model and the two
- * views built for the daily loop. Shows once on a fresh install (see
- * `useTourStore`), reopenable from the Home header. Deliberately a plain
- * centered card, not a spotlight tour: the overlays it explains are
- * full-screen and mutually exclusive, so there is nothing stable behind it
- * to point an arrow at.
+ * First-run tour: a five-card walkthrough of the mental model and the
+ * views built for the daily loop, the Board and the terminal grid. Shows
+ * once on a fresh install (see `useTourStore`), reopenable from the Board
+ * or Home header. Deliberately a plain centered card, not a spotlight tour:
+ * the overlays it explains are full-screen and mutually exclusive, so there
+ * is nothing stable behind it to point an arrow at.
  */
 
 interface TourStep {
-  icon: typeof Home;
+  icon: LucideIcon;
   title: string;
   body: string;
   hint?: string;
@@ -20,16 +21,16 @@ interface TourStep {
 
 export const TOUR_STEPS: TourStep[] = [
   {
-    icon: TerminalSquare,
-    title: "Maestro is a terminal manager",
-    body: "Tabs along the top are your projects. Inside each tab you run Claude sessions side by side. Everything else in the app is bolted around that.",
-    hint: "Cmd+T for a new terminal, Cmd+G for every project at once",
+    icon: Columns,
+    title: "The Board is your deck",
+    body: "Columns track work as it moves: Suggested, Planning, Building, Checking, Review, Done. A card glowing red needs you: it stopped and is waiting on an answer.",
+    hint: "Cmd+E takes you to your terminals",
   },
   {
-    icon: Home,
-    title: "Home is your decision queue",
-    body: "Three bands: blocked waiting on you, landed since you last looked, still running. Parked handoffs sit underneath for triage. Open it, clear it, get on with your day.",
-    hint: "Cmd+1, and it opens on launch",
+    icon: TerminalSquare,
+    title: "Terminals are one keystroke away",
+    body: "Cmd+E swaps the Board for Grid. Tabs there are your projects, and inside each one you run Claude sessions side by side.",
+    hint: "Cmd+T for a new terminal, Cmd+G for every project at once",
   },
   {
     icon: Factory,
@@ -40,13 +41,13 @@ export const TOUR_STEPS: TourStep[] = [
   {
     icon: Send,
     title: "Telegram fetches you",
-    body: "The feed watches the same board Home shows. It pings you when something sits blocked for ten minutes and sends one digest each morning. Nothing to configure in here.",
+    body: "The feed watches the same board you just saw. It pings you when something sits blocked for ten minutes and sends one digest each morning. Nothing to configure in here.",
   },
   {
     icon: MoreHorizontal,
     title: "Everything else lives behind More",
     body: "Landscape and Memory are one click from the ⋯ menu at the top right, alongside Extensions (MCP servers, plugins, skills). Samurai, Harvest, Second Brain and Journal are still in the app, just off today's map.",
-    hint: "Reopen this tour any time from the Home header",
+    hint: "Reopen this tour any time from the Board header",
   },
 ];
 

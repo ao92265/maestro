@@ -51,7 +51,8 @@ function rowOf(item: BandItem): SnapshotRow {
   }
 }
 
-function buildSnapshot(): Record<string, unknown> {
+/** Exported for its test only; the hook below is the real consumer. */
+export function buildSnapshot(): Record<string, unknown> {
   const sessions = useSessionStore.getState().sessions;
   const tabs = useWorkspaceStore.getState().tabs.map((t) => ({
     id: t.id,
@@ -68,6 +69,10 @@ function buildSnapshot(): Record<string, unknown> {
     repoPrs: band.repoPrs,
     gatedRuns: act.gatedRuns,
     watermarkMs: band.watermarkMs,
+    /* Without this the Telegram digest keeps calling work "Parked" while a
+       claude is live in its directory in iTerm, the exact false label the
+       in-app bands stopped wearing in WP2. */
+    activeDirs: band.externallyActiveDirs,
   });
   return {
     writtenAt: Date.now(),

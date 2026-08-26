@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
 import type { BandTab, HandoffInfo, RepoPrs } from "@/lib/bands";
+import { isClaudeSession, listDevProcesses } from "@/lib/processes";
 import type { PullRequestInfo } from "@/stores/useGitHubStore";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 
@@ -74,6 +75,22 @@ interface BandDataState {
   prsError: string | null;
   isRefreshing: boolean;
   watermarkMs: number;
+  /**
+   * Cwds of claude processes seen running outside a live Maestro session
+   * (best-effort liveness detection, `list_dev_processes` watchlist
+   * "claude", Maestro-spawned processes excluded via `isMaestro`). Feeds
+   * `activeDirs` into `assembleBands`/`assembleBoard`. A scan failure clears
+   * the set rather than freezing stale liveness; the unconditional handoff
+   * relabel stays the honesty floor.
+   */
+  externallyActiveDirs: Set<string>;
+  /**
+   * Last process-scan failure, cleared on the next success. While set,
+   * Building may be missing live outside-Maestro work and Suggested may hold
+   * handoffs that are actually being worked on; the view shows a stale
+   * badge, matching this store's failure convention above.
+   */
+  processesError: string | null;
   /** Fetch everything once; callers drive the interval. Never rejects. */
   refresh: () => Promise<void>;
   /** "I have looked": merged PRs up to now stop counting as news. */
@@ -89,6 +106,8 @@ export const useBandStore = create<BandDataState>((set, get) => ({
   prsError: null,
   isRefreshing: false,
   watermarkMs: initWatermark(),
+  externallyActiveDirs: new Set(),
+  processesError: null,
 
   refresh: async () => {
     /* A refresh requested mid-poll is queued, not dropped: opening project B
@@ -104,6 +123,30 @@ export const useBandStore = create<BandDataState>((set, get) => ({
       await invoke<HandoffInfo[]>("get_handoffs").then(
         (handoffs) => set({ handoffs, handoffsFetchedAt: Date.now(), handoffsError: null }),
         (err) => set({ handoffsError: String(err) }),
+      );
+
+      /* Best-effort liveness detection: a claude process running outside any
+         Maestro session still means the handoff's directory is live. Rides
+         this refresh cadence only, never a tighter poll loop. Maestro's own
+         spawned sessions are excluded: they are already on the board as
+         session cards, not "outside" anything (review finding 2 on 4f3f27a).
+         The isClaudeSession gate matters: the Rust matcher also hits on a
+         command-line substring, so MCP helpers under node and shells
+         sourcing ~/.claude snapshots all come back matched; only the CLI
+         itself is claude work (see the predicate's doc for why the process
+         name alone cannot decide this). A failed scan clears the set
+         instead of freezing stale liveness (finding 3) and records the
+         error so Building can wear a stale badge rather than silently
+         un-living real work. */
+      await listDevProcesses(["claude"]).then(
+        (procs) => {
+          const dirs = new Set<string>();
+          for (const p of procs) {
+            if (p.cwd && !p.isMaestro && isClaudeSession(p)) dirs.add(p.cwd);
+          }
+          set({ externallyActiveDirs: dirs, processesError: null });
+        },
+        (err) => set({ externallyActiveDirs: new Set<string>(), processesError: String(err) }),
       );
 
       /* One entry per distinct repo path; a workspace can point two tabs at

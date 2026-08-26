@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { normalizePath } from "@/lib/staleProcess";
 
 /**
  * Thin wrappers around the Rust process/container commands
@@ -40,6 +41,43 @@ export interface DockerContainer {
 export interface DockerPs {
   available: boolean;
   containers: DockerContainer[];
+}
+
+/** Basename of a command path, OS-normalized, without a trailing .exe. */
+function commandStem(s: string): string {
+  const base = normalizePath(s).split("/").filter(Boolean).pop() ?? "";
+  return base.endsWith(".exe") ? base.slice(0, -4) : base;
+}
+
+/**
+ * True when a watchlist-matched process is an actual claude CLI session.
+ *
+ * The Rust matcher also hits on command-line substrings, so MCP helpers
+ * under node, npm running one, and shells sourcing a ~/.claude snapshot all
+ * come back matched. The OS-reported name cannot carry the decision either:
+ * the CLI's executable image lives at ~/.local/share/claude/versions/<x.y.z>,
+ * so `name` is a bare version number (observed live, 2026-08-21). What does
+ * identify it is argv[0]: "claude", bare from a PATH launch or as the
+ * basename of a full-path launch (launchd jobs), backslashed and .exe'd on
+ * Windows, or as argv[1] behind an npm shim's env node hop. A .app bundle
+ * path is the desktop app, not a coding session in a directory, and
+ * `claude mcp` is plumbing that happens to live in the project.
+ *
+ * Known limit: `cmd` is space-joined argv, so an install path containing a
+ * space parses wrong and that process is missed. Additive-only feature, so
+ * a miss degrades to the pre-scan behaviour, never to a false card.
+ */
+export function isClaudeSession(p: DevProcess): boolean {
+  const argv = p.cmd.split(" ").filter(Boolean);
+  const argv0 = argv[0] ?? "";
+  if (normalizePath(argv0).includes(".app/")) return false;
+  let hit = commandStem(argv0) === "claude";
+  let subcommand = argv[1];
+  if (!hit && (commandStem(argv0) === "node" || commandStem(argv0) === "bun") && argv[1]) {
+    hit = commandStem(argv[1]) === "claude";
+    subcommand = argv[2];
+  }
+  return hit && subcommand !== "mcp";
 }
 
 /** Scan all OS processes and return those matching the watchlist. */

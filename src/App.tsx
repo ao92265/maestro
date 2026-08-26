@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ask } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { GitFork, RefreshCw, X } from "lucide-react";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MAC_TITLE_BAR_INSET_PX, useMacTitleBarPadding } from "@/hooks/useMacTitleBarPadding";
@@ -23,6 +24,7 @@ import {
 } from "@/stores/useSessionStore";
 import { useStandupStore } from "@/stores/useStandupStore";
 import { type RepositoryInfo, useWorkspaceStore } from "@/stores/useWorkspaceStore";
+import { BoardView } from "./components/board/BoardView";
 import { GitGraphPanel } from "./components/git/GitGraphPanel";
 import type { GitPanelTab } from "./components/git/GitPanelTabs";
 import { BottomBar } from "./components/shared/BottomBar";
@@ -52,11 +54,14 @@ import { FirstRunTour } from "./components/tour/FirstRunTour";
 import { UpdateNotification } from "./components/update/UpdateNotification";
 import { useAppKeyboard } from "./hooks/useAppKeyboard";
 import { useBandPolling } from "./hooks/useBandPolling";
+import { useLaunchHandoff } from "./hooks/useLaunchHandoff";
 import { useSwipeNavigation } from "./hooks/useSwipeNavigation";
 import { useVanguardSnapshot } from "./hooks/useVanguardSnapshot";
 import { HEALTH_CHECK_INTERVAL_MS } from "./lib/healthRules";
 import { initActivityListener, stopActivityListener } from "./stores/useActivityStore";
+import { useActStore } from "./stores/useActStore";
 import { initAgentListener, stopAgentListener } from "./stores/useAgentStore";
+import { useBoardViewStore } from "./stores/useBoardViewStore";
 import { useFactoryViewStore } from "./stores/useFactoryViewStore";
 import { useGitHubStore } from "./stores/useGitHubStore";
 import {
@@ -92,9 +97,10 @@ const WorkflowsView = lazy(() =>
 );
 
 /**
- * Home decision queue — the app's landing overlay (open by default). Lazy for
- * symmetry with the other full-screen overlays; it is closed and reopened all
- * day, so the chunk loads once at startup anyway.
+ * Home decision queue, now one keystroke away (Cmd/Ctrl+1) rather than the
+ * surface the app opens on: that is the Board. Lazy like the other
+ * full-screen overlays, and unlike the Board, which would flash a Suspense
+ * fallback on every launch.
  */
 const HomeView = lazy(() =>
   import("./components/home/HomeView").then((m) => ({ default: m.HomeView })),
@@ -171,9 +177,13 @@ function App() {
   // inside the sidebar rather than a prop App can pass down.
   const workflowsViewOpen = useWorkflowsViewStore((s) => s.isOpen);
   const closeWorkflowsView = useWorkflowsViewStore((s) => s.close);
-  // Home decision queue overlay: open by default (the landing surface). The
-  // full-screen overlays assume they are never open together, so opening Home
-  // closes the other two and vice versa (see the toggle handlers below).
+  // Board layer: the shell the app opens on. It sits at z-45, under every
+  // overlay that follows, so it takes no part in their exclusivity dance.
+  const boardViewOpen = useBoardViewStore((s) => s.isOpen);
+  const closeBoardView = useBoardViewStore((s) => s.close);
+  // Home decision queue overlay. The full-screen overlays assume they are
+  // never open together, so opening Home closes the other two and vice versa
+  // (see the toggle handlers below).
   const homeViewOpen = useHomeViewStore((s) => s.isOpen);
   const closeHomeView = useHomeViewStore((s) => s.close);
   const factoryViewOpen = useFactoryViewStore((s) => s.isOpen);
@@ -719,6 +729,81 @@ function App() {
     [selectTab, closeHomeView],
   );
 
+  // Board: clicking a card leaves the board for the terminal it describes,
+  // the same rAF handshake Home uses. The board layer closes in the same
+  // commit as the tab selection, so the zoom lands on a visible grid.
+  const handleBoardNavigate = useCallback(
+    (tabId: string, sessionId?: number) => {
+      closeBoardView();
+      setEagleView(false);
+      selectTab(tabId);
+      if (sessionId === undefined) return;
+      requestAnimationFrame(() => {
+        multiProjectRef.current?.zoomSessionInProject(tabId, sessionId);
+      });
+    },
+    [selectTab, closeBoardView],
+  );
+
+  // Resuming a handoff from the Board: same flow as Home's, and the Board
+  // gets out of the way so the launching terminal is the thing on screen.
+  const handleBoardLaunchHandoff = useLaunchHandoff(handleBoardNavigate);
+
+  // A gated run is unblocked in the Factory, so the card hands over to it.
+  const handleBoardOpenRun = useCallback((runId: string) => {
+    void useActStore.getState().openDetail(runId);
+    useBoardViewStore.getState().close();
+    useFactoryViewStore.getState().open();
+  }, []);
+
+  // Adopting an outside session's project from the Board peek: open the tab,
+  // never a second agent. Resuming the work itself stays with the Suggested
+  // handoff flow once the outside session stops. Same FDA gate and
+  // open-if-missing dance as useLaunchHandoff, minus the launch.
+  const handleBoardOpenProject = useCallback(
+    (dir: string) => {
+      void useFDAStore.getState().requireAccess(dir, async () => {
+        const ws = useWorkspaceStore.getState();
+        if (!ws.getTabByPath(dir)) await ws.openProject(dir);
+        const tab = useWorkspaceStore.getState().getTabByPath(dir);
+        if (!tab) {
+          console.error("Board open project: no tab after openProject", dir);
+          return;
+        }
+        handleBoardNavigate(tab.id);
+      });
+    },
+    [handleBoardNavigate],
+  );
+
+  // Cmd/Ctrl+E and the TopBar segments both land here. The Board is a layer,
+  // never a replacement: closing it reveals the grid that was mounted all
+  // along, so there is nothing to tear down or rebuild either way.
+  const handleSetBoardView = useCallback((open: boolean) => {
+    if (open) useBoardViewStore.getState().open();
+    else useBoardViewStore.getState().close();
+  }, []);
+
+  const handleToggleBoardView = useCallback(() => {
+    /* Cmd+E under a z-50 overlay would toggle the Board invisibly beneath
+       it (review finding 5 on 4f3f27a). The visible meaning of the keystroke
+       is "show me the Board", so leave the overlay and open it. */
+    const overlayUp =
+      landscapeView ||
+      useWorkflowsViewStore.getState().isOpen ||
+      useHomeViewStore.getState().isOpen ||
+      useFactoryViewStore.getState().isOpen;
+    if (overlayUp) {
+      setLandscapeView(false);
+      useWorkflowsViewStore.getState().close();
+      useHomeViewStore.getState().close();
+      useFactoryViewStore.getState().close();
+      useBoardViewStore.getState().open();
+      return;
+    }
+    useBoardViewStore.getState().toggle();
+  }, [landscapeView]);
+
   // The full-screen overlays are never open together: opening Home or the
   // Factory closes every other overlay, and opening the older two closes
   // both of these (effect below).
@@ -874,6 +959,7 @@ function App() {
     onToggleGitPanel: handleToggleGitPanel,
     onToggleUtilityPanel: handleToggleUtilityPanel,
     onToggleEagleView: useCallback(() => setEagleView((v) => !v), []),
+    onToggleBoardView: handleToggleBoardView,
     onToggleLandscapeView: useCallback(() => setLandscapeView((v) => !v), []),
     onToggleHomeView: handleToggleHomeView,
     onToggleFactoryView: handleToggleFactoryView,
@@ -963,6 +1049,8 @@ function App() {
               landscapeView={landscapeView}
               onToggleLandscapeView={() => setLandscapeView((v) => !v)}
               landscapeAttention={needsInputAnywhere}
+              boardViewOpen={boardViewOpen}
+              onSetBoardView={handleSetBoardView}
               homeViewOpen={homeViewOpen}
               onToggleHomeView={handleToggleHomeView}
               factoryViewOpen={factoryViewOpen}
@@ -1036,6 +1124,27 @@ function App() {
                 onSessionCountChange={handleSessionCountChange}
                 eagleView={eagleView}
               />
+
+              {/* The Board, at z-45: above the zoomed grid pane (z-40) and
+                  below every overlay after it (z-50), which is why the Board
+                  needs no entry in the overlay-exclusivity rules. Open by
+                  default (BOARD_DEFAULT_OPEN), and a layer like the rest, so
+                  the terminals underneath keep running while it is up. */}
+              {boardViewOpen && (
+                <BoardView
+                  onNavigateSession={handleBoardNavigate}
+                  onOpenRun={handleBoardOpenRun}
+                  onLaunchHandoff={handleBoardLaunchHandoff}
+                  onOpenPr={(url) =>
+                    void openUrl(url).catch((err) => console.error("Failed to open PR:", err))
+                  }
+                  onShowGrid={closeBoardView}
+                  onOpenProject={handleBoardOpenProject}
+                  overlayOpen={
+                    landscapeView || workflowsViewOpen || homeViewOpen || factoryViewOpen
+                  }
+                />
+              )}
 
               {/* Landscape graph — an overlay, never a replacement: unmounting
                   MultiProjectView would tear down every live terminal. */}
@@ -1136,7 +1245,6 @@ function App() {
           {/* Bottom action bar */}
           <div className="bg-maestro-bg">
             <BottomBar
-              inGridView={activeTabSessionsLaunched}
               slotCount={activeTabSlotCount}
               launchedCount={activeTabLaunchedCount}
               onLaunchAll={() => {
@@ -1144,6 +1252,9 @@ function App() {
                   // First enter grid view, then launch
                   handleEnterGridView();
                 }
+                // Launching into a grid hidden behind the Board would look
+                // like the button did nothing, so the Board steps aside.
+                closeBoardView();
                 multiProjectRef.current?.launchAllInActiveProject();
               }}
               onNavigateToSession={(tabId, sessionId) => {

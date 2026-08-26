@@ -1,4 +1,5 @@
 import type { ActRun } from "@/lib/act";
+import { isUnderAnyPath } from "@/lib/staleProcess";
 import type { PullRequestInfo } from "@/stores/useGitHubStore";
 import type { BackendSessionStatus, SessionConfig } from "@/stores/useSessionStore";
 
@@ -84,6 +85,14 @@ interface AssembleInput {
   gatedRuns?: ActRun[];
   /** "Since you looked": merged PRs at or before this instant are old news. */
   watermarkMs: number;
+  /**
+   * Cwds of claude processes seen running outside a live Maestro session
+   * (WP2's process-scan liveness detection). Additive-only: a handoff whose
+   * path equals, or is an ancestor of, one of these cwds is not shown, since
+   * the running work IS it. Omitted or empty leaves current behaviour
+   * unchanged.
+   */
+  activeDirs?: Set<string>;
 }
 
 const ALL_STATUSES: BackendSessionStatus[] = [
@@ -105,10 +114,23 @@ const RUNNING_STATUSES: BackendSessionStatus[] = ["Working", "Starting"];
  * snapshots (many per repository); the band exists to surface the newest few,
  * not to archive them (review fc0e6b9, HIGH #1).
  */
-const MAX_HANDOFF_ROWS = 10;
+export const MAX_HANDOFF_ROWS = 10;
 
 function sessionDir(s: SessionConfig): string {
   return s.working_directory ?? s.worktree_path ?? s.project_path;
+}
+
+/**
+ * True when some externally-running claude process's cwd sits at or under
+ * `path`. Shared by `assembleBands` and `assembleBoard` (both filter handoffs
+ * the same way) so the ancestor matching lives in one place.
+ */
+export function isCoveredByActiveDir(path: string, activeDirs: Set<string> | undefined): boolean {
+  if (!activeDirs) return false;
+  for (const cwd of activeDirs) {
+    if (cwd && isUnderAnyPath(cwd, [path])) return true;
+  }
+  return false;
 }
 
 export function assembleBands({
@@ -118,6 +140,7 @@ export function assembleBands({
   repoPrs,
   gatedRuns = [],
   watermarkMs,
+  activeDirs,
 }: AssembleInput): Bands {
   const counts = Object.fromEntries(ALL_STATUSES.map((s) => [s, 0])) as Record<
     BackendSessionStatus,
@@ -154,7 +177,10 @@ export function assembleBands({
   }
   const liveDirs = new Set(sessions.map(sessionDir));
   const sortedHandoffs = handoffs
-    .filter((h) => !h.stale && !h.orphan && !liveDirs.has(h.path))
+    .filter(
+      (h) =>
+        !h.stale && !h.orphan && !liveDirs.has(h.path) && !isCoveredByActiveDir(h.path, activeDirs),
+    )
     .sort((a, b) => Date.parse(b.lastActive) - Date.parse(a.lastActive));
   // One row per directory (newest snapshot wins), capped — the rest is a count.
   const seenPaths = new Set<string>();
