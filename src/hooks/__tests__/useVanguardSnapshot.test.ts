@@ -22,6 +22,11 @@ import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 /* Fixtures are fully synthetic: this repo is public, so no real handoff
    slugs or project paths appear here. */
 
+/* Parked now means recent AND carrying an open ask, so the fixture has to be
+   both for this test to be about the live-directory rule rather than about
+   the freshness filter. `lastActive` is relative to real time because
+   buildSnapshot reads the clock itself; a fixed date would rot into a
+   vacuous pass. */
 function handoff(slug: string, path: string): HandoffInfo {
   return {
     slug,
@@ -30,10 +35,10 @@ function handoff(slug: string, path: string): HandoffInfo {
     branch: "main",
     uncommitted: 0,
     lastCommit: null,
-    asks: [],
+    asks: ["do the thing"],
     lastAction: "did a step",
     waiting: false,
-    lastActive: "2026-08-19T08:00:00Z",
+    lastActive: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
     stale: false,
     orphan: false,
   };
