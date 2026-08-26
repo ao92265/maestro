@@ -93,6 +93,8 @@ interface AssembleInput {
    * unchanged.
    */
   activeDirs?: Set<string>;
+  /** Freshness reference for the parked window. Defaults to Date.now(). */
+  nowMs?: number;
 }
 
 const ALL_STATUSES: BackendSessionStatus[] = [
@@ -113,8 +115,21 @@ const RUNNING_STATUSES: BackendSessionStatus[] = ["Working", "Starting"];
  * Display cap on parked handoffs. The live directory holds hundreds of
  * snapshots (many per repository); the band exists to surface the newest few,
  * not to archive them (review fc0e6b9, HIGH #1).
+ *
+ * Two caps, because the two surfaces have different room. The Board's
+ * Suggested column is a screen-height list and keeps ten; the parked band,
+ * which is also what the Telegram digest reads, is a chat message and keeps
+ * five. Both show a "+N more" count, so the cap hides nothing silently.
  */
 export const MAX_HANDOFF_ROWS = 10;
+const PARKED_HANDOFF_ROWS = 5;
+
+/**
+ * A handoff idle past this window is history, not a live parking spot. The
+ * stale flag alone let week-old snapshots through because the auto-handoff
+ * writer refreshes files on every turn.
+ */
+const HANDOFF_LIVE_WINDOW_MS = 48 * 60 * 60 * 1000;
 
 function sessionDir(s: SessionConfig): string {
   return s.working_directory ?? s.worktree_path ?? s.project_path;
@@ -141,6 +156,7 @@ export function assembleBands({
   gatedRuns = [],
   watermarkMs,
   activeDirs,
+  nowMs = Date.now(),
 }: AssembleInput): Bands {
   const counts = Object.fromEntries(ALL_STATUSES.map((s) => [s, 0])) as Record<
     BackendSessionStatus,
@@ -176,10 +192,17 @@ export function assembleBands({
     }
   }
   const liveDirs = new Set(sessions.map(sessionDir));
+  // Parked means: recent, and something is actually asked of the user. A
+  // handoff with no ask and no waiting flag is a diary entry, not a decision.
   const sortedHandoffs = handoffs
     .filter(
       (h) =>
-        !h.stale && !h.orphan && !liveDirs.has(h.path) && !isCoveredByActiveDir(h.path, activeDirs),
+        !h.stale &&
+        !h.orphan &&
+        !liveDirs.has(h.path) &&
+        !isCoveredByActiveDir(h.path, activeDirs) &&
+        (h.asks.length > 0 || h.waiting) &&
+        nowMs - Date.parse(h.lastActive) <= HANDOFF_LIVE_WINDOW_MS,
     )
     .sort((a, b) => Date.parse(b.lastActive) - Date.parse(a.lastActive));
   // One row per directory (newest snapshot wins), capped — the rest is a count.
@@ -189,8 +212,8 @@ export function assembleBands({
     seenPaths.add(h.path);
     return true;
   });
-  const moreHandoffs = Math.max(0, dedupedHandoffs.length - MAX_HANDOFF_ROWS);
-  for (const h of dedupedHandoffs.slice(0, MAX_HANDOFF_ROWS)) {
+  const moreHandoffs = Math.max(0, dedupedHandoffs.length - PARKED_HANDOFF_ROWS);
+  for (const h of dedupedHandoffs.slice(0, PARKED_HANDOFF_ROWS)) {
     blocked.push({ kind: "handoff", handoff: h });
   }
 

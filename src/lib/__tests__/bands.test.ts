@@ -123,6 +123,7 @@ describe("assembleBands", () => {
       ],
       repoPrs: [],
       watermarkMs: 0,
+      nowMs: Date.parse("2026-08-19T10:00:00Z"),
     });
     const slugs = bands.blocked
       .filter((i) => i.kind === "handoff")
@@ -138,6 +139,7 @@ describe("assembleBands", () => {
       repoPrs: [],
       watermarkMs: 0,
       activeDirs: new Set(["/repo/nested/subdir", "/repo/exact"]),
+      nowMs: Date.parse("2026-08-19T10:00:00Z"),
     });
     const slugs = bands.blocked
       .filter((i) => i.kind === "handoff")
@@ -153,6 +155,7 @@ describe("assembleBands", () => {
       repoPrs: [],
       watermarkMs: 0,
       activeDirs: new Set(["/repo/unrelated"]),
+      nowMs: Date.parse("2026-08-19T10:00:00Z"),
     });
     const slugs = bands.blocked
       .filter((i) => i.kind === "handoff")
@@ -168,6 +171,7 @@ describe("assembleBands", () => {
       repoPrs: [],
       watermarkMs: 0,
       activeDirs: new Set([null as unknown as string, ""]),
+      nowMs: Date.parse("2026-08-19T10:00:00Z"),
     });
     const slugs = bands.blocked
       .filter((i) => i.kind === "handoff")
@@ -182,10 +186,58 @@ describe("assembleBands", () => {
       handoffs: [handoff("fresh")],
       repoPrs: [],
       watermarkMs: 0,
+      nowMs: Date.parse("2026-08-19T10:00:00Z"),
     };
     const withoutField = assembleBands(input);
     const withEmptySet = assembleBands({ ...input, activeDirs: new Set<string>() });
     expect(withEmptySet).toEqual(withoutField);
+  });
+
+  it("drops parked handoffs that carry no open ask", () => {
+    const bands = assembleBands({
+      sessions: [],
+      tabs: TABS,
+      handoffs: [
+        handoff("asking"),
+        handoff("silent", { asks: [], waiting: false }),
+        handoff("waiting", { asks: [], waiting: true }),
+      ],
+      repoPrs: [],
+      watermarkMs: 0,
+      nowMs: Date.parse("2026-08-19T10:00:00Z"),
+    });
+    const slugs = bands.blocked
+      .filter((i) => i.kind === "handoff")
+      .map((i) => (i.kind === "handoff" ? i.handoff.slug : ""));
+    expect(slugs).toEqual(["asking", "waiting"]);
+  });
+
+  it("drops parked handoffs idle beyond the live window", () => {
+    const bands = assembleBands({
+      sessions: [],
+      tabs: TABS,
+      handoffs: [handoff("recent"), handoff("ancient", { lastActive: "2026-08-10T08:00:00Z" })],
+      repoPrs: [],
+      watermarkMs: 0,
+      nowMs: Date.parse("2026-08-19T10:00:00Z"),
+    });
+    const slugs = bands.blocked
+      .filter((i) => i.kind === "handoff")
+      .map((i) => (i.kind === "handoff" ? i.handoff.slug : ""));
+    expect(slugs).toEqual(["recent"]);
+  });
+
+  it("caps parked rows at five and counts the overflow", () => {
+    const bands = assembleBands({
+      sessions: [],
+      tabs: TABS,
+      handoffs: Array.from({ length: 7 }, (_, i) => handoff(`h${i}`)),
+      repoPrs: [],
+      watermarkMs: 0,
+      nowMs: Date.parse("2026-08-19T10:00:00Z"),
+    });
+    expect(bands.blocked.filter((i) => i.kind === "handoff")).toHaveLength(5);
+    expect(bands.moreHandoffs).toBe(2);
   });
 
   it("puts changes-requested PRs in blocked and fresh merges in landed, honouring the watermark", () => {
@@ -217,15 +269,15 @@ describe("assembleBands", () => {
     expect(landedPrs).toEqual([11]);
   });
 
-  it("keeps only the newest handoff per path and caps the band at 10", () => {
-    const many = Array.from({ length: 14 }, (_, i) =>
-      handoff(`h${i}`, { lastActive: `2026-08-0${(i % 9) + 1}T08:00:00Z` }),
+  it("keeps only the newest handoff per path and caps the band at five", () => {
+    const many = Array.from({ length: 8 }, (_, i) =>
+      handoff(`h${i}`, { lastActive: `2026-08-19T0${i + 1}:00:00Z` }),
     );
     // Three snapshots of the same directory, different ages: newest wins.
     const dupes = [
-      handoff("dupe-old", { path: "/repo/same", lastActive: "2026-08-01T08:00:00Z" }),
-      handoff("dupe-new", { path: "/repo/same", lastActive: "2026-08-18T08:00:00Z" }),
-      handoff("dupe-mid", { path: "/repo/same", lastActive: "2026-08-10T08:00:00Z" }),
+      handoff("dupe-old", { path: "/repo/same", lastActive: "2026-08-17T12:00:00Z" }),
+      handoff("dupe-new", { path: "/repo/same", lastActive: "2026-08-19T09:00:00Z" }),
+      handoff("dupe-mid", { path: "/repo/same", lastActive: "2026-08-18T08:00:00Z" }),
     ];
     const bands = assembleBands({
       sessions: [],
@@ -233,15 +285,16 @@ describe("assembleBands", () => {
       handoffs: [...many, ...dupes],
       repoPrs: [],
       watermarkMs: 0,
+      nowMs: Date.parse("2026-08-19T10:00:00Z"),
     });
     const shown = bands.blocked.filter((i) => i.kind === "handoff");
-    expect(shown.length).toBe(10);
+    expect(shown.length).toBe(5);
     const slugs = shown.map((i) => (i.kind === "handoff" ? i.handoff.slug : ""));
     expect(slugs).toContain("dupe-new");
     expect(slugs).not.toContain("dupe-old");
     expect(slugs).not.toContain("dupe-mid");
-    // 15 distinct paths survive dedup; 10 shown, 5 counted as hidden.
-    expect(bands.moreHandoffs).toBe(5);
+    // 9 distinct paths survive dedup; 5 shown, 4 counted as hidden.
+    expect(bands.moreHandoffs).toBe(4);
   });
 
   it("puts confidence-gated ACT runs in blocked, after sessions, before PRs", () => {
@@ -272,6 +325,7 @@ describe("assembleBands", () => {
       ],
       gatedRuns: gated,
       watermarkMs: 0,
+      nowMs: Date.parse("2026-08-19T10:00:00Z"),
     });
     expect(bands.blocked.map((i) => i.kind)).toEqual(["session", "run", "pr", "handoff"]);
     const runItem = bands.blocked[1];
@@ -292,6 +346,7 @@ describe("assembleBands", () => {
         },
       ],
       watermarkMs: 0,
+      nowMs: Date.parse("2026-08-19T10:00:00Z"),
     });
     expect(bands.blocked.map((i) => i.kind)).toEqual(["session", "session", "pr", "handoff"]);
     const first = bands.blocked[0];
