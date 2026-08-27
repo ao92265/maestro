@@ -102,7 +102,7 @@ fn client() -> Result<Client, String> {
         .map_err(|error| format!("Failed to build ACT client: {error}"))
 }
 
-fn base_url() -> String {
+pub(crate) fn base_url() -> String {
     std::env::var("MAESTRO_ACT_URL")
         .unwrap_or_else(|_| DEFAULT_ACT_URL.to_string())
         .trim_end_matches('/')
