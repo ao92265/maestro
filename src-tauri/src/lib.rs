@@ -228,6 +228,7 @@ pub fn run() {
         .manage(WorktreeManager::new())
         .manage(commands::system::SystemMetricsState::new())
         .manage(commands::processes::ProcessScanState::new())
+        .manage(commands::act_engine::ActEngineState::new())
         // Issue #106 review F1: the per-(project, epic) in-flight launch
         // slots — the backend guard against a double Launch click while the
         // test gate still runs.
@@ -1255,6 +1256,10 @@ pub fn run() {
             commands::claudemd::list_context_docs,
             commands::claudemd::read_context_doc,
             commands::claudemd::write_context_doc,
+            // Terminal sessions Maestro did not start (iTerm panes)
+            commands::external_sessions::list_external_sessions,
+            commands::external_sessions::focus_external_session,
+            commands::external_sessions::close_external_session,
             // Health of the other local systems (ports + launchd jobs)
             commands::ecosystem::ecosystem_health,
             // Claude handoff files (Home view's parked-session triage)
@@ -1267,6 +1272,10 @@ pub fn run() {
             commands::act::act_set_task_status,
             commands::act::act_list_gates,
             commands::act::act_resolve_gate,
+            // ACT engine supervisor (Factory view's Start control)
+            commands::act_engine::act_engine_status,
+            commands::act_engine::act_engine_start,
+            commands::act_engine::act_engine_stop,
             // Vanguard feed (band snapshot for the launchd digest script)
             commands::vanguard::write_band_snapshot,
             // Claude auto-memory commands
@@ -1371,8 +1380,17 @@ pub fn run() {
             commands::cli::is_cli_installed,
             take_pending_cli_path,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Maestro");
+        .build(tauri::generate_context!())
+        .expect("error while running Maestro")
+        .run(|app, event| {
+            // Exit fires for every quit path, including the macOS app menu,
+            // which never reaches CloseRequested. An ACT this app started must
+            // not outlive it and keep the port for the next launch.
+            if matches!(event, tauri::RunEvent::Exit) {
+                let engine = app.state::<commands::act_engine::ActEngineState>();
+                commands::act_engine::stop_managed_blocking(&engine);
+            }
+        });
 }
 
 // Note: We intentionally don't check git availability at startup.

@@ -1,4 +1,5 @@
 pub mod act;
+pub mod act_engine;
 pub mod agents;
 pub mod ai_runner;
 pub mod catalog;
@@ -6,6 +7,7 @@ pub mod claude_sessions;
 pub mod claudemd;
 pub mod cli;
 pub mod ecosystem;
+pub mod external_sessions;
 pub mod fonts;
 pub mod git;
 pub mod github;

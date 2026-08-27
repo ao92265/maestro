@@ -1,8 +1,10 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ArrowLeft, ExternalLink, Factory, RefreshCw, Send, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { EngineBadge } from "@/components/factory/EngineBadge";
 import { badgeBaseClass } from "@/components/session/agentPresentation";
 import { type ActRun, type ActSpecInput, isTerminal, runNeedsYou, stageSummary } from "@/lib/act";
+import { useActEngineStore } from "@/stores/useActEngineStore";
 import { ACT_STALE_MS, useActStore } from "@/stores/useActStore";
 
 interface FactoryViewProps {
@@ -335,11 +337,18 @@ export function FactoryView({ onClose }: FactoryViewProps) {
   const { runs, gatedRuns, fetchedAt, error, isPolling, detail, refresh, openDetail, closeDetail } =
     useActStore();
 
+  const refreshEngine = useActEngineStore((state) => state.refresh);
+  const engineState = useActEngineStore((state) => state.status?.state ?? null);
+
   useEffect(() => {
     void refresh();
-    const timer = setInterval(() => void refresh(), POLL_INTERVAL_MS);
+    void refreshEngine();
+    const timer = setInterval(() => {
+      void refresh();
+      void refreshEngine();
+    }, POLL_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [refresh]);
+  }, [refresh, refreshEngine]);
 
   const gatedIds = new Set(gatedRuns.map((r) => r.id));
   const offline = fetchedAt === 0;
@@ -354,18 +363,7 @@ export function FactoryView({ onClose }: FactoryViewProps) {
       <div className="flex h-10 shrink-0 items-center gap-2 border-b border-maestro-border px-3">
         <Factory size={13} className="text-maestro-muted" />
         <span className="text-[12px] font-semibold text-maestro-text">Factory</span>
-        <span
-          className={`${badgeBaseClass} ${
-            offline
-              ? "bg-maestro-muted/15 text-maestro-muted"
-              : stale
-                ? "bg-maestro-yellow/15 text-maestro-yellow"
-                : "bg-maestro-green/15 text-maestro-green"
-          }`}
-          title={error ?? (offline ? "ACT has not answered yet" : "ACT is answering")}
-        >
-          {offline ? "ACT OFFLINE" : stale ? "ACT STALE" : "ACT LIVE"}
-        </span>
+        <EngineBadge runsFetchedAt={fetchedAt} stale={stale} />
         <span className="text-[11px] text-maestro-muted">
           {runs.length} run{runs.length === 1 ? "" : "s"}
           {gatedRuns.length > 0 && ` · ${gatedRuns.length} waiting on you`}
@@ -398,9 +396,11 @@ export function FactoryView({ onClose }: FactoryViewProps) {
           <div className="flex flex-1 flex-col gap-1.5 overflow-y-auto p-3">
             {runs.length === 0 ? (
               <p className="rounded border border-dashed border-maestro-border px-3 py-2 text-[11px] text-maestro-muted/70">
-                {offline
-                  ? "ACT is not answering. Start it, then refresh — the factory picks it straight up."
-                  : "No runs yet. Hand over a spec on the left."}
+                {engineState === "starting"
+                  ? "ACT is starting. The list fills itself as soon as it answers."
+                  : offline
+                    ? "ACT is not running. Press Start ACT above and the factory picks it up on its own."
+                    : "No runs yet. Hand over a spec on the left."}
               </p>
             ) : (
               runs.map((run) => (

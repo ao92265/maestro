@@ -8,6 +8,7 @@ import {
 } from "@/components/shared/PanelResizeHandle";
 import { LaunchSection } from "@/components/sidebar/LaunchSection";
 import { MemorySection } from "@/components/sidebar/MemorySection";
+import { OutsideSection } from "@/components/sidebar/OutsideSection";
 import { ProcessesSection } from "@/components/sidebar/ProcessesSection";
 import { SecondBrainSection } from "@/components/sidebar/SecondBrainSection";
 
@@ -90,7 +91,13 @@ export function UtilityPanel({
           {panel === "memory" ? (
             <MemorySection />
           ) : panel === "processes" ? (
-            <ProcessesSection />
+            /* Terminals Maestro did not start belong with the other things
+               running that it does not own, rather than behind a tab of their
+               own that would go unopened. */
+            <div className="flex flex-col gap-4">
+              <OutsideSection />
+              <ProcessesSection />
+            </div>
           ) : panel === "secondbrain" ? (
             <SecondBrainSection />
           ) : panel === "launch" ? (
