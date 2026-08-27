@@ -141,7 +141,7 @@ export function BoardPeek({
         <div className="flex h-10 shrink-0 items-center gap-2 border-b border-maestro-border px-3">
           <span className="min-w-0 flex-1 truncate text-[12px] font-semibold text-maestro-text">
             {projectName}
-            <span className="ml-2 font-normal text-maestro-muted">working outside Maestro</span>
+            <span className="ml-2 font-normal text-maestro-muted">working outside Vanguard</span>
           </span>
           <button
             type="button"
