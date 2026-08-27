@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod claude_sessions;
 pub mod claudemd;
 pub mod cli;
+pub mod external_sessions;
 pub mod fonts;
 pub mod git;
 pub mod github;
