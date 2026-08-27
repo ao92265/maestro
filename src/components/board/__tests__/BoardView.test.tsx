@@ -446,13 +446,13 @@ describe("BoardView", () => {
 
     renderBoard();
 
-    expect(column("Suggested").getByText("2 active outside Maestro")).toBeInTheDocument();
+    expect(column("Suggested").getByText("2 active outside Vanguard")).toBeInTheDocument();
   });
 
   it("says nothing about outside activity when nothing is running outside", () => {
     renderBoard();
 
-    expect(screen.queryByText(/active outside Maestro/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/active outside Vanguard/)).not.toBeInTheDocument();
   });
 
   it("refreshes, marks seen and switches to the grid from the header", () => {

@@ -87,7 +87,7 @@ describe("OutsideSection", () => {
   it("says plainly when there is nothing running outside", () => {
     render(<OutsideSection />);
 
-    expect(screen.getByText(/no terminals running outside maestro/i)).toBeTruthy();
+    expect(screen.getByText(/no terminals running outside vanguard/i)).toBeTruthy();
   });
 
   it("shows what went wrong when an action fails", () => {

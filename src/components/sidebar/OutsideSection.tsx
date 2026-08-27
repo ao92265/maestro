@@ -55,7 +55,7 @@ export function OutsideSection() {
     <div className="flex flex-col gap-2">
       <SectionHeader
         icon={Terminal}
-        label="Outside Maestro"
+        label="Outside Vanguard"
         badge={
           sessions.length > 0 ? (
             <span className="text-[10px] text-maestro-muted">{sessions.length}</span>
@@ -71,7 +71,7 @@ export function OutsideSection() {
 
       {sessions.length === 0 ? (
         <p className="rounded border border-dashed border-maestro-border px-3 py-2 text-[11px] text-maestro-muted/70">
-          No terminals running outside Maestro.
+          No terminals running outside Vanguard.
         </p>
       ) : (
         groups.map(([repo, rows]) => (

@@ -347,7 +347,7 @@ export function assembleBoard({
           handoff: deepest,
           projectName: deepest.repo,
           objective: deepest.waiting && lastAsk ? lastAsk : deepest.lastAction,
-          stageLabel: "Live outside Maestro",
+          stageLabel: "Live outside Vanguard",
           needsYou: false,
           since: deepest.lastActive,
         });
@@ -359,8 +359,8 @@ export function assembleBoard({
           handoff: null,
           /* filter(Boolean) so a root cwd names itself rather than "". */
           projectName: cwd.split("/").filter(Boolean).pop() ?? cwd,
-          objective: "Working outside Maestro",
-          stageLabel: "Live outside Maestro",
+          objective: "Working outside Vanguard",
+          stageLabel: "Live outside Vanguard",
           needsYou: false,
           since: null,
         });

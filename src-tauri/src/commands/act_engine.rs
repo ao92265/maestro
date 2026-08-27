@@ -177,7 +177,7 @@ async fn status_now(state: &ActEngineState) -> EngineStatus {
     };
     let detail = match engine_state {
         EngineState::Live if !has_child => {
-            Some("Answering on its port, started outside Maestro.".to_string())
+            Some("Answering on its port, started outside Vanguard.".to_string())
         }
         EngineState::Live => None,
         EngineState::Starting => Some("Started, waiting for it to answer.".to_string()),
