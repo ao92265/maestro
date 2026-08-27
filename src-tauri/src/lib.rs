@@ -1255,6 +1255,8 @@ pub fn run() {
             commands::claudemd::list_context_docs,
             commands::claudemd::read_context_doc,
             commands::claudemd::write_context_doc,
+            // Health of the other local systems (ports + launchd jobs)
+            commands::ecosystem::ecosystem_health,
             // Claude handoff files (Home view's parked-session triage)
             commands::handoffs::get_handoffs,
             // ACT relay (Factory view — CSP blocks direct local HTTP)

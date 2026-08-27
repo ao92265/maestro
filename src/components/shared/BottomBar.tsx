@@ -1,5 +1,6 @@
 import { Play, UserRound } from "lucide-react";
 import { useEffect } from "react";
+import { EcosystemStrip } from "@/components/shared/EcosystemStrip";
 import { useClaudeAccountStore } from "@/stores/useClaudeAccountStore";
 import { SystemMetrics } from "./SystemMetrics";
 import { TerminalNavigator } from "./TerminalNavigator";
@@ -67,6 +68,7 @@ export function BottomBar({
           with however many windows the API reports, and an unbounded absolute
           cluster would reach past the centre and cover the Launch button. */}
       <div className="absolute inset-y-0 right-4 flex max-w-[55%] items-center justify-end gap-4 overflow-hidden">
+        <EcosystemStrip />
         <SystemMetrics />
         <UsageBar />
       </div>
