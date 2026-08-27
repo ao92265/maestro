@@ -108,6 +108,12 @@ async fn health_ok() -> bool {
     matches!(client.get(url).send().await, Ok(response) if response.status().is_success())
 }
 
+/// Where `act` lives when the PATH cannot be trusted. An app launched from
+/// Finder inherits a minimal PATH with neither Homebrew prefix on it, so
+/// looking only at `which` would make the Start button work from a terminal
+/// and silently fail from the Dock.
+const ACT_FALLBACK_BINS: [&str; 2] = ["/opt/homebrew/bin/act", "/usr/local/bin/act"];
+
 /// Follow `act` on the PATH to the checkout it actually runs. Symlinks matter
 /// here: the global command is usually an npm link into a working tree, and
 /// the link target is the answer to "which ACT is this".
@@ -117,15 +123,16 @@ async fn act_bin_on_path() -> Option<PathBuf> {
         .stderr(Stdio::null())
         .output()
         .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        return None;
-    }
-    std::fs::canonicalize(path).ok()
+        .ok();
+    let from_path = output
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|path| !path.is_empty());
+
+    let candidates = from_path
+        .into_iter()
+        .chain(ACT_FALLBACK_BINS.iter().map(|path| path.to_string()));
+    candidates.filter_map(|path| std::fs::canonicalize(path).ok()).next()
 }
 
 async fn engine_dir() -> Option<PathBuf> {
@@ -211,16 +218,7 @@ pub async fn act_engine_start(state: State<'_, ActEngineState>) -> Result<Engine
         ));
     }
 
-    let (program, args) = server_command(dir.join("dist/dashboard-api/server.js").is_file());
-    let child = Command::new(program)
-        .args(&args)
-        .current_dir(&dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| format!("Could not start ACT from {}: {error}", dir.display()))?;
-
+    let child = spawn_engine(&dir)?;
     *state.child.lock().unwrap() = Some(child);
     *state.directory.lock().unwrap() = Some(dir.clone());
 
@@ -241,6 +239,22 @@ pub async fn act_engine_start(state: State<'_, ActEngineState>) -> Result<Engine
         "ACT did not answer within {} seconds of starting.",
         STARTUP_GRACE.as_secs()
     ))
+}
+
+/// The spawn itself, separated so it can be driven against a real ACT checkout
+/// without a running app. Output goes nowhere on purpose: ACT's own logs are
+/// the place to read what it did, and piping them into Maestro would fill a
+/// buffer nobody drains.
+pub fn spawn_engine(dir: &Path) -> Result<Child, String> {
+    let (program, args) = server_command(dir.join("dist/dashboard-api/server.js").is_file());
+    Command::new(program)
+        .args(&args)
+        .current_dir(dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| format!("Could not start ACT from {}: {error}", dir.display()))
 }
 
 #[tauri::command]
@@ -333,5 +347,35 @@ mod tests {
     #[test]
     fn without_a_build_we_go_through_the_npm_script_that_builds() {
         assert_eq!(server_command(false), ("npm", vec!["run", "serve"]));
+    }
+
+    /* The one test that proves the feature rather than the arithmetic: it
+       spawns a real ACT from a real checkout and waits for the real port.
+       Ignored by default because it needs that checkout and a free port; run
+       it with `cargo test -- --ignored engine_actually_comes_up`. */
+    #[tokio::test]
+    #[ignore]
+    async fn engine_actually_comes_up_and_goes_away_again() {
+        let Some(dir) = std::env::var("MAESTRO_ACT_DIR").ok().map(PathBuf::from) else {
+            panic!("set MAESTRO_ACT_DIR to an ACT checkout to run this");
+        };
+        assert!(!health_ok().await, "something already holds the ACT port");
+
+        let mut child = spawn_engine(&dir).expect("spawn");
+
+        let deadline = std::time::Instant::now() + STARTUP_GRACE;
+        let mut came_up = false;
+        while std::time::Instant::now() < deadline {
+            if health_ok().await {
+                came_up = true;
+                break;
+            }
+            tokio::time::sleep(PROBE_INTERVAL).await;
+        }
+        assert!(came_up, "ACT never answered after being spawned");
+
+        child.kill().await.expect("kill");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!health_ok().await, "ACT outlived the handle that spawned it");
     }
 }
