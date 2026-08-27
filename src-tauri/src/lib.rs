@@ -1256,6 +1256,10 @@ pub fn run() {
             commands::claudemd::list_context_docs,
             commands::claudemd::read_context_doc,
             commands::claudemd::write_context_doc,
+            // Terminal sessions Maestro did not start (iTerm panes)
+            commands::external_sessions::list_external_sessions,
+            commands::external_sessions::focus_external_session,
+            commands::external_sessions::close_external_session,
             // Claude handoff files (Home view's parked-session triage)
             commands::handoffs::get_handoffs,
             // ACT relay (Factory view — CSP blocks direct local HTTP)
