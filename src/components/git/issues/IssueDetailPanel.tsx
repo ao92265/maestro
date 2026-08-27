@@ -29,6 +29,7 @@ export function IssueDetailPanel({ repoPath, onClose }: IssueDetailPanelProps) {
   const [isSubmittingComment, setIsSubmittingComment] = useState(false);
   const [isClosing, setIsClosing] = useState(false);
   const [isReopening, setIsReopening] = useState(false);
+  const [isStarting, setIsStarting] = useState(false);
 
   if (isLoadingIssueDetail) {
     return (
@@ -83,17 +84,31 @@ export function IssueDetailPanel({ repoPath, onClose }: IssueDetailPanelProps) {
       window.alert("Open a project tab to start this issue in a worktree.");
       return;
     }
-    const branch = issueBranchName(selectedIssue.number, selectedIssue.title);
-    const result = await launchCardInWorktree({
-      tabId: activeTab.id,
-      repoPath,
-      branch,
-      customName: `issue-${selectedIssue.number}-worktree`,
-      briefStem: `issue-${selectedIssue.number}-worktree`,
-      initialPrompt: buildIssueActionPrompt({ issue: selectedIssue, repoPath, branch }),
-    });
-    if (result.warning) {
-      window.alert(result.warning);
+    setIsStarting(true);
+    try {
+      const branch = issueBranchName(selectedIssue.number, selectedIssue.title);
+      const result = await launchCardInWorktree({
+        tabId: activeTab.id,
+        repoPath,
+        branch,
+        customName: `issue-${selectedIssue.number}-worktree`,
+        briefStem: `issue-${selectedIssue.number}-worktree`,
+        worktreeBasePath: activeTab.worktreeBasePath,
+        initialPrompt: buildIssueActionPrompt({ issue: selectedIssue, repoPath, branch }),
+      });
+      if (result.worktree_path === null) {
+        window.alert(
+          `Could not create a worktree for this card, session not started.${
+            result.warning ? ` ${result.warning}` : ""
+          }`,
+        );
+        return;
+      }
+      if (result.warning) {
+        window.alert(result.warning);
+      }
+    } finally {
+      setIsStarting(false);
     }
   };
 
@@ -130,7 +145,7 @@ export function IssueDetailPanel({ repoPath, onClose }: IssueDetailPanelProps) {
         <button
           type="button"
           onClick={handleStartInWorktree}
-          disabled={!isOpen}
+          disabled={!isOpen || isStarting}
           title={
             isOpen
               ? "Start this issue in a fresh worktree"

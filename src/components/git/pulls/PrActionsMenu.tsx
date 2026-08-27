@@ -44,6 +44,7 @@ export function PrActionsMenu({ pr, repoPath }: PrActionsMenuProps) {
    */
   const [checkedCount, setCheckedCount] = useState(1);
   const [error, setError] = useState<string | null>(null);
+  const [isStarting, setIsStarting] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
   const graph = usePrWorkflowStore((s) => s.graph) ?? DEFAULT_PR_WORKFLOW;
@@ -161,23 +162,37 @@ export function PrActionsMenu({ pr, repoPath }: PrActionsMenuProps) {
       setError("Open a project tab to launch a PR action.");
       return;
     }
-    const result = await launchCardInWorktree({
-      tabId: activeTab.id,
-      repoPath,
-      branch: pr.headRefName,
-      customName: `pr-${pr.number}-worktree`,
-      briefStem: `pr-${pr.number}-worktree`,
-      initialPrompt: [
-        `You are in a dedicated git worktree on branch ${pr.headRefName} for PR #${pr.number}: ${pr.title}.`,
-        `Work only inside this worktree. Never switch branches in the main checkout.`,
-        `Start by running: gh pr view ${pr.number} --comments`,
-      ].join(" "),
-    });
-    if (result.warning) {
-      setError(result.warning);
-      return;
+    setIsStarting(true);
+    try {
+      const result = await launchCardInWorktree({
+        tabId: activeTab.id,
+        repoPath,
+        branch: pr.headRefName,
+        customName: `pr-${pr.number}-worktree`,
+        briefStem: `pr-${pr.number}-worktree`,
+        worktreeBasePath: activeTab.worktreeBasePath,
+        initialPrompt: [
+          `You are in a dedicated git worktree on branch ${pr.headRefName} for PR #${pr.number}: ${pr.title}.`,
+          `Work only inside this worktree. Never switch branches in the main checkout.`,
+          `Start by running: gh pr view ${pr.number} --comments`,
+        ].join(" "),
+      });
+      if (result.worktree_path === null) {
+        setError(
+          `Could not create a worktree for this card, session not started.${
+            result.warning ? ` ${result.warning}` : ""
+          }`,
+        );
+        return;
+      }
+      if (result.warning) {
+        setError(result.warning);
+        return;
+      }
+      setOpen(false);
+    } finally {
+      setIsStarting(false);
     }
-    setOpen(false);
   };
 
   return (
@@ -236,7 +251,8 @@ export function PrActionsMenu({ pr, repoPath }: PrActionsMenuProps) {
           <button
             type="button"
             onClick={handleOpenInWorktree}
-            className="mt-1 flex w-full items-center justify-center gap-1 rounded border border-maestro-border px-2 py-1 text-xs font-medium text-maestro-text transition-colors hover:bg-maestro-card"
+            disabled={isStarting}
+            className="mt-1 flex w-full items-center justify-center gap-1 rounded border border-maestro-border px-2 py-1 text-xs font-medium text-maestro-text transition-colors hover:bg-maestro-card disabled:cursor-not-allowed disabled:opacity-50"
           >
             <GitBranchPlus size={11} />
             Open in worktree

@@ -358,6 +358,7 @@ describe("PrActionsMenu", () => {
       expect(args.repoPath).toBe(REPO_PATH);
       expect(args.customName).toBe("pr-123-worktree");
       expect(args.briefStem).toBe("pr-123-worktree");
+      expect(args.worktreeBasePath).toBe(null);
     });
 
     it("asks for a project tab instead of launching a worktree when none is active", async () => {
@@ -387,6 +388,28 @@ describe("PrActionsMenu", () => {
       fireEvent.click(screen.getByRole("button", { name: /Open in worktree/ }));
 
       expect(await screen.findByText("Worktree already existed; reused it.")).toBeInTheDocument();
+    });
+
+    it("hard-fails through the error channel when no worktree could be created", async () => {
+      mockLaunchCardInWorktree.mockResolvedValue({
+        working_directory: REPO_PATH,
+        worktree_path: null,
+        branch: null,
+        created: false,
+        warning: "Failed to create worktree: disk full",
+      });
+      render(<PrActionsMenu pr={buildPr()} repoPath={REPO_PATH} />);
+      openMenu();
+
+      fireEvent.click(screen.getByRole("button", { name: /Open in worktree/ }));
+
+      expect(
+        await screen.findByText(
+          "Could not create a worktree for this card, session not started. Failed to create worktree: disk full",
+        ),
+      ).toBeInTheDocument();
+      // The menu stays open on a hard failure — no "Open in worktree" success close.
+      expect(screen.getByRole("button", { name: /Open in worktree/ })).toBeInTheDocument();
     });
   });
 });

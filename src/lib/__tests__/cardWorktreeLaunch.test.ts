@@ -56,9 +56,14 @@ describe("launchCardInWorktree", () => {
       customName: "pr-123-worktree",
       initialPrompt: "review this",
       briefStem: "pr-123",
+      worktreeBasePath: "/custom/base",
     });
 
-    expect(mockPrepareSessionWorktree).toHaveBeenCalledWith("/repo", "pr-123-branch");
+    expect(mockPrepareSessionWorktree).toHaveBeenCalledWith(
+      "/repo",
+      "pr-123-branch",
+      "/custom/base",
+    );
     expect(mockRequest).toHaveBeenCalledWith({
       tabId: "tab-1",
       mode: "Claude",
@@ -74,7 +79,7 @@ describe("launchCardInWorktree", () => {
     expect(returned).toBe(result);
   });
 
-  it("still queues with the fallback cwd when preparation falls back to the repo path", async () => {
+  it("does not queue a launch or mark sessions launched when preparation falls back to the repo path", async () => {
     const result = prepResult({
       working_directory: "/repo",
       worktree_path: null,
@@ -83,22 +88,19 @@ describe("launchCardInWorktree", () => {
     });
     mockPrepareSessionWorktree.mockResolvedValue(result);
 
-    await launchCardInWorktree({
+    const returned = await launchCardInWorktree({
       tabId: "tab-2",
       repoPath: "/repo",
       branch: "issue-45-fix",
       customName: "issue-45-worktree",
       initialPrompt: "fix the bug",
       briefStem: "issue-45",
+      worktreeBasePath: null,
     });
 
-    expect(mockRequest).toHaveBeenCalledWith(
-      expect.objectContaining({
-        workingDirOverride: "/repo",
-        briefDir: "/repo",
-      }),
-    );
-    expect(mockSetSessionsLaunched).toHaveBeenCalledWith("tab-2", true);
+    expect(mockRequest).not.toHaveBeenCalled();
+    expect(mockSetSessionsLaunched).not.toHaveBeenCalled();
+    expect(returned).toBe(result);
   });
 });
 

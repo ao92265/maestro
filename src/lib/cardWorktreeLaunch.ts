@@ -14,6 +14,8 @@ export interface CardWorktreeLaunchArgs {
   initialPrompt: string;
   /** File stem for the staged brief. */
   briefStem: string;
+  /** The tab's custom worktree base directory (null = use the default). */
+  worktreeBasePath: string | null;
 }
 
 /**
@@ -21,12 +23,21 @@ export interface CardWorktreeLaunchArgs {
  * marks the tab's sessions as launched so the grid mounts to consume it —
  * the same three-step sequence PrActionsMenu's handleLaunch follows, shared
  * here so both PR and issue cards launch identically.
+ *
+ * If preparation could not produce a worktree (`worktree_path === null`),
+ * the launch is NOT queued: a session in the main checkout under a prompt
+ * that claims it is isolated in a worktree is exactly the failure this
+ * feature exists to prevent. The result is still returned so the caller can
+ * surface `result.warning` as a hard failure.
  */
 export async function launchCardInWorktree(
   args: CardWorktreeLaunchArgs,
 ): Promise<WorktreePreparationResult> {
-  const { tabId, repoPath, branch, customName, initialPrompt, briefStem } = args;
-  const result = await prepareSessionWorktree(repoPath, branch);
+  const { tabId, repoPath, branch, customName, initialPrompt, briefStem, worktreeBasePath } = args;
+  const result = await prepareSessionWorktree(repoPath, branch, worktreeBasePath);
+  if (result.worktree_path === null) {
+    return result;
+  }
   usePendingLaunchStore.getState().request({
     tabId,
     mode: "Claude",

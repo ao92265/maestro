@@ -112,6 +112,7 @@ describe("IssueDetailPanel Start in worktree", () => {
     expect(args.customName).toBe("issue-42-worktree");
     expect(args.briefStem).toBe("issue-42-worktree");
     expect(args.initialPrompt).toContain("#42 Fix the login loop");
+    expect(args.worktreeBasePath).toBe(null);
   });
 
   it("alerts instead of launching when no project tab is active", async () => {
@@ -143,6 +144,28 @@ describe("IssueDetailPanel Start in worktree", () => {
 
     await waitFor(() =>
       expect(alertSpy).toHaveBeenCalledWith("Worktree already existed; reused it."),
+    );
+    alertSpy.mockRestore();
+  });
+
+  it("hard-fails with an alert when no worktree could be created", async () => {
+    mockLaunchCardInWorktree.mockResolvedValue({
+      working_directory: REPO_PATH,
+      worktree_path: null,
+      branch: null,
+      created: false,
+      warning: "Failed to create worktree: disk full",
+    });
+    useGitHubStore.setState({ selectedIssue: buildIssue() });
+    const alertSpy = vi.spyOn(window, "alert").mockImplementation(() => {});
+    render(<IssueDetailPanel repoPath={REPO_PATH} onClose={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Start in worktree/ }));
+
+    await waitFor(() =>
+      expect(alertSpy).toHaveBeenCalledWith(
+        "Could not create a worktree for this card, session not started. Failed to create worktree: disk full",
+      ),
     );
     alertSpy.mockRestore();
   });
