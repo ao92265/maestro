@@ -1,5 +1,6 @@
-import { MoreVertical, Play } from "lucide-react";
+import { GitBranchPlus, MoreVertical, Play } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { launchCardInWorktree } from "@/lib/cardWorktreeLaunch";
 import {
   buildPrActionPrompt,
   githubRepoSlug,
@@ -148,6 +149,37 @@ export function PrActionsMenu({ pr, repoPath }: PrActionsMenuProps) {
     setOpen(false);
   };
 
+  /**
+   * Opens this PR's head branch in its own dedicated worktree, isolated from
+   * whatever the main checkout has open — same activeTab guard and setError
+   * channel as {@link handleLaunch}, delegated to the shared card-to-worktree
+   * helper from Task 1 so PR and issue cards launch identically.
+   */
+  const handleOpenInWorktree = async () => {
+    setError(null);
+    if (!activeTab) {
+      setError("Open a project tab to launch a PR action.");
+      return;
+    }
+    const result = await launchCardInWorktree({
+      tabId: activeTab.id,
+      repoPath,
+      branch: pr.headRefName,
+      customName: `pr-${pr.number}-worktree`,
+      briefStem: `pr-${pr.number}-worktree`,
+      initialPrompt: [
+        `You are in a dedicated git worktree on branch ${pr.headRefName} for PR #${pr.number}: ${pr.title}.`,
+        `Work only inside this worktree. Never switch branches in the main checkout.`,
+        `Start by running: gh pr view ${pr.number} --comments`,
+      ].join(" "),
+    });
+    if (result.warning) {
+      setError(result.warning);
+      return;
+    }
+    setOpen(false);
+  };
+
   return (
     <div className="relative shrink-0" ref={menuRef}>
       <button
@@ -199,6 +231,15 @@ export function PrActionsMenu({ pr, repoPath }: PrActionsMenuProps) {
           >
             <Play size={11} />
             Launch {ticked} {ticked === 1 ? "step" : "steps"}
+          </button>
+
+          <button
+            type="button"
+            onClick={handleOpenInWorktree}
+            className="mt-1 flex w-full items-center justify-center gap-1 rounded border border-maestro-border px-2 py-1 text-xs font-medium text-maestro-text transition-colors hover:bg-maestro-card"
+          >
+            <GitBranchPlus size={11} />
+            Open in worktree
           </button>
 
           <p className="px-1 pt-1.5 text-[10px] leading-tight text-maestro-muted/70">
