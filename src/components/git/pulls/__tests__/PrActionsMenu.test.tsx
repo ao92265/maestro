@@ -14,6 +14,14 @@ vi.mock("@tauri-apps/plugin-store", () => ({
   },
 }));
 
+const { mockLaunchCardInWorktree } = vi.hoisted(() => ({
+  mockLaunchCardInWorktree: vi.fn(),
+}));
+
+vi.mock("@/lib/cardWorktreeLaunch", () => ({
+  launchCardInWorktree: mockLaunchCardInWorktree,
+}));
+
 import { DEFAULT_PR_WORKFLOW } from "@/lib/prWorkflow";
 import type { SamuraiWorkflowGraph } from "@/lib/samurai";
 import type { PullRequestInfo } from "@/stores/useGitHubStore";
@@ -89,6 +97,7 @@ describe("PrActionsMenu", () => {
     usePrWorkflowStore.setState({ graph: null });
     useWorkspaceStore.setState({ tabs: [buildTab()] });
     usePendingLaunchStore.setState({ pending: [] });
+    mockLaunchCardInWorktree.mockReset();
   });
 
   it("derives one checkbox per workflow step, with only the first ticked", () => {
@@ -326,5 +335,81 @@ describe("PrActionsMenu", () => {
     openMenu();
     fireEvent.mouseDown(document.body);
     expect(screen.queryByLabelText("Check status")).not.toBeInTheDocument();
+  });
+
+  describe("Open in worktree", () => {
+    it("launches the PR's head branch into its own worktree", async () => {
+      mockLaunchCardInWorktree.mockResolvedValue({
+        working_directory: "/worktrees/pr-123",
+        worktree_path: "/worktrees/pr-123",
+        branch: "feat/pr-monitor",
+        created: true,
+        warning: null,
+      });
+      render(<PrActionsMenu pr={buildPr()} repoPath={REPO_PATH} />);
+      openMenu();
+
+      fireEvent.click(screen.getByRole("button", { name: /Open in worktree/ }));
+
+      await waitFor(() => expect(mockLaunchCardInWorktree).toHaveBeenCalledTimes(1));
+      const args = mockLaunchCardInWorktree.mock.calls[0][0];
+      expect(args.branch).toBe("feat/pr-monitor");
+      expect(args.tabId).toBe("tab-1");
+      expect(args.repoPath).toBe(REPO_PATH);
+      expect(args.customName).toBe("pr-123-worktree");
+      expect(args.briefStem).toBe("pr-123-worktree");
+      expect(args.worktreeBasePath).toBe(null);
+    });
+
+    it("asks for a project tab instead of launching a worktree when none is active", async () => {
+      useWorkspaceStore.setState({ tabs: [buildTab({ active: false })] });
+      render(<PrActionsMenu pr={buildPr()} repoPath={REPO_PATH} />);
+      openMenu();
+
+      fireEvent.click(screen.getByRole("button", { name: /Open in worktree/ }));
+
+      expect(
+        await screen.findByText("Open a project tab to launch a PR action."),
+      ).toBeInTheDocument();
+      expect(mockLaunchCardInWorktree).not.toHaveBeenCalled();
+    });
+
+    it("surfaces a launch warning through the error channel", async () => {
+      mockLaunchCardInWorktree.mockResolvedValue({
+        working_directory: "/worktrees/pr-123",
+        worktree_path: "/worktrees/pr-123",
+        branch: "feat/pr-monitor",
+        created: false,
+        warning: "Worktree already existed; reused it.",
+      });
+      render(<PrActionsMenu pr={buildPr()} repoPath={REPO_PATH} />);
+      openMenu();
+
+      fireEvent.click(screen.getByRole("button", { name: /Open in worktree/ }));
+
+      expect(await screen.findByText("Worktree already existed; reused it.")).toBeInTheDocument();
+    });
+
+    it("hard-fails through the error channel when no worktree could be created", async () => {
+      mockLaunchCardInWorktree.mockResolvedValue({
+        working_directory: REPO_PATH,
+        worktree_path: null,
+        branch: null,
+        created: false,
+        warning: "Failed to create worktree: disk full",
+      });
+      render(<PrActionsMenu pr={buildPr()} repoPath={REPO_PATH} />);
+      openMenu();
+
+      fireEvent.click(screen.getByRole("button", { name: /Open in worktree/ }));
+
+      expect(
+        await screen.findByText(
+          "Could not create a worktree for this card, session not started. Failed to create worktree: disk full",
+        ),
+      ).toBeInTheDocument();
+      // The menu stays open on a hard failure — no "Open in worktree" success close.
+      expect(screen.getByRole("button", { name: /Open in worktree/ })).toBeInTheDocument();
+    });
   });
 });

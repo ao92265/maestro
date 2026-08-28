@@ -1,6 +1,17 @@
-import { CheckCircle2, CircleDot, ExternalLink, Loader2, MessageSquare, X } from "lucide-react";
+import {
+  CheckCircle2,
+  CircleDot,
+  ExternalLink,
+  GitBranchPlus,
+  Loader2,
+  MessageSquare,
+  X,
+} from "lucide-react";
 import { useState } from "react";
+import { issueBranchName, launchCardInWorktree } from "../../../lib/cardWorktreeLaunch";
+import { buildIssueActionPrompt } from "../../../lib/issueActionPrompt";
 import { useGitHubStore } from "../../../stores/useGitHubStore";
+import { useWorkspaceStore } from "../../../stores/useWorkspaceStore";
 import { CommentList } from "../shared/CommentList";
 import { MarkdownBody } from "../shared/MarkdownBody";
 
@@ -12,11 +23,13 @@ interface IssueDetailPanelProps {
 export function IssueDetailPanel({ repoPath, onClose }: IssueDetailPanelProps) {
   const { selectedIssue, isLoadingIssueDetail, closeIssue, reopenIssue, commentIssue } =
     useGitHubStore();
+  const activeTab = useWorkspaceStore((s) => s.tabs).find((t) => t.active);
 
   const [commentText, setCommentText] = useState("");
   const [isSubmittingComment, setIsSubmittingComment] = useState(false);
   const [isClosing, setIsClosing] = useState(false);
   const [isReopening, setIsReopening] = useState(false);
+  const [isStarting, setIsStarting] = useState(false);
 
   if (isLoadingIssueDetail) {
     return (
@@ -60,6 +73,45 @@ export function IssueDetailPanel({ repoPath, onClose }: IssueDetailPanelProps) {
     }
   };
 
+  /**
+   * Opens this issue in its own dedicated worktree on a new branch derived
+   * from the issue — same activeTab guard as PrActionsMenu's
+   * handleOpenInWorktree, delegated to the shared card-to-worktree helper
+   * from Task 1 so PR and issue cards launch identically.
+   */
+  const handleStartInWorktree = async () => {
+    if (!activeTab) {
+      window.alert("Open a project tab to start this issue in a worktree.");
+      return;
+    }
+    setIsStarting(true);
+    try {
+      const branch = issueBranchName(selectedIssue.number, selectedIssue.title);
+      const result = await launchCardInWorktree({
+        tabId: activeTab.id,
+        repoPath,
+        branch,
+        customName: `issue-${selectedIssue.number}-worktree`,
+        briefStem: `issue-${selectedIssue.number}-worktree`,
+        worktreeBasePath: activeTab.worktreeBasePath,
+        initialPrompt: buildIssueActionPrompt({ issue: selectedIssue, repoPath, branch }),
+      });
+      if (result.worktree_path === null) {
+        window.alert(
+          `Could not create a worktree for this card, session not started.${
+            result.warning ? ` ${result.warning}` : ""
+          }`,
+        );
+        return;
+      }
+      if (result.warning) {
+        window.alert(result.warning);
+      }
+    } finally {
+      setIsStarting(false);
+    }
+  };
+
   const handleComment = async () => {
     if (!commentText.trim()) return;
     setIsSubmittingComment(true);
@@ -90,6 +142,20 @@ export function IssueDetailPanel({ repoPath, onClose }: IssueDetailPanelProps) {
           <StateIcon size={16} className={isOpen ? "text-green-400" : "text-purple-400"} />
           <span className="text-sm font-medium text-maestro-text">#{selectedIssue.number}</span>
         </div>
+        <button
+          type="button"
+          onClick={handleStartInWorktree}
+          disabled={!isOpen || isStarting}
+          title={
+            isOpen
+              ? "Start this issue in a fresh worktree"
+              : "Closed issues can't be started in a worktree"
+          }
+          className="flex items-center gap-1 rounded border border-maestro-border px-2 py-1 text-xs font-medium text-maestro-text transition-colors hover:bg-maestro-surface disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <GitBranchPlus size={12} />
+          Start in worktree
+        </button>
       </div>
 
       {/* Content */}

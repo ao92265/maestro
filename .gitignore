@@ -74,3 +74,6 @@ website/.jekyll-metadata
 
 # Langfuse telemetry
 .langfuse/
+
+# Maestro staged launch briefs
+.maestro/
