@@ -1298,6 +1298,9 @@ pub fn run() {
             commands::orchestrator::orchestrator_set_scope,
             commands::orchestrator::orchestrator_clear,
             commands::orchestrator::orchestrator_drop_dir,
+            // Pulse view (today's timeline, flow score, metrics)
+            commands::pulse::pulse_transcript_stats,
+            commands::pulse::pulse_git_activity,
             // Claude auto-memory commands
             commands::memory::list_memory_projects,
             commands::memory::list_memory_files,

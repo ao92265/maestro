@@ -35,6 +35,8 @@ interface UseAppKeyboardOptions {
   onToggleFactoryView?: () => void;
   /** Callback to toggle the Orchestrator lane (Cmd/Ctrl+8) */
   onToggleOrchestratorView?: () => void;
+  /** Cmd/Ctrl+9: toggle the Pulse view (today's timeline + flow score). */
+  onTogglePulseView?: () => void;
   /** Callback to toggle the quick-open palette (Cmd/Ctrl+P) */
   onToggleQuickOpen?: () => void;
   /** Ctrl+Tab (all platforms): switch to the next project tab */
@@ -78,6 +80,7 @@ export function useAppKeyboard({
   onToggleHomeView,
   onToggleFactoryView,
   onToggleOrchestratorView,
+  onTogglePulseView,
   onToggleQuickOpen,
   onNextProject,
   onPrevProject,
@@ -159,6 +162,14 @@ export function useAppKeyboard({
         return;
       }
 
+      // Cmd/Ctrl+9: toggle Pulse, the next free digit after the Orchestrator's 8.
+      if ((event.code === "Digit9" || event.code === "Numpad9") && onTogglePulseView) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        onTogglePulseView();
+        return;
+      }
+
       // Cmd/Ctrl+2: toggle the git panel.
       // Use event.code so this still triggers on layouts where Ctrl+2 produces a non-"2" event.key.
       if ((event.code === "Digit2" || event.code === "Numpad2") && onToggleGitPanel) {
@@ -233,6 +244,7 @@ export function useAppKeyboard({
     onToggleHomeView,
     onToggleFactoryView,
     onToggleOrchestratorView,
+    onTogglePulseView,
     onToggleQuickOpen,
     onNextProject,
     onPrevProject,
