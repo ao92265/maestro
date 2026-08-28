@@ -199,15 +199,64 @@ describe("useActControlStore.setAutonomy", () => {
     expect(sent.default).toBe("L1");
   });
 
-  /* Without a snapshot to merge onto, any block we could assemble would be
-     defaults overwriting whatever the engine actually has on disk. */
-  it("refuses to write before a policy has ever been read", async () => {
-    invokeMock.mockResolvedValue(1);
+  /* The merge base must be read immediately before the write, not taken from
+     the last poll: anything the engine changed in between would otherwise be
+     carried backwards by our complete-block write. */
+  it("merges onto a fresh read, not the polled snapshot", async () => {
+    mockAllHealthy();
+    await useActControlStore.getState().refreshAll();
+
+    // The engine's policy moves after our poll — another tool, or ACT itself.
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "act_get_policy") {
+        return {
+          autonomy: {
+            default: "L0",
+            classes: { docs: "L2", dependencies: "L1" },
+            l2SampleRate: 0.75,
+            humanSampleRate: 0.5,
+            allowAllClasses: true,
+            directMerge: true,
+          },
+          writesEnabled: true,
+        };
+      }
+      return PAYLOADS[cmd] ?? [];
+    });
+
+    await useActControlStore.getState().setAutonomy({ classes: { code: "L0" } });
+
+    const write = invokeMock.mock.calls.find((call) => call[0] === "act_set_autonomy");
+    const sent = (write?.[1] as { autonomy: Record<string, unknown> }).autonomy;
+    // Every field comes from the fresh read, none from the stale snapshot.
+    expect(sent.default).toBe("L0");
+    expect(sent.l2SampleRate).toBe(0.75);
+    expect(sent.humanSampleRate).toBe(0.5);
+    expect(sent.allowAllClasses).toBe(true);
+    expect(sent.directMerge).toBe(true);
+    expect(sent.classes).toEqual({ code: "L0" });
+  });
+
+  it("re-reads the policy before writing it", async () => {
+    mockAllHealthy();
+    await useActControlStore.getState().refreshAll();
+    invokeMock.mockClear();
+
+    await useActControlStore.getState().setAutonomy({ default: "L0" });
+
+    const order = invokeMock.mock.calls.map((call) => call[0]);
+    expect(order.indexOf("act_get_policy")).toBeLessThan(order.indexOf("act_set_autonomy"));
+  });
+
+  /* Cannot confirm what we would overwrite, so overwrite nothing. This also
+     covers the never-read case: the pre-write read is the only merge base. */
+  it("writes nothing when the pre-write read fails", async () => {
+    invokeMock.mockRejectedValue(new Error("connection refused"));
 
     await useActControlStore.getState().setAutonomy({ default: "L2" });
 
-    expect(invokeMock).not.toHaveBeenCalled();
-    expect(useActControlStore.getState().reads.policy.error).toContain("No policy read yet");
+    expect(invokeMock.mock.calls.map((call) => call[0])).not.toContain("act_set_autonomy");
+    expect(useActControlStore.getState().reads.policy.error).toContain("nothing was written");
   });
 
   /* A rejected write must surface on the policy subsystem, not as a silent

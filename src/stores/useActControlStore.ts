@@ -87,12 +87,18 @@ export const useActControlStore = create<ActControlState>((set, get) => {
     }
   }
 
-  async function readPolicy(): Promise<void> {
+  /** Reads the policy; returns the snapshot, or null when the read failed. */
+  async function readPolicy(): Promise<ActPolicySnapshot | null> {
+    let fetched: ActPolicySnapshot | null = null;
     await read(
       "policy",
       () => invoke<ActPolicySnapshot>("act_get_policy"),
-      (policy) => ({ policy }),
+      (policy) => {
+        fetched = policy;
+        return { policy };
+      },
     );
+    return fetched;
   }
 
   return {
@@ -153,31 +159,37 @@ export const useActControlStore = create<ActControlState>((set, get) => {
     },
 
     setAutonomy: async (patch: ActAutonomyPatch) => {
-      const current = get().policy?.autonomy;
       /* ACT REPLACES the autonomy block rather than merging it (its
          `updatePolicy` spreads `updates` shallowly and deep-merges only
-         agent_priority, tool_policies and today_overrides). So the write has to
-         carry a complete block, merged here over the last policy we read —
-         and with no policy read yet there is nothing safe to merge onto, so
-         refuse rather than write a block assembled from defaults over whatever
-         the engine actually has on disk. */
-      if (!current) {
+         agent_priority, tool_policies and today_overrides), so the write has to
+         carry a complete block and whatever we merge onto is what survives.
+         Re-read immediately before writing rather than trusting the last poll:
+         the merge base is then at most milliseconds old instead of up to a
+         poll interval, so a policy change made elsewhere in between is carried
+         forward rather than silently clobbered. One extra request on a control
+         clicked occasionally is a cheap price for not overwriting unseen
+         state — which is the whole point of a panel meant to make policy
+         legible. */
+      const fresh = await readPolicy();
+      if (!fresh) {
+        // Could not confirm what we would be overwriting, so write nothing.
+        // `readPolicy` has already recorded the underlying cause; name the
+        // consequence so a failed click never reads as an applied one.
         set((state) => ({
           reads: {
             ...state.reads,
             policy: {
               fetchedAt: state.reads.policy.fetchedAt,
-              error: "No policy read yet — refusing to write a partial autonomy block.",
+              error: `Could not confirm the current policy, so nothing was written. ${
+                state.reads.policy.error ?? ""
+              }`.trim(),
             },
           },
         }));
         return;
       }
 
-      // Read-modify-write against an endpoint with no merge: a change another
-      // tool made since the last poll is overwritten. Re-reading first would
-      // narrow that window but not close it, and costs a round trip per click.
-      const merged = { ...current, ...patch };
+      const merged = { ...fresh.autonomy, ...patch };
       try {
         await invoke<number>("act_set_autonomy", { autonomy: merged });
       } catch (err) {

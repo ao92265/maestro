@@ -32,18 +32,17 @@ function openExternal(url: string) {
 export function IntakeLedger({ ledger, total }: { ledger: ActLedgerEntry[]; total: number }) {
   const delivered = deliveredPrs(ledger);
   const retried = ledger.filter((entry) => attemptsOf(entry) > 1).length;
-  // The relay caps the rows it returns; count what ACT actually holds.
-  const shown =
-    total > ledger.length ? `latest ${ledger.length} of ${total} tasks` : `${total} tasks`;
+  /* The relay caps the rows it returns, so say so when it bit — and only
+     then: "0 shown needed more than one attempt" reads as a qualifier on
+     nothing when the whole ledger is on screen. */
+  const truncated = total > ledger.length;
+  const hint = truncated
+    ? `latest ${ledger.length} of ${total} tasks · ${retried} of those needed more than one attempt`
+    : `${total} task${total === 1 ? "" : "s"} · ${retried} needed more than one attempt`;
 
   return (
     <>
-      <PanelSection
-        title="Intake ledger"
-        hint={
-          ledger.length > 0 ? `${shown} · ${retried} shown needed more than one attempt` : undefined
-        }
-      >
+      <PanelSection title="Intake ledger" hint={ledger.length > 0 ? hint : undefined}>
         {ledger.length === 0 ? (
           <EmptyLine>Nothing in the ledger yet.</EmptyLine>
         ) : (

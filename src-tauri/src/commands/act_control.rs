@@ -680,6 +680,72 @@ mod tests {
         assert_eq!(timeline.events.len(), 3);
     }
 
+    /// Exercises the relay against a REAL engine on 127.0.0.1:3847 rather than
+    /// against fixtures, which is the only way to catch a field ACT renamed or
+    /// never sends. Ignored by default so the suite still passes with the
+    /// engine off (its normal state):
+    ///
+    ///   cargo test -p maestro --lib act_control::tests::live -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires a running ACT on 127.0.0.1:3847"]
+    async fn live_engine_answers_every_panel_read() {
+        let policy = act_get_policy().await.expect("policy");
+        println!(
+            "policy: default={} classes={} l2={} human={} allowAll={} writes={}",
+            policy.autonomy.default,
+            policy.autonomy.classes,
+            policy.autonomy.l2_sample_rate,
+            policy.autonomy.human_sample_rate,
+            policy.autonomy.allow_all_classes,
+            policy.writes_enabled
+        );
+        // Absent autonomy block must read as the engine's own defaults, never
+        // as blanks — this engine has never had its ladder configured.
+        assert!(!policy.autonomy.default.is_empty());
+
+        let rules = act_list_intervention_rules().await.expect("rules");
+        println!("rules: {}", rules.len());
+        for rule in &rules {
+            println!("  {} {} {}", rule.r#type, rule.threshold, rule.action);
+        }
+        assert!(!rules.is_empty(), "ACT ships default intervention rules");
+
+        let events = act_list_intervention_events(Some(50)).await.expect("events");
+        println!("intervention events: {}", events.len());
+
+        let budget = act_get_budget().await.expect("budget");
+        println!(
+            "budget: used={} remaining={} cost={} over={} weeklyPct={}",
+            budget.daily_tokens_used,
+            budget.daily_tokens_remaining,
+            budget.daily_cost_used,
+            budget.is_over_budget,
+            budget.weekly_usage_percent
+        );
+
+        let ledger = act_list_ledger().await.expect("ledger");
+        println!("ledger: {} of {}", ledger.entries.len(), ledger.total);
+        for entry in ledger.entries.iter().take(5) {
+            println!(
+                "  {} {} attempts={} pr={:?}",
+                entry.id,
+                entry.status,
+                1 + entry.retry_count + entry.failover_count,
+                entry.pr_url
+            );
+        }
+
+        let replays = act_list_replays().await.expect("replays");
+        println!("replays: {}", replays.len());
+        // ACT answers 200 `{message}` rather than 404 for an unknown agent;
+        // that has to read as an empty timeline, not a failed subsystem.
+        let timeline = act_get_replay("no-such-agent".to_string())
+            .await
+            .expect("unknown agent is an empty timeline, not an error");
+        assert_eq!(timeline.total, 0);
+        assert!(timeline.events.is_empty());
+    }
+
     #[test]
     fn names_a_non_array_payload_instead_of_reading_it_as_empty() {
         let payload = json!({ "error": "boom" });
