@@ -14,6 +14,7 @@ import {
   Package,
   PanelLeft,
   Plus,
+  RadioTower,
   Sparkles,
   Square,
   Workflow,
@@ -76,6 +77,9 @@ interface TopBarProps {
   /** Factory: the ACT lane (spec in, run stages, PR out) */
   factoryViewOpen?: boolean;
   onToggleFactoryView?: () => void;
+  /** Orchestrator: goal box, session scope, safe-mode proposal queue */
+  orchestratorViewOpen?: boolean;
+  onToggleOrchestratorView?: () => void;
   /** Memory panel — buried behind the More menu, so it toggles without an
    *  active-state indicator (a plain menu action, not a persistent button). */
   onToggleMemoryPanel?: () => void;
@@ -123,6 +127,8 @@ export function TopBar({
   homeAttention = false,
   factoryViewOpen = false,
   onToggleFactoryView,
+  orchestratorViewOpen = false,
+  onToggleOrchestratorView,
   onToggleMemoryPanel,
   processesPanelOpen = false,
   onToggleProcessesPanel,
@@ -353,6 +359,25 @@ export function TopBar({
             )}
           >
             <Factory size={14} />
+          </button>
+        )}
+        {onToggleOrchestratorView && (
+          <button
+            type="button"
+            onClick={onToggleOrchestratorView}
+            className={`relative rounded p-1.5 transition-colors ${
+              orchestratorViewOpen
+                ? "text-maestro-accent hover:bg-maestro-accent/10"
+                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
+            }`}
+            aria-label="Orchestrator"
+            title={titleWithShortcut(
+              "Orchestrator — set a goal, scope the sessions, approve what it proposes",
+              modLabel(),
+              "8",
+            )}
+          >
+            <RadioTower size={14} />
           </button>
         )}
         {onToggleEagleView && (

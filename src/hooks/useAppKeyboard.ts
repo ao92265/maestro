@@ -33,6 +33,8 @@ interface UseAppKeyboardOptions {
   onToggleHomeView?: () => void;
   /** Callback to toggle the Factory ACT lane (Cmd/Ctrl+7) */
   onToggleFactoryView?: () => void;
+  /** Callback to toggle the Orchestrator lane (Cmd/Ctrl+8) */
+  onToggleOrchestratorView?: () => void;
   /** Callback to toggle the quick-open palette (Cmd/Ctrl+P) */
   onToggleQuickOpen?: () => void;
   /** Ctrl+Tab (all platforms): switch to the next project tab */
@@ -75,6 +77,7 @@ export function useAppKeyboard({
   onToggleLandscapeView,
   onToggleHomeView,
   onToggleFactoryView,
+  onToggleOrchestratorView,
   onToggleQuickOpen,
   onNextProject,
   onPrevProject,
@@ -145,6 +148,14 @@ export function useAppKeyboard({
         event.preventDefault();
         event.stopImmediatePropagation();
         onToggleFactoryView();
+        return;
+      }
+
+      // Cmd/Ctrl+8: toggle the Orchestrator, beside the Factory it hands work to.
+      if ((event.code === "Digit8" || event.code === "Numpad8") && onToggleOrchestratorView) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        onToggleOrchestratorView();
         return;
       }
 
@@ -221,6 +232,7 @@ export function useAppKeyboard({
     onToggleLandscapeView,
     onToggleHomeView,
     onToggleFactoryView,
+    onToggleOrchestratorView,
     onToggleQuickOpen,
     onNextProject,
     onPrevProject,
