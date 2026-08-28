@@ -191,6 +191,36 @@ describe("useAppKeyboard project cycling (Ctrl+Tab on all platforms)", () => {
   });
 });
 
+describe("useAppKeyboard quick open (Cmd/Ctrl+P)", () => {
+  it("fires onToggleQuickOpen and swallows the WebView print default", () => {
+    const onToggleQuickOpen = vi.fn();
+    renderAppKeyboard({ onToggleQuickOpen });
+
+    const ev = dispatch({ key: "p", code: "KeyP", ...MOD });
+
+    expect(onToggleQuickOpen).toHaveBeenCalledTimes(1);
+    expect(ev.defaultPrevented).toBe(true);
+  });
+
+  it("ignores Alt+P, which parks the focused terminal", () => {
+    const onToggleQuickOpen = vi.fn();
+    renderAppKeyboard({ onToggleQuickOpen });
+
+    dispatch({ key: "p", code: "KeyP", altKey: true });
+
+    expect(onToggleQuickOpen).not.toHaveBeenCalled();
+  });
+
+  it("ignores Cmd/Ctrl+Shift+P", () => {
+    const onToggleQuickOpen = vi.fn();
+    renderAppKeyboard({ onToggleQuickOpen });
+
+    dispatch({ key: "p", code: "KeyP", shiftKey: true, ...MOD });
+
+    expect(onToggleQuickOpen).not.toHaveBeenCalled();
+  });
+});
+
 describe("useAppKeyboard while the first-run tour is open", () => {
   it("mutes every app shortcut so the tour's own hints cannot fire behind its modal", () => {
     useTourStore.setState({ isOpen: true });

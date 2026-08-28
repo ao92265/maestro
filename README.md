@@ -121,6 +121,7 @@ A cross-platform desktop application that lets you run 1-12 Claude Code (or othe
 |----------|--------|
 | **Alt+1-4** | Toggle the left sidebar on the General / History / Infra / Settings tab |
 | **Cmd+2-6** | Toggle the right-side Git / Memory / Processes / Notes / Standup panel |
+| **Cmd+P** | Quick-open palette — fuzzy jump to any session or worktree |
 | **Cmd+T** | New terminal (stays in zoom-in view; project picker in eagle view) |
 | **Cmd+1** | Zoom the focused terminal (toggle) |
 | **Alt+←** / **Alt+→** | Previous / next terminal tab while zoomed |

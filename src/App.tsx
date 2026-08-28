@@ -18,6 +18,7 @@ import { usePlanStore } from "@/stores/usePlanStore";
 import {
   initContextUsageListener,
   initSamuraiSupervisorListener,
+  type SessionConfig,
   stopContextUsageListener,
   stopSamuraiSupervisorListener,
   useSessionStore,
@@ -40,6 +41,7 @@ import {
   RIGHT_PANEL_WIDTH_STORAGE_KEY,
 } from "./components/shared/PanelResizeHandle";
 import { ProjectTabs } from "./components/shared/ProjectTabs";
+import { QuickOpenPalette } from "./components/shared/QuickOpenPalette";
 import { type EagleProjectOption, TopBar } from "./components/shared/TopBar";
 import { UtilityPanel, type UtilityPanelKind } from "./components/shared/UtilityPanel";
 import {
@@ -55,9 +57,11 @@ import { UpdateNotification } from "./components/update/UpdateNotification";
 import { useAppKeyboard } from "./hooks/useAppKeyboard";
 import { useBandPolling } from "./hooks/useBandPolling";
 import { useLaunchHandoff } from "./hooks/useLaunchHandoff";
+import { useQuickOpenItems } from "./hooks/useQuickOpenItems";
 import { useSwipeNavigation } from "./hooks/useSwipeNavigation";
 import { useVanguardSnapshot } from "./hooks/useVanguardSnapshot";
 import { HEALTH_CHECK_INTERVAL_MS } from "./lib/healthRules";
+import type { QuickOpenItem } from "./lib/quickOpen";
 import { initActivityListener, stopActivityListener } from "./stores/useActivityStore";
 import { useActStore } from "./stores/useActStore";
 import { initAgentListener, stopAgentListener } from "./stores/useAgentStore";
@@ -124,6 +128,9 @@ const GIT_PANEL_TITLES: Record<GitPanelTab, string> = {
   discussions: "Discussions",
 };
 
+/** Stable empty list so the closed palette's selector never changes identity. */
+const EMPTY_SESSIONS: SessionConfig[] = [];
+
 type Theme = "dark" | "light";
 
 function isValidTheme(value: string | null): value is Theme {
@@ -167,6 +174,13 @@ function App() {
   const [eagleView, setEagleView] = useState(false);
   // Eagle view Cmd/Ctrl+T: arrow-navigable project picker for the new terminal.
   const [eagleAddPickerOpen, setEagleAddPickerOpen] = useState(false);
+  // Cmd/Ctrl+P quick-open palette across sessions and worktrees.
+  const [quickOpenOpen, setQuickOpenOpen] = useState(false);
+  // Only subscribe to the session list while the palette is up. The store
+  // replaces the array on every status event, so an unconditional subscription
+  // would re-render App (and the whole terminal subtree) all day for data
+  // nothing else here reads.
+  const quickOpenSessions = useSessionStore((s) => (quickOpenOpen ? s.sessions : EMPTY_SESSIONS));
   // Eagle view git carousel: index of the project whose git panel card shows.
   const [eagleGitIndex, setEagleGitIndex] = useState(0);
   // Landscape view: every project, terminal and subagent on one graph. Rendered
@@ -817,6 +831,33 @@ function App() {
     useHomeViewStore.getState().toggle();
   }, []);
 
+  const quickOpenItems = useQuickOpenItems(quickOpenOpen, quickOpenSessions, tabs);
+
+  const handleQuickOpenPick = useCallback(
+    (item: QuickOpenItem) => {
+      setQuickOpenOpen(false);
+      // Exactly the route the landscape and Home rows take out of an overlay:
+      // drop the full-screen views, select the project, then zoom on the next
+      // frame — the target project's grid is not mounted until that render, and
+      // navigateToSession would still see the pre-close eagle state this tick.
+      setLandscapeView(false);
+      setEagleView(false);
+      useHomeViewStore.getState().close();
+      useFactoryViewStore.getState().close();
+      useWorkflowsViewStore.getState().close();
+      selectTab(item.tabId);
+
+      // A worktree with no live session has no terminal to zoom; surfacing its
+      // project is the most we can honestly do.
+      const { sessionId } = item;
+      if (sessionId === null) return;
+      requestAnimationFrame(() => {
+        multiProjectRef.current?.zoomSessionInProject(item.tabId, sessionId);
+      });
+    },
+    [selectTab],
+  );
+
   const handleToggleFactoryView = useCallback(() => {
     const willOpen = !useFactoryViewStore.getState().isOpen;
     if (willOpen) {
@@ -963,6 +1004,7 @@ function App() {
     onToggleLandscapeView: useCallback(() => setLandscapeView((v) => !v), []),
     onToggleHomeView: handleToggleHomeView,
     onToggleFactoryView: handleToggleFactoryView,
+    onToggleQuickOpen: useCallback(() => setQuickOpenOpen((v) => !v), []),
     onNextProject: switchToNextTab,
     onPrevProject: switchToPrevTab,
   });
@@ -1264,6 +1306,15 @@ function App() {
           </div>
         </div>
       </div>
+
+      {/* Cmd/Ctrl+P: fuzzy jump to any session or worktree */}
+      {quickOpenOpen && (
+        <QuickOpenPalette
+          items={quickOpenItems}
+          onPick={handleQuickOpenPick}
+          onClose={() => setQuickOpenOpen(false)}
+        />
+      )}
 
       {/* Eagle view Cmd/Ctrl+T: pick which project gets the new terminal */}
       {eagleAddPickerOpen && (

@@ -1,0 +1,97 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+
+import { buildSessionItems, buildWorktreeItems, type QuickOpenItem } from "@/lib/quickOpen";
+import { listWorktrees, type WorktreeInfo } from "@/lib/worktreeManager";
+import type { SessionConfig } from "@/stores/useSessionStore";
+import type { WorkspaceTab } from "@/stores/useWorkspaceStore";
+
+/** Repo the tab's worktrees belong to (multi-repo workspaces pick one). */
+function repoPathFor(tab: WorkspaceTab): string {
+  return tab.selectedRepoPath ?? tab.projectPath;
+}
+
+interface FetchedWorktrees {
+  tabId: string;
+  worktrees: WorktreeInfo[];
+}
+
+/**
+ * Assembles the quick-open rows: every session in an open project, plus every
+ * worktree of those projects.
+ *
+ * Sessions come from state already in memory, so they are always available.
+ * Worktrees need a git call per project, so they are only fetched while `open`
+ * is true — the palette is a rare, deliberate action and this keeps the cost
+ * off the app's steady state.
+ *
+ * The effect stores only raw worktrees; sessions are attached in the memo
+ * below. Linking inside the effect would freeze the session mapping at fetch
+ * time, so a row could point at a session that had since gone away.
+ *
+ * Sessions and tabs are passed in rather than read from the stores so the
+ * assembly stays testable without standing up persisted Zustand stores.
+ */
+export function useQuickOpenItems(
+  open: boolean,
+  sessions: SessionConfig[],
+  tabs: WorkspaceTab[],
+): QuickOpenItem[] {
+  const [fetched, setFetched] = useState<FetchedWorktrees[]>([]);
+
+  // Content signature rather than array identity. Every fetch sets state, which
+  // re-renders; a caller that rebuilds `tabs` inline would then hand back a new
+  // array, refire the effect and spin forever. The signature only changes when
+  // something worth refetching does.
+  const tabsKey = tabs
+    .map((t) => `${t.id}\u0000${repoPathFor(t)}\u0000${t.workspaceType}`)
+    .join("|");
+
+  // Lets the effect read the current tabs without depending on their identity.
+  const tabsRef = useRef(tabs);
+  tabsRef.current = tabs;
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: tabsKey is the content signature of tabsRef.current — depending on the array identity would refetch on every render.
+  useEffect(() => {
+    if (!open) {
+      setFetched([]);
+      return;
+    }
+
+    let cancelled = false;
+
+    (async () => {
+      const collected: FetchedWorktrees[] = [];
+
+      for (const tab of tabsRef.current) {
+        // A non-git folder has no worktrees and `git worktree list` would just
+        // error, so skip the round trip.
+        if (tab.workspaceType === "non-git") continue;
+
+        try {
+          collected.push({ tabId: tab.id, worktrees: await listWorktrees(repoPathFor(tab)) });
+        } catch {
+          // A project that cannot be read (deleted, permissions, not a repo)
+          // must not take the whole palette down with it.
+        }
+      }
+
+      if (!cancelled) setFetched(collected);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [open, tabsKey]);
+
+  return useMemo(() => {
+    const items = buildSessionItems(sessions, tabs);
+
+    for (const entry of fetched) {
+      const tab = tabs.find((t) => t.id === entry.tabId);
+      if (!tab) continue;
+      items.push(...buildWorktreeItems(entry.worktrees, sessions, tab));
+    }
+
+    return items;
+  }, [sessions, tabs, fetched]);
+}

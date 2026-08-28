@@ -40,6 +40,7 @@ function buildGroups(mod: string, alt: string): ShortcutGroup[] {
     {
       title: "Terminals & Views",
       shortcuts: [
+        { keys: [mod, "P"], description: "Quick-open a session or worktree" },
         { keys: [mod, "T"], description: "New terminal (project picker in eagle view)" },
         { keys: [mod, "1"], description: "Zoom the focused terminal (toggle)" },
         { keys: [alt, "← →"], description: "Previous / next tab while zoomed" },
