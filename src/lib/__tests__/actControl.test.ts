@@ -3,13 +3,16 @@ import { describe, expect, it } from "vitest";
 import {
   ACT_SUBSYSTEMS,
   type ActAutonomyPolicy,
+  type ActBudget,
   type ActLedgerEntry,
   attemptsOf,
   budgetHeadroom,
   deliveredPrs,
   describeThreshold,
   effectiveLevel,
+  engineOffline,
   l2Caveat,
+  lastReadAt,
   unreadableSubsystems,
 } from "../actControl";
 
@@ -110,38 +113,38 @@ describe("deliveredPrs", () => {
   });
 });
 
+const budget = (over: Partial<ActBudget> = {}): ActBudget => ({
+  dailyTokensUsed: 0,
+  dailyTokensRemaining: 0,
+  dailyCostUsed: 0,
+  dailyCostRemaining: 0,
+  isOverBudget: false,
+  lastResetDate: null,
+  weeklyTokensUsed: 0,
+  weeklyTokensLimit: 0,
+  weeklyUsagePercent: 0,
+  cacheTokensUsed: null,
+  ...over,
+});
+
 describe("budgetHeadroom", () => {
   it("reports the used fraction of the daily token allowance", () => {
-    expect(
-      budgetHeadroom({
-        dailyTokensUsed: 250,
-        dailyTokensRemaining: 750,
-        dailyCostUsed: 1,
-        dailyCostRemaining: 3,
-        isOverBudget: false,
-        lastResetDate: null,
-        weeklyTokensUsed: 0,
-        weeklyTokensLimit: 0,
-        weeklyUsagePercent: 0,
-        cacheTokensUsed: null,
-      }),
-    ).toBe(25);
+    expect(budgetHeadroom(budget({ dailyTokensUsed: 250, dailyTokensRemaining: 750 }))).toBe(25);
   });
 
   it("returns null when there is no allowance to divide by", () => {
+    expect(budgetHeadroom(budget())).toBeNull();
+  });
+
+  /* ACT clamps dailyTokensRemaining at 0, so once spending passes the cap the
+     used+remaining reconstruction collapses to `used` and a 40% overrun would
+     render as exactly 100% of a cap equal to the overspend. ACT reports no
+     dailyTokenLimit on any route, so the honest answer is no percentage. */
+  it("refuses to invent a cap once ACT reports an overrun", () => {
     expect(
-      budgetHeadroom({
-        dailyTokensUsed: 0,
-        dailyTokensRemaining: 0,
-        dailyCostUsed: 0,
-        dailyCostRemaining: 0,
-        isOverBudget: false,
-        lastResetDate: null,
-        weeklyTokensUsed: 0,
-        weeklyTokensLimit: 0,
-        weeklyUsagePercent: 0,
-        cacheTokensUsed: null,
-      }),
+      budgetHeadroom(
+        budget({ dailyTokensUsed: 1_400_000, dailyTokensRemaining: 0, isOverBudget: true }),
+      ),
     ).toBeNull();
   });
 });
@@ -178,11 +181,54 @@ describe("unreadableSubsystems", () => {
     expect(flags).toEqual([]);
   });
 
-  it("still flags a subsystem that has never read AND has an error", () => {
+  /* The fault this flag exists for: the engine is up and answering, but one
+     of its own surfaces will not serve — an older build missing a route. */
+  it("flags a route that never answers while the rest of the engine does", () => {
     const flags = unreadableSubsystems({
       ...healthy,
-      replays: { fetchedAt: 0, error: "ACT request failed" },
+      replays: { fetchedAt: 0, error: "ACT returned HTTP 404" },
     });
     expect(flags.map((f) => f.key)).toEqual(["replays"]);
+  });
+
+  /* Regression guard for the cold-start wall: with ACT off, every read fails
+     at once and flagging all six buried the one fact that mattered. */
+  it("flags nothing when the engine itself is unreachable", () => {
+    const allDown = Object.fromEntries(
+      ACT_SUBSYSTEMS.map((s) => [s.key, { fetchedAt: 0, error: "Connection refused" }]),
+    ) as Parameters<typeof unreadableSubsystems>[0];
+
+    expect(unreadableSubsystems(allDown)).toEqual([]);
+    expect(engineOffline(allDown)).toBe(true);
+  });
+
+  it("is not offline before the first poll has run", () => {
+    const untouched = Object.fromEntries(
+      ACT_SUBSYSTEMS.map((s) => [s.key, { fetchedAt: 0, error: null }]),
+    ) as Parameters<typeof unreadableSubsystems>[0];
+
+    expect(engineOffline(untouched)).toBe(false);
+  });
+
+  it("is not offline while any subsystem still answers", () => {
+    expect(engineOffline({ ...healthy, budget: { fetchedAt: 0, error: "boom" } })).toBe(false);
+  });
+});
+
+describe("lastReadAt", () => {
+  it("takes the newest successful read across the subsystems", () => {
+    const reads = Object.fromEntries(
+      ACT_SUBSYSTEMS.map((s) => [s.key, { fetchedAt: 100, error: null }]),
+    ) as Parameters<typeof lastReadAt>[0];
+
+    expect(lastReadAt({ ...reads, ledger: { fetchedAt: 900, error: null } })).toBe(900);
+  });
+
+  it("is 0 when nothing has ever answered", () => {
+    const reads = Object.fromEntries(
+      ACT_SUBSYSTEMS.map((s) => [s.key, { fetchedAt: 0, error: "down" }]),
+    ) as Parameters<typeof lastReadAt>[0];
+
+    expect(lastReadAt(reads)).toBe(0);
   });
 });

@@ -6,10 +6,12 @@ import {
   type ActBudget,
   type ActInterventionEvent,
   type ActInterventionRule,
+  type ActLedger,
   type ActLedgerEntry,
   type ActPolicySnapshot,
   type ActReplay,
   type ActReplayEvent,
+  type ActReplayTimeline,
   type SubsystemKey,
   type SubsystemReads,
 } from "@/lib/actControl";
@@ -40,6 +42,8 @@ interface ActControlState {
   events: ActInterventionEvent[];
   budget: ActBudget | null;
   ledger: ActLedgerEntry[];
+  /** Tasks ACT holds, before the relay's display cap. */
+  ledgerTotal: number;
   replays: ActReplay[];
   /** Per-subsystem read record; drives the stale badge and the fault flags. */
   reads: SubsystemReads;
@@ -47,6 +51,8 @@ interface ActControlState {
   /** The replay opened in the timeline, and its agent id. */
   openReplayAgentId: string | null;
   replayEvents: ActReplayEvent[];
+  /** Events in the stored replay, before the relay's display cap. */
+  replayTotal: number;
   replayError: string | null;
   refreshAll: () => Promise<void>;
   setAutonomy: (patch: ActAutonomyPatch) => Promise<void>;
@@ -95,11 +101,13 @@ export const useActControlStore = create<ActControlState>((set, get) => {
     events: [],
     budget: null,
     ledger: [],
+    ledgerTotal: 0,
     replays: [],
     reads: emptyReads(),
     isPolling: false,
     openReplayAgentId: null,
     replayEvents: [],
+    replayTotal: 0,
     replayError: null,
 
     refreshAll: async () => {
@@ -130,8 +138,8 @@ export const useActControlStore = create<ActControlState>((set, get) => {
           ),
           read(
             "ledger",
-            () => invoke<ActLedgerEntry[]>("act_list_ledger"),
-            (ledger) => ({ ledger }),
+            () => invoke<ActLedger>("act_list_ledger"),
+            (payload) => ({ ledger: payload.entries, ledgerTotal: payload.total }),
           ),
           read(
             "replays",
@@ -145,12 +153,37 @@ export const useActControlStore = create<ActControlState>((set, get) => {
     },
 
     setAutonomy: async (patch: ActAutonomyPatch) => {
+      const current = get().policy?.autonomy;
+      /* ACT REPLACES the autonomy block rather than merging it (its
+         `updatePolicy` spreads `updates` shallowly and deep-merges only
+         agent_priority, tool_policies and today_overrides). So the write has to
+         carry a complete block, merged here over the last policy we read —
+         and with no policy read yet there is nothing safe to merge onto, so
+         refuse rather than write a block assembled from defaults over whatever
+         the engine actually has on disk. */
+      if (!current) {
+        set((state) => ({
+          reads: {
+            ...state.reads,
+            policy: {
+              fetchedAt: state.reads.policy.fetchedAt,
+              error: "No policy read yet — refusing to write a partial autonomy block.",
+            },
+          },
+        }));
+        return;
+      }
+
+      // Read-modify-write against an endpoint with no merge: a change another
+      // tool made since the last poll is overwritten. Re-reading first would
+      // narrow that window but not close it, and costs a round trip per click.
+      const merged = { ...current, ...patch };
       try {
-        await invoke<number>("act_set_autonomy", { autonomy: patch });
+        await invoke<number>("act_set_autonomy", { autonomy: merged });
       } catch (err) {
         // Surface on the policy subsystem and return: re-reading here would
-        // look like the write landed. ACT's own merge is the source of
-        // truth for what the policy becomes, so nothing is set optimistically.
+        // look like the write landed. ACT's stored policy stays the source of
+        // truth, so nothing is set optimistically.
         set((state) => ({
           reads: {
             ...state.reads,
@@ -163,19 +196,20 @@ export const useActControlStore = create<ActControlState>((set, get) => {
     },
 
     openReplay: async (agentId: string) => {
-      set({ openReplayAgentId: agentId, replayEvents: [], replayError: null });
+      set({ openReplayAgentId: agentId, replayEvents: [], replayTotal: 0, replayError: null });
       try {
-        const events = await invoke<ActReplayEvent[]>("act_get_replay", { agentId });
+        const timeline = await invoke<ActReplayTimeline>("act_get_replay", { agentId });
         // Guard against a slow response for a replay the user has since
         // closed or swapped away from.
         if (get().openReplayAgentId !== agentId) return;
-        set({ replayEvents: events });
+        set({ replayEvents: timeline.events, replayTotal: timeline.total });
       } catch (err) {
         if (get().openReplayAgentId !== agentId) return;
         set({ replayError: String(err) });
       }
     },
 
-    closeReplay: () => set({ openReplayAgentId: null, replayEvents: [], replayError: null }),
+    closeReplay: () =>
+      set({ openReplayAgentId: null, replayEvents: [], replayTotal: 0, replayError: null }),
   };
 });

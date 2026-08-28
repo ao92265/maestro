@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { unreadableSubsystems } from "@/lib/actControl";
+import { engineOffline, unreadableSubsystems } from "@/lib/actControl";
 import { useActControlStore } from "../useActControlStore";
 
 const invokeMock = vi.mocked(invoke);
@@ -43,21 +43,24 @@ const PAYLOADS: Record<string, unknown> = {
     weeklyUsagePercent: 10,
     cacheTokensUsed: 20,
   },
-  act_list_ledger: [
-    {
-      id: "task-1",
-      title: "Ship the panel",
-      status: "completed",
-      retryCount: 1,
-      failoverCount: 0,
-      prUrl: "https://example.test/pr/1",
-      branchName: "feat/panel",
-      blockReason: null,
-      lastFailoverReason: null,
-      createdAt: "2026-08-28T08:00:00.000Z",
-      completedAt: "2026-08-28T09:00:00.000Z",
-    },
-  ],
+  act_list_ledger: {
+    total: 1,
+    entries: [
+      {
+        id: "task-1",
+        title: "Ship the panel",
+        status: "completed",
+        retryCount: 1,
+        failoverCount: 0,
+        prUrl: "https://example.test/pr/1",
+        branchName: "feat/panel",
+        blockReason: null,
+        lastFailoverReason: null,
+        createdAt: "2026-08-28T08:00:00.000Z",
+        completedAt: "2026-08-28T09:00:00.000Z",
+      },
+    ],
+  },
   act_list_replays: [
     {
       sessionId: "s-1",
@@ -154,7 +157,11 @@ describe("useActControlStore.setAutonomy", () => {
     useActControlStore.setState(useActControlStore.getInitialState(), true);
   });
 
-  it("sends only the autonomy patch and re-reads the policy afterwards", async () => {
+  /* The engine REPLACES the autonomy block (its `updatePolicy` spreads
+     `updates` shallowly and deep-merges only agent_priority, tool_policies and
+     today_overrides). Sending just the changed key erased the default, both
+     sample rates and both switches, and persisted that to disk. */
+  it("sends the whole merged block, not just the changed key", async () => {
     mockAllHealthy();
     await useActControlStore.getState().refreshAll();
     invokeMock.mockClear();
@@ -162,18 +169,93 @@ describe("useActControlStore.setAutonomy", () => {
     await useActControlStore.getState().setAutonomy({ classes: { code: "L0" } });
 
     const write = invokeMock.mock.calls.find((call) => call[0] === "act_set_autonomy");
-    expect(write?.[1]).toEqual({ autonomy: { classes: { code: "L0" } } });
-    // The engine, not the panel, decides what the merged policy becomes.
+    expect(write?.[1]).toEqual({
+      autonomy: {
+        default: "L1",
+        classes: { code: "L0" },
+        l2SampleRate: 0.1,
+        humanSampleRate: 0.2,
+        allowAllClasses: false,
+        directMerge: false,
+      },
+    });
     expect(invokeMock.mock.calls.map((c) => c[0])).toContain("act_get_policy");
+  });
+
+  it("carries every untouched field through a single-toggle change", async () => {
+    mockAllHealthy();
+    await useActControlStore.getState().refreshAll();
+    invokeMock.mockClear();
+
+    await useActControlStore.getState().setAutonomy({ allowAllClasses: true });
+
+    const write = invokeMock.mock.calls.find((call) => call[0] === "act_set_autonomy");
+    const sent = (write?.[1] as { autonomy: Record<string, unknown> }).autonomy;
+    expect(sent.allowAllClasses).toBe(true);
+    // The rest of the ladder survives the write.
+    expect(sent.classes).toEqual({ docs: "L2" });
+    expect(sent.l2SampleRate).toBe(0.1);
+    expect(sent.humanSampleRate).toBe(0.2);
+    expect(sent.default).toBe("L1");
+  });
+
+  /* Without a snapshot to merge onto, any block we could assemble would be
+     defaults overwriting whatever the engine actually has on disk. */
+  it("refuses to write before a policy has ever been read", async () => {
+    invokeMock.mockResolvedValue(1);
+
+    await useActControlStore.getState().setAutonomy({ default: "L2" });
+
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(useActControlStore.getState().reads.policy.error).toContain("No policy read yet");
   });
 
   /* A rejected write must surface on the policy subsystem, not as a silent
      no-op that leaves the toggle looking applied. */
   it("records a rejected write against the policy subsystem", async () => {
+    mockAllHealthy();
+    await useActControlStore.getState().refreshAll();
     invokeMock.mockRejectedValue(new Error("writes are disabled"));
 
     await useActControlStore.getState().setAutonomy({ default: "L2" });
 
     expect(useActControlStore.getState().reads.policy.error).toContain("writes are disabled");
+  });
+});
+
+describe("useActControlStore with the engine off", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    useActControlStore.setState(useActControlStore.getInitialState(), true);
+  });
+
+  /* Cold start against a stopped ACT. The earlier version of this test
+     asserted the pre-first-poll state, which is all zeros and no errors, so it
+     never covered the case it was named for: the panel rendered six raw
+     connection-refused lines the first time it opened without the engine. */
+  it("reads as offline, not as six faults, after a failed first poll", async () => {
+    invokeMock.mockRejectedValue(new Error("error sending request for url (127.0.0.1:3847)"));
+
+    await useActControlStore.getState().refreshAll();
+
+    const { reads } = useActControlStore.getState();
+    expect(engineOffline(reads)).toBe(true);
+    expect(unreadableSubsystems(reads)).toEqual([]);
+  });
+
+  it("switches from offline to per-subsystem faults once ACT comes back partly", async () => {
+    invokeMock.mockRejectedValue(new Error("connection refused"));
+    await useActControlStore.getState().refreshAll();
+    expect(engineOffline(useActControlStore.getState().reads)).toBe(true);
+
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "act_list_replays") throw new Error("ACT returned HTTP 404");
+      return PAYLOADS[cmd] ?? [];
+    });
+    await useActControlStore.getState().refreshAll();
+
+    const { reads } = useActControlStore.getState();
+    expect(engineOffline(reads)).toBe(false);
+    expect(unreadableSubsystems(reads).map((f) => f.key)).toEqual(["replays"]);
   });
 });

@@ -1,10 +1,12 @@
 import { EyeOff } from "lucide-react";
 import { useEffect } from "react";
-import { unreadableSubsystems } from "@/lib/actControl";
+import { engineOffline, lastReadAt, unreadableSubsystems } from "@/lib/actControl";
 import { useActControlStore } from "@/stores/useActControlStore";
+import { ACT_STALE_MS } from "@/stores/useActStore";
 import { AutonomyLadder } from "./AutonomyLadder";
 import { GuardrailFeed } from "./GuardrailFeed";
 import { IntakeLedger } from "./IntakeLedger";
+import { relAgo } from "./primitives";
 import { ReplayTimeline } from "./ReplayTimeline";
 import { SpendPanel } from "./SpendPanel";
 
@@ -28,6 +30,7 @@ export function ControlPanel() {
   const events = useActControlStore((state) => state.events);
   const budget = useActControlStore((state) => state.budget);
   const ledger = useActControlStore((state) => state.ledger);
+  const ledgerTotal = useActControlStore((state) => state.ledgerTotal);
   const replays = useActControlStore((state) => state.replays);
   const reads = useActControlStore((state) => state.reads);
 
@@ -38,9 +41,30 @@ export function ControlPanel() {
   }, [refreshAll]);
 
   const unreadable = unreadableSubsystems(reads);
+  const offline = engineOffline(reads);
+  const readAt = lastReadAt(reads);
+  /* A read that landed but has since gone quiet: the rows below are last
+     known, not current. Same 90s threshold as the run list's badge. */
+  const stale = readAt > 0 && (unreadable.length > 0 || Date.now() - readAt > ACT_STALE_MS);
 
   return (
     <div className="flex flex-1 flex-col gap-2 overflow-y-auto p-3">
+      {offline && (
+        /* ACT not running is a NORMAL state — one line, matching the Runs
+           tab, rather than a connection error per subsystem. */
+        <p className="rounded border border-dashed border-maestro-border px-3 py-2 text-[11px] text-maestro-muted/70">
+          ACT is not running. The panel fills itself as soon as the engine answers.
+        </p>
+      )}
+
+      {stale && (
+        <p className="flex items-center gap-1.5 text-[10px] text-maestro-muted">
+          <span className="inline-block h-1.5 w-1.5 rounded-full bg-maestro-yellow" />
+          Showing the last good read
+          {readAt > 0 && ` from ${relAgo(new Date(readAt).toISOString())}`}.
+        </p>
+      )}
+
       {unreadable.length > 0 && (
         /* Named, not hidden: a subsystem the panel cannot read is a fact about
            the engine worth seeing, and ACT records no such flag itself. */
@@ -64,7 +88,7 @@ export function ControlPanel() {
           <GuardrailFeed rules={rules} events={events} />
         </div>
         <div className="flex flex-col gap-2">
-          <IntakeLedger ledger={ledger} />
+          <IntakeLedger ledger={ledger} total={ledgerTotal} />
           <ReplayTimeline replays={replays} />
         </div>
       </div>

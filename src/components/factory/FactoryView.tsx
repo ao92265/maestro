@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { ControlPanel } from "@/components/factory/control/ControlPanel";
+import { relAgo } from "@/components/factory/control/primitives";
 import { EngineBadge } from "@/components/factory/EngineBadge";
 import { badgeBaseClass } from "@/components/session/agentPresentation";
 import { type ActRun, type ActSpecInput, isTerminal, runNeedsYou, stageSummary } from "@/lib/act";
@@ -36,18 +37,6 @@ const RUN_BADGES: Record<string, string> = {
 
 function runBadge(status: string): string {
   return RUN_BADGES[status] ?? "bg-maestro-muted/15 text-maestro-muted";
-}
-
-function relAgo(iso: string | null): string {
-  if (!iso) return "";
-  const ms = Date.now() - Date.parse(iso);
-  if (!Number.isFinite(ms) || ms < 0) return "";
-  const mins = Math.floor(ms / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
-  const hours = Math.floor(mins / 60);
-  if (hours < 48) return `${hours}h ago`;
-  return `${Math.floor(hours / 24)}d ago`;
 }
 
 const fieldClass =

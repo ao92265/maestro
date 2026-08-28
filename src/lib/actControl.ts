@@ -117,6 +117,12 @@ export interface ActLedgerEntry {
   completedAt: string | null;
 }
 
+/** Ledger rows plus the untruncated task count from the relay. */
+export interface ActLedger {
+  entries: ActLedgerEntry[];
+  total: number;
+}
+
 export interface ActReplay {
   sessionId: string;
   agentId: string;
@@ -124,6 +130,12 @@ export interface ActReplay {
   runtime: string;
   startedAt: string | null;
   eventCount: number;
+}
+
+/** A replay's events plus how many the stored session actually has. */
+export interface ActReplayTimeline {
+  events: ActReplayEvent[];
+  total: number;
 }
 
 export interface ActReplayEvent {
@@ -197,34 +209,79 @@ export function attemptsOf(entry: ActLedgerEntry): number {
 
 /** The delivery list: ledger rows that actually produced a PR, newest first. */
 export function deliveredPrs(ledger: ActLedgerEntry[]): ActLedgerEntry[] {
+  /* Date.parse returns NaN for a missing or malformed completedAt, and a
+     comparator that returns NaN leaves the order unspecified — sinking the
+     undated rows keeps it total. */
+  const when = (entry: ActLedgerEntry): number => {
+    const parsed = Date.parse(entry.completedAt ?? "");
+    return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
+  };
   return ledger
     .filter((entry) => entry.prUrl !== null && entry.prUrl !== "")
-    .sort((a, b) => Date.parse(b.completedAt ?? "") - Date.parse(a.completedAt ?? ""));
+    .sort((a, b) => when(b) - when(a));
 }
 
-/** Percentage of the daily token allowance spent, or null if there is none. */
+/**
+ * Percentage of the daily token allowance spent, or null when the allowance
+ * cannot be known.
+ *
+ * The cap has to be reconstructed as used + remaining because ACT does not
+ * report `dailyTokenLimit` on any route. That reconstruction only holds while
+ * there is headroom left: `getTokensRemaining()` is `Math.max(0, limit -
+ * used)`, so once spending passes the cap `remaining` pins to 0 and the sum
+ * collapses to `used` — which would render a 40% overrun as a tidy 100% of a
+ * cap equal to the overspend. When ACT says it is over budget, the real cap is
+ * unrecoverable here, so report nothing rather than a flattering fiction.
+ */
 export function budgetHeadroom(budget: ActBudget): number | null {
+  if (budget.isOverBudget) return null;
   const allowance = budget.dailyTokensUsed + budget.dailyTokensRemaining;
   if (allowance <= 0) return null;
   return Math.round((budget.dailyTokensUsed / allowance) * 100);
 }
 
+/** True once any subsystem has ever answered — i.e. the engine is reachable. */
+export function engineReachable(reads: SubsystemReads): boolean {
+  return ACT_SUBSYSTEMS.some(({ key }) => (reads[key]?.fetchedAt ?? 0) > 0);
+}
+
+/**
+ * True when the panel has tried and nothing answered: ACT is simply not
+ * running. That is a NORMAL state and reads as one offline line, never as a
+ * wall of six connection errors.
+ */
+export function engineOffline(reads: SubsystemReads): boolean {
+  if (engineReachable(reads)) return false;
+  return ACT_SUBSYSTEMS.some(({ key }) => reads[key]?.error != null);
+}
+
 /**
  * The "unreadable subsystem" flags. ACT exposes no such concept — nothing in
  * its source records one — so the panel derives it from its own reads: a
- * subsystem is unreadable when its last read failed, and every other one keeps
- * rendering its last known rows.
+ * subsystem is unreadable when its read failed while OTHER subsystems are
+ * answering. That is the real fault this flag exists to catch — an engine that
+ * is up but cannot serve one of its own surfaces, e.g. an older build missing
+ * a route.
  *
- * A subsystem that has never been read AND has no error is not a fault: that
- * is simply ACT being off, which the panel already says once at the top rather
- * than six times over.
+ * A dead engine is deliberately not six faults. With nothing reachable at all,
+ * every subsystem would flag at once and bury the one fact that matters, which
+ * is that ACT is off; `engineOffline` covers that case instead.
  */
 export function unreadableSubsystems(
   reads: SubsystemReads,
 ): { key: SubsystemKey; label: string; reason: string }[] {
+  if (!engineReachable(reads)) return [];
   return ACT_SUBSYSTEMS.flatMap(({ key, label }) => {
     const read = reads[key];
     if (!read?.error) return [];
     return [{ key, label, reason: read.error }];
   });
+}
+
+/** Newest successful read across all subsystems; 0 when none has answered. */
+export function lastReadAt(reads: SubsystemReads): number {
+  return ACT_SUBSYSTEMS.reduce(
+    (newest, { key }) => Math.max(newest, reads[key]?.fetchedAt ?? 0),
+    0,
+  );
 }

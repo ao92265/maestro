@@ -29,18 +29,19 @@ function openExternal(url: string) {
  * runtime is a different story from one that shipped first time, and ACT
  * records those as two separate counters.
  */
-export function IntakeLedger({ ledger }: { ledger: ActLedgerEntry[] }) {
+export function IntakeLedger({ ledger, total }: { ledger: ActLedgerEntry[]; total: number }) {
   const delivered = deliveredPrs(ledger);
   const retried = ledger.filter((entry) => attemptsOf(entry) > 1).length;
+  // The relay caps the rows it returns; count what ACT actually holds.
+  const shown =
+    total > ledger.length ? `latest ${ledger.length} of ${total} tasks` : `${total} tasks`;
 
   return (
     <>
       <PanelSection
         title="Intake ledger"
         hint={
-          ledger.length > 0
-            ? `${ledger.length} tasks · ${retried} needed more than one attempt`
-            : undefined
+          ledger.length > 0 ? `${shown} · ${retried} shown needed more than one attempt` : undefined
         }
       >
         {ledger.length === 0 ? (

@@ -57,7 +57,16 @@ export function SpendPanel({ budget }: { budget: ActBudget | null }) {
         ) : null
       }
     >
-      {daily === null ? (
+      {budget.isOverBudget ? (
+        /* Past the cap ACT pins dailyTokensRemaining to 0 and reports no
+           dailyTokenLimit on any route, so the used+remaining reconstruction
+           collapses to `used`. A bar here would read as a tidy 100% of a cap
+           equal to the overspend; state the overrun instead. */
+        <p className="text-[11px] text-maestro-red">
+          Over the daily cap: {compactNumber(budget.dailyTokensUsed)} tokens spent today. ACT does
+          not report the limit itself, so the size of the overrun is not shown.
+        </p>
+      ) : daily === null ? (
         /* ACT reports no daily allowance at all — an uncapped engine, which
            is a real configuration and not a read failure. */
         <p className="text-[11px] text-maestro-muted">

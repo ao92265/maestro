@@ -112,19 +112,43 @@ pub struct ActReplayEvent {
     pub summary: String,
 }
 
-/// The autonomy patch the panel is allowed to send. Every field is optional so
-/// a single toggle never rewrites the rest of the ladder: ACT's `PUT
-/// /api/policy` merges, and sending a fully-populated object would silently
-/// re-assert stale values the user never touched.
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+/// A replay's events plus what was left out, so the view can say so rather
+/// than imply it is showing the whole session.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ActAutonomyPatch {
-    pub default: Option<String>,
-    pub classes: Option<Value>,
-    pub l2_sample_rate: Option<f64>,
-    pub human_sample_rate: Option<f64>,
-    pub allow_all_classes: Option<bool>,
-    pub direct_merge: Option<bool>,
+pub struct ActReplayTimeline {
+    pub events: Vec<ActReplayEvent>,
+    /// Events in the stored replay, before truncation.
+    pub total: usize,
+}
+
+/// Ledger rows plus the untruncated task count, for the same reason.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActLedger {
+    pub entries: Vec<ActLedgerEntry>,
+    pub total: usize,
+}
+
+/// The complete autonomy block to write. Every field is REQUIRED, and that is
+/// the safety property: ACT's `PUT /api/policy` does a shallow top-level
+/// spread (`{...this.policy, ...updates}`) and deep-merges only
+/// `agent_priority`, `tool_policies` and `today_overrides` — `autonomy` is not
+/// on that list, so whatever arrives REPLACES the stored block and is
+/// persisted to disk (`policy/manager.ts` `updatePolicy`). Sending one changed
+/// key would erase the default, both sample rates and both switches.
+///
+/// The caller therefore merges its change over the last known policy and sends
+/// the whole thing; a partial object cannot be constructed here at all.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActAutonomyInput {
+    pub default: String,
+    pub classes: Value,
+    pub l2_sample_rate: f64,
+    pub human_sample_rate: f64,
+    pub allow_all_classes: bool,
+    pub direct_merge: bool,
 }
 
 fn number(value: Option<&Value>) -> Option<f64> {
@@ -315,36 +339,32 @@ pub async fn act_get_policy() -> Result<ActPolicySnapshot, String> {
     })
 }
 
-#[tauri::command]
-pub async fn act_set_autonomy(autonomy: ActAutonomyPatch) -> Result<u16, String> {
-    let url = endpoint(&["api", "policy"])?;
-    // Only the keys the user actually changed travel: ACT merges the body into
-    // the live PolicyConfig, so anything sent is asserted.
-    let mut patch = serde_json::Map::new();
-    if let Some(value) = autonomy.default {
-        patch.insert("default".to_string(), Value::String(value));
-    }
-    if let Some(value) = autonomy.classes {
-        patch.insert("classes".to_string(), value);
-    }
-    if let Some(value) = autonomy.l2_sample_rate {
-        patch.insert("l2_sample_rate".to_string(), json!(value));
-    }
-    if let Some(value) = autonomy.human_sample_rate {
-        patch.insert("human_sample_rate".to_string(), json!(value));
-    }
-    if let Some(value) = autonomy.allow_all_classes {
-        patch.insert("allowAllClasses".to_string(), Value::Bool(value));
-    }
-    if let Some(value) = autonomy.direct_merge {
-        patch.insert("directMerge".to_string(), Value::Bool(value));
-    }
-    if patch.is_empty() {
-        return Err("No autonomy change to send".to_string());
-    }
+/// Build the exact request body for a policy write.
+///
+/// Extracted so a test can assert on the SERIALIZED key names rather than on
+/// the Rust struct: these keys have to match ACT's `AutonomyPolicy` field for
+/// field, and the casing is genuinely mixed there (`l2_sample_rate` and
+/// `human_sample_rate` are snake_case, `allowAllClasses` and `directMerge` are
+/// camelCase). A key that drifts is silently dropped by the engine's spread,
+/// which looks exactly like a control that does nothing.
+pub(crate) fn build_autonomy_body(autonomy: &ActAutonomyInput) -> Value {
+    json!({
+        "autonomy": {
+            "default": autonomy.default,
+            "classes": autonomy.classes,
+            "l2_sample_rate": autonomy.l2_sample_rate,
+            "human_sample_rate": autonomy.human_sample_rate,
+            "allowAllClasses": autonomy.allow_all_classes,
+            "directMerge": autonomy.direct_merge,
+        }
+    })
+}
 
+#[tauri::command]
+pub async fn act_set_autonomy(autonomy: ActAutonomyInput) -> Result<u16, String> {
+    let url = endpoint(&["api", "policy"])?;
     let response = with_act_token(client()?.put(url))
-        .json(&json!({ "autonomy": Value::Object(patch) }))
+        .json(&build_autonomy_body(&autonomy))
         .send()
         .await
         .map_err(|error| format!("ACT request failed: {error}"))?;
@@ -387,15 +407,16 @@ pub async fn act_get_budget() -> Result<ActBudget, String> {
 }
 
 #[tauri::command]
-pub async fn act_list_ledger() -> Result<Vec<ActLedgerEntry>, String> {
+pub async fn act_list_ledger() -> Result<ActLedger, String> {
     let payload = dashboard_get(&["api", "tasks"], &[]).await?;
     let mut entries: Vec<ActLedgerEntry> = expect_array(&payload, "tasks")?
         .iter()
         .filter_map(normalize_ledger_entry)
         .collect();
     entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let total = entries.len();
     entries.truncate(LEDGER_LIMIT);
-    Ok(entries)
+    Ok(ActLedger { entries, total })
 }
 
 #[tauri::command]
@@ -408,18 +429,30 @@ pub async fn act_list_replays() -> Result<Vec<ActReplay>, String> {
 }
 
 #[tauri::command]
-pub async fn act_get_replay(agent_id: String) -> Result<Vec<ActReplayEvent>, String> {
+pub async fn act_get_replay(agent_id: String) -> Result<ActReplayTimeline, String> {
     let payload = dashboard_get(&["api", "replay", &agent_id], &[]).await?;
     // ACT answers 200 with `{ message: 'No replay found' }` rather than a 404
     // when the agent has no stored replay — an empty timeline, not a failure.
     let Some(events) = payload.get("events").and_then(Value::as_array) else {
-        return Ok(Vec::new());
+        return Ok(ActReplayTimeline { events: Vec::new(), total: 0 });
     };
-    Ok(events
-        .iter()
-        .filter_map(normalize_replay_event)
-        .take(REPLAY_EVENT_LIMIT)
-        .collect())
+    Ok(tail_timeline(
+        events.iter().filter_map(normalize_replay_event).collect(),
+    ))
+}
+
+/// Keep the TAIL, not the head: ACT stores events oldest-first, so a long
+/// session's ending — the failure or the commit, the part worth reading — is at
+/// the end. Taking the first N hid exactly that while the header still claimed
+/// the full count.
+pub(crate) fn tail_timeline(normalized: Vec<ActReplayEvent>) -> ActReplayTimeline {
+    let total = normalized.len();
+    let events = if total > REPLAY_EVENT_LIMIT {
+        normalized[total - REPLAY_EVENT_LIMIT..].to_vec()
+    } else {
+        normalized
+    };
+    ActReplayTimeline { events, total }
 }
 
 #[cfg(test)]
@@ -554,20 +587,97 @@ mod tests {
         assert_eq!(event.summary, "alpha, beta");
     }
 
+    /// Asserts the bytes that actually go on the wire. The previous version of
+    /// this test read fields back off the Rust struct, which no caller sees —
+    /// renaming a JSON key left it green while the control silently no-opped.
     #[test]
-    fn serializes_the_autonomy_patch_field_names_act_expects() {
-        // `allowAllClasses` is camelCase in ACT's own type while the sample
-        // rates are snake_case; a mismatch here writes a key the engine
-        // ignores, which looks like the toggle silently not working.
-        let patch = ActAutonomyPatch {
-            classes: Some(json!({ "code": "L0" })),
-            l2_sample_rate: Some(0.25),
-            allow_all_classes: Some(true),
-            ..Default::default()
-        };
-        assert_eq!(patch.classes.as_ref().map(|c| c["code"].clone()), Some(json!("L0")));
-        assert_eq!(patch.l2_sample_rate, Some(0.25));
-        assert_eq!(patch.allow_all_classes, Some(true));
+    fn writes_the_exact_key_names_act_reads() {
+        let body = build_autonomy_body(&ActAutonomyInput {
+            default: "L1".to_string(),
+            classes: json!({ "code": "L0" }),
+            l2_sample_rate: 0.25,
+            human_sample_rate: 0.2,
+            allow_all_classes: true,
+            direct_merge: false,
+        });
+
+        assert_eq!(
+            body,
+            json!({
+                "autonomy": {
+                    "default": "L1",
+                    "classes": { "code": "L0" },
+                    "l2_sample_rate": 0.25,
+                    "human_sample_rate": 0.2,
+                    "allowAllClasses": true,
+                    "directMerge": false
+                }
+            })
+        );
+    }
+
+    /// The engine REPLACES the autonomy block rather than merging it, so every
+    /// key has to be present on every write or the missing ones are erased
+    /// from disk.
+    #[test]
+    fn always_sends_the_whole_autonomy_block() {
+        let body = build_autonomy_body(&ActAutonomyInput {
+            default: "L2".to_string(),
+            classes: json!({}),
+            l2_sample_rate: 0.1,
+            human_sample_rate: 0.2,
+            allow_all_classes: false,
+            direct_merge: true,
+        });
+
+        let sent = body["autonomy"].as_object().expect("autonomy object");
+        let mut keys: Vec<&str> = sent.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "allowAllClasses",
+                "classes",
+                "default",
+                "directMerge",
+                "human_sample_rate",
+                "l2_sample_rate"
+            ]
+        );
+    }
+
+    fn replay_event(n: usize) -> ActReplayEvent {
+        ActReplayEvent {
+            timestamp: None,
+            r#type: "output".to_string(),
+            agent_id: "agent-1".to_string(),
+            summary: n.to_string(),
+        }
+    }
+
+    /// The end of a long session is the part worth reading, and it is what the
+    /// head-first cut threw away.
+    #[test]
+    fn keeps_the_end_of_an_over_long_replay_and_reports_the_true_total() {
+        let events: Vec<ActReplayEvent> = (0..REPLAY_EVENT_LIMIT + 25).map(replay_event).collect();
+
+        let timeline = tail_timeline(events);
+
+        assert_eq!(timeline.total, REPLAY_EVENT_LIMIT + 25);
+        assert_eq!(timeline.events.len(), REPLAY_EVENT_LIMIT);
+        // Last event of the session survives; the first 25 are the ones cut.
+        assert_eq!(
+            timeline.events.last().map(|e| e.summary.as_str()),
+            Some((REPLAY_EVENT_LIMIT + 24).to_string().as_str())
+        );
+        assert_eq!(timeline.events.first().map(|e| e.summary.as_str()), Some("25"));
+    }
+
+    #[test]
+    fn leaves_a_short_replay_whole() {
+        let timeline = tail_timeline((0..3).map(replay_event).collect());
+        assert_eq!(timeline.total, 3);
+        assert_eq!(timeline.events.len(), 3);
     }
 
     #[test]

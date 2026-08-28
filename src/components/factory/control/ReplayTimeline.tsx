@@ -35,16 +35,22 @@ function clockOf(iso: string | null): string {
 export function ReplayTimeline({ replays }: { replays: ActReplay[] }) {
   const openReplayAgentId = useActControlStore((state) => state.openReplayAgentId);
   const replayEvents = useActControlStore((state) => state.replayEvents);
+  const replayTotal = useActControlStore((state) => state.replayTotal);
   const replayError = useActControlStore((state) => state.replayError);
   const openReplay = useActControlStore((state) => state.openReplay);
   const closeReplay = useActControlStore((state) => state.closeReplay);
 
   if (openReplayAgentId) {
     const replay = replays.find((r) => r.agentId === openReplayAgentId);
+    const truncated = replayTotal > replayEvents.length;
     return (
       <PanelSection
         title="Session replay"
-        hint={replay ? `${replay.runtime} · ${replay.eventCount} events` : openReplayAgentId}
+        hint={
+          replay
+            ? `${replay.runtime} · ${replayTotal || replay.eventCount} events`
+            : openReplayAgentId
+        }
         action={
           <button
             type="button"
@@ -58,6 +64,14 @@ export function ReplayTimeline({ replays }: { replays: ActReplay[] }) {
         {replayError && <p className="text-[11px] text-maestro-yellow">{replayError}</p>}
         {!replayError && replayEvents.length === 0 && (
           <EmptyLine>No stored timeline for this session.</EmptyLine>
+        )}
+        {truncated && (
+          /* The tail is what is shown, so say which end was cut rather than
+             letting the header's full count imply the whole session. */
+          <p className="text-[10px] text-maestro-muted">
+            Showing the last {replayEvents.length} of {replayTotal} events; the earlier{" "}
+            {replayTotal - replayEvents.length} are not loaded.
+          </p>
         )}
         {replayEvents.length > 0 && (
           <ol className="flex max-h-80 flex-col overflow-y-auto">

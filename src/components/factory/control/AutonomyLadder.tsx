@@ -1,4 +1,5 @@
 import { AlertTriangle } from "lucide-react";
+import { useEffect, useState } from "react";
 import {
   type ActPolicySnapshot,
   AUTONOMY_LEVEL_BLURB,
@@ -17,9 +18,12 @@ import { PanelSection, sliderClass } from "./primitives";
  * per task class, plus the two sampling dials that decide how much of the
  * eligible volume actually runs unattended.
  *
- * Every control writes a single-key patch. ACT merges the body into its live
- * policy, so sending the whole object back would re-assert values the user
- * never touched — including any another tool changed since the last poll.
+ * Every control writes the COMPLETE block. ACT replaces the autonomy object
+ * rather than merging it (`updatePolicy` spreads `updates` shallowly and
+ * deep-merges only agent_priority, tool_policies and today_overrides), so a
+ * single-key write erased the default, both sample rates and both switches and
+ * persisted that to disk. The store merges each change over the last policy it
+ * read; see `setAutonomy`.
  */
 export function AutonomyLadder({ policy }: { policy: ActPolicySnapshot | null }) {
   const setAutonomy = useActControlStore((state) => state.setAutonomy);
@@ -129,7 +133,10 @@ export function AutonomyLadder({ policy }: { policy: ActPolicySnapshot | null })
 
 /**
  * A rate dial. Committing on release rather than on every input event keeps a
- * drag from firing a PUT per pixel.
+ * drag from firing a PUT per pixel, but the thumb has to track the drag in the
+ * meantime — so it is controlled locally and resyncs whenever the polled
+ * policy changes underneath it (`defaultValue` only applied on mount, which
+ * left the thumb and its own label showing different numbers).
  */
 function SampleRate({
   label,
@@ -142,6 +149,21 @@ function SampleRate({
   value: number;
   onCommit: (value: number) => void;
 }) {
+  const committed = Math.round(value * 100);
+  const [draft, setDraft] = useState(committed);
+  const [dragging, setDragging] = useState(false);
+
+  // Adopt the engine's value unless the user is mid-drag, which would yank
+  // the thumb out from under them on a poll.
+  useEffect(() => {
+    if (!dragging) setDraft(committed);
+  }, [committed, dragging]);
+
+  const commit = (next: number) => {
+    setDragging(false);
+    if (next !== committed) onCommit(next / 100);
+  };
+
   return (
     <label className="flex items-center gap-2" title={hint}>
       <span className="w-36 shrink-0 text-[11px] text-maestro-text">{label}</span>
@@ -150,14 +172,22 @@ function SampleRate({
         min={0}
         max={100}
         step={5}
-        defaultValue={Math.round(value * 100)}
-        onMouseUp={(e) => onCommit(Number(e.currentTarget.value) / 100)}
-        onKeyUp={(e) => onCommit(Number(e.currentTarget.value) / 100)}
+        value={draft}
+        onChange={(e) => {
+          setDragging(true);
+          setDraft(Number(e.target.value));
+        }}
+        /* Pointer events cover mouse, touch and pen alike; onMouseUp alone
+           also missed a release that happened outside the track. onBlur is the
+           backstop for a drag that ends off-window. */
+        onPointerUp={() => commit(draft)}
+        onKeyUp={() => commit(draft)}
+        onBlur={() => commit(draft)}
         className={sliderClass}
         aria-label={label}
       />
       <span className="w-10 shrink-0 text-right font-mono text-[11px] text-maestro-muted">
-        {Math.round(value * 100)}%
+        {draft}%
       </span>
     </label>
   );
