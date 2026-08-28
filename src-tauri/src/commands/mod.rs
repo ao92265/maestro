@@ -1,4 +1,5 @@
 pub mod act;
+pub mod act_control;
 pub mod act_engine;
 pub mod agents;
 pub mod ai_runner;

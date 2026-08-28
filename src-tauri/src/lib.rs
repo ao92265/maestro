@@ -1272,6 +1272,15 @@ pub fn run() {
             commands::act::act_set_task_status,
             commands::act::act_list_gates,
             commands::act::act_resolve_gate,
+            // ACT control panel (autonomy ladder, guardrails, spend, ledger, replays)
+            commands::act_control::act_get_policy,
+            commands::act_control::act_set_autonomy,
+            commands::act_control::act_list_intervention_rules,
+            commands::act_control::act_list_intervention_events,
+            commands::act_control::act_get_budget,
+            commands::act_control::act_list_ledger,
+            commands::act_control::act_list_replays,
+            commands::act_control::act_get_replay,
             // ACT engine supervisor (Factory view's Start control)
             commands::act_engine::act_engine_status,
             commands::act_engine::act_engine_start,
