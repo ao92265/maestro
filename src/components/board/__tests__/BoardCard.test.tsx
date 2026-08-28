@@ -79,8 +79,8 @@ function externalCard(withHandoff = true): BoardCardItem {
       ? ({ slug: "hand-1", path: "/tmp/proj-b", repo: "proj-b" } as HandoffInfo)
       : null,
     projectName: "proj-b",
-    objective: withHandoff ? "left the migration half applied" : "Working outside Maestro",
-    stageLabel: "Live outside Maestro",
+    objective: withHandoff ? "left the migration half applied" : "Working outside Vanguard",
+    stageLabel: "Live outside Vanguard",
     needsYou: false,
     since: null,
   };
@@ -202,7 +202,7 @@ describe("BoardCard", () => {
     render(<BoardCard item={externalCard(false)} selected={false} onActivate={vi.fn()} />);
 
     expect(screen.getByText("proj-b")).toBeInTheDocument();
-    expect(screen.getByText("Working outside Maestro")).toBeInTheDocument();
+    expect(screen.getByText("Working outside Vanguard")).toBeInTheDocument();
   });
 
   it("marks the selected card and leaves an unselected one unmarked", () => {

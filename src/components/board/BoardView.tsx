@@ -299,8 +299,8 @@ export function BoardView({
           </span>
         )}
         {activeOutside > 0 && (
-          <span title="Directories with a claude process already running outside Maestro, so their handoffs are not waiting for anyone">
-            {activeOutside} active outside Maestro
+          <span title="Directories with a claude process already running outside Vanguard, so their handoffs are not waiting for anyone">
+            {activeOutside} active outside Vanguard
           </span>
         )}
       </span>

@@ -18,10 +18,10 @@
     --maestro-muted: 130 130 142; /* #82828e — secondary text */
 
     /* Accent & status — constant across themes */
-    --maestro-accent: 255 26 58; /* #ff1a3a — neon red, brand; signals "needs your input" */
+    --maestro-accent: 130 143 255; /* #828fff — the Vanguard V, sampled from the app icon; brand, and signals "needs your input" */
     --maestro-blue: 59 130 246; /* #3b82f6 — working / focused */
     --maestro-green: 63 185 80; /* #3fb950 */
-    --maestro-red: 220 38 38; /* #dc2626 — error red, distinct from neon accent */
+    --maestro-red: 220 38 38; /* #dc2626 — error red. Kept red on purpose once the brand went purple: this one means something is broken, and it is the only red left carrying that meaning */
     --maestro-orange: 245 158 11; /* #f59e0b — matches design spec */
     --maestro-yellow: 234 179 8; /* #eab308 — needs input */
     --maestro-purple: 188 140 255; /* #bc8cff */

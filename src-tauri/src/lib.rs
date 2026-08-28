@@ -121,7 +121,7 @@ pub fn run() {
     builder
         .menu(|handle| {
             // App submenu (macOS standard items)
-            let app_menu = SubmenuBuilder::new(handle, "Maestro")
+            let app_menu = SubmenuBuilder::new(handle, "Vanguard")
                 .about(None)
                 .separator()
                 .services()
@@ -195,10 +195,10 @@ pub fn run() {
                 window
                     .dialog()
                     .message(format!(
-                        "Quit Maestro? This will terminate {count} running terminal{}.",
+                        "Quit Vanguard? This will terminate {count} running terminal{}.",
                         if count == 1 { "" } else { "s" }
                     ))
-                    .title("Quit Maestro")
+                    .title("Quit Vanguard")
                     .kind(MessageDialogKind::Warning)
                     .buttons(MessageDialogButtons::YesNo)
                     .show(move |confirmed| {
@@ -1381,7 +1381,7 @@ pub fn run() {
             take_pending_cli_path,
         ])
         .build(tauri::generate_context!())
-        .expect("error while running Maestro")
+        .expect("error while running Vanguard")
         .run(|app, event| {
             // Exit fires for every quit path, including the macOS app menu,
             // which never reaches CloseRequested. An ACT this app started must

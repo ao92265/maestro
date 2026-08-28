@@ -531,7 +531,7 @@ describe("assembleBoard live outside-Maestro cards (WP7)", () => {
     const card = columns.building[0];
     expect(card.kind).toBe("external");
     if (card.kind !== "external") return;
-    expect(card.stageLabel).toBe("Live outside Maestro");
+    expect(card.stageLabel).toBe("Live outside Vanguard");
     expect(card.objective).toBe("rewiring the exporter");
     expect(card.projectName).toBe("live");
     expect(card.needsYou).toBe(false);
@@ -569,8 +569,8 @@ describe("assembleBoard live outside-Maestro cards (WP7)", () => {
     expect(card.kind).toBe("external");
     if (card.kind !== "external") return;
     expect(card.projectName).toBe("mystery-dir");
-    expect(card.objective).toBe("Working outside Maestro");
-    expect(card.stageLabel).toBe("Live outside Maestro");
+    expect(card.objective).toBe("Working outside Vanguard");
+    expect(card.stageLabel).toBe("Live outside Vanguard");
     expect(card.handoff).toBeNull();
     expect(card.since).toBeNull();
     expect(card.dir).toBe("/tmp/mystery-dir");

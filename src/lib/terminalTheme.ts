@@ -47,14 +47,14 @@ export interface TerminalTheme {
 }
 
 /**
- * Maestro's default terminal theme (GitHub Dark inspired).
+ * Vanguard's default terminal theme (GitHub Dark inspired).
  */
 export const DEFAULT_THEME: TerminalTheme = {
   background: "#0d0d10",
   foreground: "#e8e8ec",
-  cursor: "#ff1a3a",
+  cursor: "#828fff",
   cursorAccent: "#0d0d10",
-  selectionBackground: "#5a0f1c",
+  selectionBackground: "#232a5c",
   selectionForeground: undefined,
 
   // Standard colors
