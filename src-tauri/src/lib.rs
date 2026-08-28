@@ -1260,6 +1260,8 @@ pub fn run() {
             commands::external_sessions::list_external_sessions,
             commands::external_sessions::focus_external_session,
             commands::external_sessions::close_external_session,
+            // Health of the other local systems (ports + launchd jobs)
+            commands::ecosystem::ecosystem_health,
             // Claude handoff files (Home view's parked-session triage)
             commands::handoffs::get_handoffs,
             // ACT relay (Factory view — CSP blocks direct local HTTP)
