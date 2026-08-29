@@ -229,6 +229,7 @@ pub fn run() {
         .manage(commands::system::SystemMetricsState::new())
         .manage(commands::processes::ProcessScanState::new())
         .manage(commands::act_engine::ActEngineState::new())
+        .manage(commands::night_run::NightRunState::load())
         // Issue #106 review F1: the per-(project, epic) in-flight launch
         // slots — the backend guard against a double Launch click while the
         // test gate still runs.
@@ -1115,6 +1116,11 @@ pub fn run() {
             app.manage(watchdog.clone());
             github::watchdog::spawn_watchdog(watchdog, app.handle().clone());
 
+            // Night runs: the overnight window that starts and stops ACT's
+            // intake loop. The clock lives here rather than in the webview,
+            // which spends most of its life with the Factory unmounted.
+            commands::night_run::spawn_night_run_loop(app.handle().clone());
+
             // Capture any CLI-supplied path into PendingCliPath state. The
             // frontend drains this on mount via `take_pending_cli_path`, which
             // avoids the fragile "wait N ms then emit" race.
@@ -1287,6 +1293,12 @@ pub fn run() {
             commands::act_engine::act_engine_status,
             commands::act_engine::act_engine_start,
             commands::act_engine::act_engine_stop,
+            // Night runs (Factory view's Control tab): the intake loop and
+            // its overnight window
+            commands::night_run::night_run_status,
+            commands::night_run::night_run_save_settings,
+            commands::night_run::night_run_start,
+            commands::night_run::night_run_stop,
             // Vanguard feed (band snapshot for the launchd digest script)
             commands::vanguard::write_band_snapshot,
             // Orchestrator lane (goal box, session scope, safe-mode proposal queue)

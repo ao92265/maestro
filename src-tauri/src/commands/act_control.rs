@@ -165,14 +165,14 @@ fn number_or(value: Option<&Value>, fallback: f64) -> f64 {
     number(value).unwrap_or(fallback)
 }
 
-fn count(value: Option<&Value>) -> u32 {
+pub(crate) fn count(value: Option<&Value>) -> u32 {
     number(value)
         .filter(|number| number.is_finite() && *number >= 0.0)
         .map(|number| number as u32)
         .unwrap_or(0)
 }
 
-fn flag(value: Option<&Value>) -> bool {
+pub(crate) fn flag(value: Option<&Value>) -> bool {
     matches!(value, Some(Value::Bool(true)))
 }
 
@@ -299,7 +299,10 @@ pub(crate) fn normalize_replay_event(raw: &Value) -> Option<ActReplayEvent> {
 
 /// Shared GET: ACT's dashboard routes take the dashboard token (unlike the
 /// portal routes in `act.rs`, which take a user header).
-async fn dashboard_get(segments: &[&str], query: &[(&str, &str)]) -> Result<Value, String> {
+pub(crate) async fn dashboard_get(
+    segments: &[&str],
+    query: &[(&str, &str)],
+) -> Result<Value, String> {
     let mut url = endpoint(segments)?;
     if !query.is_empty() {
         let mut pairs = url.query_pairs_mut();
