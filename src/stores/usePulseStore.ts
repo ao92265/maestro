@@ -34,6 +34,14 @@ import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
  * `~/.claude`; the fork's equivalent is the Tauri store). Without it every
  * restart would re-derive past days from commits alone and lose every score
  * that was ever measured properly.
+ *
+ * Each source is cached on its own clock, the way rohcna cached metrics, flow
+ * and activity separately. Refreshing everything on the view's 30-second tick
+ * means walking every transcript and spawning five subprocesses per repo per
+ * tick, which on a ten-tab workspace is more work per minute than the numbers
+ * are worth — and enough `gh` calls to matter. The derivations themselves are
+ * pure and cost nothing, so they are recomputed every tick from whatever the
+ * caches hold; only the collection is throttled.
  */
 
 /** Days of commit history fetched, matching the heatmap's window. */
@@ -42,8 +50,21 @@ const BACKFILL_DAYS = 14;
 /** Cap per repo's PR list — the counters only need today's. */
 const PR_LIMIT = 30;
 
-/** Pause between consecutive `gh` invocations (the watchdog's stagger). */
+/** Pause between consecutive `gh` invocations (mirrors the watchdog's stagger). */
 const PR_STAGGER_MS = 300;
+
+/** Git: four commands per repo. Rohcna's metrics cadence. */
+export const GIT_TTL_MS = 60 * 1000;
+
+/** Transcripts: a full walk of today's `~/.claude/projects`. */
+export const TRANSCRIPT_TTL_MS = 60 * 1000;
+
+/**
+ * Pull requests: one `gh` subprocess per repo, the most expensive source and
+ * the only one with a rate limit behind it. PRs also move slowly enough that a
+ * minute's resolution buys nothing.
+ */
+export const PR_TTL_MS = 5 * 60 * 1000;
 
 /** Data older than this wears a stale badge. */
 export const PULSE_STALE_MS = 5 * 60 * 1000;
@@ -98,8 +119,10 @@ function repoPathsFromWorkspace(): string[] {
  *
  * Rohcna ran `gh search prs --author @me` once for every repo at once; the
  * fork has no cross-repo search command, so this walks the open projects with
- * the same author filter. A repo without a remote (or without `gh`) simply
- * contributes nothing.
+ * the same author filter. Two worktrees of one repo therefore return the same
+ * PRs twice — `countPrsOn` deduplicates by URL rather than this doing it, so
+ * the counting rule lives with the counting. A repo without a remote (or
+ * without `gh`) simply contributes nothing.
  */
 async function fetchOwnPrs(
   repoPaths: string[],
@@ -132,13 +155,29 @@ interface PulseState {
   metrics: PulseMetrics | null;
   flow: FlowScore | null;
   activity: ActivityEvent[];
-  /** Newest successful refresh; 0 = never. */
+
+  /* Cached sources. `*At` is 0 until the first success; `*Key` is the repo
+     list the cache was built from, so opening a project refetches rather than
+     showing the old set until the TTL happens to lapse. */
+  repos: PulseRepoActivity[];
+  reposAt: number;
+  reposKey: string;
+  transcript: PulseTranscriptStats | null;
+  transcriptAt: number;
+  prs: PullRequestInfo[];
+  prsAt: number;
+  prsKey: string;
+
+  /** Newest successful refresh of anything; 0 = never. */
   fetchedAt: number;
-  /** Last failure, cleared on the next success. */
+  /** Last failure, cleared on the next clean pass. */
   error: string | null;
   isRefreshing: boolean;
-  /** Fetch everything once; callers drive the interval. Never rejects. */
-  refresh: () => Promise<void>;
+  /**
+   * Refresh whatever has gone stale and recompute. Never rejects.
+   * `force` ignores every TTL — what the refresh button does.
+   */
+  refresh: (options?: { force?: boolean }) => Promise<void>;
 }
 
 export const usePulseStore = create<PulseState>()(
@@ -148,11 +187,20 @@ export const usePulseStore = create<PulseState>()(
       metrics: null,
       flow: null,
       activity: [],
+      repos: [],
+      reposAt: 0,
+      reposKey: "",
+      transcript: null,
+      transcriptAt: 0,
+      prs: [],
+      prsAt: 0,
+      prsKey: "",
       fetchedAt: 0,
       error: null,
       isRefreshing: false,
 
-      refresh: async () => {
+      refresh: async (options) => {
+        const force = options?.force === true;
         if (get().isRefreshing) {
           pendingRefresh = true;
           return;
@@ -161,42 +209,72 @@ export const usePulseStore = create<PulseState>()(
 
         try {
           const repoPaths = repoPathsFromWorkspace();
+          const key = repoPaths.join("\n");
           const now = new Date();
+          const nowMs = now.getTime();
+          const state = get();
+          const errors: string[] = [];
+          let touched = false;
 
-          /* Git and the transcripts are the two required sources: without
-             them there are no numbers to show, so a failure here keeps the
-             previous ones rather than blanking the view. */
-          const [repos, transcript] = await Promise.all([
-            invoke<PulseRepoActivity[]>("pulse_git_activity", {
-              repoPaths,
-              days: BACKFILL_DAYS,
-            }),
-            invoke<PulseTranscriptStats>("pulse_transcript_stats"),
-          ]);
+          if (force || state.reposKey !== key || nowMs - state.reposAt > GIT_TTL_MS) {
+            try {
+              const repos = await invoke<PulseRepoActivity[]>("pulse_git_activity", {
+                repoPaths,
+                days: BACKFILL_DAYS,
+              });
+              set({ repos, reposAt: nowMs, reposKey: key });
+              touched = true;
+            } catch (err) {
+              errors.push(String(err));
+            }
+          }
 
-          const { prs, failures } = await fetchOwnPrs(repoPaths);
+          if (force || nowMs - state.transcriptAt > TRANSCRIPT_TTL_MS) {
+            try {
+              const transcript = await invoke<PulseTranscriptStats>("pulse_transcript_stats");
+              set({ transcript, transcriptAt: nowMs });
+              touched = true;
+            } catch (err) {
+              errors.push(String(err));
+            }
+          }
+
+          if (force || state.prsKey !== key || nowMs - state.prsAt > PR_TTL_MS) {
+            const { prs, failures } = await fetchOwnPrs(repoPaths);
+            if (repoPaths.length > 0 && failures === repoPaths.length) {
+              /* Every repo failed — `gh` is likely unauthenticated, and the
+                 shipping factor would be quietly wrong. Keep the last known
+                 counts and say so rather than silently reporting zero. */
+              errors.push("Pull request counts unavailable (gh)");
+            } else {
+              set({ prs, prsAt: nowMs, prsKey: key });
+              touched = true;
+            }
+          }
+
+          const current = get();
+          if (current.transcript === null) {
+            // Nothing has ever loaded; there is nothing to compute from.
+            set({ error: errors[0] ?? null });
+            return;
+          }
 
           const inputs: PulseInputs = {
-            repos,
-            transcript,
-            sessions: toPulseSessions(useSessionStore.getState().sessions, now.getTime()),
-            prs: countPrsOn(prs, pulseDateString(now)),
+            repos: current.repos,
+            transcript: current.transcript,
+            sessions: toPulseSessions(useSessionStore.getState().sessions),
+            prs: countPrsOn(current.prs, pulseDateString(now)),
             now,
           };
 
-          const { flow, history } = computeFlowScore(inputs, get().flowHistory);
+          const { flow, history } = computeFlowScore(inputs, current.flowHistory);
           set({
             metrics: computeMetrics(inputs),
             flow,
             activity: computeActivity(inputs),
             flowHistory: history,
-            fetchedAt: Date.now(),
-            /* Every repo's PR poll failing is worth saying — `gh` is likely
-               unauthenticated, and the shipping factor is quietly wrong. */
-            error:
-              repoPaths.length > 0 && failures === repoPaths.length
-                ? "Pull request counts unavailable (gh)"
-                : null,
+            ...(touched ? { fetchedAt: nowMs } : {}),
+            error: errors[0] ?? null,
           });
         } catch (err) {
           set({ error: String(err) });

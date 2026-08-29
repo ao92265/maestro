@@ -367,7 +367,7 @@ fn fold_event(
     start_ms: i64,
     stats: &mut PulseTranscriptStats,
     repos: &mut HashSet<String>,
-    last_repo: &mut Option<String>,
+    visits: &mut Vec<(i64, String)>,
     test_ids: &mut HashSet<String>,
 ) {
     let timestamp = event_timestamp(event);
@@ -412,10 +412,12 @@ fn fold_event(
     if let Some(cwd) = event["cwd"].as_str() {
         let repo = basename(cwd);
         repos.insert(repo.clone());
-        if last_repo.as_ref().is_some_and(|previous| previous != &repo) {
-            stats.switches += 1;
+        /* Recorded rather than compared against the previous entry: a switch
+           is a move in TIME, and the entries arrive grouped by file. Ordering
+           happens once, across every file, in `count_switches`. */
+        if let Some(ts) = timestamp {
+            visits.push((ts, repo));
         }
-        *last_repo = Some(repo);
     }
 
     let Some(ts) = timestamp else { return };
@@ -447,11 +449,27 @@ fn fold_event(
     }
 }
 
+/// Context switches: how often the working repo changed, in time order.
+///
+/// The naive reading — compare each entry to the previous one as the files are
+/// walked — counts a switch at nearly every file boundary, because one file is
+/// one session in one directory and the walk interleaves projects. That floors
+/// the focus factor and fires a "fragmenting focus" warning off a number that
+/// measures the directory listing. Ordering the visits by timestamp first is
+/// what makes the count mean anything.
+fn count_switches(visits: &mut [(i64, String)]) -> u32 {
+    visits.sort_by(|a, b| a.0.cmp(&b.0));
+    visits
+        .windows(2)
+        .filter(|pair| pair[0].1 != pair[1].1)
+        .count() as u32
+}
+
 /// Walks `root` for today's transcripts and folds them into one set of counts.
 fn scan_transcripts(root: &Path, start_ms: i64) -> PulseTranscriptStats {
     let mut stats = PulseTranscriptStats::default();
     let mut repos: HashSet<String> = HashSet::new();
-    let mut last_repo: Option<String> = None;
+    let mut visits: Vec<(i64, String)> = Vec::new();
     let mut test_ids: HashSet<String> = HashSet::new();
 
     for file in recent_transcripts(root, start_ms) {
@@ -470,12 +488,13 @@ fn scan_transcripts(root: &Path, start_ms: i64) -> PulseTranscriptStats {
                 start_ms,
                 &mut stats,
                 &mut repos,
-                &mut last_repo,
+                &mut visits,
                 &mut test_ids,
             );
         }
     }
 
+    stats.switches = count_switches(&mut visits);
     stats.repos = {
         let mut names: Vec<String> = repos.into_iter().collect();
         names.sort();
@@ -595,7 +614,11 @@ async fn repo_activity(path: String, since_date: String) -> PulseRepoActivity {
             "log",
             "--since=00:00:00",
             "--pretty=%H %cd %D",
-            "--date=format:%H:%M",
+            /* format-LOCAL: `--since=00:00:00` is resolved in local time, so
+               rendering in the commit's own recorded zone puts a commit made
+               at 09:15 here on the timeline at whatever o'clock it was where
+               the committer was. Both ends of this must be local. */
+            "--date=format-local:%H:%M",
             "--decorate=short",
         ],
     )
@@ -612,7 +635,8 @@ async fn repo_activity(path: String, since_date: String) -> PulseRepoActivity {
             "log",
             &format!("--since={since_date} 00:00:00"),
             "--pretty=%cd",
-            "--date=format:%Y-%m-%d",
+            // Local, for the same reason as the timeline query above.
+            "--date=format-local:%Y-%m-%d",
         ],
     )
     .await;
@@ -632,6 +656,12 @@ async fn repo_activity(path: String, since_date: String) -> PulseRepoActivity {
 
 /// Today's commits, churn and dirty state per repo, plus a commit count per
 /// day over the last `days` days for the flow score's backfill.
+///
+/// Repos are read concurrently. Awaited in a loop this is four git processes
+/// times the number of open tabs, strictly in series — on a ten-tab workspace
+/// that is a wall-clock cost the caller pays every poll. The commands within
+/// one repo stay sequential, so the spike is bounded by the tab count rather
+/// than four times it.
 #[tauri::command]
 pub async fn pulse_git_activity(
     repo_paths: Vec<String>,
@@ -644,12 +674,17 @@ pub async fn pulse_git_activity(
     // Deduplicated: the same repo can back two open tabs, and counting its
     // commits twice would inflate every number downstream.
     let mut seen: HashSet<String> = HashSet::new();
-    let mut activity: Vec<PulseRepoActivity> = Vec::new();
+    let mut running = Vec::new();
     for path in repo_paths {
         if !seen.insert(path.clone()) {
             continue;
         }
-        activity.push(repo_activity(path, since.clone()).await);
+        running.push(tokio::spawn(repo_activity(path, since.clone())));
+    }
+
+    let mut activity: Vec<PulseRepoActivity> = Vec::with_capacity(running.len());
+    for handle in running {
+        activity.push(handle.await.map_err(|e| format!("Repo scan failed: {e}"))?);
     }
     Ok(activity)
 }
@@ -753,6 +788,32 @@ mod tests {
         // "Ported" is not the imperative "Port".
         assert!(autopilot_report("Ported the scoring [AUTOPILOT]").is_some());
         assert_eq!(autopilot_report(&"x".repeat(200)), None);
+    }
+
+    #[test]
+    fn counts_switches_in_time_order_not_file_order() {
+        // Two sessions, each in its own repo, interleaved through the morning.
+        // Walked file by file this reads as one switch; in time order it is
+        // the four it actually was.
+        let mut visits = vec![
+            (1_000, "alpha".to_string()),
+            (3_000, "alpha".to_string()),
+            (5_000, "alpha".to_string()),
+            (2_000, "beta".to_string()),
+            (4_000, "beta".to_string()),
+        ];
+        assert_eq!(count_switches(&mut visits), 4);
+    }
+
+    #[test]
+    fn a_day_spent_in_one_repo_has_no_switches() {
+        let mut visits = vec![
+            (1_000, "alpha".to_string()),
+            (2_000, "alpha".to_string()),
+            (3_000, "alpha".to_string()),
+        ];
+        assert_eq!(count_switches(&mut visits), 0);
+        assert_eq!(count_switches(&mut []), 0);
     }
 
     #[test]

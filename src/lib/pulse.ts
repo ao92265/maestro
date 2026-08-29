@@ -85,8 +85,8 @@ export interface PulseSession {
   waiting: boolean;
   /** Not live any more. Kept so the port's `!s.stale` filters read literally. */
   stale: boolean;
-  /** Epoch ms of the last status update. */
-  lastActive: number;
+  /** Epoch ms of the last status update; null when it never reported one. */
+  lastActive: number | null;
   lastAction: string;
 }
 
@@ -151,6 +151,12 @@ export interface FlowFactor {
 export interface FlowDay {
   date: string;
   score: number;
+  /**
+   * The score is a commits-only proxy for a day that was never measured — the
+   * app was not running, or predates it. Carried everywhere the day is shown
+   * so a fresh install cannot pass thirteen guesses off as history.
+   */
+  backfilled: boolean;
 }
 
 export interface FlowTrendBar {
@@ -159,6 +165,7 @@ export interface FlowTrendBar {
   /** Height against the best day in the window, 0-100. */
   heightPct: number;
   tier: FlowTier;
+  backfilled: boolean;
 }
 
 export interface FlowHeatCell {
@@ -169,22 +176,40 @@ export interface FlowHeatCell {
   /** Marks a standout day (70+). */
   ring: boolean;
   title: string;
+  backfilled: boolean;
 }
 
-export interface FlowScore {
+/** Today's half of the score: only exists once there is something to score. */
+export interface FlowToday {
   score: number;
   word: string;
   tier: FlowTier;
   delta: string;
   deltaDirection: "up" | "down" | "none";
+  /** Yesterday was never measured, so the delta is against a proxy. */
+  deltaAgainstBackfill: boolean;
+  factors: FlowFactor[];
+  insight: string;
+}
+
+export interface FlowScore {
+  /**
+   * Today's score, or null when the day has nothing to score yet.
+   *
+   * Two of the four factors are penalties — no switching, nobody blocked —
+   * so an untouched day scores 50 and calls itself Steady, then drops as soon
+   * as real work starts. Half the weight for absence of evidence is not a
+   * reading, so an unmeasured day gets no number rather than a flattering one.
+   */
+  today: FlowToday | null;
   streak: number;
   trend: FlowTrendBar[];
   heat: FlowHeatCell[];
-  factors: FlowFactor[];
-  insight: string;
   wkActive: number;
   wkAvg: number;
   wkBest: number;
+  /** How many of the week's scoring days are commit-count proxies. */
+  wkBackfilled: number;
   explain: string;
 }
 
@@ -225,15 +250,17 @@ function basename(path: string): string {
  * that exists right now, so none of them are stale — the field stays so the
  * ported `!s.stale` filters read the way rohcna's did.
  */
-export function toPulseSessions(sessions: SessionConfig[], nowMs: number): PulseSession[] {
+export function toPulseSessions(sessions: SessionConfig[]): PulseSession[] {
   return sessions.map((session) => ({
     id: session.id,
     repo: basename(session.working_directory ?? session.worktree_path ?? session.project_path),
     waiting: session.status === "NeedsInput",
     stale: false,
-    /* A session that has never reported through MCP still happened; dating it
-       now keeps it on today's timeline instead of at the epoch. */
-    lastActive: session.lastMcpUpdateTime ?? nowMs,
+    /* Null, not `Date.now()`: a session that never reported through MCP has no
+       known time, and stamping it now parks a fabricated "just now" row at the
+       top of the timeline. It still counts towards `waiting`, which is a
+       count rather than a moment. */
+    lastActive: session.lastMcpUpdateTime ?? null,
     lastAction: session.needsInputPrompt ?? session.statusMessage ?? "",
   }));
 }
@@ -244,11 +271,21 @@ export function toPulseSessions(sessions: SessionConfig[], nowMs: number): Pulse
  * Rohcna asked `gh search prs --author @me` once, across every repo at once.
  * The fork has no cross-repo search command, so `usePulseStore` lists each
  * open project's PRs with the same `author:@me` filter and counts them here.
+ *
+ * Deduplicated by URL, which matters because worktrees are the standing
+ * workflow: two checkouts of one repo are two polls of the same GitHub
+ * project, and the concatenated lists would otherwise count every PR of the
+ * day twice — inflating the headline tile and the shipping factor with it.
  */
 export function countPrsOn(prs: PullRequestInfo[], date: string): PulsePrCounts {
   let opened = 0;
   let merged = 0;
+  const seen = new Set<string>();
   for (const pr of prs) {
+    // The URL is the PR's identity across checkouts; the number alone is not
+    // (two different repos both have a #12).
+    if (seen.has(pr.url)) continue;
+    seen.add(pr.url);
     if (fallsOn(pr.createdAt, date)) opened++;
     if (pr.mergedAt && fallsOn(pr.mergedAt, date)) merged++;
   }
@@ -298,30 +335,34 @@ function formatTime(date: Date): string {
 }
 
 /**
- * Hour-by-hour tool calls and commits, from the first logged hour to the last.
+ * Hour-by-hour tool calls and commits, spanning the whole working day.
  *
- * A day with no transcript activity falls back to a 7-11 window rather than
+ * Rohcna started at the first logged hour and stopped after eight columns,
+ * which silently truncated the afternoon of any day that started early — the
+ * chart said "today" and showed a morning. The span now runs from the first
+ * hour with anything in it to the last, across both series, however long that
+ * is; a day with nothing in it falls back to a 7-11 window rather than
  * collapsing to a single empty column.
  */
 export function buildSpark(
   commitHoursByRepo: number[][],
   hourly: Record<number, number>,
 ): PulseSpark {
-  const hours = Object.keys(hourly)
-    .map(Number)
-    .sort((a, b) => a - b);
-  const lo = hours.length ? hours[0] : 7;
-  const hi = hours.length ? hours[hours.length - 1] : 11;
-
   const commitCount: Record<number, number> = {};
   for (const hour of commitHoursByRepo.flat()) {
     commitCount[hour] = (commitCount[hour] ?? 0) + 1;
   }
 
+  const busy = [...Object.keys(hourly).map(Number), ...Object.keys(commitCount).map(Number)].sort(
+    (a, b) => a - b,
+  );
+  const lo = busy.length ? busy[0] : 7;
+  const hi = busy.length ? busy[busy.length - 1] : 11;
+
   const labels: string[] = [];
   const activity: number[] = [];
   const commits: number[] = [];
-  for (let h = lo; h <= hi && labels.length < 8; h++) {
+  for (let h = lo; h <= hi; h++) {
     labels.push(`${h % 12 || 12}${h < 12 ? "a" : "p"}`);
     activity.push(hourly[h] ?? 0);
     commits.push(commitCount[h] ?? 0);
@@ -387,11 +428,34 @@ function commitsOnDate(repos: PulseRepoActivity[], date: string): number {
 }
 
 /**
+ * Whether the day has anything worth scoring yet.
+ *
+ * Focus and Responsiveness are penalties: with nothing running and nothing
+ * blocked they both sit at 100, so an untouched day would score 50 out of
+ * nowhere and then FALL as soon as real work started. Evidence of work is
+ * the gate — commits, agent activity, or a PR.
+ */
+function hasSignal(inputs: PulseInputs): boolean {
+  const commits = inputs.repos.reduce((total, repo) => total + repo.commits.length, 0);
+  return (
+    commits > 0 ||
+    inputs.transcript.toolCalls > 0 ||
+    inputs.transcript.edits > 0 ||
+    inputs.prs.opened > 0 ||
+    inputs.prs.merged > 0
+  );
+}
+
+/**
  * Today's flow score, its 14-day context, and the history that produced it.
  *
  * Pure: `history` goes in, a new array comes out. The caller persists it —
  * rohcna wrote a module global to disk on every call, which made the score
  * untestable and the disk write invisible.
+ *
+ * `flow.today` is null on a day with nothing measured yet (see `hasSignal`),
+ * and such a day is not written to history either: a fabricated 50 would drag
+ * the weekly average and hand tomorrow a delta against a number nobody earned.
  */
 export function computeFlowScore(
   inputs: PulseInputs,
@@ -400,6 +464,7 @@ export function computeFlowScore(
   const { transcript, sessions, now } = inputs;
   const metrics = computeMetrics(inputs);
   const today = pulseDateString(now);
+  const measured = hasSignal(inputs);
 
   // Factor 1: Focus — fewer context switches, and fewer repos, score higher.
   const switches = transcript.switches;
@@ -466,34 +531,55 @@ export function computeFlowScore(
   const score = Math.round(weighted.reduce((acc, f) => acc + f.raw * f.weight, 0));
 
   /* Whether there is anything to compare today against, read BEFORE backfill
-     adds thirteen zero-scored days below. Rohcna checked this after, so its
-     "first day" copy could never fire — the only deviation from its output. */
+     adds thirteen days below. Rohcna checked this after, so its "first day"
+     copy could never fire. */
   const hadPriorHistory = history.some((day) => day.date !== today);
 
-  const days = history.map((day) => ({ ...day }));
-  const existing = days.findIndex((day) => day.date === today);
-  if (existing >= 0) days[existing].score = score;
-  else {
-    days.push({ date: today, score });
-    if (days.length > HISTORY_SOFT_CAP) days.splice(0, days.length - HISTORY_SOFT_CAP);
+  /* Normalised on the way in: a persisted day from before this field existed
+     is treated as a proxy, not as something we once measured. */
+  const days: FlowDay[] = history.map((day) => ({
+    date: day.date,
+    score: day.score,
+    backfilled: day.backfilled !== false,
+  }));
+
+  if (measured) {
+    const existing = days.findIndex((day) => day.date === today);
+    if (existing >= 0) {
+      days[existing].score = score;
+      days[existing].backfilled = false;
+    } else {
+      days.push({ date: today, score, backfilled: false });
+      if (days.length > HISTORY_SOFT_CAP) days.splice(0, days.length - HISTORY_SOFT_CAP);
+    }
   }
 
-  /* A day we have never scored is worth what landed on it. Persisted on the
-     way past so the same day is never recomputed. */
-  function scoreForDate(date: string): number {
+  /* A day we have never scored is worth what landed on it — a proxy, flagged
+     as one. Persisted on the way past so the same day is never recomputed. */
+  function scoreForDate(date: string): FlowDay {
     const known = days.find((day) => day.date === date);
-    if (known) return known.score;
-    const backfilled = scoreFromCommits(commitsOnDate(inputs.repos, date));
-    days.push({ date, score: backfilled });
-    return backfilled;
+    if (known) return known;
+    const entry: FlowDay = {
+      date,
+      score: scoreFromCommits(commitsOnDate(inputs.repos, date)),
+      backfilled: true,
+    };
+    days.push(entry);
+    return entry;
   }
 
-  const window: { date: string; score: number; day: Date }[] = [];
+  const window: { date: string; score: number; backfilled: boolean; day: Date }[] = [];
   for (let i = 13; i >= 0; i--) {
     const day = new Date(now);
     day.setDate(day.getDate() - i);
     const date = pulseDateString(day);
-    window.push({ date, score: i === 0 ? score : scoreForDate(date), day });
+    if (i === 0) {
+      // Today is never a proxy: it is either measured, or it has no score.
+      window.push({ date, score: measured ? score : 0, backfilled: false, day });
+    } else {
+      const entry = scoreForDate(date);
+      window.push({ date, score: entry.score, backfilled: entry.backfilled, day });
+    }
   }
   const lastSeven = window.slice(7);
 
@@ -503,79 +589,90 @@ export function computeFlowScore(
     score: d.score,
     heightPct: Math.round((d.score / maxTrend) * 100),
     tier: flowTier(d.score),
+    backfilled: d.backfilled,
   }));
   const heat: FlowHeatCell[] = window.map((d) => ({
     date: d.date,
     score: d.score,
     tier: d.score > 0 ? flowTier(d.score) : null,
     ring: d.score >= 70,
-    title: `${d.day.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })} · ${d.score}`,
+    title: `${d.day.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })} · ${d.score}${d.backfilled ? " (from commits)" : ""}`,
+    backfilled: d.backfilled,
   }));
 
-  // Streak: consecutive scoring days ending today.
+  /* Streak: consecutive scoring days ending today. A blank today does not
+     break it — the day is not over. */
   let streak = 0;
   for (const [i, entry] of window.entries()) {
     if (entry.score > 0) streak++;
     else if (i < window.length - 1) streak = 0;
   }
 
-  const weekScores = lastSeven.map((d) => d.score);
-  const scoringDays = weekScores.filter((s) => s > 0);
+  const scoringDays = lastSeven.filter((d) => d.score > 0);
   const wkActive = scoringDays.length;
-  const wkAvg = wkActive ? Math.round(scoringDays.reduce((a, b) => a + b, 0) / wkActive) : 0;
-  const wkBest = Math.max(...weekScores, 0);
+  const wkAvg = wkActive ? Math.round(scoringDays.reduce((a, b) => a + b.score, 0) / wkActive) : 0;
+  const wkBest = Math.max(...lastSeven.map((d) => d.score), 0);
+  const wkBackfilled = scoringDays.filter((d) => d.backfilled).length;
 
-  const yesterday = new Date(now);
-  yesterday.setDate(yesterday.getDate() - 1);
-  const yesterdayScore = scoreForDate(pulseDateString(yesterday));
-  let delta: string;
-  let deltaDirection: FlowScore["deltaDirection"];
-  if (!hadPriorHistory && yesterdayScore === 0) {
-    delta = "first day";
-    deltaDirection = "none";
-  } else {
-    const diff = score - yesterdayScore;
-    delta = `${diff >= 0 ? "+" : "−"}${Math.abs(diff)} vs yest.`;
-    deltaDirection = diff >= 0 ? "up" : "down";
-  }
+  const flowToday: FlowToday | null = measured
+    ? (() => {
+        const yesterday = new Date(now);
+        yesterday.setDate(yesterday.getDate() - 1);
+        const previous = scoreForDate(pulseDateString(yesterday));
+        let delta: string;
+        let deltaDirection: FlowToday["deltaDirection"];
+        if (!hadPriorHistory && previous.score === 0) {
+          delta = "first day";
+          deltaDirection = "none";
+        } else {
+          const diff = score - previous.score;
+          delta = `${diff >= 0 ? "+" : "−"}${Math.abs(diff)} vs yest.`;
+          deltaDirection = diff >= 0 ? "up" : "down";
+        }
+
+        const insight =
+          [
+            commits >= 3 ? `Strong shipping day — ${commits} commits landed.` : null,
+            waiting >= 3 ? `${waiting} sessions are waiting on you.` : null,
+            switches >= 5 ? `High context-switching (${switches}) is fragmenting focus.` : null,
+            edits >= 20 ? "Heavy editing session — good momentum." : null,
+            score >= 80 ? "Deep work mode — protect this block." : null,
+            score < 20 ? "Light day so far — pick a task and dig in." : null,
+          ].find(Boolean) ?? "Keep your current pace through the rest of the day.";
+
+        return {
+          score,
+          word: flowWord(score),
+          tier: flowTier(score),
+          delta,
+          deltaDirection,
+          deltaAgainstBackfill: previous.backfilled && previous.score > 0,
+          factors: weighted.map((f) => ({
+            label: f.label,
+            weight: f.weight,
+            raw: f.raw,
+            pct: Math.round(f.raw),
+            detail: f.detail,
+            sign: f.raw >= f.up ? "↑" : f.raw >= f.mid ? "·" : "↓",
+            tier: flowTier(f.raw),
+          })),
+          insight,
+        };
+      })()
+    : null;
 
   if (days.length > HISTORY_HARD_CAP) days.splice(0, days.length - HISTORY_HARD_CAP);
 
-  const insight =
-    [
-      commits >= 3 ? `Strong shipping day — ${commits} commits landed.` : null,
-      waiting >= 3 ? `${waiting} sessions are waiting on you.` : null,
-      switches >= 5 ? `High context-switching (${switches}) is fragmenting focus.` : null,
-      edits >= 20 ? "Heavy editing session — good momentum." : null,
-      score >= 80 ? "Deep work mode — protect this block." : null,
-      score < 20 ? "Light day so far — pick a task and dig in." : null,
-    ].find(Boolean) ?? "Keep your current pace through the rest of the day.";
-
-  const factors: FlowFactor[] = weighted.map((f) => ({
-    label: f.label,
-    weight: f.weight,
-    raw: f.raw,
-    pct: Math.round(f.raw),
-    detail: f.detail,
-    sign: f.raw >= f.up ? "↑" : f.raw >= f.mid ? "·" : "↓",
-    tier: flowTier(f.raw),
-  }));
-
   return {
     flow: {
-      score,
-      word: flowWord(score),
-      tier: flowTier(score),
-      delta,
-      deltaDirection,
+      today: flowToday,
       streak,
       trend,
       heat,
-      factors,
-      insight,
       wkActive,
       wkAvg,
       wkBest,
+      wkBackfilled,
       explain: "Weighted blend: Focus 30%, Shipping 30%, Responsiveness 20%, Momentum 20%.",
     },
     history: days,
@@ -608,7 +705,9 @@ export function computeActivity(inputs: PulseInputs): ActivityEvent[] {
   }
 
   for (const session of sessions) {
-    if (!session.waiting || session.stale) continue;
+    // An undated session has no place on a timeline. It still shows in the
+    // waiting count; inventing a time for it would put it at the top.
+    if (!session.waiting || session.stale || session.lastActive === null) continue;
     const at = new Date(session.lastActive);
     dated.push({
       ts: at.getTime(),

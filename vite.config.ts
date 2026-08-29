@@ -72,6 +72,15 @@ export default defineConfig(async () => ({
   test: {
     globals: true,
     environment: "happy-dom",
+    /* Pinned, and pinned somewhere hostile on purpose. Every date in this app
+       is a LOCAL calendar date (`pulseDateString`, the standup's
+       `localDateString`, git's `format-local:`) compared against UTC stamps
+       from `gh` and the Claude transcripts. On a UTC machine that distinction
+       is invisible and the tests pass vacuously. Samoa is UTC-11 with no DST,
+       so a morning-UTC timestamp lands on the PREVIOUS local day and any code
+       that reaches for `toISOString` fails here. Do not "fix" a failure by
+       changing this value. */
+    env: { TZ: "Pacific/Pago_Pago" },
     setupFiles: ["./src/test/setup.ts"],
     // Without an explicit include, vitest also collects the full test suite
     // out of every stale agent worktree under .claude/worktrees.
