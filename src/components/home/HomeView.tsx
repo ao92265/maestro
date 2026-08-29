@@ -1,26 +1,44 @@
+import { ask } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   CheckCircle2,
   CircleDot,
+  Clock,
   GitMerge,
   GitPullRequest,
   HelpCircle,
   Inbox,
+  Pencil,
   Play,
   RefreshCw,
+  Sparkles,
+  Trash2,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
+import { ClosedBatchShelf } from "@/components/home/ClosedBatchShelf";
+import { ReplyDraftDialog } from "@/components/home/ReplyDraftDialog";
+import { SnoozeButton } from "@/components/home/SnoozeButton";
 import { badgeBaseClass, SESSION_STATUS_BADGES } from "@/components/session/agentPresentation";
 import { useLaunchHandoff } from "@/hooks/useLaunchHandoff";
+import { useRestoreClosedBatch } from "@/hooks/useRestoreClosedBatch";
 import { assembleBands, type BandItem, type BandTab, type HandoffInfo } from "@/lib/bands";
+import {
+  bandItemKey,
+  partitionSnoozed,
+  projectDisplayName,
+  type SnoozeKey,
+} from "@/lib/sessionActions";
 import { useActStore } from "@/stores/useActStore";
 import { useBandStore } from "@/stores/useBandStore";
+import { useClosedSessionsStore } from "@/stores/useClosedSessionsStore";
 import { useFactoryViewStore } from "@/stores/useFactoryViewStore";
 import { useHomeViewStore } from "@/stores/useHomeViewStore";
-import type { BackendSessionStatus } from "@/stores/useSessionStore";
+import { useReplyDraftStore } from "@/stores/useReplyDraftStore";
+import type { BackendSessionStatus, SessionConfig } from "@/stores/useSessionStore";
 import { useSessionStore } from "@/stores/useSessionStore";
+import { useSnoozeStore } from "@/stores/useSnoozeStore";
 import { useTourStore } from "@/stores/useTourStore";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 
@@ -60,38 +78,124 @@ function StatusBadge({ status }: { status: BackendSessionStatus }) {
   return <span className={`${badgeBaseClass} ${badge.cls}`}>{badge.label}</span>;
 }
 
-function SessionRow({
-  item,
-  onNavigate,
-}: {
+interface SessionRowProps {
   item: BandItem;
   onNavigate: HomeViewProps["onNavigate"];
+  /** Blocked-band extras; the other two bands pass nothing and render as before. */
+  onDraftReply?: (session: SessionConfig) => void;
+  snoozeKey?: SnoozeKey;
+}
+
+/**
+ * Body of a session row, past the kind guard, so the row's own hooks (the
+ * rename field) sit at the top of a component that always renders.
+ */
+function SessionRowBody({
+  session,
+  tabId,
+  projectName,
+  onNavigate,
+  onDraftReply,
+  snoozeKey,
+}: Omit<SessionRowProps, "item"> & {
+  session: SessionConfig;
+  tabId: string | null;
+  projectName: string;
 }) {
-  if (item.kind !== "session") return null;
-  const { session, tabId, projectName } = item;
+  const [editingName, setEditingName] = useState(false);
+  const [nameValue, setNameValue] = useState("");
+
   const detail =
     session.status === "NeedsInput"
       ? (session.needsInputPrompt ?? "Waiting for your input")
       : (session.statusMessage ?? "");
+
+  /* The same store action the terminal header's click-to-rename uses — one
+     rename path, two surfaces. Blank clears the custom name (the backend
+     normalizes an empty string back to None). */
+  const commitName = () => {
+    const trimmed = nameValue.trim();
+    useSessionStore.getState().renameSession(session.id, trimmed || null);
+    setEditingName(false);
+  };
+
   return (
-    <button
-      type="button"
-      className={`${rowClass} ${tabId ? "" : "cursor-default"}`}
-      onClick={() => tabId && onNavigate(tabId, session.id)}
-      title={tabId ? "Jump to this terminal" : "Project not open in a tab"}
-    >
-      <StatusBadge status={session.status} />
-      <span className="shrink-0 text-[12px] font-medium text-maestro-text">{projectName}</span>
-      {session.name && (
-        <span className="shrink-0 text-[11px] text-maestro-muted">{session.name}</span>
+    <div className={rowClass}>
+      <button
+        type="button"
+        className={`flex min-w-0 flex-1 items-center gap-2 text-left ${
+          tabId ? "" : "cursor-default"
+        }`}
+        onClick={() => tabId && onNavigate(tabId, session.id)}
+        title={tabId ? "Jump to this terminal" : "Project not open in a tab"}
+      >
+        <StatusBadge status={session.status} />
+        <span className="shrink-0 text-[12px] font-medium text-maestro-text">{projectName}</span>
+        {!editingName && session.name && (
+          <span className="shrink-0 text-[11px] text-maestro-muted">{session.name}</span>
+        )}
+        {session.branch && (
+          <span className="shrink-0 rounded bg-maestro-muted/10 px-1 text-[10px] text-maestro-muted">
+            {session.branch}
+          </span>
+        )}
+        <span className="min-w-0 flex-1 truncate text-[11px] text-maestro-muted">{detail}</span>
+      </button>
+
+      {editingName ? (
+        <input
+          type="text"
+          value={nameValue}
+          onChange={(e) => setNameValue(e.target.value)}
+          onBlur={commitName}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commitName();
+            if (e.key === "Escape") setEditingName(false);
+          }}
+          placeholder="Session name"
+          aria-label="Rename session"
+          className="w-32 shrink-0 rounded border border-maestro-accent bg-maestro-card px-1 py-0 text-[11px] text-maestro-text outline-none"
+          // biome-ignore lint/a11y/noAutofocus: revealed by an explicit click-to-rename, same as TerminalHeader's field.
+          autoFocus
+        />
+      ) : (
+        <button
+          type="button"
+          onClick={() => {
+            setNameValue(session.name ?? "");
+            setEditingName(true);
+          }}
+          className="shrink-0 rounded border border-maestro-border px-1.5 py-0.5 text-[11px] text-maestro-muted transition-colors hover:border-maestro-muted/50 hover:text-maestro-text"
+          title="Rename this session"
+        >
+          <Pencil size={11} />
+        </button>
       )}
-      {session.branch && (
-        <span className="shrink-0 rounded bg-maestro-muted/10 px-1 text-[10px] text-maestro-muted">
-          {session.branch}
-        </span>
+
+      {onDraftReply && (
+        <button
+          type="button"
+          onClick={() => onDraftReply(session)}
+          className="flex shrink-0 items-center gap-1 rounded border border-maestro-border px-1.5 py-0.5 text-[11px] text-maestro-muted transition-colors hover:border-maestro-accent/50 hover:text-maestro-accent"
+          title="Draft a reply with AI — a suggestion you edit and send yourself"
+        >
+          <Sparkles size={11} /> Draft reply
+        </button>
       )}
-      <span className="min-w-0 flex-1 truncate text-[11px] text-maestro-muted">{detail}</span>
-    </button>
+      {snoozeKey && <SnoozeButton snoozeKey={snoozeKey} label="this session" />}
+    </div>
+  );
+}
+
+function SessionRow({ item, ...rest }: SessionRowProps) {
+  if (item.kind !== "session") return null;
+  return (
+    <SessionRowBody
+      session={item.session}
+      tabId={item.tabId}
+      projectName={item.projectName}
+      {...rest}
+    />
   );
 }
 
@@ -157,7 +261,17 @@ function RunRow({ item }: { item: BandItem }) {
   );
 }
 
-function HandoffRow({ item, onLaunch }: { item: BandItem; onLaunch: (h: HandoffInfo) => void }) {
+function HandoffRow({
+  item,
+  onLaunch,
+  onDismiss,
+  snoozeKey,
+}: {
+  item: BandItem;
+  onLaunch: (h: HandoffInfo) => void;
+  onDismiss: (h: HandoffInfo) => void;
+  snoozeKey: SnoozeKey;
+}) {
   if (item.kind !== "handoff") return null;
   const h = item.handoff;
   return (
@@ -190,6 +304,15 @@ function HandoffRow({ item, onLaunch }: { item: BandItem; onLaunch: (h: HandoffI
         title="Launch a session here, seeded with the handoff"
       >
         <Play size={11} /> Resume
+      </button>
+      <SnoozeButton snoozeKey={snoozeKey} label="this handoff" />
+      <button
+        type="button"
+        onClick={() => onDismiss(h)}
+        className="flex shrink-0 items-center gap-1 rounded border border-maestro-border px-1.5 py-0.5 text-[11px] text-maestro-muted transition-colors hover:border-maestro-red/50 hover:text-maestro-red"
+        title="Delete this handoff snapshot from disk — it will not come back"
+      >
+        <Trash2 size={11} /> Dismiss
       </button>
     </div>
   );
@@ -262,6 +385,9 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
     markSeen,
   } = useBandStore();
   const gatedRuns = useActStore(useShallow((s) => s.gatedRuns));
+  const snoozeEntries = useSnoozeStore(useShallow((s) => s.entries));
+  const unsnooze = useSnoozeStore((s) => s.unsnooze);
+  const closedBatches = useClosedSessionsStore(useShallow((s) => s.batches));
   const [statusFilter, setStatusFilter] = useState<BackendSessionStatus | null>(null);
 
   const bandTabs: BandTab[] = useMemo(
@@ -282,6 +408,19 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
     void refresh();
     void useActStore.getState().refresh();
   }, [refresh]);
+
+  /* Expiry is time-based, so nothing re-renders on its own when a deadline
+     passes. A minute's granularity is right for a snooze measured in hours
+     and for a 30-minute undo shelf. */
+  useEffect(() => {
+    const tick = () => {
+      useSnoozeStore.getState().prune();
+      useClosedSessionsStore.getState().prune();
+    };
+    tick();
+    const id = window.setInterval(tick, 60_000);
+    return () => window.clearInterval(id);
+  }, []);
 
   /* `activeDirs` is what keeps a handoff from being called blocked-on-you
      while a claude session is already running in its directory outside
@@ -311,6 +450,63 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
   );
 
   const launchHandoff = useLaunchHandoff(onNavigate);
+  const restoreClosedBatch = useRestoreClosedBatch(onNavigate);
+
+  /* Snoozed rows leave the band but stay reachable in a shelf below it — a
+     hidden row with no way back is indistinguishable from a lost one. */
+  const blocked = useMemo(
+    () => partitionSnoozed(filtered(bands.blocked), snoozeEntries, Date.now()),
+    [bands.blocked, filtered, snoozeEntries],
+  );
+
+  const handleRestore = useCallback(
+    (batchId: string) => {
+      const batch = closedBatches.find((b) => b.id === batchId);
+      if (batch) restoreClosedBatch(batch);
+    },
+    [closedBatches, restoreClosedBatch],
+  );
+
+  /* Dismiss deletes the snapshot file, so it asks first — every other action
+     on this screen is reversible and this one is not. */
+  const handleDismissHandoff = useCallback((h: HandoffInfo) => {
+    void ask(
+      `Delete the handoff snapshot for ${h.repo}? It is removed from disk and cannot be restored.`,
+      { title: "Dismiss handoff", kind: "warning" },
+    )
+      .then(async (confirmed) => {
+        if (!confirmed) return;
+        const error = await useBandStore.getState().dismissHandoff(h.slug);
+        if (error) console.error("Failed to dismiss handoff:", error);
+      })
+      .catch((err) => console.error("Failed to dismiss handoff:", err));
+  }, []);
+
+  /* After inserting a draft the user has to SEE the input line to press Enter
+     on it, so the dialog hands the session back here to jump to. A session
+     whose project has no open tab has no terminal to jump to; the text is in
+     its stdin either way. */
+  const handleNavigateToSession = useCallback(
+    (sessionId: number) => {
+      const session = sessions.find((s) => s.id === sessionId);
+      const tabId = session
+        ? (bandTabs.find((t) => t.projectPath === session.project_path)?.id ?? null)
+        : null;
+      if (tabId) onNavigate(tabId, sessionId);
+    },
+    [sessions, bandTabs, onNavigate],
+  );
+
+  const handleDraftReply = useCallback((session: SessionConfig) => {
+    void useReplyDraftStore.getState().open({
+      sessionId: session.id,
+      projectPath: session.working_directory ?? session.worktree_path ?? session.project_path,
+      question: session.needsInputPrompt ?? session.statusMessage ?? "",
+      repo: projectDisplayName(session.project_path),
+      branch: session.branch,
+      statusMessage: session.statusMessage ?? null,
+    });
+  }, []);
 
   return (
     /* z-50 like the landscape overlay: the zoomed eagle pane sits at z-40. */
@@ -398,10 +594,11 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
       {/* Bands */}
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto flex w-full max-w-3xl flex-col gap-5 px-4 py-4">
+          <ClosedBatchShelf onRestore={handleRestore} />
           <Band
             title="Blocked on you"
             icon={<CircleDot size={12} className="text-maestro-accent" />}
-            items={filtered(bands.blocked)}
+            items={blocked.visible}
             emptyText="Nothing is blocked on you."
             stale={handoffsError}
             action={
@@ -416,7 +613,15 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
             }
             renderItem={(item, i) =>
               item.kind === "session" ? (
-                <SessionRow key={`s${item.session.id}`} item={item} onNavigate={onNavigate} />
+                <SessionRow
+                  key={`s${item.session.id}`}
+                  item={item}
+                  onNavigate={onNavigate}
+                  /* Only a session that actually asked something has a
+                     question worth drafting against. */
+                  onDraftReply={item.session.status === "NeedsInput" ? handleDraftReply : undefined}
+                  snoozeKey={bandItemKey(item)}
+                />
               ) : item.kind === "pr" ? (
                 <PrRow key={`p${item.pr.url}`} item={item} />
               ) : item.kind === "run" ? (
@@ -426,10 +631,55 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
                   key={`h${item.handoff.slug}-${i}`}
                   item={item}
                   onLaunch={launchHandoff}
+                  onDismiss={handleDismissHandoff}
+                  snoozeKey={bandItemKey(item)}
                 />
               )
             }
           />
+
+          {blocked.snoozed.length > 0 && (
+            <section>
+              <div className="mb-1.5 flex items-center gap-1.5">
+                <Clock size={12} className="text-maestro-muted" />
+                <h2 className="text-[11px] font-semibold uppercase tracking-wider text-maestro-muted">
+                  Snoozed
+                </h2>
+                <span className="text-[11px] text-maestro-muted/70">{blocked.snoozed.length}</span>
+              </div>
+              <div className="flex flex-col gap-1.5">
+                {blocked.snoozed.map((item) => {
+                  const key = bandItemKey(item);
+                  const label =
+                    item.kind === "session"
+                      ? (item.session.name ?? item.projectName)
+                      : item.kind === "handoff"
+                        ? item.handoff.repo
+                        : item.kind === "pr"
+                          ? `#${item.pr.number} ${item.pr.title}`
+                          : item.run.title;
+                  return (
+                    <div
+                      key={key}
+                      className="flex w-full items-center gap-2 rounded border border-maestro-border bg-maestro-card px-3 py-2 text-left opacity-70"
+                    >
+                      <span className="min-w-0 flex-1 truncate text-[11px] text-maestro-muted">
+                        {label}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => unsnooze(key)}
+                        className="shrink-0 rounded border border-maestro-border px-1.5 py-0.5 text-[11px] text-maestro-muted transition-colors hover:border-maestro-muted/50 hover:text-maestro-text"
+                        title="Bring this row back to the band now"
+                      >
+                        Bring back
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          )}
           <Band
             title="Landed since you looked"
             icon={<CheckCircle2 size={12} className="text-maestro-green" />}
@@ -477,6 +727,9 @@ export function HomeView({ onNavigate, onClose }: HomeViewProps) {
           />
         </div>
       </div>
+
+      {/* Suggestion panel for a blocked session. Renders nothing with no target. */}
+      <ReplyDraftDialog onNavigate={handleNavigateToSession} />
     </div>
   );
 }

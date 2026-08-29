@@ -8,7 +8,9 @@ import {
   samuraiListSessions,
   samuraiScheduleList,
 } from "@/lib/samurai";
+import { projectDisplayName } from "@/lib/sessionActions";
 import { useAgentStore } from "@/stores/useAgentStore";
+import { useClosedSessionsStore } from "@/stores/useClosedSessionsStore";
 import type { ClaudeEvent } from "@/types/claude-events";
 
 export type { SamuraiScheduleEntry, SamuraiSupervisorState };
@@ -776,6 +778,15 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
           ),
           samuraiBySessionId,
         };
+      });
+      /* Remember the batch so a mis-clicked tab close (or Stop all) can be
+         reopened — see `useClosedSessionsStore`. Only on the success path:
+         the fallback below fires when the project directory has gone, and a
+         batch whose cwd no longer exists cannot be relaunched. */
+      useClosedSessionsStore.getState().record({
+        projectPath,
+        projectName: projectDisplayName(projectPath),
+        sessions: removed,
       });
       return removed;
     } catch (err) {

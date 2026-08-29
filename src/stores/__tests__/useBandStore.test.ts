@@ -24,6 +24,7 @@ vi.mock("@tauri-apps/plugin-store", () => ({
   })),
 }));
 
+import type { HandoffInfo } from "@/lib/bands";
 import type { DevProcess } from "@/lib/processes";
 import { useBandStore } from "@/stores/useBandStore";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
@@ -175,5 +176,59 @@ describe("useBandStore externallyActiveDirs", () => {
     listDevProcessesMock.mockResolvedValue([]);
     await useBandStore.getState().refresh();
     expect(useBandStore.getState().processesError).toBeNull();
+  });
+});
+
+function handoff(slug: string): HandoffInfo {
+  return {
+    slug,
+    path: `/tmp/${slug}`,
+    repo: slug,
+    branch: "main",
+    uncommitted: 0,
+    lastCommit: null,
+    asks: [],
+    lastAction: "Stopped.",
+    waiting: false,
+    lastActive: new Date().toISOString(),
+    stale: false,
+    orphan: false,
+  };
+}
+
+describe("useBandStore dismissHandoff", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    useBandStore.setState({ handoffs: [handoff("keep"), handoff("go")] });
+  });
+
+  it("deletes the snapshot and drops just that row", async () => {
+    invokeMock.mockResolvedValueOnce(true);
+
+    const error = await useBandStore.getState().dismissHandoff("go");
+
+    expect(invokeMock).toHaveBeenCalledWith("dismiss_handoff", { slug: "go" });
+    expect(error).toBeNull();
+    expect(useBandStore.getState().handoffs.map((h) => h.slug)).toEqual(["keep"]);
+  });
+
+  /* A slug whose files were already swept still leaves the UI in the state
+     the user asked for. */
+  it("drops the row even when nothing was left to delete", async () => {
+    invokeMock.mockResolvedValueOnce(false);
+
+    expect(await useBandStore.getState().dismissHandoff("go")).toBeNull();
+    expect(useBandStore.getState().handoffs.map((h) => h.slug)).toEqual(["keep"]);
+  });
+
+  /* The file is still on disk, so hiding the row would only have it reappear
+     on the next refresh — worse than saying the dismiss failed. */
+  it("keeps the row and returns the error when the delete fails", async () => {
+    invokeMock.mockRejectedValueOnce("permission denied");
+
+    const error = await useBandStore.getState().dismissHandoff("go");
+
+    expect(error).toContain("permission denied");
+    expect(useBandStore.getState().handoffs.map((h) => h.slug)).toEqual(["keep", "go"]);
   });
 });
