@@ -1281,6 +1281,7 @@ pub fn run() {
             // Orchestrator lane (goal box, session scope, safe-mode proposal queue)
             commands::orchestrator::orchestrator_ingest,
             commands::orchestrator::orchestrator_decide,
+            commands::orchestrator::orchestrator_claim,
             commands::orchestrator::orchestrator_mark,
             commands::orchestrator::orchestrator_set_safe_mode,
             commands::orchestrator::orchestrator_set_scope,
