@@ -77,6 +77,14 @@ describe("usePulseStore", () => {
       metrics: null,
       flow: null,
       activity: [],
+      repos: [],
+      reposAt: 0,
+      reposKey: "",
+      transcript: null,
+      transcriptAt: 0,
+      prs: [],
+      prsAt: 0,
+      prsKey: "",
       fetchedAt: 0,
       error: null,
       isRefreshing: false,
@@ -117,7 +125,7 @@ describe("usePulseStore", () => {
 
     const { metrics, flow, activity, flowHistory, fetchedAt, error } = usePulseStore.getState();
     expect(metrics?.shipped.commits).toBe(1);
-    expect(flow?.factors).toHaveLength(4);
+    expect(flow?.today?.factors).toHaveLength(4);
     expect(activity[0].text).toContain("committed abc1234");
     expect(flowHistory).toHaveLength(14);
     expect(fetchedAt).toBeGreaterThan(0);
@@ -135,6 +143,7 @@ describe("usePulseStore", () => {
           project_path: "/tmp/alpha",
           status: "NeedsInput",
           needsInputPrompt: "Rebase or merge?",
+          lastMcpUpdateTime: Date.now(),
         } as SessionConfig,
       ],
     });
@@ -162,9 +171,9 @@ describe("usePulseStore", () => {
     const good = usePulseStore.getState().metrics;
 
     respond({ pulse_git_activity: new Error("git is not on PATH") });
-    await usePulseStore.getState().refresh();
+    await usePulseStore.getState().refresh({ force: true });
 
-    expect(usePulseStore.getState().metrics).toBe(good);
+    expect(usePulseStore.getState().metrics).toStrictEqual(good);
     expect(usePulseStore.getState().error).toContain("git is not on PATH");
   });
 

@@ -113,10 +113,10 @@ describe("buildSpark", () => {
     expect(spark.activity).toEqual([0, 0, 0, 0, 0]);
   });
 
-  it("never emits more than 8 columns", () => {
+  it("spans however many columns the day actually used, uncapped", () => {
     const hourly: Record<number, number> = {};
     for (let h = 0; h < 20; h++) hourly[h] = h;
-    expect(buildSpark([], hourly).hours).toHaveLength(8);
+    expect(buildSpark([], hourly).hours).toHaveLength(20);
   });
 
   it("labels afternoon hours with p", () => {
@@ -195,8 +195,13 @@ describe("computeMetrics", () => {
 });
 
 describe("computeFlowScore", () => {
-  /** Two repos with commits on the 27th, for the backfill path. */
-  const yesterdayRepos = [repo("maestro", { commitsByDate: { "2026-08-27": 2 } })];
+  /** A repo with commits on the 27th (backfill) and today (signal), for the backfill path. */
+  const yesterdayRepos = [
+    repo("maestro", {
+      commits: [{ hash: "a", time: "09:00", branch: "main" }],
+      commitsByDate: { "2026-08-27": 2 },
+    }),
+  ];
 
   it("blends the four factors by their published weights", () => {
     const { flow } = computeFlowScore(
@@ -219,10 +224,10 @@ describe("computeFlowScore", () => {
 
     // Focus 100-2*8-1*5=79 · Shipping 3*12+2*20=76 · Responsiveness 100-25%*60=85
     // Momentum 5*4+30=50 → .3*79+.3*76+.2*85+.2*50 = 73.5
-    expect(flow.factors.map((f) => f.raw)).toEqual([79, 76, 85, 50]);
-    expect(flow.score).toBe(74);
-    expect(flow.tier).toBe("flow");
-    expect(flow.word).toBe("In flow");
+    expect(flow.today?.factors.map((f) => f.raw)).toEqual([79, 76, 85, 50]);
+    expect(flow.today?.score).toBe(74);
+    expect(flow.today?.tier).toBe("flow");
+    expect(flow.today?.word).toBe("In flow");
     expect(flow.explain).toBe(
       "Weighted blend: Focus 30%, Shipping 30%, Responsiveness 20%, Momentum 20%.",
     );
@@ -238,25 +243,27 @@ describe("computeFlowScore", () => {
       }),
       [],
     );
-    expect(flow.factors.map((f) => [f.label, f.detail])).toEqual([
+    expect(flow.today?.factors.map((f) => [f.label, f.detail])).toEqual([
       ["Focus", "1 repo, 1 switch"],
       ["Shipping", "1 commit, 1 PR"],
       ["Responsiveness", "1 waiting"],
       ["Momentum", "2 edits, 9 tool calls"],
     ]);
-    expect(flow.factors.map((f) => f.weight)).toEqual([0.3, 0.3, 0.2, 0.2]);
+    expect(flow.today?.factors.map((f) => f.weight)).toEqual([0.3, 0.3, 0.2, 0.2]);
   });
 
   it("floors focus and responsiveness at zero", () => {
     const { flow } = computeFlowScore(
       inputs({
         sessions: [session(1, { waiting: true }), session(2, { waiting: true })],
-        transcript: transcript({ switches: 40, repos: ["a", "b", "c", "d"] }),
+        // toolCalls gives the day a signal to score; the assertions below only
+        // read the Focus and Responsiveness factors.
+        transcript: transcript({ switches: 40, repos: ["a", "b", "c", "d"], toolCalls: 1 }),
       }),
       [],
     );
-    expect(flow.factors[0].raw).toBe(0);
-    expect(flow.factors[2].raw).toBe(40);
+    expect(flow.today?.factors[0].raw).toBe(0);
+    expect(flow.today?.factors[2].raw).toBe(40);
   });
 
   it("caps shipping and momentum at 100", () => {
@@ -267,8 +274,8 @@ describe("computeFlowScore", () => {
       }),
       [],
     );
-    expect(flow.factors[1].raw).toBe(100);
-    expect(flow.factors[3].raw).toBe(100);
+    expect(flow.today?.factors[1].raw).toBe(100);
+    expect(flow.today?.factors[3].raw).toBe(100);
   });
 
   it("upserts today's score into the history it is handed", () => {
@@ -283,26 +290,33 @@ describe("computeFlowScore", () => {
 
   it("backfills a missing day from that day's commit count, and keeps it", () => {
     const { flow, history } = computeFlowScore(inputs({ repos: yesterdayRepos }), []);
-    // 2 commits on the 27th → 30. An idle today still scores 50 (nothing is
-    // switching or blocked), so the day reads as up on yesterday.
-    expect(history.find((h) => h.date === "2026-08-27")?.score).toBe(30);
-    expect(flow.delta).toBe("+20 vs yest.");
-    expect(flow.deltaDirection).toBe("up");
+    // 2 commits on the 27th → scoreFromCommits(2) = 30, flagged as an estimate.
+    expect(history.find((h) => h.date === "2026-08-27")).toEqual({
+      date: "2026-08-27",
+      score: 30,
+      backfilled: true,
+    });
+    // Focus 100 (1 repo, no switches) · Shipping 1*12=12 · Responsiveness 100
+    // Momentum 0 → .3*100+.3*12+.2*100+.2*0 = 53.6, rounds to 54.
+    expect(flow.today?.delta).toBe("+24 vs yest.");
+    expect(flow.today?.deltaDirection).toBe("up");
+    expect(flow.today?.deltaAgainstBackfill).toBe(true);
   });
 
   it("prefers a persisted score over a backfill for the same day", () => {
     const { history } = computeFlowScore(inputs({ repos: yesterdayRepos }), [
-      { date: "2026-08-27", score: 88 },
+      { date: "2026-08-27", score: 88, backfilled: false },
     ]);
     expect(history.filter((h) => h.date === "2026-08-27")).toEqual([
-      { date: "2026-08-27", score: 88 },
+      { date: "2026-08-27", score: 88, backfilled: false },
     ]);
   });
 
   it("calls the very first run a first day rather than a drop", () => {
-    const { flow } = computeFlowScore(inputs(), []);
-    expect(flow.delta).toBe("first day");
-    expect(flow.deltaDirection).toBe("none");
+    // toolCalls gives the day a signal to score; a blank day has no `today` at all.
+    const { flow } = computeFlowScore(inputs({ transcript: transcript({ toolCalls: 1 }) }), []);
+    expect(flow.today?.delta).toBe("first day");
+    expect(flow.today?.deltaDirection).toBe("none");
   });
 
   it("counts a streak of consecutive scoring days up to today", () => {
@@ -336,7 +350,7 @@ describe("computeFlowScore", () => {
       { date: "2026-08-26", score: 40 },
       { date: "2026-08-27", score: 60 },
     ]);
-    expect(flow.wkActive).toBe(3);
+    expect(flow.wkActive).toBe(2);
     expect(flow.wkAvg).toBe(50);
     expect(flow.wkBest).toBe(60);
   });
@@ -389,7 +403,7 @@ describe("computeFlowScore", () => {
       }),
       [],
     );
-    expect(flow.insight).toBe("Strong shipping day — 3 commits landed.");
+    expect(flow.today?.insight).toBe("Strong shipping day — 3 commits landed.");
   });
 
   it("falls back to a neutral insight when nothing stands out", () => {
@@ -401,12 +415,16 @@ describe("computeFlowScore", () => {
       }),
       [],
     );
-    expect(flow.insight).toBe("Keep your current pace through the rest of the day.");
+    expect(flow.today?.insight).toBe("Keep your current pace through the rest of the day.");
   });
 
   it("keeps at most 40 days of history", () => {
     const long = Array.from({ length: 60 }, (_, i) => ({ date: `2026-06-${i}`, score: 10 }));
-    const { history } = computeFlowScore(inputs(), long);
+    // toolCalls gives today a signal, so it is one of the days being capped.
+    const { history } = computeFlowScore(
+      inputs({ transcript: transcript({ toolCalls: 1 }) }),
+      long,
+    );
     expect(history.length).toBeLessThanOrEqual(40);
     expect(history.some((h) => h.date === "2026-08-28")).toBe(true);
   });
@@ -512,8 +530,6 @@ describe("pulseDateString", () => {
 });
 
 describe("toPulseSessions", () => {
-  const NOW = new Date("2026-08-28T14:30:00").getTime();
-
   function live(extra: Partial<SessionConfig> = {}): SessionConfig {
     return {
       id: 1,
@@ -527,58 +543,61 @@ describe("toPulseSessions", () => {
   }
 
   it("reads the repo off the directory the shell actually runs in", () => {
-    const [session] = toPulseSessions(
-      [live({ worktree_path: "/Users/alex/Repos/.worktrees/feat-x", working_directory: null })],
-      NOW,
-    );
+    const [session] = toPulseSessions([
+      live({ worktree_path: "/Users/alex/Repos/.worktrees/feat-x", working_directory: null }),
+    ]);
     expect(session.repo).toBe("feat-x");
   });
 
   it("prefers the working directory in a multi-repo workspace", () => {
-    const [session] = toPulseSessions(
-      [live({ working_directory: "/Users/alex/Repos/maestro/packages/cli" })],
-      NOW,
-    );
+    const [session] = toPulseSessions([
+      live({ working_directory: "/Users/alex/Repos/maestro/packages/cli" }),
+    ]);
     expect(session.repo).toBe("cli");
   });
 
   it("counts only NeedsInput as waiting, and carries the question", () => {
-    const [needsInput, done] = toPulseSessions(
-      [
-        live({ id: 1, status: "NeedsInput", needsInputPrompt: "Rebase or merge?" }),
-        live({ id: 2, status: "Done", statusMessage: "Tests green" }),
-      ],
-      NOW,
-    );
+    const [needsInput, done] = toPulseSessions([
+      live({ id: 1, status: "NeedsInput", needsInputPrompt: "Rebase or merge?" }),
+      live({ id: 2, status: "Done", statusMessage: "Tests green" }),
+    ]);
     expect(needsInput.waiting).toBe(true);
     expect(needsInput.lastAction).toBe("Rebase or merge?");
     expect(done.waiting).toBe(false);
     expect(done.lastAction).toBe("Tests green");
   });
 
-  it("treats a live session as never stale, and dates a silent one now", () => {
-    const [session] = toPulseSessions([live()], NOW);
+  it("dates a silent session null rather than fabricating now", () => {
+    const [session] = toPulseSessions([live()]);
     expect(session.stale).toBe(false);
-    expect(session.lastActive).toBe(NOW);
+    expect(session.lastActive).toBeNull();
   });
 
   it("keeps the MCP timestamp when there is one", () => {
-    const [session] = toPulseSessions([live({ lastMcpUpdateTime: 1234 })], NOW);
+    const [session] = toPulseSessions([live({ lastMcpUpdateTime: 1234 })]);
     expect(session.lastActive).toBe(1234);
   });
 });
 
 describe("countPrsOn", () => {
+  // Every timestamp lands at 20:00-21:00Z so it stays on the same calendar
+  // date under the suite's UTC-11 test timezone (Pacific/Pago_Pago) — an
+  // early-morning Z time would roll back to the previous local day there.
   function pr(number: number, createdAt: string, mergedAt: string | null = null): PullRequestInfo {
-    return { number, createdAt, mergedAt } as PullRequestInfo;
+    return {
+      number,
+      url: `https://github.com/x/y/pull/${number}`,
+      createdAt,
+      mergedAt,
+    } as PullRequestInfo;
   }
 
   it("counts opens and merges that fall on the given local day", () => {
     const counts = countPrsOn(
       [
-        pr(1, "2026-08-28T08:00:00Z"),
-        pr(2, "2026-08-27T08:00:00Z", "2026-08-28T09:00:00Z"),
-        pr(3, "2026-08-26T08:00:00Z", "2026-08-26T09:00:00Z"),
+        pr(1, "2026-08-28T20:00:00Z"),
+        pr(2, "2026-08-27T20:00:00Z", "2026-08-28T20:00:00Z"),
+        pr(3, "2026-08-26T20:00:00Z", "2026-08-26T21:00:00Z"),
       ],
       "2026-08-28",
     );
@@ -587,7 +606,7 @@ describe("countPrsOn", () => {
 
   it("counts a PR opened and merged the same day in both", () => {
     const counts = countPrsOn(
-      [pr(1, "2026-08-28T08:00:00Z", "2026-08-28T11:00:00Z")],
+      [pr(1, "2026-08-28T20:00:00Z", "2026-08-28T21:00:00Z")],
       "2026-08-28",
     );
     expect(counts).toEqual({ opened: 1, merged: 1 });
