@@ -326,8 +326,12 @@ fn accept(
 /// The drop file's modification time — how old the ADVICE is, which is not the
 /// same as how long ago we happened to read it. Falls back to now only when the
 /// filesystem cannot say.
-fn written_at(_path: &Path) -> DateTime<Utc> {
-    Utc::now()
+fn written_at(path: &Path) -> DateTime<Utc> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(DateTime::<Utc>::from)
+        .unwrap_or_else(Utc::now)
 }
 
 /// Reads every dropped file in `dir` into the queue, then invalidates what went
@@ -478,7 +482,8 @@ pub fn apply_scope(state: &mut State, scope: Vec<ScopeEntry>) {
         })
         .collect();
     for proposal in state.proposals.iter_mut() {
-        if proposal.status == ProposalStatus::Pending
+        if (proposal.status == ProposalStatus::Pending
+            || proposal.status == ProposalStatus::Approved)
             && !is_in_scope(proposal.target_session_id, &state.scope, launch)
         {
             proposal.status = ProposalStatus::Blocked;
