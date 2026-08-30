@@ -77,6 +77,7 @@ import {
 import { useGitStore } from "./stores/useGitStore";
 import { useHealthStore } from "./stores/useHealthStore";
 import { useHomeViewStore } from "./stores/useHomeViewStore";
+import { useOrchestratorViewStore } from "./stores/useOrchestratorViewStore";
 import { useTerminalSettingsStore } from "./stores/useTerminalSettingsStore";
 import { useUpdateStore } from "./stores/useUpdateStore";
 import { useWorkflowsViewStore } from "./stores/useWorkflowsViewStore";
@@ -116,6 +117,16 @@ const HomeView = lazy(() =>
  */
 const FactoryView = lazy(() =>
   import("./components/factory/FactoryView").then((m) => ({ default: m.FactoryView })),
+);
+
+/**
+ * Orchestrator — the goal box, session scope and safe-mode proposal queue.
+ * Same lazy overlay shell as the rest.
+ */
+const OrchestratorView = lazy(() =>
+  import("./components/orchestrator/OrchestratorView").then((m) => ({
+    default: m.OrchestratorView,
+  })),
 );
 
 /** Header title for each git-panel tab. */
@@ -202,6 +213,8 @@ function App() {
   const closeHomeView = useHomeViewStore((s) => s.close);
   const factoryViewOpen = useFactoryViewStore((s) => s.isOpen);
   const closeFactoryView = useFactoryViewStore((s) => s.close);
+  const orchestratorViewOpen = useOrchestratorViewStore((s) => s.isOpen);
+  const closeOrchestratorView = useOrchestratorViewStore((s) => s.close);
   // Marks the landscape button while a terminal anywhere is blocked on you.
   const needsInputAnywhere = useSessionStore((s) =>
     s.sessions.some((session) => session.status === "NeedsInput"),
@@ -806,12 +819,14 @@ function App() {
       landscapeView ||
       useWorkflowsViewStore.getState().isOpen ||
       useHomeViewStore.getState().isOpen ||
-      useFactoryViewStore.getState().isOpen;
+      useFactoryViewStore.getState().isOpen ||
+      useOrchestratorViewStore.getState().isOpen;
     if (overlayUp) {
       setLandscapeView(false);
       useWorkflowsViewStore.getState().close();
       useHomeViewStore.getState().close();
       useFactoryViewStore.getState().close();
+      useOrchestratorViewStore.getState().close();
       useBoardViewStore.getState().open();
       return;
     }
@@ -827,6 +842,7 @@ function App() {
       setLandscapeView(false);
       useWorkflowsViewStore.getState().close();
       useFactoryViewStore.getState().close();
+      useOrchestratorViewStore.getState().close();
     }
     useHomeViewStore.getState().toggle();
   }, []);
@@ -844,6 +860,7 @@ function App() {
       setEagleView(false);
       useHomeViewStore.getState().close();
       useFactoryViewStore.getState().close();
+      useOrchestratorViewStore.getState().close();
       useWorkflowsViewStore.getState().close();
       selectTab(item.tabId);
 
@@ -864,14 +881,27 @@ function App() {
       setLandscapeView(false);
       useWorkflowsViewStore.getState().close();
       useHomeViewStore.getState().close();
+      useOrchestratorViewStore.getState().close();
     }
     useFactoryViewStore.getState().toggle();
+  }, []);
+
+  const handleToggleOrchestratorView = useCallback(() => {
+    const willOpen = !useOrchestratorViewStore.getState().isOpen;
+    if (willOpen) {
+      setLandscapeView(false);
+      useWorkflowsViewStore.getState().close();
+      useHomeViewStore.getState().close();
+      useFactoryViewStore.getState().close();
+    }
+    useOrchestratorViewStore.getState().toggle();
   }, []);
 
   useEffect(() => {
     if (landscapeView || workflowsViewOpen) {
       closeHomeView();
       useFactoryViewStore.getState().close();
+      useOrchestratorViewStore.getState().close();
     }
   }, [landscapeView, workflowsViewOpen, closeHomeView]);
 
@@ -1004,6 +1034,7 @@ function App() {
     onToggleLandscapeView: useCallback(() => setLandscapeView((v) => !v), []),
     onToggleHomeView: handleToggleHomeView,
     onToggleFactoryView: handleToggleFactoryView,
+    onToggleOrchestratorView: handleToggleOrchestratorView,
     onToggleQuickOpen: useCallback(() => setQuickOpenOpen((v) => !v), []),
     onNextProject: switchToNextTab,
     onPrevProject: switchToPrevTab,
@@ -1097,6 +1128,8 @@ function App() {
               onToggleHomeView={handleToggleHomeView}
               factoryViewOpen={factoryViewOpen}
               onToggleFactoryView={handleToggleFactoryView}
+              orchestratorViewOpen={orchestratorViewOpen}
+              onToggleOrchestratorView={handleToggleOrchestratorView}
               homeAttention={needsInputAnywhere}
               onToggleMemoryPanel={() => handleToggleUtilityPanel("memory")}
               processesPanelOpen={utilityPanel === "processes"}
@@ -1183,7 +1216,11 @@ function App() {
                   onShowGrid={closeBoardView}
                   onOpenProject={handleBoardOpenProject}
                   overlayOpen={
-                    landscapeView || workflowsViewOpen || homeViewOpen || factoryViewOpen
+                    landscapeView ||
+                    workflowsViewOpen ||
+                    homeViewOpen ||
+                    factoryViewOpen ||
+                    orchestratorViewOpen
                   }
                 />
               )}
@@ -1245,6 +1282,19 @@ function App() {
                   }
                 >
                   <FactoryView onClose={closeFactoryView} />
+                </Suspense>
+              )}
+
+              {/* Orchestrator — the goal box + proposal queue, same overlay shell. */}
+              {orchestratorViewOpen && (
+                <Suspense
+                  fallback={
+                    <div className="absolute inset-0 z-50 flex items-center justify-center bg-maestro-bg text-xs text-maestro-muted">
+                      Loading…
+                    </div>
+                  }
+                >
+                  <OrchestratorView onClose={closeOrchestratorView} />
                 </Suspense>
               )}
             </main>

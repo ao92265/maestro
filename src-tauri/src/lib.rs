@@ -1289,6 +1289,15 @@ pub fn run() {
             commands::act_engine::act_engine_stop,
             // Vanguard feed (band snapshot for the launchd digest script)
             commands::vanguard::write_band_snapshot,
+            // Orchestrator lane (goal box, session scope, safe-mode proposal queue)
+            commands::orchestrator::orchestrator_ingest,
+            commands::orchestrator::orchestrator_decide,
+            commands::orchestrator::orchestrator_claim,
+            commands::orchestrator::orchestrator_mark,
+            commands::orchestrator::orchestrator_set_safe_mode,
+            commands::orchestrator::orchestrator_set_scope,
+            commands::orchestrator::orchestrator_clear,
+            commands::orchestrator::orchestrator_drop_dir,
             // Claude auto-memory commands
             commands::memory::list_memory_projects,
             commands::memory::list_memory_files,
