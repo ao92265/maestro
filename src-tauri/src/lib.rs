@@ -1264,6 +1264,8 @@ pub fn run() {
             commands::ecosystem::ecosystem_health,
             // Claude handoff files (Home view's parked-session triage)
             commands::handoffs::get_handoffs,
+            commands::handoffs::dismiss_handoff,
+            commands::reply_draft::draft_session_reply,
             // ACT relay (Factory view — CSP blocks direct local HTTP)
             commands::act::act_list_runs,
             commands::act::act_get_run,

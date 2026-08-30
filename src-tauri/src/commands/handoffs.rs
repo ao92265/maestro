@@ -235,6 +235,63 @@ pub fn get_handoffs() -> Result<Vec<HandoffInfo>, String> {
     Ok(handoffs.into_iter().map(|(_, handoff)| handoff).collect())
 }
 
+/// Deletes one handoff snapshot and its compact sibling.
+///
+/// Ported from rohcna's `dismissHandoff` (server.js:886), guard included: the
+/// slug arrives from the UI and is only ever a flat basename (handoff paths are
+/// dash-encoded), so anything outside `[A-Za-z0-9_.-]` is stripped and the
+/// resolved path is re-checked against the handoffs root. The dot survives so
+/// dotfile directories (`.claude`, `.worktrees`) keep their slugs.
+///
+/// Returns whether anything was actually deleted — a slug with no files left
+/// (already dismissed, or swept by another window) is a no-op, not an error.
+fn dismiss_handoff_in(slug: &str, root: &Path) -> Result<bool, String> {
+    let base: String = slug
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.' || *c == '-')
+        .collect();
+    if base.is_empty() || base.contains("..") {
+        return Err(format!("Refusing to dismiss unsafe handoff slug: {slug}"));
+    }
+
+    // `root` itself may not exist (no handoffs ever written); resolve what we
+    // can so the containment check below still has something to compare.
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut deleted = false;
+
+    for suffix in [".md", ".compact.md"] {
+        let candidate = root.join(format!("{base}{suffix}"));
+        // Resolve through symlinks before trusting the path: a symlinked
+        // handoff pointing outside the directory must not be followed.
+        let Ok(resolved) = candidate.canonicalize() else {
+            continue;
+        };
+        if !resolved.starts_with(&canonical_root) {
+            continue;
+        }
+        match std::fs::remove_file(&resolved) {
+            Ok(()) => deleted = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Could not dismiss handoff {}: {error}",
+                    resolved.display()
+                ));
+            }
+        }
+    }
+
+    Ok(deleted)
+}
+
+/// Dismisses a parked handoff the user has finished with, deleting its
+/// snapshot from `~/.claude/handoffs`.
+#[tauri::command]
+pub fn dismiss_handoff(slug: String) -> Result<bool, String> {
+    let root = handoffs_root()?;
+    dismiss_handoff_in(&slug, &root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,5 +400,96 @@ mod tests {
 
         assert!(handoff.stale);
         assert!(handoff.orphan);
+    }
+
+    // ---- dismiss_handoff (path-traversal guard) --------------------------
+
+    /// Writes `<slug>.md` and `<slug>.compact.md` into `dir`.
+    fn write_pair(dir: &Path, slug: &str) {
+        std::fs::write(dir.join(format!("{slug}.md")), "# handoff\n").expect("write handoff");
+        std::fs::write(dir.join(format!("{slug}.compact.md")), "# compact\n")
+            .expect("write compact");
+    }
+
+    #[test]
+    fn dismiss_removes_the_snapshot_and_its_compact_sibling() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let root = temp_dir.path();
+        write_pair(root, "repo-main");
+
+        assert_eq!(dismiss_handoff_in("repo-main", root), Ok(true));
+        assert!(!root.join("repo-main.md").exists());
+        assert!(!root.join("repo-main.compact.md").exists());
+    }
+
+    #[test]
+    fn dismiss_leaves_other_handoffs_alone() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let root = temp_dir.path();
+        write_pair(root, "repo-main");
+        write_pair(root, "other-repo");
+
+        assert_eq!(dismiss_handoff_in("repo-main", root), Ok(false | true));
+        assert!(root.join("other-repo.md").exists());
+        assert!(root.join("other-repo.compact.md").exists());
+    }
+
+    #[test]
+    fn dismiss_of_an_already_gone_slug_is_a_no_op_not_an_error() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+
+        assert_eq!(dismiss_handoff_in("never-existed", temp_dir.path()), Ok(false));
+    }
+
+    #[test]
+    fn dismiss_keeps_dotfile_slugs_working() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let root = temp_dir.path();
+        write_pair(root, ".claude-worktrees-thing");
+
+        assert_eq!(dismiss_handoff_in(".claude-worktrees-thing", root), Ok(true));
+        assert!(!root.join(".claude-worktrees-thing.md").exists());
+    }
+
+    /// The slug reaches this command straight from the UI, so traversal has to
+    /// be blocked at the boundary rather than trusted upstream.
+    #[test]
+    fn dismiss_refuses_traversal_slugs() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let root = temp_dir.path().join("handoffs");
+        std::fs::create_dir_all(&root).expect("handoffs dir");
+        let outside = temp_dir.path().join("secret.md");
+        std::fs::write(&outside, "keep me").expect("write outside file");
+
+        // Separators are stripped, leaving "....secret" — no such file, so the
+        // call is a clean no-op. What matters is that `outside` survives.
+        for slug in ["../secret", "..%2Fsecret", "../../etc/passwd"] {
+            let _ = dismiss_handoff_in(slug, &root);
+            assert!(outside.exists(), "slug {slug} escaped the handoffs root");
+        }
+    }
+
+    #[test]
+    fn dismiss_rejects_a_slug_that_sanitizes_to_nothing() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+
+        assert!(dismiss_handoff_in("/////", temp_dir.path()).is_err());
+        assert!(dismiss_handoff_in("", temp_dir.path()).is_err());
+    }
+
+    /// A symlinked handoff must not become a way to delete the target.
+    #[cfg(unix)]
+    #[test]
+    fn dismiss_does_not_follow_a_symlink_out_of_the_root() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let root = temp_dir.path().join("handoffs");
+        std::fs::create_dir_all(&root).expect("handoffs dir");
+        let outside = temp_dir.path().join("target.md");
+        std::fs::write(&outside, "keep me").expect("write outside file");
+        std::os::unix::fs::symlink(&outside, root.join("escape.md")).expect("symlink");
+
+        let _ = dismiss_handoff_in("escape", &root);
+
+        assert!(outside.exists(), "symlinked handoff deleted its target");
     }
 }

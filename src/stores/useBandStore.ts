@@ -95,6 +95,13 @@ interface BandDataState {
   refresh: () => Promise<void>;
   /** "I have looked": merged PRs up to now stop counting as news. */
   markSeen: () => void;
+  /**
+   * Delete a parked handoff the user is finished with, dropping it from the
+   * list without waiting for the next 5-minute refresh. Resolves to the
+   * error string on failure, or null on success — the caller decides how
+   * loudly to say so.
+   */
+  dismissHandoff: (slug: string) => Promise<string | null>;
 }
 
 export const useBandStore = create<BandDataState>((set, get) => ({
@@ -219,5 +226,20 @@ export const useBandStore = create<BandDataState>((set, get) => ({
     const now = Date.now();
     localStorage.setItem(WATERMARK_KEY, String(now));
     set({ watermarkMs: now });
+  },
+
+  dismissHandoff: async (slug) => {
+    try {
+      await invoke<boolean>("dismiss_handoff", { slug });
+    } catch (err) {
+      /* The file is still on disk, so the row must stay: dropping it here
+         would hide a handoff the next refresh brings straight back. */
+      return String(err);
+    }
+    /* Drop it locally rather than re-running the whole refresh — the PR polls
+       in `refresh` cost seconds of `gh` calls this action has no use for.
+       A dismiss that deleted nothing (already gone) still removes the row. */
+    set({ handoffs: get().handoffs.filter((h) => h.slug !== slug) });
+    return null;
   },
 }));

@@ -10,6 +10,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 import { invoke } from "@tauri-apps/api/core";
 
+import { useClosedSessionsStore } from "../useClosedSessionsStore";
 import { type SessionConfig, useSessionStore } from "../useSessionStore";
 
 const invokeMock = vi.mocked(invoke);
@@ -40,6 +41,7 @@ describe("useSessionStore removeSessionsForProject", () => {
         3: { project: KEPT, epic: "e", generation: 1, state: "WORKING" },
       },
     });
+    useClosedSessionsStore.setState({ batches: [] });
     invokeMock.mockReset();
     vi.spyOn(console, "error").mockImplementation(() => {});
   });
@@ -82,5 +84,27 @@ describe("useSessionStore removeSessionsForProject", () => {
     await useSessionStore.getState().removeSessionsForProject("C:/never-opened");
 
     expect(useSessionStore.getState().sessions.map((s) => s.id)).toEqual([1, 2, 3]);
+  });
+
+  it("records the removed batch so the close can be reopened", async () => {
+    invokeMock.mockResolvedValue([session(1, GONE), session(2, GONE)]);
+
+    await useSessionStore.getState().removeSessionsForProject(GONE);
+
+    const [batch] = useClosedSessionsStore.getState().batches;
+    expect(batch.projectPath).toBe(GONE);
+    expect(batch.projectName).toBe("gone");
+    expect(batch.sessions.map((s) => s.id)).toEqual([1, 2]);
+  });
+
+  /* The reject path fires when the project directory has gone. Offering to
+     reopen sessions in a directory that no longer exists would be a button
+     that can only fail. */
+  it("records nothing when the backend rejected (the directory is gone)", async () => {
+    invokeMock.mockRejectedValue(new Error("Invalid project path"));
+
+    await useSessionStore.getState().removeSessionsForProject(GONE);
+
+    expect(useClosedSessionsStore.getState().batches).toEqual([]);
   });
 });
