@@ -95,7 +95,7 @@ struct ResolveGateBody<'a> {
     input: Option<&'a str>,
 }
 
-fn client() -> Result<Client, String> {
+pub(crate) fn client() -> Result<Client, String> {
     Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()
@@ -117,7 +117,7 @@ pub(crate) fn base_url() -> String {
 /// Reads the Tauri process env: a token exported only in .zshrc is invisible
 /// to a packaged app launched from Finder. Launch from a shell or set it via
 /// launchd if the token is ever required.
-fn with_act_token(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+pub(crate) fn with_act_token(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     match std::env::var("ACT_DASHBOARD_TOKEN") {
         Ok(token) if !token.is_empty() => request.header("x-act-token", token),
         _ => request,
@@ -126,7 +126,7 @@ fn with_act_token(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
 
 /// Read the body of a failed mutating call so the error names what ACT said
 /// ("gate not found", "unauthorized…") instead of a bare status code.
-async fn failure_with_body(response: reqwest::Response) -> String {
+pub(crate) async fn failure_with_body(response: reqwest::Response) -> String {
     let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
     let detail = serde_json::from_str::<Value>(&body)
@@ -140,7 +140,7 @@ async fn failure_with_body(response: reqwest::Response) -> String {
     }
 }
 
-fn endpoint(segments: &[&str]) -> Result<Url, String> {
+pub(crate) fn endpoint(segments: &[&str]) -> Result<Url, String> {
     let mut url = Url::parse(&base_url()).map_err(|error| format!("Invalid ACT URL: {error}"))?;
     let mut path = url
         .path_segments_mut()
@@ -179,7 +179,7 @@ fn js_string(value: &Value) -> String {
     }
 }
 
-fn truthy_string(value: Option<&Value>) -> Option<String> {
+pub(crate) fn truthy_string(value: Option<&Value>) -> Option<String> {
     value.filter(|value| is_js_truthy(value)).map(js_string)
 }
 
@@ -246,7 +246,7 @@ fn normalize_run_detail(raw: &Value) -> Option<ActRunDetail> {
     })
 }
 
-fn response_error(status: u16) -> String {
+pub(crate) fn response_error(status: u16) -> String {
     format!("ACT returned HTTP {status}")
 }
 

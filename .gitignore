@@ -77,3 +77,6 @@ website/.jekyll-metadata
 
 # Maestro staged launch briefs
 .maestro/
+
+# ACT engine runtime state (intervention history, replays, worktrees)
+.act/

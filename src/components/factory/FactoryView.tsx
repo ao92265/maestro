@@ -1,9 +1,20 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { ArrowLeft, ExternalLink, Factory, RefreshCw, Send, X } from "lucide-react";
+import {
+  ArrowLeft,
+  ExternalLink,
+  Factory,
+  RefreshCw,
+  Send,
+  SlidersHorizontal,
+  X,
+} from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { ControlPanel } from "@/components/factory/control/ControlPanel";
+import { relAgo } from "@/components/factory/control/primitives";
 import { EngineBadge } from "@/components/factory/EngineBadge";
 import { badgeBaseClass } from "@/components/session/agentPresentation";
 import { type ActRun, type ActSpecInput, isTerminal, runNeedsYou, stageSummary } from "@/lib/act";
+import { useActControlStore } from "@/stores/useActControlStore";
 import { useActEngineStore } from "@/stores/useActEngineStore";
 import { ACT_STALE_MS, useActStore } from "@/stores/useActStore";
 
@@ -26,18 +37,6 @@ const RUN_BADGES: Record<string, string> = {
 
 function runBadge(status: string): string {
   return RUN_BADGES[status] ?? "bg-maestro-muted/15 text-maestro-muted";
-}
-
-function relAgo(iso: string | null): string {
-  if (!iso) return "";
-  const ms = Date.now() - Date.parse(iso);
-  if (!Number.isFinite(ms) || ms < 0) return "";
-  const mins = Math.floor(ms / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
-  const hours = Math.floor(mins / 60);
-  if (hours < 48) return `${hours}h ago`;
-  return `${Math.floor(hours / 24)}d ago`;
 }
 
 const fieldClass =
@@ -328,16 +327,25 @@ function RunDetail({ onBack }: { onBack: () => void }) {
   );
 }
 
+type FactoryTab = "runs" | "control";
+
 /**
- * Factory — the ACT lane. Hand a spec over on the left, watch runs on the
- * right, unblock a gated run in place. ACT unreachable renders as an offline
- * chip and yesterday's list, never an error wall.
+ * Factory — the ACT lane. Two tabs over one engine: Runs hands a spec over and
+ * watches it through, Control shows and sets what the engine is allowed to do
+ * on its own. ACT unreachable renders as an offline chip and yesterday's list,
+ * never an error wall.
  */
 export function FactoryView({ onClose }: FactoryViewProps) {
+  const [tab, setTab] = useState<FactoryTab>("runs");
   const { runs, gatedRuns, fetchedAt, error, isPolling, detail, refresh, openDetail, closeDetail } =
     useActStore();
 
   const refreshEngine = useActEngineStore((state) => state.refresh);
+  const refreshControl = useActControlStore((state) => state.refreshAll);
+  /* The two lanes poll separately, so the header control has to follow
+     whichever one is on screen rather than the runs poller alone. */
+  const isControlPolling = useActControlStore((state) => state.isPolling);
+  const tabIsPolling = tab === "control" ? isControlPolling : isPolling;
   const engineState = useActEngineStore((state) => state.status?.state ?? null);
 
   useEffect(() => {
@@ -364,19 +372,46 @@ export function FactoryView({ onClose }: FactoryViewProps) {
         <Factory size={13} className="text-maestro-muted" />
         <span className="text-[12px] font-semibold text-maestro-text">Factory</span>
         <EngineBadge runsFetchedAt={fetchedAt} stale={stale} />
-        <span className="text-[11px] text-maestro-muted">
-          {runs.length} run{runs.length === 1 ? "" : "s"}
-          {gatedRuns.length > 0 && ` · ${gatedRuns.length} waiting on you`}
-        </span>
+        <div className="flex overflow-hidden rounded border border-maestro-border">
+          {(
+            [
+              ["runs", "Runs", Factory],
+              ["control", "Control", SlidersHorizontal],
+            ] as const
+          ).map(([id, label, Icon]) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => setTab(id)}
+              aria-pressed={tab === id}
+              className={`flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium transition-colors ${
+                tab === id
+                  ? "bg-maestro-accent/20 text-maestro-accent"
+                  : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
+              }`}
+            >
+              <Icon size={11} />
+              {label}
+            </button>
+          ))}
+        </div>
+        {tab === "runs" && (
+          <span className="text-[11px] text-maestro-muted">
+            {runs.length} run{runs.length === 1 ? "" : "s"}
+            {gatedRuns.length > 0 && ` · ${gatedRuns.length} waiting on you`}
+          </span>
+        )}
         <div className="flex-1" />
         <button
           type="button"
-          onClick={() => void refresh()}
-          disabled={isPolling}
+          onClick={() => {
+            void (tab === "control" ? refreshControl() : refresh());
+          }}
+          disabled={tabIsPolling}
           className="rounded p-1.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text disabled:opacity-50"
-          aria-label="Refresh runs"
+          aria-label={tab === "control" ? "Refresh control panel" : "Refresh runs"}
         >
-          <RefreshCw size={13} className={isPolling ? "animate-spin" : ""} />
+          <RefreshCw size={13} className={tabIsPolling ? "animate-spin" : ""} />
         </button>
         <button
           type="button"
@@ -389,31 +424,33 @@ export function FactoryView({ onClose }: FactoryViewProps) {
       </div>
 
       <div className="flex flex-1 overflow-hidden">
-        <SpecForm />
-        {detail ? (
-          <RunDetail onBack={closeDetail} />
-        ) : (
-          <div className="flex flex-1 flex-col gap-1.5 overflow-y-auto p-3">
-            {runs.length === 0 ? (
-              <p className="rounded border border-dashed border-maestro-border px-3 py-2 text-[11px] text-maestro-muted/70">
-                {engineState === "starting"
-                  ? "ACT is starting. The list fills itself as soon as it answers."
-                  : offline
-                    ? "ACT is not running. Press Start ACT above and the factory picks it up on its own."
-                    : "No runs yet. Hand over a spec on the left."}
-              </p>
-            ) : (
-              runs.map((run) => (
-                <RunRow
-                  key={run.id}
-                  run={run}
-                  gated={gatedIds.has(run.id)}
-                  onOpen={() => void openDetail(run.id)}
-                />
-              ))
-            )}
-          </div>
-        )}
+        {tab === "control" && <ControlPanel />}
+        {tab === "runs" && <SpecForm />}
+        {tab === "runs" &&
+          (detail ? (
+            <RunDetail onBack={closeDetail} />
+          ) : (
+            <div className="flex flex-1 flex-col gap-1.5 overflow-y-auto p-3">
+              {runs.length === 0 ? (
+                <p className="rounded border border-dashed border-maestro-border px-3 py-2 text-[11px] text-maestro-muted/70">
+                  {engineState === "starting"
+                    ? "ACT is starting. The list fills itself as soon as it answers."
+                    : offline
+                      ? "ACT is not running. Press Start ACT above and the factory picks it up on its own."
+                      : "No runs yet. Hand over a spec on the left."}
+                </p>
+              ) : (
+                runs.map((run) => (
+                  <RunRow
+                    key={run.id}
+                    run={run}
+                    gated={gatedIds.has(run.id)}
+                    onOpen={() => void openDetail(run.id)}
+                  />
+                ))
+              )}
+            </div>
+          ))}
       </div>
     </div>
   );
