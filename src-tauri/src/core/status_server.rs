@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use chrono::Utc;
@@ -22,6 +22,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;
 
 use super::claude_event::ClaudeEvent;
+use super::process_manager::ProcessManager;
 
 /// Maximum number of pending statuses to buffer (prevents memory leaks).
 const MAX_PENDING_STATUSES: usize = 100;
@@ -124,6 +125,10 @@ struct ServerState {
     /// are cleared by the signals that genuinely end the wait (PostToolUse,
     /// UserPromptSubmit, Stop, SessionEnd), so the map stays session-bounded.
     notified_at: Arc<RwLock<HashMap<u32, Instant>>>,
+    /// Shared secret for the control door routes (loopback only).
+    control_token: Option<String>,
+    /// PTY access for the control/answer route.
+    process_manager: Option<ProcessManager>,
 }
 
 /// HTTP status server that receives status updates from MCP servers.
@@ -146,6 +151,8 @@ fn build_router(state: Arc<ServerState>) -> Router {
         .route("/hook/stop", post(handle_hook_stop))
         .route("/hook/notification", post(handle_hook_notification))
         .route("/hook/user-prompt", post(handle_hook_user_prompt_submit))
+        .route("/control/sessions", get(handle_control_sessions))
+        .route("/control/answer", post(handle_control_answer))
         .with_state(state)
 }
 
@@ -192,6 +199,7 @@ impl StatusServer {
         app_handle: AppHandle,
         instance_id: String,
         hook_emit_fn: Option<Arc<dyn Fn(ClaudeEvent) + Send + Sync>>,
+        process_manager: Option<ProcessManager>,
     ) -> Option<Self> {
         // Find and bind in one step to avoid race conditions where another
         // process grabs the port between checking and binding
@@ -200,6 +208,8 @@ impl StatusServer {
         let pending_statuses = Arc::new(RwLock::new(HashMap::new()));
         let emit_fn = emit_fn_from_app_handle(app_handle);
 
+        let control_token = load_or_create_control_token().await;
+
         let state = Arc::new(ServerState {
             emit_fn: emit_fn.clone(),
             hook_emit_fn,
@@ -207,6 +217,8 @@ impl StatusServer {
             session_projects: session_projects.clone(),
             pending_statuses: pending_statuses.clone(),
             notified_at: Arc::new(RwLock::new(HashMap::new())),
+            control_token,
+            process_manager,
         });
 
         let app = build_router(state);
@@ -955,6 +967,169 @@ async fn handle_hook_stop(
     StatusCode::OK
 }
 
+// ── Control door ────────────────────────────────────────────────────
+
+fn control_token_path() -> std::path::PathBuf {
+    directories::BaseDirs::new()
+        .expect("home directory")
+        .home_dir()
+        .join(".maestro")
+        .join("control-token")
+}
+
+async fn load_or_create_control_token() -> Option<String> {
+    let path = control_token_path();
+    if let Ok(token) = tokio::fs::read_to_string(&path).await {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            eprintln!("[CONTROL] Loaded control token from {}", path.display());
+            return Some(token);
+        }
+    }
+    let token = uuid::Uuid::new_v4().to_string().replace('-', "");
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    // Owner-only permissions (0600).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                let _ = f.write_all(token.as_bytes());
+            }
+            Err(e) => {
+                eprintln!("[CONTROL] Failed to write control token: {e}");
+                return None;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(e) = tokio::fs::write(&path, &token).await {
+            eprintln!("[CONTROL] Failed to write control token: {e}");
+            return None;
+        }
+    }
+    eprintln!("[CONTROL] Generated control token at {}", path.display());
+    Some(token)
+}
+
+fn verify_control_token(headers: &HeaderMap, expected: &Option<String>) -> bool {
+    let Some(expected) = expected.as_deref() else {
+        return false;
+    };
+    headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|got| got == expected)
+        .unwrap_or(false)
+}
+
+fn is_loopback_request(headers: &HeaderMap) -> bool {
+    for key in ["host", "origin"] {
+        if let Some(val) = headers.get(key).and_then(|v| v.to_str().ok()) {
+            let host_part = val
+                .strip_prefix("http://")
+                .or_else(|| val.strip_prefix("https://"))
+                .unwrap_or(val);
+            let host = host_part.split(':').next().unwrap_or("");
+            if !matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]") {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[derive(Serialize)]
+struct ControlSession {
+    session_id: u32,
+    project_path: String,
+}
+
+async fn handle_control_sessions(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ControlSession>>, StatusCode> {
+    if !is_loopback_request(&headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !verify_control_token(&headers, &state.control_token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let projects = state.session_projects.read().await;
+    let sessions: Vec<ControlSession> = projects
+        .iter()
+        .map(|(&id, path)| ControlSession {
+            session_id: id,
+            project_path: path.clone(),
+        })
+        .collect();
+    Ok(Json(sessions))
+}
+
+#[derive(Deserialize)]
+struct ControlAnswerRequest {
+    session_id: u32,
+    text: String,
+}
+
+async fn handle_control_answer(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<ControlAnswerRequest>,
+) -> StatusCode {
+    if !is_loopback_request(&headers) {
+        return StatusCode::FORBIDDEN;
+    }
+    if !verify_control_token(&headers, &state.control_token) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    // Only answer a session that is genuinely still blocked (NeedsInput).
+    // If notified_at has no entry for this session, it moved on.
+    let is_blocked = state
+        .notified_at
+        .read()
+        .await
+        .contains_key(&payload.session_id);
+    if !is_blocked {
+        eprintln!(
+            "[CONTROL] session {} is not blocked, refusing answer",
+            payload.session_id
+        );
+        return StatusCode::CONFLICT;
+    }
+    let Some(ref pm) = state.process_manager else {
+        eprintln!("[CONTROL] answer: no process manager available");
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
+    let pm = pm.clone();
+    let text = format!("{}\n", payload.text);
+    match tokio::task::spawn_blocking(move || pm.write_stdin(payload.session_id, &text)).await {
+        Ok(Ok(())) => {
+            eprintln!("[CONTROL] Answered session {}", payload.session_id);
+            StatusCode::OK
+        }
+        Ok(Err(e)) => {
+            eprintln!("[CONTROL] write_stdin failed for session {}: {e}", payload.session_id);
+            StatusCode::NOT_FOUND
+        }
+        Err(e) => {
+            eprintln!("[CONTROL] spawn_blocking failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,6 +1172,8 @@ mod tests {
             session_projects: Arc::new(RwLock::new(HashMap::new())),
             pending_statuses: Arc::new(RwLock::new(HashMap::new())),
             notified_at: Arc::new(RwLock::new(HashMap::new())),
+            control_token: None,
+            process_manager: None,
         });
 
         let app = build_router(state.clone());
@@ -2011,6 +2188,8 @@ mod tests {
             session_projects: Arc::new(RwLock::new(HashMap::new())),
             pending_statuses: Arc::new(RwLock::new(HashMap::new())),
             notified_at: Arc::new(RwLock::new(HashMap::new())),
+            control_token: None,
+            process_manager: None,
         });
 
         let app = build_router(state);

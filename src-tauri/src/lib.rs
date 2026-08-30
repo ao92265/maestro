@@ -432,8 +432,9 @@ pub fn run() {
             // IMPORTANT: This must be done synchronously so the server is ready
             // before any commands try to use it
             let app_handle = app.handle().clone();
+            let pm_for_control = app.state::<ProcessManager>().inner().clone();
             let server = tauri::async_runtime::block_on(async {
-                StatusServer::start(app_handle, instance_id, Some(hook_emit_fn)).await
+                StatusServer::start(app_handle, instance_id, Some(hook_emit_fn), Some(pm_for_control)).await
             });
 
             match server {

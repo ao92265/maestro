@@ -8,6 +8,10 @@
 use directories::BaseDirs;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tauri::State;
+
+use crate::core::status_server::StatusServer;
 
 fn snapshot_path() -> Result<PathBuf, String> {
     let base_dirs = BaseDirs::new().ok_or("Could not resolve home directory")?;
@@ -46,7 +50,14 @@ async fn write_atomically(path: &Path, snapshot: &Value) -> Result<(), String> {
 /// frontend (`useVanguardSnapshot`) and the digest script, and typing it here
 /// would force a Rust rebuild for every field the feed adds.
 #[tauri::command]
-pub async fn write_band_snapshot(snapshot: Value) -> Result<(), String> {
+pub async fn write_band_snapshot(
+    snapshot: Value,
+    server: State<'_, Arc<StatusServer>>,
+) -> Result<(), String> {
+    let mut snapshot = snapshot;
+    if let Some(obj) = snapshot.as_object_mut() {
+        obj.insert("controlPort".to_string(), Value::from(server.port()));
+    }
     let path = snapshot_path()?;
     write_atomically(&path, &snapshot).await
 }
