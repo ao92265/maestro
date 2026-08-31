@@ -5,6 +5,7 @@ import {
   Brain,
   Columns,
   Factory,
+  Gauge,
   GitMerge,
   Home,
   LayoutGrid,
@@ -80,6 +81,9 @@ interface TopBarProps {
   /** Orchestrator: goal box, session scope, safe-mode proposal queue */
   orchestratorViewOpen?: boolean;
   onToggleOrchestratorView?: () => void;
+  /** Pulse: today's timeline, flow score and metrics */
+  pulseViewOpen?: boolean;
+  onTogglePulseView?: () => void;
   /** Memory panel — buried behind the More menu, so it toggles without an
    *  active-state indicator (a plain menu action, not a persistent button). */
   onToggleMemoryPanel?: () => void;
@@ -129,6 +133,8 @@ export function TopBar({
   onToggleFactoryView,
   orchestratorViewOpen = false,
   onToggleOrchestratorView,
+  pulseViewOpen = false,
+  onTogglePulseView,
   onToggleMemoryPanel,
   processesPanelOpen = false,
   onToggleProcessesPanel,
@@ -378,6 +384,25 @@ export function TopBar({
             )}
           >
             <RadioTower size={14} />
+          </button>
+        )}
+        {onTogglePulseView && (
+          <button
+            type="button"
+            onClick={onTogglePulseView}
+            className={`relative rounded p-1.5 transition-colors ${
+              pulseViewOpen
+                ? "text-maestro-accent hover:bg-maestro-accent/10"
+                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
+            }`}
+            aria-label="Pulse"
+            title={titleWithShortcut(
+              "Pulse — today's timeline, flow score and metrics",
+              modLabel(),
+              "9",
+            )}
+          >
+            <Gauge size={14} />
           </button>
         )}
         {onToggleEagleView && (

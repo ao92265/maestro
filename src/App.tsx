@@ -78,6 +78,7 @@ import { useGitStore } from "./stores/useGitStore";
 import { useHealthStore } from "./stores/useHealthStore";
 import { useHomeViewStore } from "./stores/useHomeViewStore";
 import { useOrchestratorViewStore } from "./stores/useOrchestratorViewStore";
+import { usePulseViewStore } from "./stores/usePulseViewStore";
 import { useTerminalSettingsStore } from "./stores/useTerminalSettingsStore";
 import { useUpdateStore } from "./stores/useUpdateStore";
 import { useWorkflowsViewStore } from "./stores/useWorkflowsViewStore";
@@ -127,6 +128,15 @@ const OrchestratorView = lazy(() =>
   import("./components/orchestrator/OrchestratorView").then((m) => ({
     default: m.OrchestratorView,
   })),
+);
+
+/**
+ * Pulse — today's timeline, the flow score and the metrics pulse. Same lazy
+ * overlay shell as the rest; its git and transcript scans only run while it
+ * is on screen.
+ */
+const PulseView = lazy(() =>
+  import("./components/pulse/PulseView").then((m) => ({ default: m.PulseView })),
 );
 
 /** Header title for each git-panel tab. */
@@ -215,6 +225,8 @@ function App() {
   const closeFactoryView = useFactoryViewStore((s) => s.close);
   const orchestratorViewOpen = useOrchestratorViewStore((s) => s.isOpen);
   const closeOrchestratorView = useOrchestratorViewStore((s) => s.close);
+  const pulseViewOpen = usePulseViewStore((s) => s.isOpen);
+  const closePulseView = usePulseViewStore((s) => s.close);
   // Marks the landscape button while a terminal anywhere is blocked on you.
   const needsInputAnywhere = useSessionStore((s) =>
     s.sessions.some((session) => session.status === "NeedsInput"),
@@ -820,13 +832,15 @@ function App() {
       useWorkflowsViewStore.getState().isOpen ||
       useHomeViewStore.getState().isOpen ||
       useFactoryViewStore.getState().isOpen ||
-      useOrchestratorViewStore.getState().isOpen;
+      useOrchestratorViewStore.getState().isOpen ||
+      usePulseViewStore.getState().isOpen;
     if (overlayUp) {
       setLandscapeView(false);
       useWorkflowsViewStore.getState().close();
       useHomeViewStore.getState().close();
       useFactoryViewStore.getState().close();
       useOrchestratorViewStore.getState().close();
+      usePulseViewStore.getState().close();
       useBoardViewStore.getState().open();
       return;
     }
@@ -843,6 +857,7 @@ function App() {
       useWorkflowsViewStore.getState().close();
       useFactoryViewStore.getState().close();
       useOrchestratorViewStore.getState().close();
+      usePulseViewStore.getState().close();
     }
     useHomeViewStore.getState().toggle();
   }, []);
@@ -861,6 +876,7 @@ function App() {
       useHomeViewStore.getState().close();
       useFactoryViewStore.getState().close();
       useOrchestratorViewStore.getState().close();
+      usePulseViewStore.getState().close();
       useWorkflowsViewStore.getState().close();
       selectTab(item.tabId);
 
@@ -882,6 +898,7 @@ function App() {
       useWorkflowsViewStore.getState().close();
       useHomeViewStore.getState().close();
       useOrchestratorViewStore.getState().close();
+      usePulseViewStore.getState().close();
     }
     useFactoryViewStore.getState().toggle();
   }, []);
@@ -893,8 +910,21 @@ function App() {
       useWorkflowsViewStore.getState().close();
       useHomeViewStore.getState().close();
       useFactoryViewStore.getState().close();
+      usePulseViewStore.getState().close();
     }
     useOrchestratorViewStore.getState().toggle();
+  }, []);
+
+  const handleTogglePulseView = useCallback(() => {
+    const willOpen = !usePulseViewStore.getState().isOpen;
+    if (willOpen) {
+      setLandscapeView(false);
+      useWorkflowsViewStore.getState().close();
+      useHomeViewStore.getState().close();
+      useFactoryViewStore.getState().close();
+      useOrchestratorViewStore.getState().close();
+    }
+    usePulseViewStore.getState().toggle();
   }, []);
 
   useEffect(() => {
@@ -902,6 +932,7 @@ function App() {
       closeHomeView();
       useFactoryViewStore.getState().close();
       useOrchestratorViewStore.getState().close();
+      usePulseViewStore.getState().close();
     }
   }, [landscapeView, workflowsViewOpen, closeHomeView]);
 
@@ -1035,6 +1066,7 @@ function App() {
     onToggleHomeView: handleToggleHomeView,
     onToggleFactoryView: handleToggleFactoryView,
     onToggleOrchestratorView: handleToggleOrchestratorView,
+    onTogglePulseView: handleTogglePulseView,
     onToggleQuickOpen: useCallback(() => setQuickOpenOpen((v) => !v), []),
     onNextProject: switchToNextTab,
     onPrevProject: switchToPrevTab,
@@ -1130,6 +1162,8 @@ function App() {
               onToggleFactoryView={handleToggleFactoryView}
               orchestratorViewOpen={orchestratorViewOpen}
               onToggleOrchestratorView={handleToggleOrchestratorView}
+              pulseViewOpen={pulseViewOpen}
+              onTogglePulseView={handleTogglePulseView}
               homeAttention={needsInputAnywhere}
               onToggleMemoryPanel={() => handleToggleUtilityPanel("memory")}
               processesPanelOpen={utilityPanel === "processes"}
@@ -1295,6 +1329,19 @@ function App() {
                   }
                 >
                   <OrchestratorView onClose={closeOrchestratorView} />
+                </Suspense>
+              )}
+
+              {/* Pulse — how the day is going, same overlay shell. */}
+              {pulseViewOpen && (
+                <Suspense
+                  fallback={
+                    <div className="absolute inset-0 z-50 flex items-center justify-center bg-maestro-bg text-xs text-maestro-muted">
+                      Loading…
+                    </div>
+                  }
+                >
+                  <PulseView onClose={closePulseView} />
                 </Suspense>
               )}
             </main>
