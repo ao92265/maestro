@@ -19,6 +19,7 @@ pub mod initial_prompt;
 pub mod marketplace;
 pub mod mcp;
 pub mod memory;
+pub mod night_run;
 pub mod orchestrator;
 pub mod plan;
 pub mod plugin;

@@ -3,9 +3,11 @@ import { useEffect } from "react";
 import { engineOffline, lastReadAt, unreadableSubsystems } from "@/lib/actControl";
 import { useActControlStore } from "@/stores/useActControlStore";
 import { ACT_STALE_MS } from "@/stores/useActStore";
+import { useNightRunStore } from "@/stores/useNightRunStore";
 import { AutonomyLadder } from "./AutonomyLadder";
 import { GuardrailFeed } from "./GuardrailFeed";
 import { IntakeLedger } from "./IntakeLedger";
+import { NightRuns } from "./NightRuns";
 import { relAgo } from "./primitives";
 import { ReplayTimeline } from "./ReplayTimeline";
 import { SpendPanel } from "./SpendPanel";
@@ -25,6 +27,7 @@ const POLL_INTERVAL_MS = 30 * 1000;
  */
 export function ControlPanel() {
   const refreshAll = useActControlStore((state) => state.refreshAll);
+  const refreshNightRun = useNightRunStore((state) => state.refresh);
   const policy = useActControlStore((state) => state.policy);
   const rules = useActControlStore((state) => state.rules);
   const events = useActControlStore((state) => state.events);
@@ -35,10 +38,16 @@ export function ControlPanel() {
   const reads = useActControlStore((state) => state.reads);
 
   useEffect(() => {
-    void refreshAll();
-    const timer = setInterval(() => void refreshAll(), POLL_INTERVAL_MS);
+    /* One timer for the whole tab. The night-run schedule keeps its own clock
+       in Rust, so this poll only refreshes what is on screen. */
+    const poll = () => {
+      void refreshAll();
+      void refreshNightRun();
+    };
+    poll();
+    const timer = setInterval(poll, POLL_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [refreshAll]);
+  }, [refreshAll, refreshNightRun]);
 
   const unreadable = unreadableSubsystems(reads);
   const offline = engineOffline(reads);
@@ -80,6 +89,8 @@ export function ControlPanel() {
           ))}
         </div>
       )}
+
+      <NightRuns />
 
       <div className="grid grid-cols-1 gap-2 xl:grid-cols-2">
         <div className="flex flex-col gap-2">
