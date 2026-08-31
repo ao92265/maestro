@@ -2276,4 +2276,115 @@ mod tests {
 
         assert_eq!(resp.status().as_u16(), 400);
     }
+
+    // ── Control door ────────────────────────────────────────────────
+    //
+    // The socket only ever binds 127.0.0.1, so these cover the second gate:
+    // the shared token, and the refusal to type into a session that is not
+    // actually waiting on a human.
+
+    /// A control-door server with a token of our choosing, so the routes can
+    /// be exercised without touching the real ~/.maestro/control-token.
+    async fn start_control_test_server(
+        control_token: Option<String>,
+    ) -> (std::net::SocketAddr, Arc<ServerState>) {
+        let (emit_fn, _events) = test_emit_fn();
+        let state = Arc::new(ServerState {
+            emit_fn,
+            hook_emit_fn: None,
+            instance_id: "inst-control".to_string(),
+            session_projects: Arc::new(RwLock::new(HashMap::new())),
+            pending_statuses: Arc::new(RwLock::new(HashMap::new())),
+            notified_at: Arc::new(RwLock::new(HashMap::new())),
+            control_token,
+            process_manager: None,
+        });
+
+        let app = build_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (addr, state)
+    }
+
+    async fn post_answer(addr: std::net::SocketAddr, bearer: Option<&str>, session_id: u32) -> u16 {
+        let mut req = reqwest::Client::new()
+            .post(format!("http://{}/control/answer", addr))
+            .json(&serde_json::json!({ "session_id": session_id, "text": "yes" }));
+        if let Some(token) = bearer {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+        req.send().await.unwrap().status().as_u16()
+    }
+
+    async fn get_sessions(addr: std::net::SocketAddr, bearer: Option<&str>) -> reqwest::Response {
+        let mut req = reqwest::Client::new().get(format!("http://{}/control/sessions", addr));
+        if let Some(token) = bearer {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+        req.send().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn control_answer_needs_the_token() {
+        let (addr, state) = start_control_test_server(Some("s3cret".to_string())).await;
+        // A blocked session, so the only thing left to fail on is the token.
+        state.notified_at.write().await.insert(1, Instant::now());
+
+        assert_eq!(post_answer(addr, None, 1).await, 401);
+        assert_eq!(post_answer(addr, Some("wrong"), 1).await, 401);
+    }
+
+    #[tokio::test]
+    async fn control_answer_is_shut_when_no_token_could_be_created() {
+        // Writing the token file failed, so control_token is None. That must
+        // read as "closed", never as "no token required".
+        let (addr, state) = start_control_test_server(None).await;
+        state.notified_at.write().await.insert(1, Instant::now());
+
+        assert_eq!(post_answer(addr, None, 1).await, 401);
+        assert_eq!(post_answer(addr, Some("anything"), 1).await, 401);
+    }
+
+    #[tokio::test]
+    async fn control_answer_refuses_a_session_that_is_not_waiting() {
+        // Nothing in notified_at means the session moved on. Typing into it
+        // would land mid-turn, so it is refused rather than best-effort.
+        let (addr, _state) = start_control_test_server(Some("s3cret".to_string())).await;
+
+        assert_eq!(post_answer(addr, Some("s3cret"), 1).await, 409);
+    }
+
+    #[tokio::test]
+    async fn control_answer_gets_past_the_gates_for_a_blocked_session() {
+        // Right token, genuinely blocked: it reaches the PTY write and only
+        // then finds there is no process manager in a test build. 503 rather
+        // than 401/409 is what proves both gates opened.
+        let (addr, state) = start_control_test_server(Some("s3cret".to_string())).await;
+        state.notified_at.write().await.insert(7, Instant::now());
+
+        assert_eq!(post_answer(addr, Some("s3cret"), 7).await, 503);
+    }
+
+    #[tokio::test]
+    async fn control_sessions_needs_the_token_then_lists_what_is_open() {
+        let (addr, state) = start_control_test_server(Some("s3cret".to_string())).await;
+        state
+            .session_projects
+            .write()
+            .await
+            .insert(3, "/path/project".to_string());
+
+        assert_eq!(get_sessions(addr, None).await.status().as_u16(), 401);
+
+        let resp = get_sessions(addr, Some("s3cret")).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body.as_array().unwrap().len(), 1);
+        assert_eq!(body[0]["session_id"], 3);
+        assert_eq!(body[0]["project_path"], "/path/project");
+    }
 }
