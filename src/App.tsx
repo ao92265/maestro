@@ -726,6 +726,17 @@ function App() {
     [selectTab, showGrid],
   );
 
+  /**
+   * Jump between terminals WITHOUT rearranging the shell: the footer navigator
+   * and the sidebar Agents list both mean "put me in that terminal", not "take
+   * me to that project". `navigateToSession` keeps the user's eagle view and
+   * their grid-versus-zoom context, which a plain zoom would throw away.
+   */
+  const jumpToTerminal = useCallback((tabId: string, sessionId: number) => {
+    useSurfaceStore.getState().showTerminals();
+    multiProjectRef.current?.navigateToSession(tabId, sessionId);
+  }, []);
+
   /** The one route to a NEW terminal, for the same reason. */
   const addTerminalInProject = useCallback(
     (tabId: string) => {
@@ -748,10 +759,10 @@ function App() {
     [navigateToTerminal],
   );
 
-  // Sidebar Agents section: zoom into a terminal. In eagle view the eagle zoom
-  // overlay is used (panes stay mounted); otherwise activate the project tab
-  // and zoom its pane once the tab switch has committed to the DOM.
-  const handleAgentNavigate = navigateToTerminal;
+  // Sidebar Agents section: jump to a terminal. In eagle view the eagle zoom
+  // overlay is used (panes stay mounted); otherwise the pane is focused or
+  // zoomed to match whatever the user was already looking at.
+  const handleAgentNavigate = jumpToTerminal;
 
   // Sidebar Agents section: kill one terminal. Normally routed through the
   // project's grid for full pane cleanup; if that grid isn't mounted (stale
@@ -830,8 +841,7 @@ function App() {
   }, []);
 
   // The full-screen overlays are never open together: opening Home or the
-  // Factory closes every other overlay, and opening the older two closes
-  // both of these (effect below).
+  // Factory closes every other overlay,
   // Every overlay toggle is now the same one-liner: the store holds a single
   // overlay slot, so "close the other five" is not something a handler can
   // forget to do.
@@ -969,9 +979,10 @@ function App() {
         );
         if (targetTab && !targetTab.active) selectTab(targetTab.id);
       }
-      // The git panel targets the active tab outside eagle view; show the
-      // grid so the selected project is actually the one shown.
-      useSurfaceStore.getState().showGrid();
+      // The git panel targets the active tab outside eagle view, so leave
+      // eagle. It renders beside the shell rather than under it, so there is
+      // no reason to dismiss the Board or an overlay the user is reading.
+      if (useSurfaceStore.getState().eagle) useSurfaceStore.getState().showGrid();
 
       const repoPath = target?.repoPath ?? activeRepo;
       if (repoPath) {
@@ -1084,10 +1095,10 @@ function App() {
               onToggleGitPanel={() => setGitPanelOpen((prev) => !prev)}
               gitPanelOpen={gitPanelOpen}
               hideWindowControls
-              inGridView={activeTabSessionsLaunched}
               slotCount={activeTabSlotCount}
               maxSessions={MAX_SESSIONS}
               onAddSession={handleAddSessionShortcut}
+              hasProject={tabs.length > 0}
               eagleView={eagleView}
               onToggleEagleView={() => useSurfaceStore.getState().toggleEagle()}
               eagleProjects={eagleProjects}
@@ -1331,7 +1342,7 @@ function App() {
                 showGrid();
                 multiProjectRef.current?.launchAllInActiveProject();
               }}
-              onNavigateToSession={navigateToTerminal}
+              onNavigateToSession={jumpToTerminal}
             />
           </div>
         </div>

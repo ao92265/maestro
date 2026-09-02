@@ -66,6 +66,17 @@ interface SurfaceState {
    * must make before it touches the grid.
    */
   showGrid: () => void;
+  /**
+   * Reveal the terminals but leave eagle view as the user set it.
+   *
+   * The difference from `showGrid` matters: a card that names ONE project
+   * (a Board card, a Home row, a Landscape node) means "take me to this
+   * project", so flattening eagle is right. A route that just jumps between
+   * terminals (the footer navigator, the sidebar Agents list) has no business
+   * changing the layout the user chose, and eagle has its own zoom overlay
+   * that keeps every pane mounted.
+   */
+  showTerminals: () => void;
   /** Show the aerial view of the grid, leaving any overlay. */
   showEagle: () => void;
   /** Flip the aerial view, surfacing the result rather than hiding it. */
@@ -91,6 +102,7 @@ export const useSurfaceStore = create<SurfaceState>((set, get) => ({
 
   showBoard: () => set({ base: "board", eagle: false, overlay: null }),
   showGrid: () => set({ base: "grid", eagle: false, overlay: null }),
+  showTerminals: () => set({ base: "grid", overlay: null }),
   showEagle: () => set({ base: "grid", eagle: true, overlay: null }),
 
   toggleEagle: () => set((s) => ({ base: "grid", eagle: !s.eagle, overlay: null })),
@@ -108,14 +120,3 @@ export const useSurfaceStore = create<SurfaceState>((set, get) => ({
   closeOverlay: () => set({ overlay: null }),
   toggleOverlay: (overlay) => set((s) => ({ overlay: s.overlay === overlay ? null : overlay })),
 }));
-
-/**
- * True when a full-screen surface is covering the base. Keyboard handlers that
- * drive the Board or the grid must check this: `j`/`k`/Enter were still moving
- * a hidden Board selection while Pulse covered it, and Enter could launch
- * something the user could not see.
- */
-export const selectIsCovered = (s: SurfaceState) => s.overlay !== null;
-
-/** True when the Board layer is the visible surface. */
-export const selectBoardVisible = (s: SurfaceState) => s.base === "board" && s.overlay === null;
