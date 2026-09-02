@@ -46,9 +46,7 @@ export function BoardColumn({
         {note}
       </div>
       {count === 0 ? (
-        <p className="rounded-md border border-maestro-border px-2 py-2 text-[11px] leading-snug text-maestro-faint">
-          {emptyText}
-        </p>
+        <p className="px-0.5 py-1 text-[11px] leading-snug text-maestro-faint">{emptyText}</p>
       ) : (
         <div className="flex flex-col gap-1.5">{children}</div>
       )}

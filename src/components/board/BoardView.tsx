@@ -313,7 +313,6 @@ export function BoardView({
        top of the Board with no change to the overlay-exclusivity rules. */
     <div className="absolute inset-0 z-[45] flex flex-col bg-maestro-bg">
       <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-maestro-border px-3">
-        <span className="mr-1 shrink-0 text-[12px] font-semibold text-maestro-text">Board</span>
         {actError && (
           <span
             className={`${badgeBaseClass} bg-maestro-yellow/15 text-maestro-yellow`}
@@ -326,7 +325,7 @@ export function BoardView({
         <button
           type="button"
           onClick={markSeen}
-          className="shrink-0 rounded border border-maestro-border px-1.5 py-0.5 text-[10px] text-maestro-muted transition-colors hover:text-maestro-text"
+          className="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-maestro-muted transition-colors hover:bg-maestro-elevated hover:text-maestro-text"
           title="Merged pull requests and finished runs up to now stop counting as news"
         >
           Mark seen
@@ -353,7 +352,7 @@ export function BoardView({
         <button
           type="button"
           onClick={onShowGrid}
-          className="flex shrink-0 items-center gap-1 rounded border border-maestro-border px-1.5 py-1 text-[11px] text-maestro-muted transition-colors hover:text-maestro-text"
+          className="flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-[11px] text-maestro-muted transition-colors hover:bg-maestro-elevated hover:text-maestro-text"
           aria-label="Grid view"
           title="Show the terminal grid"
         >
@@ -408,7 +407,7 @@ export function BoardView({
           return (
             <span
               key={status}
-              className={`flex shrink-0 items-center gap-1 rounded border border-maestro-border px-1.5 py-0.5 text-[10px] text-maestro-muted ${
+              className={`flex shrink-0 items-center gap-1 px-0.5 text-[10px] text-maestro-faint ${
                 count === 0 ? "opacity-40" : ""
               }`}
               title={`${badge.label}: ${count} session${count === 1 ? "" : "s"}`}
