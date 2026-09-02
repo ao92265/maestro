@@ -59,146 +59,77 @@ describe("QuietRail", () => {
     expect(screen.queryByRole("button", { name: "Landscape view" })).not.toBeInTheDocument();
   });
 
-  it("renders the More menu closed by default and opens it on click", () => {
-    renderRail();
-    expect(screen.queryByRole("button", { name: "Landscape" })).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "More" }));
-
-    expect(screen.getByRole("button", { name: "Landscape" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Memory" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Workflows" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Extensions" })).toBeInTheDocument();
-  });
-
-  it("dispatches onToggleLandscapeView and closes the menu", () => {
-    const handlers = renderRail();
-    fireEvent.click(screen.getByRole("button", { name: "More" }));
-
-    fireEvent.click(screen.getByRole("button", { name: "Landscape" }));
-
-    expect(handlers.onToggleLandscapeView).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole("button", { name: "Landscape" })).not.toBeInTheDocument();
-  });
-
-  it("dispatches onToggleMemoryPanel", () => {
-    const handlers = renderRail();
-    fireEvent.click(screen.getByRole("button", { name: "More" }));
-
-    fireEvent.click(screen.getByRole("button", { name: "Memory" }));
-
-    expect(handlers.onToggleMemoryPanel).toHaveBeenCalledTimes(1);
-  });
-
-  it("dispatches onOpenWorkflows", () => {
-    const handlers = renderRail();
-    fireEvent.click(screen.getByRole("button", { name: "More" }));
-
-    fireEvent.click(screen.getByRole("button", { name: "Workflows" }));
-
-    expect(handlers.onOpenWorkflows).toHaveBeenCalledTimes(1);
-  });
-
-  it("dispatches onOpenExtensions", () => {
-    const handlers = renderRail();
-    fireEvent.click(screen.getByRole("button", { name: "More" }));
-
-    fireEvent.click(screen.getByRole("button", { name: "Extensions" }));
-
-    expect(handlers.onOpenExtensions).toHaveBeenCalledTimes(1);
-  });
-
-  it("closes the More menu on an outside click", () => {
-    renderRail();
-    fireEvent.click(screen.getByRole("button", { name: "More" }));
-    expect(screen.getByRole("button", { name: "Landscape" })).toBeInTheDocument();
-
-    fireEvent.mouseDown(document.body);
-
-    expect(screen.queryByRole("button", { name: "Landscape" })).not.toBeInTheDocument();
-  });
-
-  it("has no Board/Grid toggle when the shell does not offer one", () => {
-    renderRail();
-    expect(screen.queryByRole("button", { name: "Board view" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Grid view" })).not.toBeInTheDocument();
-  });
-
-  it("marks the Board segment as the active one while the Board is open", () => {
-    const onSetBoardView = vi.fn();
-    renderRail({ boardViewOpen: true, onSetBoardView });
-
-    expect(screen.getByRole("button", { name: "Board view" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
-    expect(screen.getByRole("button", { name: "Grid view" })).toHaveAttribute(
-      "aria-pressed",
-      "false",
-    );
-  });
-
-  it("marks the Grid segment as the active one while the Board is closed", () => {
-    const onSetBoardView = vi.fn();
-    renderRail({ boardViewOpen: false, onSetBoardView });
-
-    expect(screen.getByRole("button", { name: "Grid view" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
-  });
-
-  it("asks for the grid when the Grid segment is clicked", () => {
-    const onSetBoardView = vi.fn();
-    renderRail({ boardViewOpen: true, onSetBoardView });
-
-    fireEvent.click(screen.getByRole("button", { name: "Grid view" }));
-
-    expect(onSetBoardView).toHaveBeenCalledWith(false);
-  });
-
-  it("asks for the board when the Board segment is clicked", () => {
-    const onSetBoardView = vi.fn();
-    renderRail({ boardViewOpen: false, onSetBoardView });
-
-    fireEvent.click(screen.getByRole("button", { name: "Board view" }));
-
-    expect(onSetBoardView).toHaveBeenCalledWith(true);
-  });
-
-  it("shows an aggregated dot on the More button when Memory has a health flag", () => {
-    useHealthStore.setState({
-      flags: [
-        {
-          key: "memory:maestro",
-          area: "memory",
-          scope: "maestro",
-          target: "maestro",
-          reason: "12 stale files",
-        },
-      ],
+  /**
+   * The four surfaces that used to hide behind an ellipsis are on the rail
+   * itself now. The rail runs down the window, so it has the room the old
+   * horizontal strip did not, and a menu you have to open first is one more
+   * thing to remember about an app Alex already said he could not read.
+   */
+  describe("the surfaces that used to be buried", () => {
+    it("draws all four on the rail, with no menu to open first", () => {
+      renderRail();
+      for (const label of ["Landscape", "Memory", "Workflows", "Extensions"]) {
+        expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
+      }
+      expect(screen.queryByRole("button", { name: "More" })).not.toBeInTheDocument();
     });
-    renderRail();
 
-    const moreButton = screen.getByRole("button", { name: "More" });
-    expect(moreButton.querySelector("span[aria-hidden]")).toBeInTheDocument();
-  });
-
-  it("shows the per-item health badge on the Memory row inside the menu", () => {
-    useHealthStore.setState({
-      flags: [
-        {
-          key: "memory:maestro",
-          area: "memory",
-          scope: "maestro",
-          target: "maestro",
-          reason: "12 stale files",
-        },
-      ],
+    it("dispatches onToggleLandscapeView", () => {
+      const handlers = renderRail();
+      fireEvent.click(screen.getByRole("button", { name: "Landscape" }));
+      expect(handlers.onToggleLandscapeView).toHaveBeenCalledTimes(1);
     });
-    renderRail();
-    fireEvent.click(screen.getByRole("button", { name: "More" }));
 
-    expect(screen.getByLabelText("1 health item need a look")).toBeInTheDocument();
+    it("dispatches onToggleMemoryPanel", () => {
+      const handlers = renderRail();
+      fireEvent.click(screen.getByRole("button", { name: "Memory" }));
+      expect(handlers.onToggleMemoryPanel).toHaveBeenCalledTimes(1);
+    });
+
+    it("dispatches onOpenWorkflows", () => {
+      const handlers = renderRail();
+      fireEvent.click(screen.getByRole("button", { name: "Workflows" }));
+      expect(handlers.onOpenWorkflows).toHaveBeenCalledTimes(1);
+    });
+
+    it("dispatches onOpenExtensions", () => {
+      const handlers = renderRail();
+      fireEvent.click(screen.getByRole("button", { name: "Extensions" }));
+      expect(handlers.onOpenExtensions).toHaveBeenCalledTimes(1);
+    });
+
+    it("leaves out a surface the shell does not offer, rather than drawing a dead one", () => {
+      render(<QuietRail onToggleGitPanel={vi.fn()} onToggleMemoryPanel={vi.fn()} />);
+      expect(screen.getByRole("button", { name: "Memory" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Landscape" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Workflows" })).not.toBeInTheDocument();
+    });
+
+    /* The health flag used to be aggregated onto the More button because the
+       thing it described was hidden inside the menu. It goes back on Memory. */
+    it("marks Memory itself when Memory has a health flag", () => {
+      useHealthStore.setState({
+        flags: [
+          {
+            key: "memory:maestro",
+            area: "memory",
+            scope: "maestro",
+            target: "maestro",
+            reason: "12 stale files",
+          },
+        ],
+      });
+      renderRail();
+      expect(screen.getByRole("button", { name: "Memory" })).toContainElement(
+        screen.getByLabelText("1 health item need a look"),
+      );
+    });
+
+    it("marks Landscape when a terminal somewhere is waiting for input", () => {
+      renderRail({ landscapeAttention: true, landscapeView: false });
+      expect(
+        screen.getByRole("button", { name: "Landscape" }).querySelector("span[aria-hidden]"),
+      ).toBeInTheDocument();
+    });
   });
 });

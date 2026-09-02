@@ -8,17 +8,14 @@ import {
   GitMerge,
   Home,
   LayoutGrid,
-  MoreHorizontal,
   Network,
   Package,
   RadioTower,
   Sparkles,
   Workflow,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
 import { HealthAttentionBadge } from "@/components/shared/HealthAttentionBadge";
 import { modLabel, titleWithShortcut } from "@/lib/shortcuts";
-import { countForArea, useHealthStore } from "@/stores/useHealthStore";
 
 /**
  * The Quiet Deck rail: the app's whole navigation, 44px wide, down the left.
@@ -87,22 +84,6 @@ export function QuietRail({
   onOpenWorkflows,
   onOpenExtensions,
 }: QuietRailProps) {
-  const memoryHealthCount = useHealthStore((s) => countForArea(s.flags, "memory"));
-
-  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
-  const moreMenuRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    if (!moreMenuOpen) return;
-    const onPointerDown = (e: MouseEvent) => {
-      if (moreMenuRef.current && !moreMenuRef.current.contains(e.target as Node)) {
-        setMoreMenuOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onPointerDown);
-    return () => document.removeEventListener("mousedown", onPointerDown);
-  }, [moreMenuOpen]);
-
   return (
     <nav
       aria-label="Surfaces"
@@ -299,91 +280,66 @@ export function QuietRail({
       >
         <GitMerge size={14} />
       </button>
-      {/* More menu — Landscape, Memory, Workflows and Extensions moved here
-            (issue declutter): each keeps its keyboard shortcut/store wiring,
-            just off the always-visible strip. */}
-      {/* Everything below the spacer is buried on purpose: reachable, never in
-          the way. The rail's job is the surfaces you use, not the ones you own. */}
+      {/* The four surfaces that used to hide behind an ellipsis. The rail runs
+          down the window, so it has the room the old horizontal strip did not,
+          and a menu you have to open first is one more thing to remember about
+          an app Alex already said he could not read. Each is drawn only when
+          the shell offers it, so none of them is ever a dead control. */}
       <div className="flex-1" />
-      {(onToggleLandscapeView || onToggleMemoryPanel || onOpenWorkflows || onOpenExtensions) && (
-        <div className="relative" ref={moreMenuRef}>
-          <button
-            type="button"
-            onClick={() => setMoreMenuOpen((v) => !v)}
-            className={`relative rounded p-1.5 transition-colors ${
-              moreMenuOpen
-                ? "bg-maestro-card text-maestro-text"
-                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
-            }`}
-            aria-label="More"
-            title="More — Landscape, Memory, Workflows, Extensions"
-          >
-            <MoreHorizontal size={14} />
-            {((landscapeAttention && !landscapeView) || memoryHealthCount > 0) && (
-              <span
-                aria-hidden="true"
-                className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-maestro-accent"
-              />
-            )}
-          </button>
-          {moreMenuOpen && (
-            <div className="absolute bottom-0 left-full z-50 ml-1 min-w-[170px] rounded-md border border-maestro-border bg-maestro-surface py-1 shadow-lg">
-              {onToggleLandscapeView && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setMoreMenuOpen(false);
-                    onToggleLandscapeView();
-                  }}
-                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-maestro-text transition-colors hover:bg-maestro-card"
-                >
-                  <Network size={13} className="shrink-0 text-maestro-muted" />
-                  Landscape
-                </button>
-              )}
-              {onToggleMemoryPanel && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setMoreMenuOpen(false);
-                    onToggleMemoryPanel();
-                  }}
-                  className="relative flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-maestro-text transition-colors hover:bg-maestro-card"
-                >
-                  <Brain size={13} className="shrink-0 text-maestro-muted" />
-                  Memory
-                  <HealthAttentionBadge area="memory" />
-                </button>
-              )}
-              {onOpenWorkflows && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setMoreMenuOpen(false);
-                    onOpenWorkflows();
-                  }}
-                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-maestro-text transition-colors hover:bg-maestro-card"
-                >
-                  <Workflow size={13} className="shrink-0 text-maestro-muted" />
-                  Workflows
-                </button>
-              )}
-              {onOpenExtensions && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setMoreMenuOpen(false);
-                    onOpenExtensions();
-                  }}
-                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-maestro-text transition-colors hover:bg-maestro-card"
-                >
-                  <Package size={13} className="shrink-0 text-maestro-muted" />
-                  Extensions
-                </button>
-              )}
-            </div>
+      {onToggleLandscapeView && (
+        <button
+          type="button"
+          onClick={onToggleLandscapeView}
+          className={`relative rounded p-1.5 transition-colors ${
+            landscapeView
+              ? "text-maestro-accent hover:bg-maestro-accent/10"
+              : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
+          }`}
+          aria-label="Landscape"
+          title="Landscape — every project, terminal and subagent on one canvas"
+        >
+          <Network size={14} />
+          {landscapeAttention && !landscapeView && (
+            <span
+              aria-hidden="true"
+              className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-maestro-alarm"
+            />
           )}
-        </div>
+        </button>
+      )}
+      {onToggleMemoryPanel && (
+        <button
+          type="button"
+          onClick={onToggleMemoryPanel}
+          className="relative rounded p-1.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text"
+          aria-label="Memory"
+          title="Memory — what the agents have written down"
+        >
+          <Brain size={14} />
+          <HealthAttentionBadge area="memory" />
+        </button>
+      )}
+      {onOpenWorkflows && (
+        <button
+          type="button"
+          onClick={onOpenWorkflows}
+          className="rounded p-1.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text"
+          aria-label="Workflows"
+          title="Workflows — the full screen editor"
+        >
+          <Workflow size={14} />
+        </button>
+      )}
+      {onOpenExtensions && (
+        <button
+          type="button"
+          onClick={onOpenExtensions}
+          className="rounded p-1.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text"
+          aria-label="Extensions"
+          title="Extensions — MCP servers, plugins and skills"
+        >
+          <Package size={14} />
+        </button>
       )}
     </nav>
   );
