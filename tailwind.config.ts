@@ -21,6 +21,7 @@ export default {
           faint: rgb("faint"),
           accent: rgb("accent"),
           alarm: rgb("alarm"),
+          "alarm-ground": rgb("alarm-ground"),
           brand: rgb("brand"),
           blue: rgb("blue"),
           green: rgb("green"),

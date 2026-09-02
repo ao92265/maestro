@@ -29,6 +29,11 @@
     /* The alarm. One colour, one meaning: this is waiting on Alex. Distinct
        from --maestro-red, which is reserved for something being broken. */
     --maestro-alarm: 235 87 87; /* #eb5757 */
+    /* The ground under a card that is waiting on Alex: the card step with the
+       alarm mixed in, so the tint reads as the same card rather than a hole.
+       It has to be a token, not a literal, because the light theme needs the
+       tint to go the other way. */
+    --maestro-alarm-ground: 20 15 17; /* #140f11 */
     --maestro-brand: 94 106 210; /* #5e6ad2 — the accent at rest: primary buttons and filled controls, so the brighter accent above stays reserved for needs-you */
     --maestro-blue: 59 130 246; /* #3b82f6 — working / focused */
     --maestro-green: 63 185 80; /* #3fb950 */
@@ -50,6 +55,7 @@
     --maestro-text-2: 51 52 60; /* #33343c */
     --maestro-muted: 100 100 112; /* #646470 */
     --maestro-faint: 139 143 155; /* #8b8f9b */
+    --maestro-alarm-ground: 254 244 244; /* #fef4f4 — the same tint, lifted instead of sunk */
     --maestro-brand: 74 84 196; /* #4a54c4 — darkened so it holds contrast on a light ground */
   }
 

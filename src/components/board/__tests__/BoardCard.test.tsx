@@ -265,4 +265,20 @@ describe("BoardCard", () => {
     );
     expect(screen.getByTestId("board-card").className).toMatch(/shadow-\[/);
   });
+
+  /* The needs-you ground used to be a literal near-black hex, which meant the
+     one card that most has to be readable rendered as a black block on the
+     light theme. It has to come from a token so both themes get a tint. */
+  it("takes the needs-you ground from a token, not a literal colour", () => {
+    render(
+      <BoardCard
+        item={sessionCard("NeedsInput", "tab-1")}
+        selected={false}
+        onActivate={() => {}}
+      />,
+    );
+    const cls = screen.getByTestId("board-card").className;
+    expect(cls).toMatch(/bg-maestro-alarm-ground/);
+    expect(cls).not.toMatch(/bg-\[#/);
+  });
 });

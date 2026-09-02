@@ -211,7 +211,7 @@ export function BoardCard({
     "flex w-full flex-col rounded-md border border-l-2 bg-maestro-card px-2.5 py-2 text-left transition-colors",
     STAGE_STRIPE[stage],
     item.needsYou
-      ? "border-maestro-alarm/60 bg-[#140f11] shadow-[0_0_0_1px_rgb(var(--maestro-alarm)/0.16),0_0_24px_-8px_rgb(var(--maestro-alarm)/0.55)]"
+      ? "border-maestro-alarm/60 bg-maestro-alarm-ground shadow-[0_0_0_1px_rgb(var(--maestro-alarm)/0.16),0_0_24px_-8px_rgb(var(--maestro-alarm)/0.55)]"
       : "border-maestro-border",
     selected ? "ring-1 ring-maestro-text/50" : "",
   ].join(" ");
