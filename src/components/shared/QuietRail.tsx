@@ -108,13 +108,15 @@ export function QuietRail({
       aria-label="Surfaces"
       className="flex w-11 shrink-0 flex-col items-center gap-1 border-r border-maestro-border bg-maestro-surface py-2"
     >
-      {/* The mark, and the rail's only saturated pixel that is not an alert. */}
-      <span
+      {/* The app's own mark, not a letterform stand-in: the samurai mask the
+          icon and the accent colour both come from. */}
+      <img
+        src="/favicon.png"
+        alt=""
         aria-hidden="true"
-        className="mb-1 flex h-6 w-6 items-center justify-center rounded-md bg-maestro-brand/15 font-semibold text-[13px] text-maestro-accent"
-      >
-        V
-      </span>
+        className="mb-1 h-[22px] w-[22px] shrink-0 select-none"
+        draggable={false}
+      />
       {onSetBoardView && (
         <div className="flex flex-col items-center gap-0.5 rounded-md border border-maestro-border bg-maestro-card p-0.5">
           <button
