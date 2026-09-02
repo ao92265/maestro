@@ -46,12 +46,14 @@ interface TopBarProps {
   /** When true, hides window controls (minimize/maximize/close) - use when ProjectTabs provides them */
   hideWindowControls?: boolean;
   /** Whether sessions have been launched for the active project (grid view) */
-  inGridView?: boolean;
   /** Number of session slots in the active project */
   slotCount?: number;
   /** Maximum number of sessions allowed */
   maxSessions?: number;
   onAddSession?: () => void;
+  /** Whether any project is open. With none, "add a terminal" has nothing to
+      add to, so the button is absent rather than present and inert. */
+  hasProject?: boolean;
   /** Whether eagle view (all projects' terminals at once) is active */
   eagleView?: boolean;
   onToggleEagleView?: () => void;
@@ -113,10 +115,10 @@ export function TopBar({
   onToggleGitPanel,
   gitPanelOpen,
   hideWindowControls = false,
-  inGridView = false,
   slotCount = 0,
   maxSessions = MAX_SESSIONS,
   onAddSession,
+  hasProject = false,
   eagleView = false,
   onToggleEagleView,
   eagleProjects = [],
@@ -190,6 +192,9 @@ export function TopBar({
     return () => document.removeEventListener("mousedown", onPointerDown);
   }, [moreMenuOpen]);
 
+  /** At the per-project terminal cap. The button greys out, so say why. */
+  const atMaxSessions = slotCount >= maxSessions;
+
   return (
     <div data-tauri-drag-region className="no-select flex h-10 flex-1 items-center bg-maestro-bg">
       {/* Left: collapse toggle + branch area (inset from CSS var for macOS traffic lights) */}
@@ -261,15 +266,23 @@ export function TopBar({
         )}
         {/* GitHub watchdog totals (review requests / assigned issues) */}
         {onWatchdogNavigate && <GitHubWatchdogBadge onNavigate={onWatchdogNavigate} />}
-        {/* Active project: adds a pre-launch slot to its grid. */}
-        {inGridView && !eagleView && (
+        {/* Active project: adds a pre-launch slot to its grid. Always present
+            outside eagle view, including before the first session exists: it
+            used to appear only once something was already running, which is
+            precisely when a new user does not need it. Adding from the Board
+            surfaces the grid rather than filing the card out of sight. */}
+        {!eagleView && hasProject && (
           <button
             type="button"
             onClick={onAddSession}
-            disabled={slotCount >= maxSessions}
+            disabled={atMaxSessions}
             className="rounded p-1.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text disabled:cursor-not-allowed disabled:opacity-50"
             aria-label="Add session"
-            title={titleWithShortcut("New terminal", modLabel(), "T")}
+            title={
+              atMaxSessions
+                ? `Maximum of ${maxSessions} terminals in this project`
+                : titleWithShortcut("New terminal", modLabel(), "T")
+            }
           >
             <Plus size={14} />
           </button>

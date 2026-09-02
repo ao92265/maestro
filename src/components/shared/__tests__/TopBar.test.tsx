@@ -33,6 +33,64 @@ describe("TopBar", () => {
     useHealthStore.setState({ flags: [] });
   });
 
+  /**
+   * The "+" is the only route to a first terminal on a cold start, and it used
+   * to appear ONLY once a session was already running. These cases exist
+   * because a green suite happily shipped both a missing button and, briefly,
+   * a present-but-inert one.
+   */
+  describe("the add-terminal button", () => {
+    it("is offered before any session has been launched", () => {
+      renderTopBar({ hasProject: true, slotCount: 0, maxSessions: 4 });
+      expect(screen.getByRole("button", { name: "Add session" })).toBeEnabled();
+    });
+
+    it("is absent with no project open, rather than present and inert", () => {
+      renderTopBar({ hasProject: false, slotCount: 0, maxSessions: 4 });
+      expect(screen.queryByRole("button", { name: "Add session" })).not.toBeInTheDocument();
+    });
+
+    it("is absent in eagle view, which offers a project picker instead", () => {
+      renderTopBar({ hasProject: true, eagleView: true, slotCount: 0, maxSessions: 4 });
+      expect(screen.queryByRole("button", { name: "Add session" })).not.toBeInTheDocument();
+    });
+
+    it("says why it is disabled at the terminal cap", () => {
+      renderTopBar({ hasProject: true, slotCount: 4, maxSessions: 4 });
+      const button = screen.getByRole("button", { name: "Add session" });
+      expect(button).toBeDisabled();
+      expect(button).toHaveAttribute("title", "Maximum of 4 terminals in this project");
+    });
+
+    it("calls back when clicked below the cap", () => {
+      const onAddSession = vi.fn();
+      renderTopBar({ hasProject: true, slotCount: 1, maxSessions: 4, onAddSession });
+      fireEvent.click(screen.getByRole("button", { name: "Add session" }));
+      expect(onAddSession).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  /**
+   * From an overlay, both segments used to look dead: one opened the Board
+   * underneath what you were reading, the other closed a Board you could not
+   * see. The TopBar's job is to name the surface it wants; App decides how.
+   */
+  describe("the Board/Grid selector", () => {
+    it("asks for the Board, not for a blind toggle", () => {
+      const onSetBoardView = vi.fn();
+      renderTopBar({ onSetBoardView, boardViewOpen: false });
+      fireEvent.click(screen.getByRole("button", { name: "Board view" }));
+      expect(onSetBoardView).toHaveBeenCalledWith(true);
+    });
+
+    it("asks for the grid even when the Board is already the base surface", () => {
+      const onSetBoardView = vi.fn();
+      renderTopBar({ onSetBoardView, boardViewOpen: true });
+      fireEvent.click(screen.getByRole("button", { name: "Grid view" }));
+      expect(onSetBoardView).toHaveBeenCalledWith(false);
+    });
+  });
+
   it("does not render the buttons cut by the declutter (Notes, Second Brain, Launch)", () => {
     renderTopBar();
     for (const label of ["Notes", "Second Brain", "Launch"]) {

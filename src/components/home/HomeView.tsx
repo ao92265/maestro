@@ -33,12 +33,11 @@ import {
 import { useActStore } from "@/stores/useActStore";
 import { useBandStore } from "@/stores/useBandStore";
 import { useClosedSessionsStore } from "@/stores/useClosedSessionsStore";
-import { useFactoryViewStore } from "@/stores/useFactoryViewStore";
-import { useHomeViewStore } from "@/stores/useHomeViewStore";
 import { useReplyDraftStore } from "@/stores/useReplyDraftStore";
 import type { BackendSessionStatus, SessionConfig } from "@/stores/useSessionStore";
 import { useSessionStore } from "@/stores/useSessionStore";
 import { useSnoozeStore } from "@/stores/useSnoozeStore";
+import { useSurfaceStore } from "@/stores/useSurfaceStore";
 import { useTourStore } from "@/stores/useTourStore";
 import { useWorkspaceStore } from "@/stores/useWorkspaceStore";
 
@@ -245,8 +244,8 @@ function RunRow({ item }: { item: BandItem }) {
       className={rowClass}
       onClick={() => {
         void useActStore.getState().openDetail(run.id);
-        useHomeViewStore.getState().close();
-        useFactoryViewStore.getState().open();
+        // One overlay slot, so handing over to the Factory IS closing Home.
+        useSurfaceStore.getState().openOverlay("factory");
       }}
       title="Open this run in the Factory to approve or reject the gate"
     >
