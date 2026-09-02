@@ -1,7 +1,9 @@
 import { HelpCircle, LayoutGrid, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
+import { BoardAlertBand } from "@/components/board/BoardAlertBand";
 import { BoardCard, boardCardKey, cardAction } from "@/components/board/BoardCard";
+import { BoardColdStart } from "@/components/board/BoardColdStart";
 import { BoardColumn } from "@/components/board/BoardColumn";
 import { BoardPeek } from "@/components/board/BoardPeek";
 import { badgeBaseClass, SESSION_STATUS_BADGES } from "@/components/session/agentPresentation";
@@ -12,6 +14,8 @@ import {
   type BoardCardItem,
   type BoardColumnKey,
   type BoardReviewRequests,
+  blockedOldestFirst,
+  isColdStart,
 } from "@/lib/board";
 import { useActStore } from "@/stores/useActStore";
 import { useBandStore } from "@/stores/useBandStore";
@@ -359,6 +363,22 @@ export function BoardView({
           <LayoutGrid size={12} /> Grid
         </button>
       </div>
+
+      {/* What is waiting on you, before where everything else is. The board
+          under it keeps its shape: this adds a band, it does not take a lane. */}
+      <BoardAlertBand blocked={blockedOldestFirst(columns)} onActivate={activate} />
+
+      {/* Six empty lanes say nothing is happening but not why. This says both,
+          and offers the handoffs as the thing to pick up. It sits above the
+          lanes, never instead of them, so a column emptied by a failed poll
+          still gets to show its STALE badge. */}
+      {isColdStart(columns) && (
+        <BoardColdStart
+          handoffs={columns.suggested}
+          moreHandoffs={columns.moreHandoffs}
+          onActivate={activate}
+        />
+      )}
 
       <div className="min-h-0 flex-1 overflow-x-auto">
         <div className="flex h-full min-w-[64rem] divide-x divide-maestro-border">

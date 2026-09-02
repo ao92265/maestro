@@ -26,6 +26,9 @@
 
     /* Accent & status — constant across themes */
     --maestro-accent: 130 143 255; /* #828fff — the Vanguard V, sampled from the app icon; brand, and signals "needs your input" */
+    /* The alarm. One colour, one meaning: this is waiting on Alex. Distinct
+       from --maestro-red, which is reserved for something being broken. */
+    --maestro-alarm: 235 87 87; /* #eb5757 */
     --maestro-brand: 94 106 210; /* #5e6ad2 — the accent at rest: primary buttons and filled controls, so the brighter accent above stays reserved for needs-you */
     --maestro-blue: 59 130 246; /* #3b82f6 — working / focused */
     --maestro-green: 63 185 80; /* #3fb950 */

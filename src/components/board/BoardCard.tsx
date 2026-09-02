@@ -165,7 +165,7 @@ export function stageOf(item: BoardCardItem): CardStage {
 
 /** The stripe colour for a stage. Accent is reserved for needs-you. */
 const STAGE_STRIPE: Record<CardStage, string> = {
-  needs: "border-l-maestro-accent",
+  needs: "border-l-maestro-alarm",
   working: "border-l-maestro-blue",
   waiting: "border-l-maestro-yellow",
   review: "border-l-maestro-blue/60",
@@ -211,7 +211,7 @@ export function BoardCard({
     "flex w-full flex-col rounded-md border border-l-2 bg-maestro-card px-2.5 py-2 text-left transition-colors",
     STAGE_STRIPE[stage],
     item.needsYou
-      ? "border-maestro-accent/70 shadow-[0_0_10px_rgb(var(--maestro-accent)/0.35)]"
+      ? "border-maestro-alarm/60 bg-[#140f11] shadow-[0_0_0_1px_rgb(var(--maestro-alarm)/0.16),0_0_24px_-8px_rgb(var(--maestro-alarm)/0.55)]"
       : "border-maestro-border",
     selected ? "ring-1 ring-maestro-text/50" : "",
   ].join(" ");
@@ -237,7 +237,7 @@ export function BoardCard({
           {chip.label}
         </span>
         {item.needsYou && (
-          <span className={`${badgeBaseClass} bg-maestro-accent/20 text-maestro-accent`}>
+          <span className={`${badgeBaseClass} bg-maestro-alarm/20 text-maestro-alarm`}>
             NEEDS YOU
           </span>
         )}

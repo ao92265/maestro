@@ -20,6 +20,7 @@ export default {
           muted: rgb("muted"),
           faint: rgb("faint"),
           accent: rgb("accent"),
+          alarm: rgb("alarm"),
           brand: rgb("brand"),
           blue: rgb("blue"),
           green: rgb("green"),

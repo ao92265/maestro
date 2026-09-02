@@ -456,3 +456,48 @@ export function assembleBoard({
 
   return columns;
 }
+
+/**
+ * Every card waiting on Alex, across all six columns, oldest first.
+ *
+ * Sorted by how long it has been waiting rather than by column, because the
+ * column a blocked card sits in is an accident of what kind of work it is.
+ * A card with no timestamp sorts last: an unknown wait cannot outrank a
+ * measured one.
+ */
+export function blockedOldestFirst(columns: BoardColumns): BoardCardItem[] {
+  const all = [
+    ...columns.suggested,
+    ...columns.planning,
+    ...columns.building,
+    ...columns.checking,
+    ...columns.review,
+    ...columns.done,
+  ].filter((card) => card.needsYou);
+
+  return all.sort((a, b) => {
+    if (!a.since && !b.since) return 0;
+    if (!a.since) return 1;
+    if (!b.since) return -1;
+    return Date.parse(a.since) - Date.parse(b.since);
+  });
+}
+
+/**
+ * Is the board looking at a machine with nothing running on it?
+ *
+ * True only when every lane except Suggested is empty. Suggested holds
+ * handoff files, which are not work in flight, so a board carrying nothing
+ * but handoffs has nothing running by definition. Anything at all in the
+ * other five lanes makes this false: a cold-start panel that hid a live
+ * session would be exactly the silent under-reporting the pivot bans.
+ */
+export function isColdStart(columns: BoardColumns): boolean {
+  return (
+    columns.planning.length === 0 &&
+    columns.building.length === 0 &&
+    columns.checking.length === 0 &&
+    columns.review.length === 0 &&
+    columns.done.length === 0
+  );
+}
