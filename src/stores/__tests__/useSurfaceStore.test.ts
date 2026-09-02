@@ -171,6 +171,48 @@ describe("useSurfaceStore", () => {
     });
   });
 
+  describe("handing over from one surface to another", () => {
+    /**
+     * Opening the Factory on a gated run FROM the Board must also leave the
+     * Board, or closing the Factory drops the user back on the Board instead
+     * of the terminals. Opening the overlay alone preserves the base, which
+     * silently changed where the exit landed.
+     */
+    it("leaves the Board behind when the Board hands over to an overlay", () => {
+      useSurfaceStore.getState().showGrid();
+      useSurfaceStore.getState().openOverlay("factory");
+      useSurfaceStore.getState().closeOverlay();
+      expect(snapshot()).toEqual({ base: "grid", eagle: false, overlay: null });
+    });
+
+    it("keeps the Board when an overlay is opened from the Board deliberately", () => {
+      useSurfaceStore.getState().openOverlay("home");
+      useSurfaceStore.getState().closeOverlay();
+      expect(snapshot()).toEqual({ base: "board", eagle: false, overlay: null });
+    });
+  });
+
+  describe("showTerminals", () => {
+    // Jumping between terminals must not rearrange the shell the user chose.
+    it("reveals the terminals without flattening eagle view", () => {
+      useSurfaceStore.getState().showEagle();
+      useSurfaceStore.getState().openOverlay("home");
+      useSurfaceStore.getState().showTerminals();
+      expect(snapshot()).toEqual({ base: "grid", eagle: true, overlay: null });
+    });
+
+    it("drops the Board like showGrid does", () => {
+      useSurfaceStore.getState().showTerminals();
+      expect(snapshot()).toEqual({ base: "grid", eagle: false, overlay: null });
+    });
+
+    it.each(EACH_OVERLAY)("leaves %s", (overlay) => {
+      useSurfaceStore.getState().openOverlay(overlay);
+      useSurfaceStore.getState().showTerminals();
+      expect(useSurfaceStore.getState().overlay).toBeNull();
+    });
+  });
+
   describe("isCovered", () => {
     // Hidden keyboard handlers were driving the Board while Pulse covered it.
     it("is false on the bare Board", () => {

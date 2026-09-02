@@ -3,7 +3,7 @@ import { create } from "zustand";
 /**
  * First-run tour state. The overlay shows once on a fresh install (no seen
  * marker), then never again on its own; the Home header keeps a button to
- * reopen it on demand. Same store shape as `useHomeViewStore` so the toggle
+ * reopen it on demand. Same store shape as `useSurfaceStore` so the toggle
  * can live anywhere without prop-drilling.
  */
 const TOUR_SEEN_KEY = "maestro-tour-seen";

@@ -796,8 +796,13 @@ function App() {
   const handleBoardLaunchHandoff = useLaunchHandoff(handleBoardNavigate);
 
   // A gated run is unblocked in the Factory, so the card hands over to it.
+  // The Board steps aside in the same move, so closing the Factory afterwards
+  // returns to the terminals rather than back to the Board: opening the
+  // overlay alone would leave the Board as the base and change where the user
+  // lands on the way out.
   const handleBoardOpenRun = useCallback((runId: string) => {
     void useActStore.getState().openDetail(runId);
+    useSurfaceStore.getState().showGrid();
     useSurfaceStore.getState().openOverlay("factory");
   }, []);
 
