@@ -65,8 +65,6 @@ import type { QuickOpenItem } from "./lib/quickOpen";
 import { initActivityListener, stopActivityListener } from "./stores/useActivityStore";
 import { useActStore } from "./stores/useActStore";
 import { initAgentListener, stopAgentListener } from "./stores/useAgentStore";
-import { useBoardViewStore } from "./stores/useBoardViewStore";
-import { useFactoryViewStore } from "./stores/useFactoryViewStore";
 import { useGitHubStore } from "./stores/useGitHubStore";
 import {
   useGitHubWatchdogStore,
@@ -76,12 +74,9 @@ import {
 } from "./stores/useGitHubWatchdogStore";
 import { useGitStore } from "./stores/useGitStore";
 import { useHealthStore } from "./stores/useHealthStore";
-import { useHomeViewStore } from "./stores/useHomeViewStore";
-import { useOrchestratorViewStore } from "./stores/useOrchestratorViewStore";
-import { usePulseViewStore } from "./stores/usePulseViewStore";
+import { useSurfaceStore } from "./stores/useSurfaceStore";
 import { useTerminalSettingsStore } from "./stores/useTerminalSettingsStore";
 import { useUpdateStore } from "./stores/useUpdateStore";
-import { useWorkflowsViewStore } from "./stores/useWorkflowsViewStore";
 
 /**
  * Landscape graph, loaded on demand: it pulls in React Flow, which would
@@ -96,7 +91,7 @@ const LandscapeView = lazy(() =>
 /**
  * Full-screen workflow editor, loaded on demand for the same reason as
  * LandscapeView above — its own React Flow canvas, opened from the Launch
- * tab via `useWorkflowsViewStore` rather than a prop passed down.
+ * tab via `useSurfaceStore` rather than a prop passed down.
  */
 const WorkflowsView = lazy(() =>
   import("./components/workflows/WorkflowsView").then((m) => ({ default: m.WorkflowsView })),
@@ -191,8 +186,14 @@ function App() {
   >(new Map());
   const [isStoppingAll, setIsStoppingAll] = useState(false);
   const [currentBranch, setCurrentBranch] = useState<string | undefined>(undefined);
+  // What you are looking at. One store, so two full-screen surfaces cannot be
+  // open together and no caller can change the grid underneath one of them.
+  // The old per-surface booleans are derived below purely so the render tree
+  // and the TopBar props stay as they were.
+  const surfaceBase = useSurfaceStore((s) => s.base);
+  const surfaceOverlay = useSurfaceStore((s) => s.overlay);
   // Eagle view: one flat grid of every project's terminals at once
-  const [eagleView, setEagleView] = useState(false);
+  const eagleView = useSurfaceStore((s) => s.eagle);
   // Eagle view Cmd/Ctrl+T: arrow-navigable project picker for the new terminal.
   const [eagleAddPickerOpen, setEagleAddPickerOpen] = useState(false);
   // Cmd/Ctrl+P quick-open palette across sessions and worktrees.
@@ -206,27 +207,33 @@ function App() {
   const [eagleGitIndex, setEagleGitIndex] = useState(0);
   // Landscape view: every project, terminal and subagent on one graph. Rendered
   // over the terminals rather than instead of them, so nothing is torn down.
-  const [landscapeView, setLandscapeView] = useState(false);
-  // Full-screen workflow editor (Launch tab → "Open workflow editor"):
-  // opened via a store rather than local state, since the trigger lives deep
-  // inside the sidebar rather than a prop App can pass down.
-  const workflowsViewOpen = useWorkflowsViewStore((s) => s.isOpen);
-  const closeWorkflowsView = useWorkflowsViewStore((s) => s.close);
+  // It is an overlay like the rest now: being outside the union is exactly what
+  // let it sit open underneath the workflow editor.
+  const landscapeView = surfaceOverlay === "landscape";
+  // Full-screen workflow editor (Launch tab → "Open workflow editor").
+  const workflowsViewOpen = surfaceOverlay === "workflows";
   // Board layer: the shell the app opens on. It sits at z-45, under every
-  // overlay that follows, so it takes no part in their exclusivity dance.
-  const boardViewOpen = useBoardViewStore((s) => s.isOpen);
-  const closeBoardView = useBoardViewStore((s) => s.close);
-  // Home decision queue overlay. The full-screen overlays assume they are
-  // never open together, so opening Home closes the other two and vice versa
-  // (see the toggle handlers below).
-  const homeViewOpen = useHomeViewStore((s) => s.isOpen);
-  const closeHomeView = useHomeViewStore((s) => s.close);
-  const factoryViewOpen = useFactoryViewStore((s) => s.isOpen);
-  const closeFactoryView = useFactoryViewStore((s) => s.close);
-  const orchestratorViewOpen = useOrchestratorViewStore((s) => s.isOpen);
-  const closeOrchestratorView = useOrchestratorViewStore((s) => s.close);
-  const pulseViewOpen = usePulseViewStore((s) => s.isOpen);
-  const closePulseView = usePulseViewStore((s) => s.close);
+  // overlay that follows, so an overlay hides it rather than replacing it.
+  const boardViewOpen = surfaceBase === "board";
+  // The remaining full-screen overlays. Exactly one of these can be true,
+  // by construction rather than by every handler remembering to close the
+  // others.
+  const homeViewOpen = surfaceOverlay === "home";
+  const factoryViewOpen = surfaceOverlay === "factory";
+  const orchestratorViewOpen = surfaceOverlay === "orchestrator";
+  const pulseViewOpen = surfaceOverlay === "pulse";
+  // Returning to the base surface. Every overlay's own close button wants the
+  // same thing, so they all get the same function.
+  const closeOverlay = useSurfaceStore((s) => s.closeOverlay);
+  const closeWorkflowsView = closeOverlay;
+  const closeHomeView = closeOverlay;
+  const closeFactoryView = closeOverlay;
+  const closeOrchestratorView = closeOverlay;
+  const closePulseView = closeOverlay;
+  // "Show me the terminals themselves." Every route that selects, adds or
+  // zooms a terminal must call this FIRST: it drops the overlay AND the Board,
+  // which is the step fifteen call sites each forgot a different part of.
+  const showGrid = useSurfaceStore((s) => s.showGrid);
   // Marks the landscape button while a terminal anywhere is blocked on you.
   const needsInputAnywhere = useSessionStore((s) =>
     s.sessions.some((session) => session.status === "NeedsInput"),
@@ -670,6 +677,10 @@ function App() {
       setEagleAddPickerOpen(true);
       return;
     }
+    // Show the terminals first. On a cold start the Board covers the idle
+    // landing view (the big "+" that tells a new user what to do), so adding
+    // a session from behind it produced a card nobody could see.
+    useSurfaceStore.getState().showGrid();
     multiProjectRef.current?.addSessionToActiveProject();
   }, [eagleView]);
 
@@ -693,37 +704,54 @@ function App() {
     atMax: (sessionCounts.get(t.id)?.slotCount ?? 0) >= MAX_SESSIONS,
   }));
 
-  const handleAddSessionToProject = useCallback(
+  /**
+   * The one route to a terminal. Every caller that wants a terminal on screen
+   * goes through here: it shows the grid FIRST (which drops both the overlay
+   * and the Board), then selects, then zooms once the tab switch has committed
+   * to the DOM.
+   *
+   * Fifteen call sites used to inline some subset of this and each forgot a
+   * different part, so the selection landed correctly underneath something the
+   * user was still looking at and the click read as dead.
+   */
+  const navigateToTerminal = useCallback(
+    (tabId: string, sessionId?: number) => {
+      showGrid();
+      selectTab(tabId);
+      if (sessionId === undefined) return;
+      requestAnimationFrame(() => {
+        multiProjectRef.current?.zoomSessionInProject(tabId, sessionId);
+      });
+    },
+    [selectTab, showGrid],
+  );
+
+  /** The one route to a NEW terminal, for the same reason. */
+  const addTerminalInProject = useCallback(
     (tabId: string) => {
-      setEagleView(false);
+      showGrid();
       selectTab(tabId);
       multiProjectRef.current?.addSessionInProject(tabId);
     },
-    [selectTab],
+    [selectTab, showGrid],
   );
 
-  // Sidebar History tab queued a recovery launch: leave eagle view and select
-  // the project so its grid mounts and consumes the pending launch.
+  const handleAddSessionToProject = addTerminalInProject;
+
+  // Sidebar History tab queued a recovery launch: show the project's grid so
+  // it mounts and consumes the pending launch. Used to leave eagle view only,
+  // which launched the recovered session behind whatever was covering it.
   const handleHistoryLaunch = useCallback(
     (tabId: string) => {
-      setEagleView(false);
-      selectTab(tabId);
+      navigateToTerminal(tabId);
     },
-    [selectTab],
+    [navigateToTerminal],
   );
 
   // Sidebar Agents section: zoom into a terminal. In eagle view the eagle zoom
   // overlay is used (panes stay mounted); otherwise activate the project tab
   // and zoom its pane once the tab switch has committed to the DOM.
-  const handleAgentNavigate = useCallback(
-    (tabId: string, sessionId: number) => {
-      selectTab(tabId);
-      requestAnimationFrame(() => {
-        multiProjectRef.current?.zoomSessionInProject(tabId, sessionId);
-      });
-    },
-    [selectTab],
-  );
+  const handleAgentNavigate = navigateToTerminal;
 
   // Sidebar Agents section: kill one terminal. Normally routed through the
   // project's grid for full pane cleanup; if that grid isn't mounted (stale
@@ -741,48 +769,16 @@ function App() {
   // Landscape view: clicking a node leaves the graph for that project (and,
   // when the node is a terminal, zooms it) — the same route the sidebar's
   // Agents section takes.
-  const handleLandscapeNavigate = useCallback(
-    (tabId: string, sessionId?: number) => {
-      setEagleView(false);
-      selectTab(tabId);
-      if (sessionId === undefined) return;
-      requestAnimationFrame(() => {
-        multiProjectRef.current?.zoomSessionInProject(tabId, sessionId);
-      });
-    },
-    [selectTab],
-  );
+  const handleLandscapeNavigate = navigateToTerminal;
 
   // Home view: clicking a band row leaves the queue for that terminal — the
   // same route the landscape takes, plus closing the Home overlay itself.
-  const handleHomeNavigate = useCallback(
-    (tabId: string, sessionId?: number) => {
-      closeHomeView();
-      setEagleView(false);
-      selectTab(tabId);
-      if (sessionId === undefined) return;
-      requestAnimationFrame(() => {
-        multiProjectRef.current?.zoomSessionInProject(tabId, sessionId);
-      });
-    },
-    [selectTab, closeHomeView],
-  );
+  const handleHomeNavigate = navigateToTerminal;
 
   // Board: clicking a card leaves the board for the terminal it describes,
   // the same rAF handshake Home uses. The board layer closes in the same
   // commit as the tab selection, so the zoom lands on a visible grid.
-  const handleBoardNavigate = useCallback(
-    (tabId: string, sessionId?: number) => {
-      closeBoardView();
-      setEagleView(false);
-      selectTab(tabId);
-      if (sessionId === undefined) return;
-      requestAnimationFrame(() => {
-        multiProjectRef.current?.zoomSessionInProject(tabId, sessionId);
-      });
-    },
-    [selectTab, closeBoardView],
-  );
+  const handleBoardNavigate = navigateToTerminal;
 
   // Resuming a handoff from the Board: same flow as Home's, and the Board
   // gets out of the way so the launching terminal is the thing on screen.
@@ -791,8 +787,7 @@ function App() {
   // A gated run is unblocked in the Factory, so the card hands over to it.
   const handleBoardOpenRun = useCallback((runId: string) => {
     void useActStore.getState().openDetail(runId);
-    useBoardViewStore.getState().close();
-    useFactoryViewStore.getState().open();
+    useSurfaceStore.getState().openOverlay("factory");
   }, []);
 
   // Adopting an outside session's project from the Board peek: open the tab,
@@ -819,47 +814,29 @@ function App() {
   // never a replacement: closing it reveals the grid that was mounted all
   // along, so there is nothing to tear down or rebuild either way.
   const handleSetBoardView = useCallback((open: boolean) => {
-    if (open) useBoardViewStore.getState().open();
-    else useBoardViewStore.getState().close();
+    // A two-position selector, so each segment names the surface it shows.
+    // Setting the Board flag alone used to open the Board UNDERNEATH whatever
+    // overlay was up, and "Grid" closed a Board nobody could see: both
+    // segments looked dead from Home.
+    if (open) useSurfaceStore.getState().showBoard();
+    else useSurfaceStore.getState().showGrid();
   }, []);
 
+  // Cmd/Ctrl+E. Under an overlay the visible meaning of the keystroke is
+  // "show me the Board" rather than "flip a bit I cannot see", which the store
+  // now owns for every caller.
   const handleToggleBoardView = useCallback(() => {
-    /* Cmd+E under a z-50 overlay would toggle the Board invisibly beneath
-       it (review finding 5 on 4f3f27a). The visible meaning of the keystroke
-       is "show me the Board", so leave the overlay and open it. */
-    const overlayUp =
-      landscapeView ||
-      useWorkflowsViewStore.getState().isOpen ||
-      useHomeViewStore.getState().isOpen ||
-      useFactoryViewStore.getState().isOpen ||
-      useOrchestratorViewStore.getState().isOpen ||
-      usePulseViewStore.getState().isOpen;
-    if (overlayUp) {
-      setLandscapeView(false);
-      useWorkflowsViewStore.getState().close();
-      useHomeViewStore.getState().close();
-      useFactoryViewStore.getState().close();
-      useOrchestratorViewStore.getState().close();
-      usePulseViewStore.getState().close();
-      useBoardViewStore.getState().open();
-      return;
-    }
-    useBoardViewStore.getState().toggle();
-  }, [landscapeView]);
+    useSurfaceStore.getState().toggleBoard();
+  }, []);
 
   // The full-screen overlays are never open together: opening Home or the
   // Factory closes every other overlay, and opening the older two closes
   // both of these (effect below).
+  // Every overlay toggle is now the same one-liner: the store holds a single
+  // overlay slot, so "close the other five" is not something a handler can
+  // forget to do.
   const handleToggleHomeView = useCallback(() => {
-    const willOpen = !useHomeViewStore.getState().isOpen;
-    if (willOpen) {
-      setLandscapeView(false);
-      useWorkflowsViewStore.getState().close();
-      useFactoryViewStore.getState().close();
-      useOrchestratorViewStore.getState().close();
-      usePulseViewStore.getState().close();
-    }
-    useHomeViewStore.getState().toggle();
+    useSurfaceStore.getState().toggleOverlay("home");
   }, []);
 
   const quickOpenItems = useQuickOpenItems(quickOpenOpen, quickOpenSessions, tabs);
@@ -867,74 +844,32 @@ function App() {
   const handleQuickOpenPick = useCallback(
     (item: QuickOpenItem) => {
       setQuickOpenOpen(false);
-      // Exactly the route the landscape and Home rows take out of an overlay:
-      // drop the full-screen views, select the project, then zoom on the next
-      // frame — the target project's grid is not mounted until that render, and
-      // navigateToSession would still see the pre-close eagle state this tick.
-      setLandscapeView(false);
-      setEagleView(false);
-      useHomeViewStore.getState().close();
-      useFactoryViewStore.getState().close();
-      useOrchestratorViewStore.getState().close();
-      usePulseViewStore.getState().close();
-      useWorkflowsViewStore.getState().close();
-      selectTab(item.tabId);
-
       // A worktree with no live session has no terminal to zoom; surfacing its
-      // project is the most we can honestly do.
+      // project is the most we can honestly do. Either way this goes through
+      // the one terminal route, which used to close five overlays by hand and
+      // still leave the Board covering every result.
       const { sessionId } = item;
-      if (sessionId === null) return;
-      requestAnimationFrame(() => {
-        multiProjectRef.current?.zoomSessionInProject(item.tabId, sessionId);
-      });
+      navigateToTerminal(item.tabId, sessionId ?? undefined);
     },
-    [selectTab],
+    [navigateToTerminal],
   );
 
   const handleToggleFactoryView = useCallback(() => {
-    const willOpen = !useFactoryViewStore.getState().isOpen;
-    if (willOpen) {
-      setLandscapeView(false);
-      useWorkflowsViewStore.getState().close();
-      useHomeViewStore.getState().close();
-      useOrchestratorViewStore.getState().close();
-      usePulseViewStore.getState().close();
-    }
-    useFactoryViewStore.getState().toggle();
+    useSurfaceStore.getState().toggleOverlay("factory");
   }, []);
 
   const handleToggleOrchestratorView = useCallback(() => {
-    const willOpen = !useOrchestratorViewStore.getState().isOpen;
-    if (willOpen) {
-      setLandscapeView(false);
-      useWorkflowsViewStore.getState().close();
-      useHomeViewStore.getState().close();
-      useFactoryViewStore.getState().close();
-      usePulseViewStore.getState().close();
-    }
-    useOrchestratorViewStore.getState().toggle();
+    useSurfaceStore.getState().toggleOverlay("orchestrator");
   }, []);
 
   const handleTogglePulseView = useCallback(() => {
-    const willOpen = !usePulseViewStore.getState().isOpen;
-    if (willOpen) {
-      setLandscapeView(false);
-      useWorkflowsViewStore.getState().close();
-      useHomeViewStore.getState().close();
-      useFactoryViewStore.getState().close();
-      useOrchestratorViewStore.getState().close();
-    }
-    usePulseViewStore.getState().toggle();
+    useSurfaceStore.getState().toggleOverlay("pulse");
   }, []);
 
-  useEffect(() => {
-    if (landscapeView || workflowsViewOpen) {
-      closeHomeView();
-      useFactoryViewStore.getState().close();
-      useOrchestratorViewStore.getState().close();
-      usePulseViewStore.getState().close();
-    }
-  }, [landscapeView, workflowsViewOpen, closeHomeView]);
+  // The effect that used to force overlay exclusivity is gone: a single
+  // overlay slot cannot hold two surfaces, so there is no state to reconcile
+  // after the fact. It also never covered Landscape against Workflows, which
+  // is how those two ended up open together.
 
   // Band data (handoffs, PR polls, ACT) refreshes app-wide, and every change
   // mirrors to the Vanguard snapshot file the launchd digest reads.
@@ -960,11 +895,11 @@ function App() {
   }, [handleSelectSidebarTab]);
 
   // TopBar's More menu → Workflows: the full-screen workflow editor is a
-  // standalone store-driven overlay (see useWorkflowsViewStore) — its only
+  // standalone store-driven overlay (see useSurfaceStore) — its only
   // trigger used to be a button inside the now-cut Launch panel, but the
   // overlay itself never depended on that panel being open.
   const handleOpenWorkflows = useCallback(() => {
-    useWorkflowsViewStore.getState().open();
+    useSurfaceStore.getState().openOverlay("workflows");
   }, []);
 
   // Alt+1-3: open the sidebar on tab N; pressing the active tab's shortcut
@@ -1034,9 +969,9 @@ function App() {
         );
         if (targetTab && !targetTab.active) selectTab(targetTab.id);
       }
-      // The git panel targets the active tab outside eagle view; leave eagle
-      // view so the selected project is actually the one shown.
-      setEagleView(false);
+      // The git panel targets the active tab outside eagle view; show the
+      // grid so the selected project is actually the one shown.
+      useSurfaceStore.getState().showGrid();
 
       const repoPath = target?.repoPath ?? activeRepo;
       if (repoPath) {
@@ -1056,13 +991,19 @@ function App() {
     onAddSession: handleAddSessionShortcut,
     // Eagle view: Cmd/Ctrl+T opens the project picker instead of adding
     // directly, so it only needs at least one open project.
-    canAddSession: eagleView ? tabs.length > 0 : activeTabSessionsLaunched,
+    // A project being open is the only precondition. This used to require a
+    // session to ALREADY be running, so the shortcut the first-run tour
+    // advertises did nothing on a fresh install.
+    canAddSession: tabs.length > 0,
     onSidebarTab: handleSidebarTabShortcut,
     onToggleGitPanel: handleToggleGitPanel,
     onToggleUtilityPanel: handleToggleUtilityPanel,
-    onToggleEagleView: useCallback(() => setEagleView((v) => !v), []),
+    onToggleEagleView: useCallback(() => useSurfaceStore.getState().toggleEagle(), []),
     onToggleBoardView: handleToggleBoardView,
-    onToggleLandscapeView: useCallback(() => setLandscapeView((v) => !v), []),
+    onToggleLandscapeView: useCallback(
+      () => useSurfaceStore.getState().toggleOverlay("landscape"),
+      [],
+    ),
     onToggleHomeView: handleToggleHomeView,
     onToggleFactoryView: handleToggleFactoryView,
     onToggleOrchestratorView: handleToggleOrchestratorView,
@@ -1146,13 +1087,13 @@ function App() {
               inGridView={activeTabSessionsLaunched}
               slotCount={activeTabSlotCount}
               maxSessions={MAX_SESSIONS}
-              onAddSession={() => multiProjectRef.current?.addSessionToActiveProject()}
+              onAddSession={handleAddSessionShortcut}
               eagleView={eagleView}
-              onToggleEagleView={() => setEagleView((v) => !v)}
+              onToggleEagleView={() => useSurfaceStore.getState().toggleEagle()}
               eagleProjects={eagleProjects}
               onAddSessionToProject={handleAddSessionToProject}
               landscapeView={landscapeView}
-              onToggleLandscapeView={() => setLandscapeView((v) => !v)}
+              onToggleLandscapeView={() => useSurfaceStore.getState().toggleOverlay("landscape")}
               landscapeAttention={needsInputAnywhere}
               boardViewOpen={boardViewOpen}
               onSetBoardView={handleSetBoardView}
@@ -1247,15 +1188,12 @@ function App() {
                   onOpenPr={(url) =>
                     void openUrl(url).catch((err) => console.error("Failed to open PR:", err))
                   }
-                  onShowGrid={closeBoardView}
+                  onShowGrid={showGrid}
                   onOpenProject={handleBoardOpenProject}
-                  overlayOpen={
-                    landscapeView ||
-                    workflowsViewOpen ||
-                    homeViewOpen ||
-                    factoryViewOpen ||
-                    orchestratorViewOpen
-                  }
+                  // Any overlay at all, Pulse included: it used to be left out,
+                  // so j/k still moved a hidden Board selection and Enter could
+                  // launch something off screen.
+                  overlayOpen={surfaceOverlay !== null}
                 />
               )}
 
@@ -1271,10 +1209,7 @@ function App() {
                     </div>
                   }
                 >
-                  <LandscapeView
-                    onNavigate={handleLandscapeNavigate}
-                    onClose={() => setLandscapeView(false)}
-                  />
+                  <LandscapeView onNavigate={handleLandscapeNavigate} onClose={closeOverlay} />
                 </Suspense>
               )}
 
@@ -1391,14 +1326,12 @@ function App() {
                   // First enter grid view, then launch
                   handleEnterGridView();
                 }
-                // Launching into a grid hidden behind the Board would look
-                // like the button did nothing, so the Board steps aside.
-                closeBoardView();
+                // Launching into a grid hidden behind the Board (or any
+                // overlay) would look like the button did nothing.
+                showGrid();
                 multiProjectRef.current?.launchAllInActiveProject();
               }}
-              onNavigateToSession={(tabId, sessionId) => {
-                multiProjectRef.current?.navigateToSession(tabId, sessionId);
-              }}
+              onNavigateToSession={navigateToTerminal}
             />
           </div>
         </div>

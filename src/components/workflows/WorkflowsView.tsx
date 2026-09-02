@@ -51,7 +51,7 @@ import { useSamuraiWorkflowStore } from "@/stores/useSamuraiWorkflowStore";
  * Full-screen editor for the workflow graphs (issue #91 Part B, promoted out
  * of the Launch tab's sidebar card to its own overlay). Step text is edited
  * in place; steps can be added, removed and rewired. Opened from
- * `LaunchSection` via `useWorkflowsViewStore`, rendered by `App` next to
+ * `LaunchSection` via `useSurfaceStore`, rendered by `App` next to
  * `LandscapeView` — same overlay shell (`absolute inset-0 z-50`), same
  * "toolbar + React Flow canvas" shape.
  *

@@ -190,6 +190,9 @@ export function TopBar({
     return () => document.removeEventListener("mousedown", onPointerDown);
   }, [moreMenuOpen]);
 
+  /** At the per-project terminal cap. The button greys out, so say why. */
+  const atMaxSessions = inGridView && slotCount >= maxSessions;
+
   return (
     <div data-tauri-drag-region className="no-select flex h-10 flex-1 items-center bg-maestro-bg">
       {/* Left: collapse toggle + branch area (inset from CSS var for macOS traffic lights) */}
@@ -261,15 +264,23 @@ export function TopBar({
         )}
         {/* GitHub watchdog totals (review requests / assigned issues) */}
         {onWatchdogNavigate && <GitHubWatchdogBadge onNavigate={onWatchdogNavigate} />}
-        {/* Active project: adds a pre-launch slot to its grid. */}
-        {inGridView && !eagleView && (
+        {/* Active project: adds a pre-launch slot to its grid. Always present
+            outside eagle view, including before the first session exists: it
+            used to appear only once something was already running, which is
+            precisely when a new user does not need it. Adding from the Board
+            surfaces the grid rather than filing the card out of sight. */}
+        {!eagleView && (
           <button
             type="button"
             onClick={onAddSession}
-            disabled={slotCount >= maxSessions}
+            disabled={atMaxSessions}
             className="rounded p-1.5 text-maestro-muted transition-colors hover:bg-maestro-card hover:text-maestro-text disabled:cursor-not-allowed disabled:opacity-50"
             aria-label="Add session"
-            title={titleWithShortcut("New terminal", modLabel(), "T")}
+            title={
+              atMaxSessions
+                ? `Maximum of ${maxSessions} terminals in this project`
+                : titleWithShortcut("New terminal", modLabel(), "T")
+            }
           >
             <Plus size={14} />
           </button>

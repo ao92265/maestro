@@ -45,8 +45,8 @@ import {
   type SamuraiSupervisorState,
   useSessionStore,
 } from "@/stores/useSessionStore";
+import { useSurfaceStore } from "@/stores/useSurfaceStore";
 import { useUsageStore } from "@/stores/useUsageStore";
-import { useWorkflowsViewStore } from "@/stores/useWorkflowsViewStore";
 import { useWorkspaceStore, type WorkspaceTab } from "@/stores/useWorkspaceStore";
 import { cardClass, SectionHeader } from "./sectionChrome";
 
@@ -664,7 +664,8 @@ export function LaunchSection({
   // Issue #91 (full-screen follow-up): the run workflow now opens as a
   // full-screen overlay (`WorkflowsView`, rendered by App) instead of
   // embedding a cramped editor here.
-  const openWorkflowsView = useWorkflowsViewStore((s) => s.open);
+  const openOverlay = useSurfaceStore((s) => s.openOverlay);
+  const openWorkflowsView = () => openOverlay("workflows");
   // 1 Hz re-render while the gate line is showing (drives the elapsed time).
   const [, setGateTick] = useState(0);
   const [preflight, setPreflight] = useState<SamuraiPreflight | null>(null);
