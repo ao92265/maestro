@@ -1,4 +1,4 @@
-import { BoardCard } from "@/components/board/BoardCard";
+import { BoardCard, boardCardKey } from "@/components/board/BoardCard";
 import type { BoardCardItem } from "@/lib/board";
 
 /**
@@ -28,7 +28,12 @@ export function BoardColdStart({
 }) {
   const total = handoffs.length + moreHandoffs;
   const shown = handoffs.slice(0, 3);
-  const hidden = total - shown.length;
+  /* Counts the lane, not the disk. `moreHandoffs` is exactly the set the
+     board's display cap kept OUT of the lane, so folding it in here sent you
+     down to look for rows that were never rendered. The disk total still
+     leads the paragraph above; this number only ever describes what is
+     genuinely below. */
+  const alsoInLane = handoffs.length - shown.length;
 
   return (
     <section
@@ -63,16 +68,16 @@ export function BoardColdStart({
           <div className="grid min-w-0 gap-2 sm:grid-cols-3">
             {shown.map((item) => (
               <BoardCard
-                key={`${item.projectName}:${item.objective}`}
+                key={boardCardKey(item)}
                 item={item}
                 selected={false}
                 onActivate={() => onActivate(item)}
               />
             ))}
           </div>
-          {hidden > 0 && (
+          {alsoInLane > 0 && (
             <p className="text-[11px] text-maestro-faint">
-              {hidden} more {hidden === 1 ? "is" : "are"} in the Suggested lane below.
+              {alsoInLane} more {alsoInLane === 1 ? "is" : "are"} in the Suggested lane below.
             </p>
           )}
         </div>

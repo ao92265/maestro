@@ -1,4 +1,4 @@
-import { cardAction, relAgo } from "@/components/board/BoardCard";
+import { boardCardKey, cardAction, relAgo } from "@/components/board/BoardCard";
 import type { BoardCardItem } from "@/lib/board";
 
 /**
@@ -70,7 +70,7 @@ export function BoardAlertBand({
           data-testid="band-queue"
         >
           {queue.slice(0, 2).map((item) => (
-            <div key={`${item.projectName}:${item.objective}`} className="flex flex-col">
+            <div key={boardCardKey(item)} className="flex flex-col">
               <span className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-maestro-faint">
                 {item.projectName}
                 {item.since ? ` · ${relAgo(item.since)}` : ""}

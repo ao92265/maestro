@@ -1149,7 +1149,7 @@ function App() {
                 In eagle view it describes the carousel-selected project. */}
             {gitPanelOpen && (
               <div
-                className="flex h-10 shrink-0 items-center border-l border-maestro-border px-3 gap-2 bg-maestro-bg"
+                className="flex h-9 shrink-0 items-center border-l border-maestro-border px-3 gap-2 bg-maestro-bg"
                 style={{ width: rightPanelWidth }}
               >
                 <GitFork size={14} className="text-maestro-muted" />
