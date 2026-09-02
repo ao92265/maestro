@@ -206,13 +206,18 @@ export function BoardCard({
   const stage = stageOf(item);
 
   /* Border contrast before shadow: the card is held by its hairline and its
-     stage stripe, and the glow is spent on the one card that needs you. */
+     stage stripe, and the glow is spent on the one card that needs you.
+
+     The ground is set in the branch, never in the base. Two background
+     utilities on one element do not stack, they race, and the winner is
+     whichever Tailwind emits last: the needs-you fill lost that race and
+     never painted at all. */
   const shell = [
-    "flex w-full flex-col rounded-md border border-l-2 bg-maestro-card px-2.5 py-2 text-left transition-colors",
+    "flex w-full flex-col rounded-md border border-l-2 px-2.5 py-2 text-left transition-colors",
     STAGE_STRIPE[stage],
     item.needsYou
       ? "border-maestro-alarm/60 bg-maestro-alarm-ground shadow-[0_0_0_1px_rgb(var(--maestro-alarm)/0.16),0_0_24px_-8px_rgb(var(--maestro-alarm)/0.55)]"
-      : "border-maestro-border",
+      : "border-maestro-border bg-maestro-card",
     selected ? "ring-1 ring-maestro-text/50" : "",
   ].join(" ");
 

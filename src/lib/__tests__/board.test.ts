@@ -9,9 +9,11 @@ import {
   type BoardColumns,
   type BoardReviewRequests,
   blockedOldestFirst,
+  handoffsOnDiskCount,
   inferActColumn,
   inferSessionColumn,
   isColdStart,
+  liveSessionCount,
   needsYou,
 } from "@/lib/board";
 import type { PullRequestInfo } from "@/stores/useGitHubStore";
@@ -776,5 +778,33 @@ describe("isColdStart", () => {
 
   it("is not a cold start when a pull request is waiting on review", () => {
     expect(isColdStart(cols({ review: [handoff("a")] }))).toBe(false);
+  });
+});
+
+describe("crumb counts match the lanes", () => {
+  function stub(status: BackendSessionStatus, path = "/tmp/p"): SessionConfig {
+    return { id: 1, status, project_path: path } as SessionConfig;
+  }
+
+  /* The crumb used to exclude only Done, Error and Timeout, so an Idle
+     terminal counted as live while the board gave it no card at all: "3 live"
+     over a board saying nothing was running. */
+  it("does not count an idle session the board draws no card for", () => {
+    expect(liveSessionCount([stub("Idle"), stub("Idle"), stub("Idle")])).toBe(0);
+    expect(liveSessionCount([stub("Working"), stub("Idle")])).toBe(1);
+    expect(liveSessionCount([stub("Done")])).toBe(0);
+    expect(liveSessionCount([stub("Starting"), stub("NeedsInput")])).toBe(2);
+  });
+
+  /* The crumb read the raw store while the lane filtered it, so the two
+     printed the same phrase with different numbers on one screen. */
+  it("counts the handoffs the Suggested lane keeps, not the raw store", () => {
+    const handoffs = [
+      { path: "/a", stale: false, orphan: false, lastActive: "2026-01-03T00:00:00Z" },
+      { path: "/b", stale: true, orphan: false, lastActive: "2026-01-02T00:00:00Z" },
+      { path: "/c", stale: false, orphan: true, lastActive: "2026-01-01T00:00:00Z" },
+    ] as unknown as Parameters<typeof handoffsOnDiskCount>[0];
+    expect(handoffs).toHaveLength(3);
+    expect(handoffsOnDiskCount(handoffs, [], new Set())).toBe(1);
   });
 });

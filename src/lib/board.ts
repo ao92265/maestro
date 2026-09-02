@@ -284,16 +284,7 @@ export function assembleBoard({
      handoff covered by a live session is dropped, and one covered by an
      externally running claude (activeDirs) is not "on disk waiting" either:
      the running work IS it, so it shows in Building below instead. */
-  const liveDirs = new Set(sessions.map(sessionDir));
-  const sortedHandoffs = handoffs
-    .filter((h) => !h.stale && !h.orphan && !liveDirs.has(h.path))
-    .sort((a, b) => Date.parse(b.lastActive) - Date.parse(a.lastActive));
-  const seenPaths = new Set<string>();
-  const dedupedHandoffs = sortedHandoffs.filter((h) => {
-    if (seenPaths.has(h.path)) return false;
-    seenPaths.add(h.path);
-    return true;
-  });
+  const dedupedHandoffs = dedupeWaitingHandoffs(handoffs, sessions);
   const waitingHandoffs = dedupedHandoffs.filter((h) => !isCoveredByActiveDir(h.path, activeDirs));
   const liveOutsideHandoffs = dedupedHandoffs.filter((h) =>
     isCoveredByActiveDir(h.path, activeDirs),
@@ -500,4 +491,55 @@ export function isColdStart(columns: BoardColumns): boolean {
     columns.review.length === 0 &&
     columns.done.length === 0
   );
+}
+
+/**
+ * The handoffs the Suggested lane will consider, in the order it shows them.
+ *
+ * Extracted so the top bar's crumb counts the same rows the lane draws.
+ * The two used to be computed separately, and the crumb read the raw store,
+ * so "10 handoffs on disk" could sit above a lane showing four: the stale,
+ * the orphaned and the ones a live session had already picked up were all
+ * counted by the chrome and dropped by the board.
+ */
+export function dedupeWaitingHandoffs(
+  handoffs: HandoffInfo[],
+  sessions: SessionConfig[],
+): HandoffInfo[] {
+  const liveDirs = new Set(sessions.map(sessionDir));
+  const sorted = handoffs
+    .filter((h) => !h.stale && !h.orphan && !liveDirs.has(h.path))
+    .sort((a, b) => Date.parse(b.lastActive) - Date.parse(a.lastActive));
+  const seenPaths = new Set<string>();
+  return sorted.filter((h) => {
+    if (seenPaths.has(h.path)) return false;
+    seenPaths.add(h.path);
+    return true;
+  });
+}
+
+/** How many handoffs are genuinely waiting on disk, the lane's own number. */
+export function handoffsOnDiskCount(
+  handoffs: HandoffInfo[],
+  sessions: SessionConfig[],
+  activeDirs: Set<string>,
+): number {
+  return dedupeWaitingHandoffs(handoffs, sessions).filter(
+    (h) => !isCoveredByActiveDir(h.path, activeDirs),
+  ).length;
+}
+
+/**
+ * Sessions that have a card in a lane other than Done.
+ *
+ * Defined off `inferSessionColumn` rather than off a status list of its own,
+ * so the crumb cannot claim work the board does not draw. The old count only
+ * excluded Done, Error and Timeout, which meant three idle terminals read as
+ * "3 live" over a board correctly saying nothing was running.
+ */
+export function liveSessionCount(sessions: SessionConfig[]): number {
+  return sessions.filter((s) => {
+    const column = inferSessionColumn(s.status);
+    return column !== null && column !== "done";
+  }).length;
 }

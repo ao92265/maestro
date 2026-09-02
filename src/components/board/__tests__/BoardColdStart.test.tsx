@@ -72,4 +72,22 @@ describe("BoardColdStart", () => {
     expect(screen.getByTestId("cold-start")).toHaveTextContent(/no handoffs/i);
     expect(screen.queryAllByTestId("board-card")).toHaveLength(0);
   });
+
+  /* "N more are in the Suggested lane below" is a claim about the lane, so it
+     may only count cards the lane actually holds. The over-cap handoffs are
+     precisely the ones the lane left out, so folding them in sent you looking
+     for rows that were not there. */
+  it("counts only the handoffs the Suggested lane really holds", () => {
+    render(
+      <BoardColdStart
+        handoffs={[handoff("a"), handoff("b"), handoff("c"), handoff("d"), handoff("e")]}
+        moreHandoffs={2}
+        onActivate={() => {}}
+      />,
+    );
+    const panel = screen.getByTestId("cold-start");
+    expect(panel).toHaveTextContent("7 handoffs on disk");
+    expect(panel).toHaveTextContent("2 more are in the Suggested lane below");
+    expect(panel).not.toHaveTextContent("4 more are in the Suggested lane below");
+  });
 });

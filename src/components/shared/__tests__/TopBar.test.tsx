@@ -97,6 +97,10 @@ describe("TopBar", () => {
       expect(crumb).not.toHaveTextContent("0 handoffs");
     });
 
+    /* The count is defined as "sessions the board draws a card for, outside
+       Done", so the crumb and the lanes can never print different totals for
+       the same machine. Done drops out; an errored session does not, because
+       the board still shows it in Building and it still wants you. */
     it("does not count a finished session as live", () => {
       useSessionStore.setState({
         sessions: [
@@ -106,7 +110,21 @@ describe("TopBar", () => {
         ] as SessionConfig[],
       });
       renderTopBar({ boardViewOpen: true, onSetBoardView: vi.fn() });
-      expect(screen.getByTestId("topbar-crumb")).toHaveTextContent("1 live");
+      expect(screen.getByTestId("topbar-crumb")).toHaveTextContent("2 live");
+    });
+
+    /* Idle terminals used to count. Three open shells with nothing running
+       read as "3 live" in the chrome while the board below them correctly
+       said nothing was running: the two disagreed on one screen. */
+    it("does not count an idle terminal the board gives no card", () => {
+      useSessionStore.setState({
+        sessions: [
+          { id: 1, status: "Idle", project_path: "/tmp/a" },
+          { id: 2, status: "Idle", project_path: "/tmp/b" },
+        ] as SessionConfig[],
+      });
+      renderTopBar({ boardViewOpen: true, onSetBoardView: vi.fn() });
+      expect(screen.getByTestId("topbar-crumb")).not.toHaveTextContent("live");
     });
   });
 

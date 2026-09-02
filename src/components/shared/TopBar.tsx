@@ -1,7 +1,9 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Minus, PanelLeft, Plus, Square, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { MAX_SESSIONS } from "@/components/terminal/splitTree";
+import { handoffsOnDiskCount, liveSessionCount } from "@/lib/board";
 import { isMac } from "@/lib/platform";
 import { modLabel, titleWithShortcut } from "@/lib/shortcuts";
 import { useBandStore } from "@/stores/useBandStore";
@@ -83,16 +85,14 @@ export function TopBar({
      in someone else's iTerm is deliberately NOT counted here, because Maestro
      cannot see it, and a number that quietly includes guesses is the thing
      the data-honesty rule exists to stop. */
-  const liveCount = useSessionStore(
-    (s) =>
-      s.sessions.filter(
-        (session) =>
-          session.status !== "Done" && session.status !== "Error" && session.status !== "Timeout",
-      ).length,
-  );
+  const sessions = useSessionStore(useShallow((s) => s.sessions));
+  const liveCount = liveSessionCount(sessions);
   /* Files on disk, named as files on disk. This used to read "sessions
-     parked", which was wrong in both nouns. */
-  const handoffCount = useBandStore((s) => s.handoffs.length);
+     parked", which was wrong in both nouns, and then it read the raw store,
+     which was the right noun with the wrong number. */
+  const handoffs = useBandStore(useShallow((s) => s.handoffs));
+  const externallyActiveDirs = useBandStore(useShallow((s) => s.externallyActiveDirs));
+  const handoffCount = handoffsOnDiskCount(handoffs, sessions, externallyActiveDirs);
 
   const surfaceName = eagleView
     ? "Eagle"

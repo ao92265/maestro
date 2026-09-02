@@ -280,13 +280,23 @@ export function BoardView({
           .join(", ")}`
       : null);
 
+  /* Any poll that did not come back. Empty lanes mean "we do not know", not
+     "nothing is happening", so the cold start panel holds its tongue. */
+  const pollFailing = Boolean(handoffsError || processesError || actError || prsStale);
+
   function staleFor(key: BoardColumnKey): string | null {
     /* A failed process scan empties the live outside-Maestro cards AND
        drops their handoffs back into Suggested with a live Launch action;
        both columns say so, since launching a second agent onto a directory
        already being driven is the harmful direction. */
     if (key === "suggested") return handoffsError ?? processesError;
-    if (key === "building") return processesError;
+    if (key === "building") return processesError ?? actError;
+    /* A failed FIRST ACT poll leaves `runs` empty rather than stale, because
+       the store only preserves data it already had. Without this the three
+       lanes ACT feeds go quiet, the cold start panel reads the quiet as an
+       idle machine, and the board states "Nothing is running." on the
+       strength of a request that never came back. */
+    if (key === "planning" || key === "checking") return actError;
     if (key === "review" || key === "done") return prsStale;
     return null;
   }
@@ -371,8 +381,14 @@ export function BoardView({
       {/* Six empty lanes say nothing is happening but not why. This says both,
           and offers the handoffs as the thing to pick up. It sits above the
           lanes, never instead of them, so a column emptied by a failed poll
-          still gets to show its STALE badge. */}
-      {isColdStart(columns) && (
+          still gets to show its STALE badge.
+
+          It stays away entirely while any poll is failing. "Nothing is
+          running" is a positive claim about the machine, and a lane that is
+          empty because the request errored is not evidence for it: that is
+          silence being read as an answer. A STALE badge on its own lane is
+          the honest thing to show instead. */}
+      {isColdStart(columns) && !pollFailing && (
         <BoardColdStart
           handoffs={columns.suggested}
           moreHandoffs={columns.moreHandoffs}
