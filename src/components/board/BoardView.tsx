@@ -1,7 +1,9 @@
 import { HelpCircle, LayoutGrid, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
+import { BoardAlertBand } from "@/components/board/BoardAlertBand";
 import { BoardCard, boardCardKey, cardAction } from "@/components/board/BoardCard";
+import { BoardColdStart } from "@/components/board/BoardColdStart";
 import { BoardColumn } from "@/components/board/BoardColumn";
 import { BoardPeek } from "@/components/board/BoardPeek";
 import { badgeBaseClass, SESSION_STATUS_BADGES } from "@/components/session/agentPresentation";
@@ -12,6 +14,8 @@ import {
   type BoardCardItem,
   type BoardColumnKey,
   type BoardReviewRequests,
+  blockedOldestFirst,
+  isColdStart,
 } from "@/lib/board";
 import { useActStore } from "@/stores/useActStore";
 import { useBandStore } from "@/stores/useBandStore";
@@ -312,8 +316,7 @@ export function BoardView({
        Landscape/Workflows overlays (z-50), which therefore keep stacking on
        top of the Board with no change to the overlay-exclusivity rules. */
     <div className="absolute inset-0 z-[45] flex flex-col bg-maestro-bg">
-      <div className="flex h-10 shrink-0 items-center gap-1.5 border-b border-maestro-border px-3">
-        <span className="mr-1 shrink-0 text-[12px] font-semibold text-maestro-text">Board</span>
+      <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-maestro-border px-3">
         {actError && (
           <span
             className={`${badgeBaseClass} bg-maestro-yellow/15 text-maestro-yellow`}
@@ -326,7 +329,7 @@ export function BoardView({
         <button
           type="button"
           onClick={markSeen}
-          className="shrink-0 rounded border border-maestro-border px-1.5 py-0.5 text-[10px] text-maestro-muted transition-colors hover:text-maestro-text"
+          className="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-maestro-muted transition-colors hover:bg-maestro-elevated hover:text-maestro-text"
           title="Merged pull requests and finished runs up to now stop counting as news"
         >
           Mark seen
@@ -353,7 +356,7 @@ export function BoardView({
         <button
           type="button"
           onClick={onShowGrid}
-          className="flex shrink-0 items-center gap-1 rounded border border-maestro-border px-1.5 py-1 text-[11px] text-maestro-muted transition-colors hover:text-maestro-text"
+          className="flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-[11px] text-maestro-muted transition-colors hover:bg-maestro-elevated hover:text-maestro-text"
           aria-label="Grid view"
           title="Show the terminal grid"
         >
@@ -361,12 +364,28 @@ export function BoardView({
         </button>
       </div>
 
+      {/* What is waiting on you, before where everything else is. The board
+          under it keeps its shape: this adds a band, it does not take a lane. */}
+      <BoardAlertBand blocked={blockedOldestFirst(columns)} onActivate={activate} />
+
+      {/* Six empty lanes say nothing is happening but not why. This says both,
+          and offers the handoffs as the thing to pick up. It sits above the
+          lanes, never instead of them, so a column emptied by a failed poll
+          still gets to show its STALE badge. */}
+      {isColdStart(columns) && (
+        <BoardColdStart
+          handoffs={columns.suggested}
+          moreHandoffs={columns.moreHandoffs}
+          onActivate={activate}
+        />
+      )}
+
       <div className="min-h-0 flex-1 overflow-x-auto">
-        <div className="flex h-full min-w-[64rem] gap-3 px-3 py-3">
+        <div className="flex h-full min-w-[64rem] divide-x divide-maestro-border">
           {BOARD_COLUMN_ORDER.map((key) => {
             const items = columns[key];
             return (
-              <div key={key} className="flex min-w-0 flex-1 flex-col overflow-y-auto">
+              <div key={key} className="flex min-w-0 flex-1 flex-col overflow-y-auto px-2.5 py-3">
                 <BoardColumn
                   title={COLUMN_META[key].title}
                   count={items.length}
@@ -408,7 +427,7 @@ export function BoardView({
           return (
             <span
               key={status}
-              className={`flex shrink-0 items-center gap-1 rounded border border-maestro-border px-1.5 py-0.5 text-[10px] text-maestro-muted ${
+              className={`flex shrink-0 items-center gap-1 px-0.5 text-[10px] text-maestro-faint ${
                 count === 0 ? "opacity-40" : ""
               }`}
               title={`${badge.label}: ${count} session${count === 1 ? "" : "s"}`}

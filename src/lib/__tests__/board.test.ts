@@ -6,9 +6,12 @@ import {
   assembleBoard,
   type BoardCardItem,
   type BoardColumnKey,
+  type BoardColumns,
   type BoardReviewRequests,
+  blockedOldestFirst,
   inferActColumn,
   inferSessionColumn,
+  isColdStart,
   needsYou,
 } from "@/lib/board";
 import type { PullRequestInfo } from "@/stores/useGitHubStore";
@@ -652,5 +655,126 @@ describe("assembleBoard live outside-Maestro cards (WP7)", () => {
     expect(columns.suggested.length).toBe(10);
     expect(columns.moreHandoffs).toBe(2);
     expect(columns.building.filter((c) => c.kind === "external").length).toBe(1);
+  });
+});
+
+describe("blockedOldestFirst", () => {
+  function card(name: string, needsYou: boolean, since: string | null): BoardCardItem {
+    return {
+      kind: "handoff",
+      handoff: { slug: name, path: `/tmp/${name}`, repo: name } as HandoffInfo,
+      projectName: name,
+      objective: `${name} objective`,
+      stageLabel: "On disk",
+      needsYou,
+      since,
+    };
+  }
+
+  function columns(over: Partial<BoardColumns>): BoardColumns {
+    return {
+      suggested: [],
+      planning: [],
+      building: [],
+      checking: [],
+      review: [],
+      done: [],
+      counts: {
+        Starting: 0,
+        Idle: 0,
+        Working: 0,
+        NeedsInput: 0,
+        Done: 0,
+        Error: 0,
+        Timeout: 0,
+      },
+      moreHandoffs: 0,
+      ...over,
+    };
+  }
+
+  it("finds blocked cards wherever in the board they sit", () => {
+    const got = blockedOldestFirst(
+      columns({
+        suggested: [card("a", true, "2026-09-02T10:00:00Z")],
+        review: [card("b", true, "2026-09-02T10:05:00Z")],
+        done: [card("c", false, "2026-09-02T09:00:00Z")],
+      }),
+    );
+    expect(got.map((c) => c.projectName)).toEqual(["a", "b"]);
+  });
+
+  it("puts the longest wait first, whatever column it came from", () => {
+    const got = blockedOldestFirst(
+      columns({
+        checking: [
+          card("newer", true, "2026-09-02T10:30:00Z"),
+          card("oldest", true, "2026-09-02T09:00:00Z"),
+        ],
+        building: [card("middle", true, "2026-09-02T10:00:00Z")],
+      }),
+    );
+    expect(got.map((c) => c.projectName)).toEqual(["oldest", "middle", "newer"]);
+  });
+
+  it("sorts a card with no timestamp last rather than pretending it is oldest", () => {
+    const got = blockedOldestFirst(
+      columns({
+        building: [card("unknown", true, null), card("known", true, "2026-09-02T10:00:00Z")],
+      }),
+    );
+    expect(got.map((c) => c.projectName)).toEqual(["known", "unknown"]);
+  });
+
+  it("returns nothing when nothing is waiting", () => {
+    expect(blockedOldestFirst(columns({ building: [card("a", false, null)] }))).toEqual([]);
+  });
+});
+
+describe("isColdStart", () => {
+  function handoff(name: string): BoardCardItem {
+    return {
+      kind: "handoff",
+      handoff: { slug: name, path: `/tmp/${name}`, repo: name } as HandoffInfo,
+      projectName: name,
+      objective: `${name} objective`,
+      stageLabel: "On disk",
+      needsYou: false,
+      since: null,
+    };
+  }
+
+  function cols(over: Partial<BoardColumns>): BoardColumns {
+    return {
+      suggested: [],
+      planning: [],
+      building: [],
+      checking: [],
+      review: [],
+      done: [],
+      counts: { Starting: 0, Idle: 0, Working: 0, NeedsInput: 0, Done: 0, Error: 0, Timeout: 0 },
+      moreHandoffs: 0,
+      ...over,
+    };
+  }
+
+  it("is a cold start when the board holds nothing but handoffs", () => {
+    expect(isColdStart(cols({ suggested: [handoff("a"), handoff("b")] }))).toBe(true);
+  });
+
+  it("is a cold start on a completely empty board", () => {
+    expect(isColdStart(cols({}))).toBe(true);
+  });
+
+  it("is not a cold start while anything at all is building", () => {
+    expect(isColdStart(cols({ suggested: [handoff("a")], building: [handoff("b")] }))).toBe(false);
+  });
+
+  it("is not a cold start when something merged since you last looked", () => {
+    expect(isColdStart(cols({ done: [handoff("a")] }))).toBe(false);
+  });
+
+  it("is not a cold start when a pull request is waiting on review", () => {
+    expect(isColdStart(cols({ review: [handoff("a")] }))).toBe(false);
   });
 });

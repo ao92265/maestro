@@ -42,6 +42,7 @@ import {
 } from "./components/shared/PanelResizeHandle";
 import { ProjectTabs } from "./components/shared/ProjectTabs";
 import { QuickOpenPalette } from "./components/shared/QuickOpenPalette";
+import { QuietRail } from "./components/shared/QuietRail";
 import { type EagleProjectOption, TopBar } from "./components/shared/TopBar";
 import { UtilityPanel, type UtilityPanelKind } from "./components/shared/UtilityPanel";
 import {
@@ -1071,8 +1072,38 @@ function App() {
         onMoveTab={moveTab}
       />
 
-      {/* Main area: sidebar + content */}
+      {/* Main area: rail + sidebar + content */}
       <div className="flex flex-1 overflow-hidden">
+        {/* Quiet Deck rail — every surface, 44px, always there. The sidebar
+            beside it is a detail panel that comes and goes; navigation does
+            not, which is why it left the top bar. */}
+        <QuietRail
+          boardViewOpen={boardViewOpen}
+          onSetBoardView={handleSetBoardView}
+          homeViewOpen={homeViewOpen}
+          onToggleHomeView={handleToggleHomeView}
+          homeAttention={needsInputAnywhere}
+          factoryViewOpen={factoryViewOpen}
+          onToggleFactoryView={handleToggleFactoryView}
+          orchestratorViewOpen={orchestratorViewOpen}
+          onToggleOrchestratorView={handleToggleOrchestratorView}
+          pulseViewOpen={pulseViewOpen}
+          onTogglePulseView={handleTogglePulseView}
+          eagleView={eagleView}
+          onToggleEagleView={() => useSurfaceStore.getState().toggleEagle()}
+          processesPanelOpen={utilityPanel === "processes"}
+          onToggleProcessesPanel={() => handleToggleUtilityPanel("processes")}
+          aiPanelOpen={utilityPanel === "ai"}
+          onToggleAiPanel={() => handleToggleUtilityPanel("ai")}
+          gitPanelOpen={gitPanelOpen}
+          onToggleGitPanel={() => setGitPanelOpen((prev) => !prev)}
+          landscapeView={landscapeView}
+          onToggleLandscapeView={() => useSurfaceStore.getState().toggleOverlay("landscape")}
+          landscapeAttention={needsInputAnywhere}
+          onToggleMemoryPanel={() => handleToggleUtilityPanel("memory")}
+          onOpenWorkflows={handleOpenWorkflows}
+          onOpenExtensions={handleOpenExtensions}
+        />
         {/* Sidebar — below project tabs */}
         <Sidebar
           collapsed={!sidebarOpen}
@@ -1092,44 +1123,26 @@ function App() {
         {/* Right column: top bar + content + bottom bar */}
         <div className="flex flex-1 flex-col overflow-hidden">
           {/* Top bar row - includes git panel header when open */}
-          <div className="flex h-10 shrink-0 bg-maestro-bg">
+          <div className="flex h-9 shrink-0 bg-maestro-bg">
             {/* TopBar takes flex-1 to fill available space */}
             <TopBar
               sidebarOpen={sidebarOpen}
               onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
-              onToggleGitPanel={() => setGitPanelOpen((prev) => !prev)}
-              gitPanelOpen={gitPanelOpen}
               hideWindowControls
               slotCount={activeTabSlotCount}
               maxSessions={MAX_SESSIONS}
               onAddSession={handleAddSessionShortcut}
               hasProject={tabs.length > 0}
               eagleView={eagleView}
-              onToggleEagleView={() => useSurfaceStore.getState().toggleEagle()}
               eagleProjects={eagleProjects}
               onAddSessionToProject={handleAddSessionToProject}
               landscapeView={landscapeView}
-              onToggleLandscapeView={() => useSurfaceStore.getState().toggleOverlay("landscape")}
-              landscapeAttention={needsInputAnywhere}
               boardViewOpen={boardViewOpen}
-              onSetBoardView={handleSetBoardView}
               homeViewOpen={homeViewOpen}
-              onToggleHomeView={handleToggleHomeView}
               factoryViewOpen={factoryViewOpen}
-              onToggleFactoryView={handleToggleFactoryView}
               orchestratorViewOpen={orchestratorViewOpen}
-              onToggleOrchestratorView={handleToggleOrchestratorView}
               pulseViewOpen={pulseViewOpen}
-              onTogglePulseView={handleTogglePulseView}
-              homeAttention={needsInputAnywhere}
-              onToggleMemoryPanel={() => handleToggleUtilityPanel("memory")}
-              processesPanelOpen={utilityPanel === "processes"}
-              onToggleProcessesPanel={() => handleToggleUtilityPanel("processes")}
-              aiPanelOpen={utilityPanel === "ai"}
-              onToggleAiPanel={() => handleToggleUtilityPanel("ai")}
               onWatchdogNavigate={handleWatchdogNavigate}
-              onOpenExtensions={handleOpenExtensions}
-              onOpenWorkflows={handleOpenWorkflows}
             />
 
             {/* Git panel header - inline at same level as TopBar.
