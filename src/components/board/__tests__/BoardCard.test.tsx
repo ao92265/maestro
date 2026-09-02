@@ -215,4 +215,54 @@ describe("BoardCard", () => {
     render(<BoardCard item={handoffCard()} selected={false} onActivate={vi.fn()} />);
     expect(document.querySelector('[data-selected="true"]')).not.toBeInTheDocument();
   });
+
+  /* Quiet Deck: the stage a card is in must be readable without reading the
+     card. The stripe is a 2px left border keyed off data-stage, so a column
+     of cards shows the shape of the work before any word is parsed. */
+  it("stripes every card with the stage it is actually in", () => {
+    const cases: Array<[BoardCardItem, string]> = [
+      [sessionCard("Working", "tab-1"), "working"],
+      [sessionCard("Starting", "tab-1"), "starting"],
+      [sessionCard("Idle", "tab-1"), "idle"],
+      [sessionCard("Done", "tab-1"), "done"],
+      [sessionCard("Error", "tab-1"), "error"],
+      [sessionCard("Timeout", "tab-1"), "error"],
+      [handoffCard(), "waiting"],
+      [runCard("Building"), "working"],
+      [prCard("Review requested", null, false), "review"],
+      [prCard("Merged", "2026-01-01T00:00:00Z", false), "merged"],
+    ];
+    for (const [item, stage] of cases) {
+      const { unmount } = render(<BoardCard item={item} selected={false} onActivate={() => {}} />);
+      expect(screen.getByTestId("board-card").dataset.stage).toBe(stage);
+      unmount();
+    }
+  });
+
+  it("overrides the stage stripe on any card that needs you", () => {
+    render(
+      <BoardCard
+        item={sessionCard("NeedsInput", "tab-1")}
+        selected={false}
+        onActivate={() => {}}
+      />,
+    );
+    expect(screen.getByTestId("board-card").dataset.stage).toBe("needs");
+  });
+
+  it("spends the glow on needs-you and nothing else", () => {
+    const { unmount } = render(
+      <BoardCard item={sessionCard("Working", "tab-1")} selected={false} onActivate={() => {}} />,
+    );
+    expect(screen.getByTestId("board-card").className).not.toMatch(/shadow-\[/);
+    unmount();
+    render(
+      <BoardCard
+        item={sessionCard("NeedsInput", "tab-1")}
+        selected={false}
+        onActivate={() => {}}
+      />,
+    );
+    expect(screen.getByTestId("board-card").className).toMatch(/shadow-\[/);
+  });
 });

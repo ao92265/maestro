@@ -33,7 +33,7 @@ export function BoardColumn({
         <h2 className="shrink-0 text-[11px] font-semibold uppercase tracking-wider text-maestro-muted">
           {title}
         </h2>
-        <span className="shrink-0 text-[11px] text-maestro-muted/70">{count}</span>
+        <span className="shrink-0 font-mono text-[11px] text-maestro-faint">{count}</span>
         {stale && (
           <span
             className={`${badgeBaseClass} bg-maestro-yellow/15 text-maestro-yellow`}
@@ -46,7 +46,7 @@ export function BoardColumn({
         {note}
       </div>
       {count === 0 ? (
-        <p className="rounded border border-dashed border-maestro-border px-2 py-2 text-[11px] text-maestro-muted/70">
+        <p className="rounded-md border border-maestro-border px-2 py-2 text-[11px] leading-snug text-maestro-faint">
           {emptyText}
         </p>
       ) : (

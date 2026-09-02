@@ -13,7 +13,10 @@ vi.mock("@tauri-apps/api/window", () => ({
   }),
 }));
 
+import { useBandStore } from "@/stores/useBandStore";
 import { useHealthStore } from "@/stores/useHealthStore";
+import type { SessionConfig } from "@/stores/useSessionStore";
+import { useSessionStore } from "@/stores/useSessionStore";
 import { TopBar } from "../TopBar";
 
 function renderTopBar(overrides: Partial<ComponentProps<typeof TopBar>> = {}) {
@@ -31,6 +34,80 @@ function renderTopBar(overrides: Partial<ComponentProps<typeof TopBar>> = {}) {
 describe("TopBar", () => {
   beforeEach(() => {
     useHealthStore.setState({ flags: [] });
+    useSessionStore.setState({ sessions: [] });
+    useBandStore.setState({ handoffs: [] });
+  });
+
+  /**
+   * Quiet Deck's crumb: the one line the chrome keeps. It names the surface
+   * you are on and the two counts worth a glance.
+   *
+   * "Parked" is banned here on purpose. The pivot's data-honesty rule was
+   * written against exactly this string: handoff files on disk were being
+   * reported as parked sessions while Alex was typing in that directory in
+   * iTerm. The count is real, the noun has to be too.
+   */
+  describe("the crumb", () => {
+    function withCounts(live: number, handoffs: number) {
+      useSessionStore.setState({
+        sessions: Array.from({ length: live }, (_, i) => ({
+          id: i + 1,
+          status: "Working",
+          project_path: `/tmp/p${i}`,
+        })) as SessionConfig[],
+      });
+      useBandStore.setState({
+        handoffs: Array.from({ length: handoffs }, (_, i) => ({
+          slug: `h${i}`,
+          path: `/tmp/h${i}`,
+          repo: `h${i}`,
+        })) as ReturnType<typeof useBandStore.getState>["handoffs"],
+      });
+    }
+
+    it("names the surface you are actually on", () => {
+      renderTopBar({ boardViewOpen: true, onSetBoardView: vi.fn() });
+      expect(screen.getByTestId("topbar-crumb")).toHaveTextContent("Board");
+    });
+
+    it("names the grid when the Board layer is closed", () => {
+      renderTopBar({ boardViewOpen: false, onSetBoardView: vi.fn() });
+      expect(screen.getByTestId("topbar-crumb")).toHaveTextContent("Grid");
+    });
+
+    it("counts handoffs as files on disk, never as parked sessions", () => {
+      withCounts(2, 10);
+      renderTopBar({ boardViewOpen: true, onSetBoardView: vi.fn() });
+      const crumb = screen.getByTestId("topbar-crumb");
+      expect(crumb).toHaveTextContent("10 handoffs on disk");
+      expect(crumb.textContent).not.toMatch(/parked/i);
+    });
+
+    it("counts only live sessions as live", () => {
+      withCounts(3, 0);
+      renderTopBar({ boardViewOpen: true, onSetBoardView: vi.fn() });
+      expect(screen.getByTestId("topbar-crumb")).toHaveTextContent("3 live");
+    });
+
+    it("says nothing rather than zero when there is nothing to count", () => {
+      withCounts(0, 0);
+      renderTopBar({ boardViewOpen: true, onSetBoardView: vi.fn() });
+      const crumb = screen.getByTestId("topbar-crumb");
+      expect(crumb).not.toHaveTextContent("0 live");
+      expect(crumb).not.toHaveTextContent("0 handoffs");
+    });
+
+    it("does not count a finished session as live", () => {
+      useSessionStore.setState({
+        sessions: [
+          { id: 1, status: "Working", project_path: "/tmp/a" },
+          { id: 2, status: "Done", project_path: "/tmp/b" },
+          { id: 3, status: "Error", project_path: "/tmp/c" },
+        ] as SessionConfig[],
+      });
+      renderTopBar({ boardViewOpen: true, onSetBoardView: vi.fn() });
+      expect(screen.getByTestId("topbar-crumb")).toHaveTextContent("1 live");
+    });
   });
 
   /**

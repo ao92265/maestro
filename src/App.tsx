@@ -1092,7 +1092,7 @@ function App() {
         {/* Right column: top bar + content + bottom bar */}
         <div className="flex flex-1 flex-col overflow-hidden">
           {/* Top bar row - includes git panel header when open */}
-          <div className="flex h-10 shrink-0 bg-maestro-bg">
+          <div className="flex h-9 shrink-0 bg-maestro-bg">
             {/* TopBar takes flex-1 to fill available space */}
             <TopBar
               sidebarOpen={sidebarOpen}

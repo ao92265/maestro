@@ -312,7 +312,7 @@ export function BoardView({
        Landscape/Workflows overlays (z-50), which therefore keep stacking on
        top of the Board with no change to the overlay-exclusivity rules. */
     <div className="absolute inset-0 z-[45] flex flex-col bg-maestro-bg">
-      <div className="flex h-10 shrink-0 items-center gap-1.5 border-b border-maestro-border px-3">
+      <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-maestro-border px-3">
         <span className="mr-1 shrink-0 text-[12px] font-semibold text-maestro-text">Board</span>
         {actError && (
           <span
@@ -362,11 +362,11 @@ export function BoardView({
       </div>
 
       <div className="min-h-0 flex-1 overflow-x-auto">
-        <div className="flex h-full min-w-[64rem] gap-3 px-3 py-3">
+        <div className="flex h-full min-w-[64rem] divide-x divide-maestro-border">
           {BOARD_COLUMN_ORDER.map((key) => {
             const items = columns[key];
             return (
-              <div key={key} className="flex min-w-0 flex-1 flex-col overflow-y-auto">
+              <div key={key} className="flex min-w-0 flex-1 flex-col overflow-y-auto px-2.5 py-3">
                 <BoardColumn
                   title={COLUMN_META[key].title}
                   count={items.length}

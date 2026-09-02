@@ -113,6 +113,69 @@ function stageChip(item: BoardCardItem): { label: string; cls: string; mono: boo
   }
 }
 
+/**
+ * The stage a card is in, as one word, exposed on the DOM as `data-stage`.
+ *
+ * Quiet Deck's rule: a column of cards must show the shape of the work before
+ * a single word is read, so the stage is carried by a 2px stripe down the left
+ * edge rather than by the chip alone. `needsYou` outranks everything: a card
+ * waiting on Alex is that, whatever else is also true of it.
+ */
+export type CardStage =
+  | "needs"
+  | "working"
+  | "waiting"
+  | "review"
+  | "merged"
+  | "done"
+  | "starting"
+  | "error"
+  | "idle";
+
+export function stageOf(item: BoardCardItem): CardStage {
+  if (item.needsYou) return "needs";
+  switch (item.kind) {
+    case "session":
+      switch (item.session.status) {
+        case "Working":
+          return "working";
+        case "Starting":
+          return "starting";
+        case "Done":
+          return "done";
+        case "Error":
+        case "Timeout":
+          return "error";
+        default:
+          return "idle";
+      }
+    /* A handoff is not work in flight, it is work waiting for you to pick it
+       up, so it shares the waiting colour rather than borrowing working. */
+    case "handoff":
+      return "waiting";
+    case "run":
+      return "working";
+    case "pr":
+      return item.pr.mergedAt ? "merged" : "review";
+    /* Live work Maestro cannot open is still live work. */
+    case "external":
+      return "working";
+  }
+}
+
+/** The stripe colour for a stage. Accent is reserved for needs-you. */
+const STAGE_STRIPE: Record<CardStage, string> = {
+  needs: "border-l-maestro-accent",
+  working: "border-l-maestro-blue",
+  waiting: "border-l-maestro-yellow",
+  review: "border-l-maestro-blue/60",
+  merged: "border-l-maestro-purple",
+  done: "border-l-maestro-green",
+  starting: "border-l-maestro-orange",
+  error: "border-l-maestro-red",
+  idle: "border-l-maestro-border-strong",
+};
+
 function cardIcon(item: BoardCardItem) {
   switch (item.kind) {
     case "session":
@@ -140,8 +203,13 @@ export function BoardCard({
   const chip = stageChip(item);
   const Icon = cardIcon(item);
 
+  const stage = stageOf(item);
+
+  /* Border contrast before shadow: the card is held by its hairline and its
+     stage stripe, and the glow is spent on the one card that needs you. */
   const shell = [
-    "flex w-full flex-col rounded-md border bg-maestro-card px-2 py-1.5 text-left transition-colors",
+    "flex w-full flex-col rounded-md border border-l-2 bg-maestro-card px-2 py-1.5 text-left transition-colors",
+    STAGE_STRIPE[stage],
     item.needsYou
       ? "border-maestro-accent/70 shadow-[0_0_10px_rgb(var(--maestro-accent)/0.35)]"
       : "border-maestro-border",
@@ -180,6 +248,8 @@ export function BoardCard({
       <div
         className={`${shell} cursor-default`}
         title={action.title}
+        data-testid="board-card"
+        data-stage={stage}
         data-selected={selected || undefined}
       >
         {body}
@@ -193,6 +263,8 @@ export function BoardCard({
       className={`${shell} hover:border-maestro-muted/50`}
       onClick={onActivate}
       title={action.title}
+      data-testid="board-card"
+      data-stage={stage}
       data-selected={selected || undefined}
     >
       {body}

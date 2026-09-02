@@ -25,7 +25,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { MAX_SESSIONS } from "@/components/terminal/splitTree";
 import { isMac } from "@/lib/platform";
 import { modLabel, titleWithShortcut } from "@/lib/shortcuts";
+import { useBandStore } from "@/stores/useBandStore";
 import { countForArea, useHealthStore } from "@/stores/useHealthStore";
+import { useSessionStore } from "@/stores/useSessionStore";
 import { GitHubWatchdogBadge } from "./GitHubWatchdogBadge";
 import { HealthAttentionBadge } from "./HealthAttentionBadge";
 
@@ -153,6 +155,48 @@ export function TopBar({
   // per-item badge inside the menu still uses HealthAttentionBadge directly).
   const memoryHealthCount = useHealthStore((s) => countForArea(s.flags, "memory"));
 
+  /* The crumb's two counts. Both are read straight from the stores that own
+     them so the chrome cannot drift from the Board: whatever the Board is
+     showing, this line is counting the same rows.
+
+     "Live" is a session Maestro launched that has not finished. Work running
+     in someone else's iTerm is deliberately NOT counted here, because Maestro
+     cannot see it, and a number that quietly includes guesses is the thing
+     the data-honesty rule exists to stop. */
+  const liveCount = useSessionStore(
+    (s) =>
+      s.sessions.filter(
+        (session) =>
+          session.status !== "Done" && session.status !== "Error" && session.status !== "Timeout",
+      ).length,
+  );
+  /* Files on disk, named as files on disk. This used to read "sessions
+     parked", which was wrong in both nouns. */
+  const handoffCount = useBandStore((s) => s.handoffs.length);
+
+  const surfaceName = eagleView
+    ? "Eagle"
+    : landscapeView
+      ? "Landscape"
+      : homeViewOpen
+        ? "Home"
+        : factoryViewOpen
+          ? "Factory"
+          : orchestratorViewOpen
+            ? "Orchestrator"
+            : pulseViewOpen
+              ? "Pulse"
+              : boardViewOpen
+                ? "Board"
+                : "Grid";
+
+  /* Zero is not worth a word. An empty count says nothing rather than
+     drawing "0 live" across the only line of chrome the app keeps. */
+  const crumbCounts = [
+    liveCount > 0 ? `${liveCount} live` : null,
+    handoffCount > 0 ? `${handoffCount} handoffs on disk` : null,
+  ].filter(Boolean) as string[];
+
   // Eagle view add-terminal dropdown (pick which project gets the new terminal)
   const [addMenuOpen, setAddMenuOpen] = useState(false);
   const addMenuRef = useRef<HTMLDivElement | null>(null);
@@ -196,7 +240,7 @@ export function TopBar({
   const atMaxSessions = slotCount >= maxSessions;
 
   return (
-    <div data-tauri-drag-region className="no-select flex h-10 flex-1 items-center bg-maestro-bg">
+    <div data-tauri-drag-region className="no-select flex h-9 flex-1 items-center bg-maestro-bg">
       {/* Left: collapse toggle + branch area (inset from CSS var for macOS traffic lights) */}
       <div
         className="flex items-center gap-2 pr-2"
@@ -219,8 +263,21 @@ export function TopBar({
         )}
       </div>
 
-      {/* Center: drag region */}
-      <div data-tauri-drag-region className="flex-1" />
+      {/* Centre: the crumb, then drag region. Quiet Deck keeps exactly one
+          line of chrome, so this is where the app says what you are looking
+          at and how much is in flight. */}
+      <div
+        data-tauri-drag-region
+        data-testid="topbar-crumb"
+        className="flex min-w-0 flex-1 items-center gap-1.5 pl-1 text-[12px]"
+      >
+        <span className="shrink-0 font-medium text-maestro-text-2">{surfaceName}</span>
+        {crumbCounts.length > 0 && (
+          <span className="min-w-0 truncate text-maestro-faint">
+            {crumbCounts.map((count) => `· ${count}`).join(" ")}
+          </span>
+        )}
+      </div>
 
       {/* Right: action icons */}
       <div className="flex items-center gap-0.5 mr-1">
@@ -244,8 +301,7 @@ export function TopBar({
                 "E",
               )}
             >
-              <Columns size={12} />
-              Board
+              <Columns size={13} />
             </button>
             <button
               type="button"
@@ -259,8 +315,7 @@ export function TopBar({
               aria-label="Grid view"
               title={titleWithShortcut("Grid: the terminals themselves", modLabel(), "E")}
             >
-              <LayoutGrid size={12} />
-              Grid
+              <LayoutGrid size={13} />
             </button>
           </div>
         )}
