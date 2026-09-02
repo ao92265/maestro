@@ -1,35 +1,12 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import {
-  Activity,
-  Bird,
-  Brain,
-  Columns,
-  Factory,
-  Gauge,
-  GitMerge,
-  Home,
-  LayoutGrid,
-  Minus,
-  MoreHorizontal,
-  Network,
-  Package,
-  PanelLeft,
-  Plus,
-  RadioTower,
-  Sparkles,
-  Square,
-  Workflow,
-  X,
-} from "lucide-react";
+import { Minus, PanelLeft, Plus, Square, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { MAX_SESSIONS } from "@/components/terminal/splitTree";
 import { isMac } from "@/lib/platform";
 import { modLabel, titleWithShortcut } from "@/lib/shortcuts";
 import { useBandStore } from "@/stores/useBandStore";
-import { countForArea, useHealthStore } from "@/stores/useHealthStore";
 import { useSessionStore } from "@/stores/useSessionStore";
 import { GitHubWatchdogBadge } from "./GitHubWatchdogBadge";
-import { HealthAttentionBadge } from "./HealthAttentionBadge";
 
 /** One entry of the eagle-view "add terminal" project dropdown. */
 export interface EagleProjectOption {
@@ -43,8 +20,6 @@ export interface EagleProjectOption {
 interface TopBarProps {
   sidebarOpen: boolean;
   onToggleSidebar: () => void;
-  onToggleGitPanel?: () => void;
-  gitPanelOpen?: boolean;
   /** When true, hides window controls (minimize/maximize/close) - use when ProjectTabs provides them */
   hideWindowControls?: boolean;
   /** Whether sessions have been launched for the active project (grid view) */
@@ -58,102 +33,47 @@ interface TopBarProps {
   hasProject?: boolean;
   /** Whether eagle view (all projects' terminals at once) is active */
   eagleView?: boolean;
-  onToggleEagleView?: () => void;
   /** Eagle view: projects offered in the add-terminal dropdown. */
   eagleProjects?: EagleProjectOption[];
   /** Eagle view: add a terminal to the given project (opens its pre-launch card). */
   onAddSessionToProject?: (tabId: string) => void;
   /** Landscape view: every project, terminal and subagent on one canvas */
   landscapeView?: boolean;
-  onToggleLandscapeView?: () => void;
-  /** A terminal somewhere is waiting for input — marks the landscape button. */
-  landscapeAttention?: boolean;
   /** Board layer: every piece of live work, in the stage it is in */
   boardViewOpen?: boolean;
-  /** Board/Grid segmented toggle. A two-position selector, not a toggle
-   *  button: clicking the segment you are already on is a no-op by design,
-   *  the way a radio group behaves. */
-  onSetBoardView?: (open: boolean) => void;
   /** Home decision queue: blocked on you / landed / running */
   homeViewOpen?: boolean;
-  onToggleHomeView?: () => void;
-  /** A terminal somewhere is waiting for input — marks the Home button. */
-  homeAttention?: boolean;
   /** Factory: the ACT lane (spec in, run stages, PR out) */
   factoryViewOpen?: boolean;
-  onToggleFactoryView?: () => void;
   /** Orchestrator: goal box, session scope, safe-mode proposal queue */
   orchestratorViewOpen?: boolean;
-  onToggleOrchestratorView?: () => void;
   /** Pulse: today's timeline, flow score and metrics */
   pulseViewOpen?: boolean;
-  onTogglePulseView?: () => void;
-  /** Memory panel — buried behind the More menu, so it toggles without an
-   *  active-state indicator (a plain menu action, not a persistent button). */
-  onToggleMemoryPanel?: () => void;
-  /** Right-side Processes panel */
-  processesPanelOpen?: boolean;
-  onToggleProcessesPanel?: () => void;
-  /** Right-side AI panel (Report / Plan / Catalog tabs) */
-  aiPanelOpen?: boolean;
-  onToggleAiPanel?: () => void;
   /** GitHub watchdog badge: navigate to the git panel with the matching
    *  tab + search filter. Badge hides itself when totals are zero. */
   onWatchdogNavigate?: (kind: "prs" | "issues") => void;
-  /** More menu → Extensions: opens the sidebar on its Infra tab (MCP
-   *  servers, plugins, skills) — that tab no longer has its own strip
-   *  button, but its content still renders when selected. */
-  onOpenExtensions?: () => void;
-  /** More menu → Workflows: opens the full-screen workflow editor overlay.
-   *  Its only trigger used to live inside the (now cut) Launch panel, but
-   *  the overlay itself is a standalone store-driven view — reachable here
-   *  with no change to the editor. */
-  onOpenWorkflows?: () => void;
 }
 
 export function TopBar({
   sidebarOpen,
   onToggleSidebar,
-  onToggleGitPanel,
-  gitPanelOpen,
   hideWindowControls = false,
   slotCount = 0,
   maxSessions = MAX_SESSIONS,
   onAddSession,
   hasProject = false,
   eagleView = false,
-  onToggleEagleView,
   eagleProjects = [],
   onAddSessionToProject,
   landscapeView = false,
-  onToggleLandscapeView,
-  landscapeAttention = false,
   boardViewOpen = false,
-  onSetBoardView,
   homeViewOpen = false,
-  onToggleHomeView,
-  homeAttention = false,
   factoryViewOpen = false,
-  onToggleFactoryView,
   orchestratorViewOpen = false,
-  onToggleOrchestratorView,
   pulseViewOpen = false,
-  onTogglePulseView,
-  onToggleMemoryPanel,
-  processesPanelOpen = false,
-  onToggleProcessesPanel,
-  aiPanelOpen = false,
-  onToggleAiPanel,
   onWatchdogNavigate,
-  onOpenExtensions,
-  onOpenWorkflows,
 }: TopBarProps) {
   const appWindow = useMemo(() => getCurrentWindow(), []);
-
-  // Memory's health flags lost their button when Memory moved into the More
-  // menu; this feeds the aggregated dot on the More button below (the
-  // per-item badge inside the menu still uses HealthAttentionBadge directly).
-  const memoryHealthCount = useHealthStore((s) => countForArea(s.flags, "memory"));
 
   /* The crumb's two counts. Both are read straight from the stores that own
      them so the chrome cannot drift from the Board: whatever the Board is
@@ -201,12 +121,6 @@ export function TopBar({
   const [addMenuOpen, setAddMenuOpen] = useState(false);
   const addMenuRef = useRef<HTMLDivElement | null>(null);
 
-  // More menu — Landscape, Memory and Extensions, buried behind the ellipsis
-  // instead of their own topbar buttons (declutter). Same outside-click
-  // pattern as the add-terminal dropdown above.
-  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
-  const moreMenuRef = useRef<HTMLDivElement | null>(null);
-
   // Close the dropdown on any outside click.
   useEffect(() => {
     if (!addMenuOpen) return;
@@ -223,18 +137,6 @@ export function TopBar({
   useEffect(() => {
     if (!eagleView) setAddMenuOpen(false);
   }, [eagleView]);
-
-  // Close the More menu on any outside click.
-  useEffect(() => {
-    if (!moreMenuOpen) return;
-    const onPointerDown = (e: MouseEvent) => {
-      if (moreMenuRef.current && !moreMenuRef.current.contains(e.target as Node)) {
-        setMoreMenuOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onPointerDown);
-    return () => document.removeEventListener("mousedown", onPointerDown);
-  }, [moreMenuOpen]);
 
   /** At the per-project terminal cap. The button greys out, so say why. */
   const atMaxSessions = slotCount >= maxSessions;
@@ -283,42 +185,6 @@ export function TopBar({
       <div className="flex items-center gap-0.5 mr-1">
         {/* Shell mode. The Board is a layer over the permanently mounted
             grid, so "Grid" closes the layer rather than unmounting anything. */}
-        {onSetBoardView && (
-          <div className="mr-1.5 flex items-center gap-0.5 rounded-md border border-maestro-border bg-maestro-card p-0.5">
-            <button
-              type="button"
-              onClick={() => onSetBoardView(true)}
-              aria-pressed={boardViewOpen}
-              className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] transition-colors ${
-                boardViewOpen
-                  ? "bg-maestro-surface text-maestro-text"
-                  : "text-maestro-muted hover:text-maestro-text"
-              }`}
-              aria-label="Board view"
-              title={titleWithShortcut(
-                "Board: every piece of work in the stage it is in",
-                modLabel(),
-                "E",
-              )}
-            >
-              <Columns size={13} />
-            </button>
-            <button
-              type="button"
-              onClick={() => onSetBoardView(false)}
-              aria-pressed={!boardViewOpen}
-              className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] transition-colors ${
-                boardViewOpen
-                  ? "text-maestro-muted hover:text-maestro-text"
-                  : "bg-maestro-surface text-maestro-text"
-              }`}
-              aria-label="Grid view"
-              title={titleWithShortcut("Grid: the terminals themselves", modLabel(), "E")}
-            >
-              <LayoutGrid size={13} />
-            </button>
-          </div>
-        )}
         {/* GitHub watchdog totals (review requests / assigned issues) */}
         {onWatchdogNavigate && <GitHubWatchdogBadge onNavigate={onWatchdogNavigate} />}
         {/* Active project: adds a pre-launch slot to its grid. Always present
@@ -387,232 +253,6 @@ export function TopBar({
                     <span className="truncate">{project.name}</span>
                   </button>
                 ))}
-              </div>
-            )}
-          </div>
-        )}
-        {onToggleHomeView && (
-          <button
-            type="button"
-            onClick={onToggleHomeView}
-            className={`relative rounded p-1.5 transition-colors ${
-              homeViewOpen
-                ? "text-maestro-accent hover:bg-maestro-accent/10"
-                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
-            }`}
-            aria-label="Home"
-            title={titleWithShortcut(
-              "Home — blocked on you, landed since you looked, running",
-              modLabel(),
-              "1",
-            )}
-          >
-            <Home size={14} />
-            {homeAttention && !homeViewOpen && (
-              <span
-                aria-hidden="true"
-                className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-maestro-accent"
-              />
-            )}
-          </button>
-        )}
-        {onToggleFactoryView && (
-          <button
-            type="button"
-            onClick={onToggleFactoryView}
-            className={`relative rounded p-1.5 transition-colors ${
-              factoryViewOpen
-                ? "text-maestro-accent hover:bg-maestro-accent/10"
-                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
-            }`}
-            aria-label="Factory"
-            title={titleWithShortcut(
-              "Factory — hand ACT a spec, watch the run, get the PR",
-              modLabel(),
-              "7",
-            )}
-          >
-            <Factory size={14} />
-          </button>
-        )}
-        {onToggleOrchestratorView && (
-          <button
-            type="button"
-            onClick={onToggleOrchestratorView}
-            className={`relative rounded p-1.5 transition-colors ${
-              orchestratorViewOpen
-                ? "text-maestro-accent hover:bg-maestro-accent/10"
-                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
-            }`}
-            aria-label="Orchestrator"
-            title={titleWithShortcut(
-              "Orchestrator — set a goal, scope the sessions, approve what it proposes",
-              modLabel(),
-              "8",
-            )}
-          >
-            <RadioTower size={14} />
-          </button>
-        )}
-        {onTogglePulseView && (
-          <button
-            type="button"
-            onClick={onTogglePulseView}
-            className={`relative rounded p-1.5 transition-colors ${
-              pulseViewOpen
-                ? "text-maestro-accent hover:bg-maestro-accent/10"
-                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
-            }`}
-            aria-label="Pulse"
-            title={titleWithShortcut(
-              "Pulse — today's timeline, flow score and metrics",
-              modLabel(),
-              "9",
-            )}
-          >
-            <Gauge size={14} />
-          </button>
-        )}
-        {onToggleEagleView && (
-          <button
-            type="button"
-            onClick={onToggleEagleView}
-            className={`rounded p-1.5 transition-colors ${
-              eagleView
-                ? "text-maestro-accent hover:bg-maestro-accent/10"
-                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
-            }`}
-            aria-label="Eagle view"
-            title={titleWithShortcut("Eagle view", modLabel(), "G")}
-          >
-            <Bird size={14} />
-          </button>
-        )}
-        {onToggleProcessesPanel && (
-          <button
-            type="button"
-            onClick={onToggleProcessesPanel}
-            className={`relative rounded p-1.5 transition-colors ${
-              processesPanelOpen
-                ? "text-maestro-accent hover:bg-maestro-accent/10"
-                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
-            }`}
-            aria-label="Processes"
-            title={titleWithShortcut("Processes", modLabel(), "4")}
-          >
-            <Activity size={14} />
-            <HealthAttentionBadge area="processes" />
-          </button>
-        )}
-        {onToggleAiPanel && (
-          <button
-            type="button"
-            onClick={onToggleAiPanel}
-            className={`rounded p-1.5 transition-colors ${
-              aiPanelOpen
-                ? "text-maestro-accent hover:bg-maestro-accent/10"
-                : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
-            }`}
-            aria-label="AI"
-            title={titleWithShortcut("AI — daily report and plan", modLabel(), "6")}
-          >
-            <Sparkles size={14} />
-          </button>
-        )}
-        {/* Git panel — in eagle view it becomes a per-project carousel
-            (swipe between one git card per open project). */}
-        <button
-          type="button"
-          onClick={onToggleGitPanel}
-          className={`rounded p-1.5 transition-colors ${
-            gitPanelOpen
-              ? "text-maestro-accent hover:bg-maestro-accent/10"
-              : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
-          }`}
-          aria-label="Git"
-          title={titleWithShortcut("Git", modLabel(), "2")}
-        >
-          <GitMerge size={14} />
-        </button>
-        {/* More menu — Landscape, Memory, Workflows and Extensions moved here
-            (issue declutter): each keeps its keyboard shortcut/store wiring,
-            just off the always-visible strip. */}
-        {(onToggleLandscapeView || onToggleMemoryPanel || onOpenWorkflows || onOpenExtensions) && (
-          <div className="relative" ref={moreMenuRef}>
-            <button
-              type="button"
-              onClick={() => setMoreMenuOpen((v) => !v)}
-              className={`relative rounded p-1.5 transition-colors ${
-                moreMenuOpen
-                  ? "bg-maestro-card text-maestro-text"
-                  : "text-maestro-muted hover:bg-maestro-card hover:text-maestro-text"
-              }`}
-              aria-label="More"
-              title="More — Landscape, Memory, Workflows, Extensions"
-            >
-              <MoreHorizontal size={14} />
-              {((landscapeAttention && !landscapeView) || memoryHealthCount > 0) && (
-                <span
-                  aria-hidden="true"
-                  className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-maestro-accent"
-                />
-              )}
-            </button>
-            {moreMenuOpen && (
-              <div className="absolute right-0 top-full z-50 mt-1 min-w-[170px] rounded-md border border-maestro-border bg-maestro-surface py-1 shadow-lg">
-                {onToggleLandscapeView && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setMoreMenuOpen(false);
-                      onToggleLandscapeView();
-                    }}
-                    className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-maestro-text transition-colors hover:bg-maestro-card"
-                  >
-                    <Network size={13} className="shrink-0 text-maestro-muted" />
-                    Landscape
-                  </button>
-                )}
-                {onToggleMemoryPanel && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setMoreMenuOpen(false);
-                      onToggleMemoryPanel();
-                    }}
-                    className="relative flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-maestro-text transition-colors hover:bg-maestro-card"
-                  >
-                    <Brain size={13} className="shrink-0 text-maestro-muted" />
-                    Memory
-                    <HealthAttentionBadge area="memory" />
-                  </button>
-                )}
-                {onOpenWorkflows && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setMoreMenuOpen(false);
-                      onOpenWorkflows();
-                    }}
-                    className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-maestro-text transition-colors hover:bg-maestro-card"
-                  >
-                    <Workflow size={13} className="shrink-0 text-maestro-muted" />
-                    Workflows
-                  </button>
-                )}
-                {onOpenExtensions && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setMoreMenuOpen(false);
-                      onOpenExtensions();
-                    }}
-                    className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-maestro-text transition-colors hover:bg-maestro-card"
-                  >
-                    <Package size={13} className="shrink-0 text-maestro-muted" />
-                    Extensions
-                  </button>
-                )}
               </div>
             )}
           </div>
