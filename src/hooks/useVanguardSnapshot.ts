@@ -24,6 +24,8 @@ interface SnapshotRow {
   kind: BandItem["kind"];
   label: string;
   detail: string;
+  /** Stable identifier for addressing this row from outside (e.g. Telegram reply resolver). */
+  id?: string;
 }
 
 function rowOf(item: BandItem): SnapshotRow {
@@ -33,6 +35,7 @@ function rowOf(item: BandItem): SnapshotRow {
         kind: item.kind,
         label: `${item.projectName} (${item.session.status})`,
         detail: item.session.needsInputPrompt ?? item.session.statusMessage ?? "",
+        id: `session:${item.session.id}`,
       };
     case "pr":
       return {
@@ -46,8 +49,8 @@ function rowOf(item: BandItem): SnapshotRow {
       return {
         kind: item.kind,
         label: `Parked: ${item.handoff.repo}`,
-        // The open ask is the decision; lastAction is only a fallback narration.
         detail: item.handoff.asks[0] || item.handoff.lastAction,
+        id: `handoff:${item.handoff.slug}`,
       };
   }
 }

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use chrono::Utc;
@@ -22,6 +22,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;
 
 use super::claude_event::ClaudeEvent;
+use super::process_manager::ProcessManager;
 
 /// Maximum number of pending statuses to buffer (prevents memory leaks).
 const MAX_PENDING_STATUSES: usize = 100;
@@ -124,6 +125,14 @@ struct ServerState {
     /// are cleared by the signals that genuinely end the wait (PostToolUse,
     /// UserPromptSubmit, Stop, SessionEnd), so the map stays session-bounded.
     notified_at: Arc<RwLock<HashMap<u32, Instant>>>,
+    /// Whether the control door opened at all at startup. `None` means it
+    /// never did, and no amount of re-reading should change that.
+    control_token: Option<String>,
+    /// Where the shared secret lives. Held rather than recomputed so the
+    /// door's own tests exercise the real file handling.
+    control_token_path: std::path::PathBuf,
+    /// PTY access for the control/answer route.
+    process_manager: Option<ProcessManager>,
 }
 
 /// HTTP status server that receives status updates from MCP servers.
@@ -146,6 +155,8 @@ fn build_router(state: Arc<ServerState>) -> Router {
         .route("/hook/stop", post(handle_hook_stop))
         .route("/hook/notification", post(handle_hook_notification))
         .route("/hook/user-prompt", post(handle_hook_user_prompt_submit))
+        .route("/control/sessions", get(handle_control_sessions))
+        .route("/control/answer", post(handle_control_answer))
         .with_state(state)
 }
 
@@ -192,6 +203,7 @@ impl StatusServer {
         app_handle: AppHandle,
         instance_id: String,
         hook_emit_fn: Option<Arc<dyn Fn(ClaudeEvent) + Send + Sync>>,
+        process_manager: Option<ProcessManager>,
     ) -> Option<Self> {
         // Find and bind in one step to avoid race conditions where another
         // process grabs the port between checking and binding
@@ -200,6 +212,8 @@ impl StatusServer {
         let pending_statuses = Arc::new(RwLock::new(HashMap::new()));
         let emit_fn = emit_fn_from_app_handle(app_handle);
 
+        let control_token = load_or_create_control_token().await;
+
         let state = Arc::new(ServerState {
             emit_fn: emit_fn.clone(),
             hook_emit_fn,
@@ -207,6 +221,9 @@ impl StatusServer {
             session_projects: session_projects.clone(),
             pending_statuses: pending_statuses.clone(),
             notified_at: Arc::new(RwLock::new(HashMap::new())),
+            control_token,
+            control_token_path: control_token_path(),
+            process_manager,
         });
 
         let app = build_router(state);
@@ -690,6 +707,10 @@ async fn handle_hook_pre_tool(
             );
             return StatusCode::OK;
         }
+        // The session is working again, so drop the stamp. It used to survive
+        // the downgrade, which left the control door treating a busy session
+        // as one still waiting on a human.
+        state.notified_at.write().await.remove(&maestro_session_id);
         emit_hook_status(
             &state,
             maestro_session_id,
@@ -955,6 +976,257 @@ async fn handle_hook_stop(
     StatusCode::OK
 }
 
+// ── Control door ────────────────────────────────────────────────────
+
+fn control_token_path() -> std::path::PathBuf {
+    directories::BaseDirs::new()
+        .expect("home directory")
+        .home_dir()
+        .join(".maestro")
+        .join("control-token")
+}
+
+/// The most an answer may be. A human answering a prompt does not need more,
+/// and without a cap the only limit is the web framework's whole-body default.
+const MAX_CONTROL_ANSWER_LEN: usize = 4096;
+
+/// Read the token that is on disk right now, or `None` if there is not a
+/// usable one.
+///
+/// Every branch that is not "a good file with a non-empty secret" returns
+/// `None` rather than minting a replacement. An empty, whitespace-only or
+/// unreadable file is a tampered or truncated state, and quietly generating a
+/// new token there would hide that AND hand out fresh access. The file is left
+/// alone so a human can see what happened.
+fn read_existing_control_token(path: &std::path::Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    // A symlink or a fifo here is somebody else steering where we read from.
+    if !meta.is_file() {
+        eprintln!("[CONTROL] token path is not a regular file, refusing");
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            eprintln!(
+                "[CONTROL] token file is readable by others (mode {mode:o}), refusing. \
+                 Fix with: chmod 600 {}",
+                path.display()
+            );
+            return None;
+        }
+    }
+    let token = std::fs::read_to_string(path).ok()?.trim().to_string();
+    if token.is_empty() {
+        eprintln!("[CONTROL] token file is empty, refusing");
+        return None;
+    }
+    Some(token)
+}
+
+/// Write a token owner-only, surfacing a failure rather than swallowing it.
+fn write_control_token(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        // A partial write leaves a token nobody holds, so do not ignore it.
+        f.write_all(token.as_bytes())?;
+        f.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, token)?;
+    }
+    Ok(())
+}
+
+/// Bootstrap on first run only: create a token if there is no file at all.
+/// An existing but unusable file is never replaced.
+async fn load_or_create_control_token() -> Option<String> {
+    let path = control_token_path();
+    if path.exists() {
+        return read_existing_control_token(&path);
+    }
+    let token = uuid::Uuid::new_v4().to_string().replace('-', "");
+    if let Err(e) = write_control_token(&path, &token) {
+        eprintln!("[CONTROL] Failed to write control token: {e}");
+        return None;
+    }
+    eprintln!("[CONTROL] Generated control token at {}", path.display());
+    Some(token)
+}
+
+/// Constant-time comparison, so the number of matching leading bytes cannot be
+/// read off the response time.
+fn tokens_match(got: &str, expected: &str) -> bool {
+    let (got, expected) = (got.as_bytes(), expected.as_bytes());
+    // Length is not a secret; the bytes are. Bail early only on length.
+    if got.len() != expected.len() || expected.is_empty() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in got.iter().zip(expected.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// Check the caller's token against the one on disk RIGHT NOW, not the one
+/// cached at startup: deleting the file has to revoke access without needing
+/// the app restarted.
+fn verify_control_token(
+    headers: &HeaderMap,
+    startup_token: &Option<String>,
+    path: &std::path::Path,
+) -> bool {
+    // No token at startup means the door never opened; nothing to re-read.
+    if startup_token.is_none() {
+        return false;
+    }
+    let Some(expected) = read_existing_control_token(path) else {
+        return false;
+    };
+    headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|got| tokens_match(got, &expected))
+        .unwrap_or(false)
+}
+
+fn is_loopback_request(headers: &HeaderMap) -> bool {
+    for key in ["host", "origin"] {
+        if let Some(val) = headers.get(key).and_then(|v| v.to_str().ok()) {
+            let host_part = val
+                .strip_prefix("http://")
+                .or_else(|| val.strip_prefix("https://"))
+                .unwrap_or(val);
+            let host = host_part.split(':').next().unwrap_or("");
+            if !matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]") {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[derive(Serialize)]
+struct ControlSession {
+    session_id: u32,
+    project_path: String,
+}
+
+async fn handle_control_sessions(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ControlSession>>, StatusCode> {
+    if !is_loopback_request(&headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !verify_control_token(&headers, &state.control_token, &state.control_token_path) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let projects = state.session_projects.read().await;
+    let sessions: Vec<ControlSession> = projects
+        .iter()
+        .map(|(&id, path)| ControlSession {
+            session_id: id,
+            project_path: path.clone(),
+        })
+        .collect();
+    Ok(Json(sessions))
+}
+
+#[derive(Deserialize)]
+struct ControlAnswerRequest {
+    session_id: u32,
+    text: String,
+}
+
+async fn handle_control_answer(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<ControlAnswerRequest>,
+) -> StatusCode {
+    if !is_loopback_request(&headers) {
+        return StatusCode::FORBIDDEN;
+    }
+    if !verify_control_token(&headers, &state.control_token, &state.control_token_path) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    // The text lands as keystrokes in a terminal running an agent, so it has
+    // to be an ANSWER and not a sequence of commands. Anything below 0x20 or
+    // DEL is a control code: an embedded newline is a second submission, an
+    // escape byte drives the terminal itself.
+    if payload.text.len() > MAX_CONTROL_ANSWER_LEN {
+        eprintln!(
+            "[CONTROL] answer for session {} is {} bytes, over the {} cap",
+            payload.session_id,
+            payload.text.len(),
+            MAX_CONTROL_ANSWER_LEN
+        );
+        return StatusCode::BAD_REQUEST;
+    }
+    if payload.text.chars().any(|c| c.is_control()) {
+        eprintln!(
+            "[CONTROL] answer for session {} carries control characters, refusing",
+            payload.session_id
+        );
+        return StatusCode::BAD_REQUEST;
+    }
+
+    // Only answer a session that is genuinely still blocked, and CONSUME the
+    // marker while doing it. Reading it and writing later left a window where
+    // the session moved on in between, and let the same answer be replayed
+    // into a session that was no longer waiting. Taking it under the write
+    // lock makes the check and the claim one step.
+    let was_blocked = state
+        .notified_at
+        .write()
+        .await
+        .remove(&payload.session_id)
+        .is_some();
+    if !was_blocked {
+        eprintln!(
+            "[CONTROL] session {} is not blocked, refusing answer",
+            payload.session_id
+        );
+        return StatusCode::CONFLICT;
+    }
+    let Some(ref pm) = state.process_manager else {
+        eprintln!("[CONTROL] answer: no process manager available");
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
+    let pm = pm.clone();
+    let text = format!("{}\n", payload.text);
+    match tokio::task::spawn_blocking(move || pm.write_stdin(payload.session_id, &text)).await {
+        Ok(Ok(())) => {
+            eprintln!("[CONTROL] Answered session {}", payload.session_id);
+            StatusCode::OK
+        }
+        Ok(Err(e)) => {
+            eprintln!("[CONTROL] write_stdin failed for session {}: {e}", payload.session_id);
+            StatusCode::NOT_FOUND
+        }
+        Err(e) => {
+            eprintln!("[CONTROL] spawn_blocking failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,6 +1269,9 @@ mod tests {
             session_projects: Arc::new(RwLock::new(HashMap::new())),
             pending_statuses: Arc::new(RwLock::new(HashMap::new())),
             notified_at: Arc::new(RwLock::new(HashMap::new())),
+            control_token: None,
+            control_token_path: std::path::PathBuf::from("/nonexistent/control-token"),
+            process_manager: None,
         });
 
         let app = build_router(state.clone());
@@ -2011,6 +2286,9 @@ mod tests {
             session_projects: Arc::new(RwLock::new(HashMap::new())),
             pending_statuses: Arc::new(RwLock::new(HashMap::new())),
             notified_at: Arc::new(RwLock::new(HashMap::new())),
+            control_token: None,
+            control_token_path: std::path::PathBuf::from("/nonexistent/control-token"),
+            process_manager: None,
         });
 
         let app = build_router(state);
@@ -2096,5 +2374,317 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status().as_u16(), 400);
+    }
+
+    // ── Control door ────────────────────────────────────────────────
+    //
+    // The socket only ever binds 127.0.0.1, so these cover the second gate:
+    // the shared token, and the refusal to type into a session that is not
+    // actually waiting on a human.
+
+    /// A control-door server with a token of our choosing, so the routes can
+    /// be exercised without touching the real ~/.maestro/control-token.
+    /// Keeps each control test's token file alive for the length of the test.
+    /// Dropping the TempDir would delete the file, which now genuinely
+    /// revokes access.
+    fn control_token_file(token: Option<&str>) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-token");
+        if let Some(token) = token {
+            write_control_token(&path, token).unwrap();
+        }
+        (dir, path)
+    }
+
+    async fn start_control_test_server(
+        control_token: Option<String>,
+    ) -> (std::net::SocketAddr, Arc<ServerState>) {
+        let (dir, control_token_path) = control_token_file(control_token.as_deref());
+        // The door reads the file on every request, so the directory has to
+        // outlive the server rather than the helper.
+        std::mem::forget(dir);
+        let (emit_fn, _events) = test_emit_fn();
+        let state = Arc::new(ServerState {
+            emit_fn,
+            hook_emit_fn: None,
+            instance_id: "inst-control".to_string(),
+            session_projects: Arc::new(RwLock::new(HashMap::new())),
+            pending_statuses: Arc::new(RwLock::new(HashMap::new())),
+            notified_at: Arc::new(RwLock::new(HashMap::new())),
+            control_token,
+            control_token_path,
+            process_manager: None,
+        });
+
+        let app = build_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (addr, state)
+    }
+
+    async fn post_answer(addr: std::net::SocketAddr, bearer: Option<&str>, session_id: u32) -> u16 {
+        let mut req = reqwest::Client::new()
+            .post(format!("http://{}/control/answer", addr))
+            .json(&serde_json::json!({ "session_id": session_id, "text": "yes" }));
+        if let Some(token) = bearer {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+        req.send().await.unwrap().status().as_u16()
+    }
+
+    /// Same as `post_answer`, but with control over the answer text itself.
+    async fn post_answer_text(
+        addr: std::net::SocketAddr,
+        bearer: Option<&str>,
+        session_id: u32,
+        text: &str,
+    ) -> u16 {
+        let mut req = reqwest::Client::new()
+            .post(format!("http://{}/control/answer", addr))
+            .json(&serde_json::json!({ "session_id": session_id, "text": text }));
+        if let Some(token) = bearer {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+        req.send().await.unwrap().status().as_u16()
+    }
+
+    async fn get_sessions(addr: std::net::SocketAddr, bearer: Option<&str>) -> reqwest::Response {
+        let mut req = reqwest::Client::new().get(format!("http://{}/control/sessions", addr));
+        if let Some(token) = bearer {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+        req.send().await.unwrap()
+    }
+
+    // ── Review findings: the answer text reaches a live terminal ─────────
+
+    /// The text is written straight to a PTY running an agent. Anything that
+    /// is not plain text is a keystroke, not an answer.
+    #[tokio::test]
+    async fn control_answer_refuses_text_carrying_control_characters() {
+        let (addr, state) = start_control_test_server(Some("s3cret".to_string())).await;
+
+        for hostile in [
+            "yes\u{1b}[2J",       // clear the screen
+            "yes\u{3}",           // Ctrl-C
+            "yes\u{7f}no",        // backspace
+            "yes\r\nrm -rf /",    // carriage return
+        ] {
+            state.notified_at.write().await.insert(1, Instant::now());
+            assert_eq!(
+                post_answer_text(addr, Some("s3cret"), 1, hostile).await,
+                400,
+                "control characters must be refused, not typed: {hostile:?}"
+            );
+        }
+    }
+
+    /// An embedded newline is a second submission. One request, one answer.
+    #[tokio::test]
+    async fn control_answer_refuses_a_second_submission_smuggled_in_a_newline() {
+        let (addr, state) = start_control_test_server(Some("s3cret".to_string())).await;
+        state.notified_at.write().await.insert(1, Instant::now());
+
+        assert_eq!(
+            post_answer_text(addr, Some("s3cret"), 1, "yes\nnow delete everything").await,
+            400
+        );
+    }
+
+    #[tokio::test]
+    async fn control_answer_refuses_text_beyond_the_length_cap() {
+        let (addr, state) = start_control_test_server(Some("s3cret".to_string())).await;
+        state.notified_at.write().await.insert(1, Instant::now());
+
+        let huge = "a".repeat(MAX_CONTROL_ANSWER_LEN + 1);
+        assert_eq!(post_answer_text(addr, Some("s3cret"), 1, &huge).await, 400);
+    }
+
+    #[tokio::test]
+    async fn control_answer_still_accepts_ordinary_text() {
+        // Punctuation, spaces and non-ASCII are answers, not keystrokes. 503
+        // means both gates opened and it reached the PTY write.
+        let (addr, state) = start_control_test_server(Some("s3cret".to_string())).await;
+        state.notified_at.write().await.insert(1, Instant::now());
+
+        assert_eq!(
+            post_answer_text(addr, Some("s3cret"), 1, "yes, option 2 (the café one)").await,
+            503
+        );
+    }
+
+    // ── Review findings: the waiting gate ────────────────────────────────
+
+    /// The marker is consumed, so the same answer cannot be replayed into a
+    /// session that has since moved on.
+    #[tokio::test]
+    async fn control_answer_cannot_be_replayed() {
+        let (addr, state) = start_control_test_server(Some("s3cret".to_string())).await;
+        state.notified_at.write().await.insert(7, Instant::now());
+
+        // First answer gets through both gates (503 = no PTY in a test build).
+        assert_eq!(post_answer(addr, Some("s3cret"), 7).await, 503);
+        // Second is refused: the session is no longer recorded as waiting.
+        assert_eq!(post_answer(addr, Some("s3cret"), 7).await, 409);
+    }
+
+    /// A session that went back to work must stop being answerable. The shield
+    /// stamp used to survive the downgrade, leaving a working session open to
+    /// injection.
+    #[tokio::test]
+    async fn a_session_that_resumed_work_is_no_longer_answerable() {
+        let (addr, state) = start_control_test_server(Some("s3cret".to_string())).await;
+        // Waiting long enough ago that the shield has expired.
+        let aged = Instant::now() - NOTIFICATION_SHIELD_WINDOW - Duration::from_secs(1);
+        state.notified_at.write().await.insert(1, aged);
+
+        // A tool call proves it is working again.
+        let pre_tool_status = post_hook(
+            addr,
+            "/hook/pre-tool",
+            Some("inst-control"),
+            serde_json::json!({
+                "session_id": "claude-1",
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash"
+            }),
+        )
+        .await;
+        assert_eq!(pre_tool_status, 200, "the pre-tool hook must have been accepted");
+
+        assert_eq!(post_answer(addr, Some("s3cret"), 1).await, 409);
+    }
+
+    // ── Review findings: the token ───────────────────────────────────────
+
+    #[test]
+    fn an_unusable_token_file_closes_the_door_rather_than_minting_a_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-token");
+
+        // Empty and whitespace-only are tampered or truncated states. Quietly
+        // generating a replacement would hide that and hand out fresh access.
+        //
+        // Written through write_control_token so the file keeps owner-only
+        // permissions: a plain fs::write lands at 0644, which the permission
+        // guard rejects first, and the test would then pass without ever
+        // reaching the emptiness check it is here to prove.
+        for contents in ["", "   \n"] {
+            write_control_token(&path, contents).unwrap();
+            assert!(
+                read_existing_control_token(&path).is_none(),
+                "an unusable token file must not be accepted: {contents:?}"
+            );
+            assert!(
+                path.exists(),
+                "it must be left alone for a human to look at, not overwritten"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_world_readable_token_file_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-token");
+        std::fs::write(&path, "s3cret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(read_existing_control_token(&path).is_none());
+    }
+
+    #[test]
+    fn a_good_token_file_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-token");
+        write_control_token(&path, "s3cret").unwrap();
+
+        assert_eq!(read_existing_control_token(&path).as_deref(), Some("s3cret"));
+    }
+
+    /// Deleting the file must revoke access without restarting the app.
+    #[test]
+    fn deleting_the_token_file_revokes_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-token");
+        write_control_token(&path, "s3cret").unwrap();
+        assert!(read_existing_control_token(&path).is_some());
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(read_existing_control_token(&path).is_none());
+    }
+
+    #[test]
+    fn token_comparison_does_not_short_circuit_on_the_first_byte() {
+        assert!(tokens_match("s3cret", "s3cret"));
+        assert!(!tokens_match("s3cret", "s3crXt"));
+        assert!(!tokens_match("s3cret", "s3cre"));
+        assert!(!tokens_match("s3cret", ""));
+        assert!(!tokens_match("", ""));
+    }
+
+    #[tokio::test]
+    async fn control_answer_needs_the_token() {
+        let (addr, state) = start_control_test_server(Some("s3cret".to_string())).await;
+        // A blocked session, so the only thing left to fail on is the token.
+        state.notified_at.write().await.insert(1, Instant::now());
+
+        assert_eq!(post_answer(addr, None, 1).await, 401);
+        assert_eq!(post_answer(addr, Some("wrong"), 1).await, 401);
+    }
+
+    #[tokio::test]
+    async fn control_answer_is_shut_when_no_token_could_be_created() {
+        // Writing the token file failed, so control_token is None. That must
+        // read as "closed", never as "no token required".
+        let (addr, state) = start_control_test_server(None).await;
+        state.notified_at.write().await.insert(1, Instant::now());
+
+        assert_eq!(post_answer(addr, None, 1).await, 401);
+        assert_eq!(post_answer(addr, Some("anything"), 1).await, 401);
+    }
+
+    #[tokio::test]
+    async fn control_answer_refuses_a_session_that_is_not_waiting() {
+        // Nothing in notified_at means the session moved on. Typing into it
+        // would land mid-turn, so it is refused rather than best-effort.
+        let (addr, _state) = start_control_test_server(Some("s3cret".to_string())).await;
+
+        assert_eq!(post_answer(addr, Some("s3cret"), 1).await, 409);
+    }
+
+    #[tokio::test]
+    async fn control_answer_gets_past_the_gates_for_a_blocked_session() {
+        // Right token, genuinely blocked: it reaches the PTY write and only
+        // then finds there is no process manager in a test build. 503 rather
+        // than 401/409 is what proves both gates opened.
+        let (addr, state) = start_control_test_server(Some("s3cret".to_string())).await;
+        state.notified_at.write().await.insert(7, Instant::now());
+
+        assert_eq!(post_answer(addr, Some("s3cret"), 7).await, 503);
+    }
+
+    #[tokio::test]
+    async fn control_sessions_needs_the_token_then_lists_what_is_open() {
+        let (addr, state) = start_control_test_server(Some("s3cret".to_string())).await;
+        state
+            .session_projects
+            .write()
+            .await
+            .insert(3, "/path/project".to_string());
+
+        assert_eq!(get_sessions(addr, None).await.status().as_u16(), 401);
+
+        let resp = get_sessions(addr, Some("s3cret")).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body.as_array().unwrap().len(), 1);
+        assert_eq!(body[0]["session_id"], 3);
+        assert_eq!(body[0]["project_path"], "/path/project");
     }
 }
